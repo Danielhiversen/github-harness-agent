@@ -257,6 +257,7 @@ def test_linux_worker_executes_without_controller_credentials(fixture, monkeypat
     task = replace(task, checks=(("python", "test_number.py"),))
     gateway = ScriptedGateway(
         "import os\nassert 'GH_TOKEN' not in os.environ\n"
+        "assert os.stat('.').st_uid == os.getuid()\n"
         "assert not os.path.exists('/var/run/docker.sock')\n"
         "open('number.txt','w').write('4\\n')",
         python="python",
