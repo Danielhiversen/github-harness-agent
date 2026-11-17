@@ -154,7 +154,7 @@ class DockerRunner:
                         "--env",
                         "GIT_CONFIG_GLOBAL=/dev/null",
                         "--tmpfs",
-                        "/work:rw,exec,nosuid,nodev,size=512m,mode=1777",
+                        "/work:rw,exec,nosuid,nodev,size=512m,uid=65532,gid=65532,mode=0755",
                         "--tmpfs",
                         "/tmp:rw,nosuid,nodev,size=128m,mode=1777",
                         "--workdir",
