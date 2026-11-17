@@ -1,0 +1,12 @@
+database = "agent.sqlite3"
+bot_login = "your-github-app[bot]"
+
+[repositories."example/project"]
+installation_id = 12345
+mode = "shadow"
+backend = "plain"
+base = "main"
+label = "agent:ready"
+branch_prefix = "agent/"
+worker_image = "your-tested-worker-image"
+checks = [["python", "-m", "unittest", "discover"]]

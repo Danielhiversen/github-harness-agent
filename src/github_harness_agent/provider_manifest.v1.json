@@ -1,0 +1,1066 @@
+{
+  "version": 1,
+  "web": {
+    "kilo-free": {
+      "protocol": "chat",
+      "models": [
+        {
+          "id": "kilo-auto/free",
+          "input": [
+            "text"
+          ],
+          "context_window": 256000,
+          "max_tokens": 16384
+        },
+        {
+          "id": "nvidia/nemotron-3.5-super-vl:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 1000000,
+          "max_tokens": 16384
+        },
+        {
+          "id": "reflection/beam-free",
+          "input": [
+            "text"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 16384
+        },
+        {
+          "id": "stealth/glyph-cluster",
+          "input": [
+            "text"
+          ],
+          "context_window": 256000,
+          "max_tokens": 16384
+        },
+        {
+          "id": "recursive/flint-v1.0:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 16384
+        },
+        {
+          "id": "xingchen-agi/xing4.0-29b-a4b:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 16384
+        },
+        {
+          "id": "dots-studio/dots-3-note-preview:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 512000,
+          "max_tokens": 16384
+        },
+        {
+          "id": "liquid/lfm-2.5-2.6b:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 65536,
+          "max_tokens": 8192
+        },
+        {
+          "id": "nvidia/nemotron-3.5-lightning:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 1000000,
+          "max_tokens": 16384
+        },
+        {
+          "id": "thinkingmachines/inkling-small:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 16384
+        },
+        {
+          "id": "thinkingmachines/inkling:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 16384
+        },
+        {
+          "id": "cohere/north-mini-code:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 256000,
+          "max_tokens": 16384
+        },
+        {
+          "id": "nvidia/nemotron-3-ultra-550b-a55b:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 1000000,
+          "max_tokens": 16384
+        },
+        {
+          "id": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 256000,
+          "max_tokens": 16384
+        },
+        {
+          "id": "google/gemma-4-31b-it:free",
+          "input": [
+            "image",
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 16384
+        },
+        {
+          "id": "openrouter/free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 200000,
+          "max_tokens": 8192
+        }
+      ]
+    },
+    "ollama-local": {
+      "protocol": "chat",
+      "models": [
+        {
+          "id": "gemma4:26b",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 32768,
+          "max_tokens": 8192
+        },
+        {
+          "id": "qwen2.5-coder:7b",
+          "input": [
+            "text"
+          ],
+          "context_window": 32768,
+          "max_tokens": 8192
+        }
+      ]
+    },
+    "openrouter-free": {
+      "protocol": "chat",
+      "models": [
+        {
+          "id": "baidu/ernie-5.5-flash-preview:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 1024000,
+          "max_tokens": 16384
+        },
+        {
+          "id": "thinkingmachines/inkling-2-small:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 16384
+        },
+        {
+          "id": "liquid/lfm-3-1.7b:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 8192
+        },
+        {
+          "id": "particle-ai/particle-1:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 16384
+        },
+        {
+          "id": "apodex/apodex-1.1-mini:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 16384
+        },
+        {
+          "id": "recursive/flint-v1.0:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 16384
+        },
+        {
+          "id": "xingchen-agi/xing4.0-29b-a4b:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 16384
+        },
+        {
+          "id": "nvidia/nemotron-3.5-super-vl:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 1000000,
+          "max_tokens": 16384
+        },
+        {
+          "id": "dots-studio/dots-3-note-preview:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 512000,
+          "max_tokens": 16384
+        },
+        {
+          "id": "liquid/lfm-2.5-2.6b:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 65536,
+          "max_tokens": 8192
+        },
+        {
+          "id": "nvidia/nemotron-3.5-lightning:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 1000000,
+          "max_tokens": 16384
+        },
+        {
+          "id": "thinkingmachines/inkling-small:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 16384
+        },
+        {
+          "id": "thinkingmachines/inkling:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 16384
+        },
+        {
+          "id": "cohere/north-mini-code:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 256000,
+          "max_tokens": 16384
+        },
+        {
+          "id": "nvidia/nemotron-3-ultra-550b-a55b:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 1000000,
+          "max_tokens": 16384
+        },
+        {
+          "id": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 256000,
+          "max_tokens": 16384
+        },
+        {
+          "id": "google/gemma-4-26b-a4b-it:free",
+          "input": [
+            "image",
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 16384
+        },
+        {
+          "id": "google/gemma-4-31b-it:free",
+          "input": [
+            "image",
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 16384
+        },
+        {
+          "id": "openrouter/free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 200000,
+          "max_tokens": 8192
+        }
+      ]
+    },
+    "nvidia-free": {
+      "protocol": "chat",
+      "models": [
+        {
+          "id": "deepseek-ai/deepseek-v4.1-flash",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 1000000,
+          "max_tokens": 16384
+        },
+        {
+          "id": "google/diffusiongemma-26b-a4b-it",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 250000,
+          "max_tokens": 16384
+        },
+        {
+          "id": "stepfun-ai/step-5-preview",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 262144,
+          "max_tokens": 16384
+        },
+        {
+          "id": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 256000,
+          "max_tokens": 16384
+        },
+        {
+          "id": "meta/muse-glimmer-30b",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 131072,
+          "max_tokens": 16384
+        },
+        {
+          "id": "nvidia/nemotron-3.5-lightning-30b-a3b",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 16384
+        },
+        {
+          "id": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 262144,
+          "max_tokens": 8192
+        },
+        {
+          "id": "nvidia/nemotron-3-ultra-550b-a55b",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 16384
+        },
+        {
+          "id": "poolside/laguna-xs-2.1",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 16384
+        }
+      ]
+    },
+    "routeway-free": {
+      "protocol": "chat",
+      "models": [
+        {
+          "id": "deepseek-v4.1-flash:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 42000,
+          "max_tokens": 8192
+        }
+      ]
+    },
+    "groq-free": {
+      "protocol": "chat",
+      "models": [
+        {
+          "id": "qwen/qwen3.8-27b",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 131072,
+          "max_tokens": 16384
+        },
+        {
+          "id": "openai/gpt-oss-120b",
+          "input": [
+            "text"
+          ],
+          "context_window": 131072,
+          "max_tokens": 16384
+        }
+      ]
+    }
+  },
+  "catalog": {
+    "openrouter": {
+      "protocol": "chat",
+      "models": [
+        {
+          "id": "baidu/ernie-5.5-flash-preview:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 1024000,
+          "max_tokens": 16384
+        },
+        {
+          "id": "thinkingmachines/inkling-2-small:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 16384
+        },
+        {
+          "id": "liquid/lfm-3-1.7b:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 8192
+        },
+        {
+          "id": "particle-ai/particle-1:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 16384
+        },
+        {
+          "id": "apodex/apodex-1.1-mini:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 16384
+        },
+        {
+          "id": "nvidia/nemotron-3.5-super-vl:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 131072
+        },
+        {
+          "id": "nvidia/nemotron-3-ultra-550b-a55b:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 65536
+        },
+        {
+          "id": "nvidia/nemotron-3.5-lightning:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 65536
+        },
+        {
+          "id": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 262144,
+          "max_tokens": 65536
+        },
+        {
+          "id": "google/gemma-4-31b-it:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 262144,
+          "max_tokens": 32768
+        },
+        {
+          "id": "google/gemma-4-26b-a4b-it:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 262144,
+          "max_tokens": 32768
+        },
+        {
+          "id": "cohere/north-mini-code:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 64000
+        },
+        {
+          "id": "dots-studio/dots-3-note-preview:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 524288,
+          "max_tokens": 460800
+        },
+        {
+          "id": "liquid/lfm-2.5-2.6b:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 65536,
+          "max_tokens": 8192
+        },
+        {
+          "id": "recursive/flint-v1.0:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 235929
+        },
+        {
+          "id": "thinkingmachines/inkling-small:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 262144
+        },
+        {
+          "id": "thinkingmachines/inkling:free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 262144
+        },
+        {
+          "id": "xingchen-agi/xing4.0-29b-a4b:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 235929
+        },
+        {
+          "id": "openrouter/free",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 2097152,
+          "max_tokens": 4096
+        },
+        {
+          "id": "openrouter/auto",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 2097152,
+          "max_tokens": 4096
+        },
+        {
+          "id": "openrouter/auto-beta",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 2097152,
+          "max_tokens": 65536
+        },
+        {
+          "id": "openrouter/fusion",
+          "input": [
+            "text"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 30000
+        },
+        {
+          "id": "openrouter/pareto-code",
+          "input": [
+            "text"
+          ],
+          "context_window": 2097152,
+          "max_tokens": 4096
+        },
+        {
+          "id": "typesafe/jev-router",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 65536
+        },
+        {
+          "id": "auto",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 2097152,
+          "max_tokens": 30000
+        }
+      ]
+    },
+    "nvidia": {
+      "protocol": "chat",
+      "models": [
+        {
+          "id": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 65536
+        },
+        {
+          "id": "nvidia/nemotron-3-ultra-550b-a55b",
+          "input": [
+            "text"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 65536
+        },
+        {
+          "id": "nvidia/nemotron-3.5-lightning-30b-a3b",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 65536
+        },
+        {
+          "id": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 262144,
+          "max_tokens": 65536
+        },
+        {
+          "id": "deepseek-ai/deepseek-v4.1-flash",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 1000000,
+          "max_tokens": 16384
+        },
+        {
+          "id": "z-ai/glm-5.3-flash",
+          "input": [
+            "text"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 65536
+        },
+        {
+          "id": "stepfun-ai/step-5-preview",
+          "input": [
+            "text"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 65536
+        },
+        {
+          "id": "meta/llama-3.1-nemotron-70b-instruct",
+          "input": [
+            "text"
+          ],
+          "context_window": 131072,
+          "max_tokens": 65536
+        },
+        {
+          "id": "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+          "input": [
+            "text"
+          ],
+          "context_window": 131072,
+          "max_tokens": 65536
+        },
+        {
+          "id": "meta/llama-3.2-90b-vision-instruct",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 131072,
+          "max_tokens": 65536
+        },
+        {
+          "id": "meta/llama-3.2-11b-vision-instruct",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 131072,
+          "max_tokens": 65536
+        },
+        {
+          "id": "openai/gpt-oss-20b",
+          "input": [
+            "text"
+          ],
+          "context_window": 131072,
+          "max_tokens": 65536
+        },
+        {
+          "id": "google/gemma-3-12b-it",
+          "input": [
+            "text"
+          ],
+          "context_window": 131072,
+          "max_tokens": 65536
+        },
+        {
+          "id": "google/gemma-3-4b-it",
+          "input": [
+            "text"
+          ],
+          "context_window": 131072,
+          "max_tokens": 65536
+        },
+        {
+          "id": "google/diffusiongemma-26b-a4b-it",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 65536
+        },
+        {
+          "id": "meta/muse-glimmer-30b",
+          "input": [
+            "text"
+          ],
+          "context_window": 131072,
+          "max_tokens": 65536
+        },
+        {
+          "id": "minimaxai/minimax-m3.1-flash",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 65536
+        },
+        {
+          "id": "mistralai/mistral-7b-instruct-v0.3",
+          "input": [
+            "text"
+          ],
+          "context_window": 65536,
+          "max_tokens": 65536
+        },
+        {
+          "id": "moonshotai/kimi-k2.6",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 65536
+        },
+        {
+          "id": "nvidia/cosmos-reason2-8b",
+          "input": [
+            "text"
+          ],
+          "context_window": 131072,
+          "max_tokens": 65536
+        },
+        {
+          "id": "poolside/laguna-xs-2.1",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 65536
+        }
+      ]
+    },
+    "google": {
+      "protocol": "gemini",
+      "models": [
+        {
+          "id": "gemma-4-31b-it",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 262144,
+          "max_tokens": 32768
+        },
+        {
+          "id": "gemma-4-26b-a4b-it",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 262144,
+          "max_tokens": 32768
+        }
+      ]
+    },
+    "zai": {
+      "protocol": "chat",
+      "models": [
+        {
+          "id": "glm-5.3-highspeed",
+          "input": [
+            "text"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 65536
+        },
+        {
+          "id": "glm-5.2-highspeed",
+          "input": [
+            "text"
+          ],
+          "context_window": 1048576,
+          "max_tokens": 65536
+        }
+      ]
+    },
+    "mistral": {
+      "protocol": "chat",
+      "models": [
+        {
+          "id": "labs-leanstral-1-5-1",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 65536
+        },
+        {
+          "id": "labs-devstral-small-2512",
+          "input": [
+            "text"
+          ],
+          "context_window": 262144,
+          "max_tokens": 65536
+        }
+      ]
+    },
+    "huggingface": {
+      "protocol": "chat",
+      "models": [
+        {
+          "id": "zai-org/GLM-4.7-Flash",
+          "input": [
+            "text"
+          ],
+          "context_window": 2097152,
+          "max_tokens": 65536
+        }
+      ]
+    },
+    "routeway-free": {
+      "protocol": "chat",
+      "models": [
+        {
+          "id": "deepseek-v4.1-flash:free",
+          "input": [
+            "text"
+          ],
+          "context_window": 42000,
+          "max_tokens": 8192
+        }
+      ]
+    },
+    "groq-free": {
+      "protocol": "chat",
+      "models": [
+        {
+          "id": "qwen/qwen3.8-27b",
+          "input": [
+            "text",
+            "image"
+          ],
+          "context_window": 131072,
+          "max_tokens": 16384
+        },
+        {
+          "id": "openai/gpt-oss-120b",
+          "input": [
+            "text"
+          ],
+          "context_window": 131072,
+          "max_tokens": 16384
+        }
+      ]
+    }
+  },
+  "default": {
+    "provider": "kilo-free",
+    "model": "nvidia/nemotron-3.5-super-vl:free"
+  },
+  "fallback": [
+    {
+      "provider": "kilo-free",
+      "model": "kilo-auto/free"
+    },
+    {
+      "provider": "kilo-free",
+      "model": "nvidia/nemotron-3.5-super-vl:free"
+    },
+    {
+      "provider": "kilo-free",
+      "model": "reflection/beam-free"
+    },
+    {
+      "provider": "kilo-free",
+      "model": "stealth/glyph-cluster"
+    },
+    {
+      "provider": "kilo-free",
+      "model": "recursive/flint-v1.0:free"
+    },
+    {
+      "provider": "kilo-free",
+      "model": "xingchen-agi/xing4.0-29b-a4b:free"
+    },
+    {
+      "provider": "kilo-free",
+      "model": "dots-studio/dots-3-note-preview:free"
+    },
+    {
+      "provider": "kilo-free",
+      "model": "liquid/lfm-2.5-2.6b:free"
+    },
+    {
+      "provider": "kilo-free",
+      "model": "nvidia/nemotron-3.5-lightning:free"
+    },
+    {
+      "provider": "kilo-free",
+      "model": "thinkingmachines/inkling-small:free"
+    },
+    {
+      "provider": "kilo-free",
+      "model": "thinkingmachines/inkling:free"
+    },
+    {
+      "provider": "kilo-free",
+      "model": "cohere/north-mini-code:free"
+    },
+    {
+      "provider": "kilo-free",
+      "model": "nvidia/nemotron-3-ultra-550b-a55b:free"
+    },
+    {
+      "provider": "kilo-free",
+      "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+    },
+    {
+      "provider": "kilo-free",
+      "model": "google/gemma-4-31b-it:free"
+    },
+    {
+      "provider": "kilo-free",
+      "model": "openrouter/free"
+    },
+    {
+      "provider": "nvidia-free",
+      "model": "google/diffusiongemma-26b-a4b-it"
+    },
+    {
+      "provider": "nvidia-free",
+      "model": "stepfun-ai/step-5-preview"
+    },
+    {
+      "provider": "nvidia-free",
+      "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+    },
+    {
+      "provider": "nvidia-free",
+      "model": "meta/muse-glimmer-30b"
+    },
+    {
+      "provider": "nvidia-free",
+      "model": "nvidia/nemotron-3.5-lightning-30b-a3b"
+    },
+    {
+      "provider": "nvidia-free",
+      "model": "nvidia/nemotron-3.5-super-vl-120b-a12b"
+    },
+    {
+      "provider": "nvidia-free",
+      "model": "nvidia/nemotron-3-ultra-550b-a55b"
+    },
+    {
+      "provider": "nvidia-free",
+      "model": "poolside/laguna-xs-2.1"
+    }
+  ]
+}
