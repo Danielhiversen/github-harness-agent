@@ -1,0 +1,24 @@
+name: Live issue 2 canary
+on:
+  push:
+    branches: [dhh/live-canary-2]
+permissions: {}
+jobs:
+  issue-to-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 22
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked --python 3.12
+      - run: docker build -t canary-worker worker
+      - run: uv run --no-sync python -u live_canary.py
+        env:
+          CANARY_MODE: shadow
+          CANARY_INSTALLATION_TOKEN: ${{ github.token }}
