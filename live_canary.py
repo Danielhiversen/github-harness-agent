@@ -8,6 +8,7 @@ from pathlib import Path
 import httpx
 from github_harness_agent.controller import Controller
 from github_harness_agent.executor import PlainExecutor, DockerRunner, Limits
+from github_harness_agent.worker import ExecutionError
 from github_harness_agent.github import GitHubApp, GitHubClient
 from github_harness_agent.intake import reconcile
 from github_harness_agent.providers import ProviderRouter, load_manifest, ProviderExhausted
@@ -50,8 +51,8 @@ while time.monotonic()<deadline:
     assert job["issue"]==2
     try:
         controller.run(job)
-    except ProviderExhausted as err:
-        print("Provider failure",err.failures,flush=True)
+    except (ProviderExhausted, ExecutionError) as err:
+        print("Attempt failed",getattr(err,"failures",str(err)),flush=True)
         attempts+=1
         if attempts>=4: raise
         db.save(job,"queued",delay=10)
