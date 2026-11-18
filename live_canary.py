@@ -37,7 +37,7 @@ config = dict(label="agent:live-canary", base="dhh/implement-github-agent", mode
 router = ProviderRouter(load_manifest(), [dict(model="kilo-free/kilo-auto/free",
     url="https://ai-gateway.kilo.ai/api/v1", headers={"Authorization":"Bearer anonymous"},
     free_verified=True,tools=True)])
-executor = PlainExecutor(DockerRunner("canary-worker",runtime="runc"),router,Limits(wall_time=300,model_requests=16))
+executor = PlainExecutor(DockerRunner("canary-worker",runtime="runc"),router,Limits(wall_time=300,model_requests=40))
 controller = Controller(db,api,executor,config,"github-actions[bot]")
 reconcile(api,db,repo,config)
 deadline = time.monotonic()+900
