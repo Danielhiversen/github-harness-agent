@@ -8,7 +8,7 @@ from pathlib import Path
 
 import uvicorn
 
-from .intake import reconcile
+from .intake import adopt_open_pulls, reconcile
 from .store import LeaseLost, Store
 from .webhooks import create_app
 
@@ -60,6 +60,18 @@ def run_worker(store, config, once=False):
             failed = set()
             for repo, controller in controllers.items():
                 try:
+                    if account is not None:
+                        count = adopt_open_pulls(
+                            controller.api,
+                            store,
+                            repo,
+                            controller.config,
+                            config["bot_login"],
+                        )
+                        if count:
+                            logging.getLogger(__name__).info(
+                                "Adopted %s open PR(s) in %s", count, repo
+                            )
                     reconcile(controller.api, store, repo, controller.config)
                     if repo not in online:
                         logging.getLogger(__name__).info(
@@ -82,6 +94,7 @@ def run_worker(store, config, once=False):
             next_sync = time.monotonic() + 60
         job = store.claim(ttl=1800)
         if job:
+            before = (job["data"]["stage"], job["data"].get("last_commit"))
             try:
                 controllers[job["repo"]].run(job)
             except LeaseLost:
@@ -112,11 +125,16 @@ def run_worker(store, config, once=False):
                 except LeaseLost:
                     pass
             else:
-                with store.tx() as db:
-                    db.execute(
-                        """UPDATE tasks SET data=json_remove(data,'$.consecutive_failures')
-                        WHERE repo=? AND issue=? AND generation=? AND token IS NULL""",
-                        (job["repo"], job["issue"], job["generation"]),
+                store.clear_failures(job)
+                after = (job["data"]["stage"], job["data"].get("last_commit"))
+                if after != before:
+                    logging.getLogger(__name__).info(
+                        "%s %s #%s entered %s (commit %s)",
+                        job["repo"],
+                        job["kind"],
+                        job["issue"],
+                        after[0],
+                        after[1] or "pending",
                     )
         if once:
             return
@@ -146,7 +164,7 @@ def main():
     elif args.command == "status":
         with store.tx() as db:
             for row in db.execute(
-                "SELECT repo,issue,state,generation,attempts FROM tasks"
+                "SELECT repo,kind,issue,state,generation,attempts FROM tasks"
             ):
                 print(json.dumps(dict(row)))
     elif args.command == "fence":

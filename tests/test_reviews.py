@@ -148,6 +148,85 @@ def test_new_review_and_edited_body_remain_pending_after_previous_batch():
     ]
 
 
+def test_adopted_pull_distinguishes_handled_history_from_current_inline_feedback():
+    github = ReviewGitHub()
+    first = dict(
+        review(10, body="Use the provider's first-seen time."), commit={"oid": "b" * 40}
+    )
+    reply = dict(
+        review(
+            11,
+            login="test-app[bot]",
+            body="Addressing review feedback: the cap now uses first seen.",
+        ),
+        submittedAt="2026-01-02T00:00:00Z",
+        commit={"oid": "c" * 40},
+    )
+    older = dict(
+        review(12, body="Retain timestamp collisions."),
+        submittedAt="2026-01-03T00:00:00Z",
+        commit={"oid": "c" * 40},
+    )
+    latest = dict(
+        review(
+            13,
+            body="The cap is covered. I found a compatibility issue with existing archives.",
+        ),
+        submittedAt="2026-01-04T00:00:00Z",
+        commit={"oid": github.head},
+    )
+    historic_body = dict(
+        review(14, body="Retain unaddressed review text."),
+        submittedAt="2026-01-05T00:00:00Z",
+        commit={"oid": github.head},
+    )
+    github.reviews = [first, reply, older, latest, historic_body]
+    old_inline = dict(comment(20), pullRequestReview=first)
+    latest_inline = dict(
+        comment(21, body="Preserve legacy equivalence."), pullRequestReview=latest
+    )
+    open_inline = dict(comment(22), pullRequestReview=first)
+    github.pages = [
+        [thread("outdated", [old_inline])],
+        [
+            dict(thread("latest", [latest_inline]), isOutdated=False),
+            dict(thread("still-open", [open_inline]), isOutdated=False),
+        ],
+    ]
+    batch = collect(github, adopted_at="2026-01-06T00:00:00Z")
+    assert [item.thread for item in batch.items] == [
+        "review:14",
+        "latest",
+        "still-open",
+    ]
+    assert {item.thread for item in batch.handled} == {
+        "review:10",
+        "review:12",
+        "review:13",
+        "outdated",
+    }
+
+
+def test_adopted_pull_uses_exact_agent_reply_with_review_revision_time():
+    github = ReviewGitHub()
+    github.reviews = [
+        review(10, body="Include the example."),
+        review(11, body="Document the result.", edited="2026-01-03T00:00:00Z"),
+    ]
+    github.pages = [[], []]
+    github.comments = [
+        {
+            "body": f"Following up on review #{number}.\n\nAddressed this feedback in `abcd`.",
+            "user": {"login": "test-app[bot]"},
+            "created_at": "2026-01-02T00:00:00Z",
+        }
+        for number in (10, 11)
+    ]
+    batch = collect(github, adopted_at="2026-01-04T00:00:00Z")
+    assert [item.thread for item in batch.handled] == ["review:10"]
+    assert [item.thread for item in batch.items] == ["review:11"]
+
+
 def test_known_thread_followup_waits_for_debounce():
     github = ReviewGitHub()
     github.pages[0][0]["comments"]["nodes"].append(

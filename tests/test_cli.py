@@ -5,6 +5,7 @@ from github_harness_agent.store import Store
 def test_worker_uses_named_account_without_app_credentials(monkeypatch, tmp_path):
     api = object()
     created = []
+    scans = []
 
     def get_named_account(login, config_dir, *, gh):
         assert (login, config_dir, gh) == (
@@ -20,6 +21,11 @@ def test_worker_uses_named_account_without_app_credentials(monkeypatch, tmp_path
     def reconcile(client, store, repo, config):
         assert client is api
         assert repo == "example/project"
+        scans.append("issues")
+
+    def adopt(client, store, repo, config, login):
+        assert client is api and (repo, login) == ("example/project", "example-agent")
+        scans.append("pulls")
 
     monkeypatch.delenv("GITHUB_APP_ID", raising=False)
     monkeypatch.delenv("GITHUB_APP_PRIVATE_KEY_FILE", raising=False)
@@ -28,6 +34,7 @@ def test_worker_uses_named_account_without_app_credentials(monkeypatch, tmp_path
     monkeypatch.setattr(executor, "DockerRunner", make_runner)
     monkeypatch.setattr(providers.ModelGatewayClient, "from_env", lambda: object())
     monkeypatch.setattr(cli, "reconcile", reconcile)
+    monkeypatch.setattr(cli, "adopt_open_pulls", adopt)
     cli.run_worker(
         Store(tmp_path / "agent.db"),
         {
@@ -44,3 +51,4 @@ def test_worker_uses_named_account_without_app_credentials(monkeypatch, tmp_path
         once=True,
     )
     assert created == [("agent:test", "runc")]
+    assert scans == ["pulls", "issues"]

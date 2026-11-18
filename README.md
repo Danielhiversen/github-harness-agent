@@ -27,6 +27,8 @@ The worker can use an existing GitHub CLI login for a dedicated account with acc
 
 Run `work` for polling. For signed webhooks, separately configure an authorized repository webhook and run `serve` with `GITHUB_WEBHOOK_SECRET`. The named-account credential stays in controller process memory after startup. Restart the controller after replacing the GitHub CLI credential.
 
+In named-account mode, each scan also discovers open pull requests authored by that account with a head branch in the configured repository. The controller adopts each PR for review handling on its existing branch, including PRs created before deployment and PRs without a linked issue. Adoption runs before labeled issue intake. The issue label continues to select new implementation tasks. A review repair uses the PR's current target, rechecks branch ownership and head, and replies on the original PR after verification.
+
 ## Qualify a replacement
 
 Use the [qualification guide](docs/qualification.md) and [implementation plan](docs/superpowers/plans/2026-11-17-github-agent.md) for matched replay, shadow and canary gates. Offline tests exercise recovery, provider contracts and both executors. Live GitHub, provider, isolation and reviewer-time evidence are additional cutover requirements.

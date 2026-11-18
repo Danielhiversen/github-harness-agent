@@ -24,6 +24,7 @@ from github_harness_agent.executor import (
     TaskSnapshot,
 )
 from github_harness_agent.providers import ProviderExhausted
+from github_harness_agent.worker import CommandOutputExceeded
 
 
 class FixtureRunner:
@@ -50,7 +51,7 @@ class FixtureWorkspace:
         self.root = root
 
     def command(self, argv, timeout, cancelled, *, data=b"", cap=65536):
-        return subprocess.run(
+        result = subprocess.run(
             argv,
             cwd=self.root,
             input=data,
@@ -58,6 +59,9 @@ class FixtureWorkspace:
             timeout=timeout,
             env=dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull),
         )
+        if len(result.stdout) + len(result.stderr) > cap:
+            raise CommandOutputExceeded("Command output exceeded the configured size")
+        return result
 
 
 class ScriptedGateway:
@@ -155,6 +159,95 @@ def test_rejects_patch_that_weakens_trusted_check(fixture):
     gateway = ScriptedGateway("open('test_number.py','w').write('pass\\n')")
     with pytest.raises(ExecutionError, match="protected"):
         PlainExecutor(runner, gateway).execute(task, source)
+
+
+def test_adds_new_regression_without_loading_it_during_trusted_checks(fixture):
+    task, source, runner = fixture
+    task = replace(
+        task,
+        checks=(
+            (
+                sys.executable,
+                "-c",
+                "import runpy; from pathlib import Path; "
+                "[runpy.run_path(str(path)) for path in Path('.').glob('test_*.py')]",
+            ),
+        ),
+    )
+    gateway = ScriptedGateway(
+        "open('number.txt','w').write('4\\n'); "
+        "open('test_regression.py','w').write(\"print('new regression ran')\\n\")"
+    )
+    result = PlainExecutor(runner, gateway).execute(task, source)
+    assert b"test_regression.py" in result.patch
+    assert [check.output.strip() for check in result.checks] == [
+        "",
+        "new regression ran",
+    ]
+    assert len(runner.workspaces) == 3
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "open('conftest.py','w').write('pass\\n')",
+        "__import__('os').symlink('number.txt', 'test_regression.py')",
+        "__import__('os').mkdir('tests'); open('tests/__init__.py','w').write('pass\\n')",
+        "__import__('os').unlink('test_number.py'); "
+        "__import__('os').symlink('number.txt', 'test_number.py')",
+    ],
+)
+def test_rejects_test_configuration_and_symlink_replacements(fixture, change):
+    task, source, runner = fixture
+    with pytest.raises(ExecutionError, match="protected|symlink"):
+        PlainExecutor(runner, ScriptedGateway(change)).execute(task, source)
+
+
+def test_new_test_cannot_bypass_existing_checks(fixture):
+    task, source, runner = fixture
+    task = replace(
+        task,
+        checks=(
+            (
+                sys.executable,
+                "-c",
+                "import runpy; from pathlib import Path; "
+                "Path('test_regression.py').exists() or runpy.run_path('test_number.py')",
+            ),
+        ),
+    )
+    gateway = ScriptedGateway(
+        "open('number.txt','w').write('99\\n'); "
+        "open('test_regression.py','w').write('pass\\n')"
+    )
+    with pytest.raises(ExecutionError, match="Required check"):
+        PlainExecutor(runner, gateway).execute(task, source)
+
+
+def test_model_can_continue_after_an_oversized_tool_read(fixture):
+    task, source, runner = fixture
+
+    class NarrowingGateway(ScriptedGateway):
+        def complete(self, **kwargs):
+            if kwargs["messages"][-1]["role"] == "user":
+                return super().complete(**kwargs)
+            if "output limit" in kwargs["messages"][-1]["content"]:
+                self.code = "open('number.txt','w').write('4\\n')"
+                return super().complete(**(kwargs | {"messages": [{"role": "user"}]}))
+            return super().complete(**kwargs)
+
+    result = PlainExecutor(runner, NarrowingGateway("print('x' * 80000)")).execute(
+        task, source
+    )
+    assert b"+4\n" in result.patch
+
+
+def test_oversized_checkout_reports_the_archive_limit(fixture):
+    task, source, runner = fixture
+    executor = PlainExecutor(runner, ScriptedGateway(None), Limits(archive_bytes=1024))
+    with pytest.raises(LimitExceeded, match="archive limit"):
+        executor.execute(task, source)
+    assert runner.workspaces == []
 
 
 def test_rejects_empty_patch(fixture):

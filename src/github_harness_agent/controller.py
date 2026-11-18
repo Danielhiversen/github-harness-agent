@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 
 from .executor import AttemptRejected, ExecutionError, NeedsClarification, TaskSnapshot
-from .intake import eligible, maintainer
+from .intake import adoptable_pull, eligible, maintainer
 from .publish import (
     BranchUpdate,
     ClosedPull,
@@ -31,7 +31,7 @@ from .reviews import ReviewItem, collect_reviews, map_feedback, reply_to_review
 from .store import LeaseLost
 
 
-def prepare_commit(path, parent, patch, issue, identity=BOT_IDENTITY):
+def prepare_commit(path, parent, patch, issue, identity=BOT_IDENTITY, *, adopted=False):
     # Stage patch directly in the index. No checked-out project code runs here.
     git(path, "read-tree", parent)
     git(path, "apply", "--cached", "--binary", "-", data=patch)
@@ -48,7 +48,9 @@ def prepare_commit(path, parent, patch, issue, identity=BOT_IDENTITY):
             "-p",
             parent,
             "-m",
-            f"Address issue #{issue}",
+            f"Address review feedback on PR #{issue}"
+            if adopted
+            else f"Address issue #{issue}",
         )
         .decode()
         .strip()
@@ -56,9 +58,19 @@ def prepare_commit(path, parent, patch, issue, identity=BOT_IDENTITY):
 
 
 def verified_commit(
-    path, parent, patch, issue, checks, origin, target, identity, previous_base
+    path,
+    parent,
+    patch,
+    issue,
+    checks,
+    origin,
+    target,
+    identity,
+    previous_base,
+    *,
+    adopted=False,
 ):
-    sha = prepare_commit(path, parent, patch, issue, identity)
+    sha = prepare_commit(path, parent, patch, issue, identity, adopted=adopted)
     return {
         "patch": base64.b64encode(patch).decode(),
         "sha": sha,
@@ -120,15 +132,31 @@ class Controller:
         data = job["data"]
         repo, issue = job["repo"], job["issue"]
         api, store, cfg = self.api, self.store, self.config
+        adopted = job.get("kind") == "pull"
         label = cfg.get("label", "agent:ready")
-        branch = cfg.get("branch_prefix", "agent/") + f"issue-{issue}"
+        branch = (
+            data.get("branch") or cfg.get("branch_prefix", "agent/") + f"issue-{issue}"
+        )
+
+        def read_pull():
+            result = api.rest("GET", f"/repos/{repo}/pulls/{data['pull']}")
+            if result["state"] != "open":
+                raise ClosedPull("pull request is closed")
+            if adopted and not adoptable_pull(result, repo, self.bot_login, branch):
+                raise ClosedPull(
+                    "pull request no longer matches its adopted branch and author"
+                )
+            return result
 
         def authorize():
             store.check(job)
-            current = api.rest("GET", f"/repos/{repo}/issues/{issue}")
-            if not eligible(api, repo, current, label):
-                store.cancel(repo, issue)
-                raise LeaseLost()
+            if adopted:
+                read_pull()
+            else:
+                current = api.rest("GET", f"/repos/{repo}/issues/{issue}")
+                if not eligible(api, repo, current, label):
+                    store.cancel(repo, issue)
+                    raise LeaseLost()
             store.check(job)
 
         def cancelled():
@@ -142,16 +170,22 @@ class Controller:
         journal = Journal(data, lambda: store.save(job))
         publisher = Publisher(api, journal, authorize)
         stage = data["stage"]
+        if adopted and (stage == "implement" or data["pull"] != issue):
+            raise ValueError("adopted jobs can only review their existing pull request")
         origin = None
         instructions = f"{data['title']}\n\n{data['body']}"
         checks = tuple(tuple(check) for check in cfg["checks"])
         if not checks:
             raise ValueError("Configure at least one trusted check")
         if stage != "implement":
-            pr = api.rest("GET", f"/repos/{repo}/pulls/{data['pull']}")
-            if pr["state"] != "open":
-                store.save(job, "complete")
-                return
+            pr = read_pull()
+            if adopted:
+                instructions = (
+                    "The pull request implementation is already present. Treat its description as "
+                    "background. Change only what the outstanding review requests require, and add "
+                    "the requested regression tests.\n\n"
+                    f"{pr['title']}\n\n{pr.get('body') or ''}"
+                )
             if stage == "watch":
                 batch = collect_reviews(
                     api,
@@ -161,7 +195,10 @@ class Controller:
                     authorized=lambda user: maintainer(api, repo, user),
                     known_threads=data["threads"],
                     seen=data["seen"],
+                    adopted_at=data["adopted_at"] if adopted else None,
                 )
+                for item in batch.handled:
+                    acknowledge_feedback(data, item)
                 if not batch.items:
                     store.save(job, "queued", delay=45)
                     return
@@ -349,6 +386,7 @@ class Controller:
                             target,
                             identity,
                             previous_base,
+                            adopted=adopted,
                         ),
                         "trace": [
                             dataclasses.asdict(route) for route in result.route_trace
@@ -410,6 +448,7 @@ class Controller:
                             target,
                             identity,
                             previous_base,
+                            adopted=adopted,
                         )
                     )
                     store.save(job)

@@ -11,19 +11,32 @@ class LeaseLost(RuntimeError):
     pass
 
 
+_TASK_TABLE = """
+CREATE TABLE IF NOT EXISTS tasks(
+    repo TEXT, issue INTEGER, state TEXT, generation INTEGER,
+    token TEXT, expires REAL, due REAL, data TEXT, attempts INTEGER,
+    kind TEXT NOT NULL DEFAULT 'issue' CHECK(kind IN ('issue', 'pull')),
+    PRIMARY KEY(repo,kind,issue));
+"""
+
+
 class Store:
     def __init__(self, path, clock=time.time):
         self.path = str(path)
         self.clock = clock
         with self.tx() as db:
-            db.executescript("""
+            db.execute("""
                 CREATE TABLE IF NOT EXISTS deliveries(
                     id TEXT PRIMARY KEY, payload TEXT, event TEXT, received REAL);
-                CREATE TABLE IF NOT EXISTS tasks(
-                    repo TEXT, issue INTEGER, state TEXT, generation INTEGER,
-                    token TEXT, expires REAL, due REAL, data TEXT, attempts INTEGER,
-                    PRIMARY KEY(repo,issue));
             """)
+            columns = db.execute("PRAGMA table_info(tasks)").fetchall()
+            if columns and not any(column["name"] == "kind" for column in columns):
+                db.execute("ALTER TABLE tasks RENAME TO issue_tasks")
+                db.execute(_TASK_TABLE)
+                db.execute("INSERT INTO tasks SELECT *, 'issue' FROM issue_tasks")
+                db.execute("DROP TABLE issue_tasks")
+            else:
+                db.execute(_TASK_TABLE)
 
     @contextmanager
     def tx(self):
@@ -58,22 +71,148 @@ class Store:
 
     def enqueue(self, repo, issue, data):
         with self.tx() as db:
+            if db.execute(
+                """SELECT 1 FROM tasks WHERE repo=? AND kind='pull'
+                   AND state NOT IN ('complete','cancelled')
+                   AND (json_extract(data,'$.branch')=?
+                     OR EXISTS (SELECT 1 FROM json_each(data,'$.linked_issues') WHERE value=?))""",
+                (repo, data.get("branch"), issue),
+            ).fetchone():
+                return
             db.execute(
-                """INSERT INTO tasks VALUES(?,?,'queued',1,NULL,0,0,?,0)
-                ON CONFLICT(repo,issue) DO UPDATE SET state='queued',generation=generation+1,
+                """INSERT INTO tasks VALUES(?,?,'queued',1,NULL,0,?,?,0,'issue')
+                ON CONFLICT(repo,kind,issue) DO UPDATE SET state='queued',generation=generation+1,
                 data=CASE WHEN json_extract(tasks.data,'$.pull') IS NOT NULL
                      OR json_extract(tasks.data,'$.github_operations') IS NOT NULL
                      THEN tasks.data ELSE excluded.data END,
-                due=0,attempts=0 WHERE state='cancelled'""",
-                (repo, issue, json.dumps(data)),
+                due=excluded.due,attempts=0 WHERE state IN ('cancelled','superseded')""",
+                (repo, issue, self.clock(), json.dumps(data)),
             )
 
     def cancel(self, repo, issue):
         with self.tx() as db:
             db.execute(
                 """UPDATE tasks SET state='cancelled',token=NULL,generation=generation+1
-                WHERE repo=? AND issue=? AND state!='cancelled'""",
+                WHERE repo=? AND issue=? AND kind='issue' AND state!='cancelled'""",
                 (repo, issue),
+            )
+
+    def adopt_pull(self, repo, pull, data, branch_prefix):
+        """Assign at most one active job to this PR's exact source branch."""
+        with self.tx() as db:
+            now = self.clock()
+            existing = db.execute(
+                "SELECT * FROM tasks WHERE repo=? AND kind='pull' AND issue=?",
+                (repo, pull),
+            ).fetchone()
+            active_issue_jobs = db.execute(
+                """SELECT issue,state,expires,data FROM tasks WHERE repo=? AND kind='issue'
+                   AND state NOT IN ('complete','superseded')""",
+                (repo,),
+            )
+            replacements = []
+            state = "queued"
+            for job in active_issue_jobs:
+                original = json.loads(job["data"])
+                owned_pull = original.get("pull")
+                same_branch = data["branch"] == original.get(
+                    "branch", f"{branch_prefix}issue-{job['issue']}"
+                )
+                if owned_pull is not None and owned_pull != pull:
+                    continue
+                if (
+                    owned_pull != pull
+                    and not same_branch
+                    and job["issue"] not in data["linked_issues"]
+                ):
+                    continue
+                if job["state"] == "running" and job["expires"] > now:
+                    return False
+                replacements.append(job["issue"])
+                if owned_pull == pull and existing is None:
+                    for key in (
+                        "seen",
+                        "threads",
+                        "round",
+                        "last_commit",
+                        "last_checks",
+                        "last_target",
+                        "last_evidence",
+                        "github_operations",
+                    ):
+                        if key in original:
+                            data[key] = original[key]
+                    if original["stage"] == "reply":
+                        for key in ("stage", "feedback", "review_head"):
+                            data[key] = original[key]
+                    if job["state"] == "paused":
+                        state = "paused"
+                        if "pause_reason" in original:
+                            data["pause_reason"] = original["pause_reason"]
+            for issue in replacements:
+                db.execute(
+                    """UPDATE tasks SET state='superseded', token=NULL, generation=generation+1
+                       WHERE repo=? AND kind='issue' AND issue=?""",
+                    (repo, issue),
+                )
+            if existing is not None:
+                if existing["state"] == "running":
+                    return False
+                previous = json.loads(existing["data"])
+                if (
+                    previous["branch"] != data["branch"]
+                    or previous["author"] != data["author"]
+                ):
+                    return False
+                previous["linked_issues"] = data["linked_issues"]
+                reopened = existing["state"] in {"complete", "cancelled"}
+                if reopened:
+                    previous["stage"] = "watch"
+                    for key in (
+                        "prepared",
+                        "model_attempt_failures",
+                        "feedback",
+                        "question",
+                    ):
+                        previous.pop(key, None)
+                db.execute(
+                    """UPDATE tasks SET data=?,state=?,due=?,generation=generation+?
+                       WHERE repo=? AND kind='pull' AND issue=?""",
+                    (
+                        json.dumps(previous),
+                        "queued" if reopened else existing["state"],
+                        now if reopened else existing["due"],
+                        int(reopened),
+                        repo,
+                        pull,
+                    ),
+                )
+                return False
+            db.execute(
+                """INSERT INTO tasks VALUES(?,?,?,1,NULL,0,?,?,0,'pull')""",
+                (repo, pull, state, now, json.dumps(data)),
+            )
+            return True
+
+    def complete_missing_pulls(self, repo, open_pulls):
+        with self.tx() as db:
+            for row in db.execute(
+                "SELECT issue FROM tasks WHERE repo=? AND kind='pull' AND state!='complete'",
+                (repo,),
+            ).fetchall():
+                if row["issue"] not in open_pulls:
+                    db.execute(
+                        """UPDATE tasks SET state='complete',token=NULL,generation=generation+1
+                           WHERE repo=? AND kind='pull' AND issue=?""",
+                        (repo, row["issue"]),
+                    )
+
+    def clear_failures(self, job):
+        with self.tx() as db:
+            db.execute(
+                """UPDATE tasks SET data=json_remove(data,'$.consecutive_failures')
+                   WHERE repo=? AND issue=? AND kind=? AND generation=? AND token IS NULL""",
+                (job["repo"], job["issue"], job["kind"], job["generation"]),
             )
 
     def claim(self, ttl=900):
@@ -81,7 +220,7 @@ class Store:
         with self.tx() as db:
             row = db.execute(
                 """SELECT * FROM tasks WHERE (state='queued' AND due<=?)
-                OR (state='running' AND expires<=?) ORDER BY due,repo,issue LIMIT 1""",
+                OR (state='running' AND expires<=?) ORDER BY due,repo,kind,issue LIMIT 1""",
                 (now, now),
             ).fetchone()
             if row is None:
@@ -89,8 +228,8 @@ class Store:
             token = uuid.uuid4().hex
             db.execute(
                 """UPDATE tasks SET token=?,state='running',expires=?,attempts=attempts+1
-                WHERE repo=? AND issue=?""",
-                (token, now + ttl, row["repo"], row["issue"]),
+                WHERE repo=? AND issue=? AND kind=?""",
+                (token, now + ttl, row["repo"], row["issue"], row["kind"]),
             )
             return {**dict(row), "data": json.loads(row["data"]), "token": token}
 

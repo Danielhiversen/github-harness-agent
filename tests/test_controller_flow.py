@@ -8,10 +8,11 @@ import pytest
 from github_harness_agent import controller
 from github_harness_agent.controller import Controller, git
 from github_harness_agent.executor import AttemptRejected, CheckEvidence, RouteEvidence
-from github_harness_agent.intake import reconcile
+from github_harness_agent.intake import adopt_open_pulls, reconcile
 from github_harness_agent.reviews import Feedback, ReviewBatch
 from github_harness_agent.store import Store
 
+from test_intake import pull
 from test_publish import FakeGitHub
 
 
@@ -288,3 +289,105 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario):
         state["seen"] == ["ambiguous-revision", "review-revision"]
         and state["stage"] == "watch"
     )
+
+
+@pytest.mark.parametrize("revoke", [False, True])
+def test_adopted_job_repairs_only_the_existing_branch_without_issue_eligibility(
+    tmp_path, monkeypatch, revoke
+):
+    repo = tmp_path / "repository"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    (repo / "value").write_text("existing work\n")
+    git(repo, "add", "value")
+    git(
+        repo,
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.com",
+        "commit",
+        "-qm",
+        "base",
+    )
+    base = git(repo, "rev-parse", "HEAD").decode().strip()
+    git(repo, "branch", "past/feature", base)
+    request = pull(25, "past/feature", body="Existing work.")
+    request["base"]["sha"] = request["head"]["sha"] = base
+
+    class API:
+        def paginate(self, path, *, params):
+            assert path == "/repos/owner/repo/pulls"
+            return [request]
+
+        def rest(self, method, path):
+            assert method == "GET"
+            if path.endswith("/pulls/25"):
+                return request
+            if path.endswith("/git/ref/heads/release/2"):
+                return {"object": {"sha": base}}
+            assert path.endswith("/git/ref/heads/past/feature")
+            return {"object": {"sha": request["head"]["sha"]}}
+
+        def fetch(self, name, checkout, sha):
+            git(checkout, "fetch", str(repo), sha)
+
+        def push(
+            self,
+            name,
+            checkout,
+            branch,
+            expected_head,
+            commit,
+            *,
+            before_write,
+            **kwargs,
+        ):
+            assert branch == "past/feature"
+            before_write()
+            git(repo, "fetch", str(checkout), commit)
+            git(repo, "update-ref", "refs/heads/past/feature", commit, expected_head)
+            request["head"]["sha"] = commit
+
+    class Executor:
+        def execute(self, task, path, *, cancelled):
+            assert "implementation is already present" in task.instructions
+            assert "Outstanding fix" in task.instructions
+            assert (path / "value").read_text() == "existing work\n"
+            (path / "value").write_text("reviewed work\n")
+            if revoke:
+                request["user"]["login"] = "unowned"
+            return SimpleNamespace(
+                patch=git(path, "diff"),
+                checks=(CheckEvidence(("test",), 0, "ok"),),
+                route_trace=(),
+                usage={},
+                refinement=None,
+            )
+
+    review = Feedback("review-key", "thread", 42, "Outstanding fix", "reviewer")
+    monkeypatch.setattr(
+        controller,
+        "collect_reviews",
+        lambda *args, **kwargs: ReviewBatch(base, (review,)),
+    )
+    replies = []
+    monkeypatch.setattr(
+        controller, "reply_to_review", lambda *args, **kw: replies.append(kw)
+    )
+    store = Store(tmp_path / "db", lambda: 100)
+    api = API()
+    config = {"base": "configured-but-unused", "checks": [["test"]], "mode": "canary"}
+    assert adopt_open_pulls(api, store, "owner/repo", config, "agent-user") == 1
+    Controller(store, api, Executor(), config, "agent-user").run(store.claim())
+    if revoke:
+        assert not replies
+        assert request["head"]["sha"] == base
+        with store.tx() as db:
+            assert db.execute("SELECT state FROM tasks").fetchone()[0] == "complete"
+    else:
+        assert replies[0]["pull"] == 25
+        assert git(repo, "show", "past/feature:value") == b"reviewed work\n"
+        assert b"Address review feedback on PR #25" in git(
+            repo, "log", "-1", "past/feature"
+        )

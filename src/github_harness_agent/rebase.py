@@ -75,6 +75,23 @@ def branch_parent(
                 raise RebaseConflict(
                     "could not separate task commits from the previous PR base"
                 )
+        # A task branch may have merged a squash-integrated base and explicitly
+        # retained exactly the base tree. Replaying commits before that merge
+        # would resurrect changes the merge already settled.
+        fork_tree = git(checkout, "rev-parse", f"{fork}^{{tree}}").decode().strip()
+        merges = git(
+            checkout,
+            "log",
+            "--first-parent",
+            "--merges",
+            "--format=%H %T %P",
+            f"{fork}..{origin}",
+        )
+        for line in merges.decode().splitlines():
+            merge, tree, *parents = line.split()
+            if tree == fork_tree and fork in parents[1:]:
+                fork = merge
+                break
         git(checkout, "checkout", "--detach", "--force", origin)
         git(
             checkout,

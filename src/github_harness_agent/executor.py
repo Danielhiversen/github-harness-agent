@@ -39,7 +39,9 @@ __all__ = [
 
 SYSTEM_PROMPT = (
     "Implement the repository task. Inspect the pinned checkout with the run tool and edit files "
-    "in place. Keep the patch focused and preserve existing checks. Finish when the patch is ready. "
+    "in place. Keep the patch focused and preserve existing checks and their configuration. "
+    "When the task requests regression coverage, add new test files using the repository's naming convention. "
+    "Finish when the patch is ready. "
     "If the task has conflicting or materially ambiguous requirements, return only a JSON object "
     "with a clarification key containing one concise question for the maintainer."
 )
@@ -252,11 +254,23 @@ def _combined(result):
     return (result.stdout + result.stderr).decode("utf-8", "replace")
 
 
-def _protected(path: str, task: TaskSnapshot) -> bool:
-    """Preserve test/setup files and direct script arguments used by required checks."""
+def _test_module(name: str) -> bool:
+    return (
+        name.startswith("test_")
+        and name.endswith(".py")
+        or name.endswith(
+            ("_test.py", "_test.go", ".test.js", ".test.ts", ".spec.js", ".spec.ts")
+        )
+    )
+
+
+def _protected(path: str, task: TaskSnapshot, *, new_test: bool) -> bool:
+    """Preserve existing tests, test infrastructure, and configured protected paths."""
     names = PurePosixPath(path).parts
     test_configs = {
         "conftest.py",
+        "sitecustomize.py",
+        "usercustomize.py",
         "pyproject.toml",
         "pytest.ini",
         "setup.cfg",
@@ -281,11 +295,15 @@ def _protected(path: str, task: TaskSnapshot) -> bool:
         if not arg.startswith("-")
     }
     return (
-        bool(set(names) & {".git", ".github", "tests", "test", "__tests__"})
+        bool(set(names) & {".git", ".github", ".circleci"})
         or names[-1] in test_configs
-        or names[-1].startswith("test_")
-        or names[-1].endswith(
-            ("_test.go", ".test.js", ".test.ts", ".spec.js", ".spec.ts")
+        or (
+            not new_test
+            and (
+                bool(set(names) & {"tests", "test", "__tests__"})
+                or names[-1].startswith("test_")
+                or _test_module(names[-1])
+            )
         )
         or path in check_args
         or any(fnmatchcase(path, pattern) for pattern in task.protected_paths)
@@ -327,20 +345,25 @@ class PlainExecutor:
             raise ExecutionError("At least one trusted required check is required")
         if len(task.repository_guidance) > 3000:
             raise ExecutionError("Repository guidance exceeds the configured size")
-        result = run_process(
-            [
-                "git",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "archive",
-                "--format=tar",
-                task.base_sha,
-            ],
-            budget.remaining(),
-            budget.cancelled,
-            cwd=checkout,
-            cap=self.limits.archive_bytes,
-        )
+        try:
+            result = run_process(
+                [
+                    "git",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "archive",
+                    "--format=tar",
+                    task.base_sha,
+                ],
+                budget.remaining(),
+                budget.cancelled,
+                cwd=checkout,
+                cap=self.limits.archive_bytes,
+            )
+        except CommandOutputExceeded as error:
+            raise LimitExceeded(
+                f"Pinned checkout exceeds the archive limit ({self.limits.archive_bytes} bytes)"
+            ) from error
         if result.returncode:
             raise ExecutionError("Could not archive the pinned checkout")
         return result.stdout
@@ -365,17 +388,16 @@ class PlainExecutor:
             **kwargs,
         )
 
+    def _stage_baseline(self, workspace, budget):
+        self._git(workspace, budget, "init", "-q", "--template=")
+        self._git(workspace, budget, "add", "-A", "-f")
+        return self._git(workspace, budget, "write-tree").stdout.strip().decode("ascii")
+
     def _rollout(self, task, archive, budget, prompt, role, *, clarification=True):
         with self.runner.workspace(
             archive, budget.remaining, budget.cancelled
         ) as workspace:
-            self._git(workspace, budget, "init", "-q", "--template=")
-            self._git(workspace, budget, "add", "-A", "-f")
-            baseline = (
-                self._git(workspace, budget, "write-tree")
-                .stdout.strip()
-                .decode("ascii")
-            )
+            baseline = self._stage_baseline(workspace, budget)
             messages = [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": task.instructions},
@@ -408,23 +430,24 @@ class PlainExecutor:
                         budget.claim("command", self.limits.commands)
                         argv = self._tool_argv(tool)
                         response = self._command(workspace, budget, argv, checked=False)
-                    except (
-                        _RequestBudgetExceeded,
-                        _CandidateOutputError,
-                        CommandOutputExceeded,
-                    ) as error:
+                    except CommandOutputExceeded:
+                        output = (
+                            "Command exceeded the output limit. Select a narrower range or "
+                            "redirect output to a workspace file and inspect a slice."
+                        )
+                    except (_RequestBudgetExceeded, _CandidateOutputError) as error:
                         budget.reject(error, last)
+                    else:
+                        output = f"exit {response.returncode}\n{_combined(response)}"
                     actor = last
-                    output = _combined(response)
                     trajectory.append(
-                        f"[ACTION] {json.dumps(argv)}\n[OBSERVATION] "
-                        f"exit {response.returncode}\n{output}"
+                        f"[ACTION] {json.dumps(argv)}\n[OBSERVATION] {output}"
                     )
                     messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": tool["id"],
-                            "content": f"exit {response.returncode}\n{output}",
+                            "content": output,
                         }
                     )
             self._git(workspace, budget, "add", "-A")
@@ -442,7 +465,7 @@ class PlainExecutor:
                     cap=self.limits.patch_bytes,
                 ).stdout
                 if patch and not clarification:
-                    self._check_patch_paths(workspace, task, budget, patch)
+                    self._check_patch_paths(workspace, task, budget, baseline)
             except (CommandOutputExceeded, _CandidateOutputError) as error:
                 budget.reject(error, actor or last)
         return patch, "\n".join(trajectory)[-32768:], actor or last
@@ -481,25 +504,44 @@ class PlainExecutor:
             pass
         raise _CandidateOutputError("Model provided an invalid run tool call")
 
-    def _check_patch_paths(self, workspace, task, budget, patch):
+    def _check_patch_paths(self, workspace, task, budget, baseline):
         result = self._git(
             workspace,
             budget,
-            "apply",
-            "--numstat",
+            "diff",
+            "--cached",
+            "--raw",
+            "--no-renames",
+            "--no-ext-diff",
             "-z",
+            baseline,
+            "--",
             cap=self.limits.patch_bytes,
-            data=patch,
-            checked=False,
         )
-        self._require_valid_patch(result, "Invalid patch metadata")
-        for entry in result.stdout.rstrip(b"\0").split(b"\0"):
-            parts = entry.split(b"\t", 2)
-            if len(parts) != 3 or not parts[-1]:
+        entries = result.stdout.split(b"\0")[:-1]
+        if not entries or len(entries) % 2:
+            raise _CandidateOutputError("Unexpected patch metadata")
+        new_tests = []
+        for header, raw_path in zip(entries[::2], entries[1::2], strict=True):
+            fields = header.split()
+            if len(fields) != 5 or not header.startswith(b":") or not raw_path:
                 raise _CandidateOutputError("Unexpected patch metadata")
-            path = parts[-1].decode("utf-8", "surrogateescape")
-            if _protected(path, task):
+            mode, status = fields[1], fields[-1]
+            path = raw_path.decode("utf-8", "surrogateescape")
+            new_test = (
+                status == b"A"
+                and mode == b"100644"
+                and _test_module(PurePosixPath(path).name)
+            )
+            if _protected(path, task, new_test=new_test):
                 raise _CandidateOutputError(f"Patch changes protected path: {path}")
+            if mode in {b"120000", b"160000"}:
+                raise _CandidateOutputError(
+                    f"Patch adds or changes a symlink or submodule: {path}"
+                )
+            if new_test:
+                new_tests.append(path)
+        return new_tests
 
     @staticmethod
     def _require_valid_patch(result, message):
@@ -509,6 +551,15 @@ class PlainExecutor:
             ):
                 raise ExecutionError("Worker could not validate the generated patch")
             raise _CandidateOutputError(message)
+
+    def _run_checks(self, workspace, budget, commands):
+        checks = []
+        for command in commands:
+            result = self._command(workspace, budget, command, checked=False)
+            checks.append(CheckEvidence(command, result.returncode, _combined(result)))
+            if result.returncode:
+                break
+        return checks
 
     def _verify(self, task, archive, budget, patch, refinement=None, *, actor=None):
         if not patch:
@@ -522,10 +573,8 @@ class PlainExecutor:
         with self.runner.workspace(
             archive, budget.remaining, budget.cancelled
         ) as workspace:
-            self._git(workspace, budget, "init", "-q", "--template=")
-            self._git(workspace, budget, "add", "-A", "-f")
+            baseline_tree = self._stage_baseline(workspace, budget)
             try:
-                self._check_patch_paths(workspace, task, budget, patch)
                 check = self._git(
                     workspace,
                     budget,
@@ -539,16 +588,32 @@ class PlainExecutor:
                 self._require_valid_patch(
                     check, "Invalid patch did not apply to the pinned checkout"
                 )
+                self._git(workspace, budget, "apply", "--index", "--binary", data=patch)
+                new_tests = self._check_patch_paths(
+                    workspace, task, budget, baseline_tree
+                )
             except (_CandidateOutputError, CommandOutputExceeded) as error:
                 budget.reject(error, actor)
-            self._git(workspace, budget, "apply", "--index", "--binary", data=patch)
-            checks = []
-            for command in task.checks:
-                result = self._command(workspace, budget, command, checked=False)
-                evidence = CheckEvidence(command, result.returncode, _combined(result))
-                checks.append(evidence)
-                if result.returncode:
-                    break
+            if new_tests:
+                self._git(
+                    workspace,
+                    budget,
+                    "--literal-pathspecs",
+                    "rm",
+                    "-q",
+                    "-f",
+                    "--",
+                    *new_tests,
+                )
+            checks = self._run_checks(workspace, budget, task.checks)
+        trusted_passed = checks[-1].returncode == 0
+        if new_tests and trusted_passed:
+            with self.runner.workspace(
+                archive, budget.remaining, budget.cancelled
+            ) as workspace:
+                self._stage_baseline(workspace, budget)
+                self._git(workspace, budget, "apply", "--index", "--binary", data=patch)
+                checks.extend(self._run_checks(workspace, budget, task.checks))
         if checks[-1].returncode:
             failed = checks[-1]
             error = ExecutionError(f"Required check failed: {failed.command[0]}")
@@ -558,11 +623,12 @@ class PlainExecutor:
                 and actor.configured_model
                 and 0 < failed.returncode < 125
             ):
+                if trusted_passed:
+                    budget.reject(error, actor)
                 with self.runner.workspace(
                     archive, budget.remaining, budget.cancelled
                 ) as baseline:
-                    self._git(baseline, budget, "init", "-q", "--template=")
-                    self._git(baseline, budget, "add", "-A", "-f")
+                    self._stage_baseline(baseline, budget)
                     result = self._command(
                         baseline, budget, failed.command, checked=False
                     )
