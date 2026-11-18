@@ -8,9 +8,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 22
     permissions:
-      contents: read
+      contents: write
       issues: read
-      pull-requests: read
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -20,5 +20,5 @@ jobs:
       - run: docker build -t canary-worker worker
       - run: uv run --no-sync python -u live_canary.py
         env:
-          CANARY_MODE: shadow
+          CANARY_MODE: canary
           CANARY_INSTALLATION_TOKEN: ${{ github.token }}
