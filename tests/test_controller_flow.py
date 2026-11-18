@@ -138,11 +138,23 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch):
         lambda *a, **kw: ReviewBatch(first, (item, ambiguous)),
     )
     replies = []
-    monkeypatch.setattr(
-        controller, "reply_to_review", lambda *a, **kw: replies.append(kw)
-    )
+    lag = True
+
+    def reply(*args, **kw):
+        nonlocal lag
+        if kw["commit"] and lag:
+            lag = False
+            raise controller.StaleHead("PR view still reports pre-push head")
+        replies.append(kw)
+
+    monkeypatch.setattr(controller, "reply_to_review", reply)
     clock[0] += 46
     run(db.claim())
+    assert len(replies) == 1
+    clock[0] += 16
+    retry = db.claim()
+    assert retry["data"]["stage"] == "reply"
+    run(retry)
     assert git(repo, "show", api.branch + ":value") == b"two\n"
     assert git(repo, "rev-parse", api.branch + "^").decode().strip() == first
     assert len(api.pulls) == 1 and replies[1]["commit"] == api.branch

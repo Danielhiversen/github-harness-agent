@@ -316,6 +316,13 @@ class Controller:
                         expected_head=data["review_head"] if question else None,
                     )
                 except StaleHead:
+                    if not question:
+                        ref = api.rest("GET", f"/repos/{repo}/git/ref/heads/{branch}")
+                        if ref["object"]["sha"] == data["last_commit"]:
+                            # GitHub can serve the previous PR head briefly after a push.
+                            # Keep the verified reply pending while the PR view catches up.
+                            store.save(job, "queued", delay=15)
+                            return
                     data.pop("question", None)
                     data["stage"] = "watch"
                     store.save(job, "queued")
