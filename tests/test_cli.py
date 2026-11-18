@@ -84,6 +84,7 @@ def test_targeted_once_uses_repo_limits_and_runs_only_exact_eligible_pull(
         def __init__(self, store, api, backend, config, bot_login):
             assert backend.limits.model_requests == 120
             assert backend.limits.commands == 200
+            assert backend.limits.rollout_requests == 24
             assert backend.runner.image == "worker:test"
             assert backend.verification_runner.image == "verify:test"
             assert (
@@ -113,6 +114,7 @@ def test_targeted_once_uses_repo_limits_and_runs_only_exact_eligible_pull(
                 "worker_runtime": "runc",
                 "model_requests": 120,
                 "commands": 200,
+                "rollout_requests": 24,
             },
             "example/other": {"worker_image": "worker:test", "model_requests": False},
         },
@@ -148,6 +150,38 @@ def test_rejects_invalid_repository_budgets_before_using_credentials(
         },
     }
     with pytest.raises(ValueError, match=key):
+        cli.run_worker(Store(tmp_path / "agent.db"), config, once=True)
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"rollout_requests": 4}, "verification_image"),
+        (
+            {"rollout_requests": 0, "verification_image": "checks:test"},
+            "rollout_requests",
+        ),
+        (
+            {"rollout_requests": True, "verification_image": "checks:test"},
+            "rollout_requests",
+        ),
+        (
+            {"rollout_requests": 5, "verification_image": "checks:test"},
+            "rollout_requests",
+        ),
+    ],
+)
+def test_rollout_budget_requires_a_verification_image_and_fits_shared_budget(
+    tmp_path, override, message
+):
+    repo = {"worker_image": "worker:test", "model_requests": 4}
+    repo.update(override)
+    config = {
+        "github_auth": "named-account",
+        "bot_login": "example-agent",
+        "repositories": {"example/project": repo},
+    }
+    with pytest.raises(ValueError, match=message):
         cli.run_worker(Store(tmp_path / "agent.db"), config, once=True)
 
 

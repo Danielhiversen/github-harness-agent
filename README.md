@@ -21,6 +21,8 @@ Set `model_requests` and `commands` in a repository's configuration to cap model
 
 Set `verification_image` to run required checks in a separate trusted image with the same worker runtime. The verification image needs Git, tar, and the tools and fixtures used by the required checks. The model's tool workspace uses `worker_image`.
 
+With an explicit `verification_image`, set `rollout_requests` to cap model turns in each rollout. It accepts integers from 1 through `model_requests`. The executor stages the current patch at the cap and qualifies it through the usual required checks. Harness2 proposals, composition, and all rollouts still share `model_requests`.
+
 To process only an existing adopted PR job, run `uv run github-harness-agent --config agent.toml once --repo example/project --pull 20`. The job must be due or have an expired lease.
 
 The controller revisits submitted review bodies and unresolved threads, checks the reviewer and current head, and records replies. It pauses after three repair rounds, persistent failure or exhausted routes without a retry time. Inspect paused jobs before intervention. To roll back, stop the worker, run `uv run github-harness-agent --config agent.toml fence`, reconcile each open branch and PR, then assign outstanding issues to one owner before restoring incumbent intake.

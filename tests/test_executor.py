@@ -154,6 +154,58 @@ def test_plain_verifies_patch_in_independent_checkout(fixture):
     assert (source / "number.txt").read_text() == "3\n"
 
 
+@pytest.mark.parametrize(
+    ("code", "error"),
+    [
+        ("open('number.txt','w').write('4\\n')", None),
+        ("open('number.txt','w').write('5\\n')", "Required check"),
+        ("print('inspection only')", "empty patch"),
+    ],
+)
+def test_capped_rollout_keeps_only_a_verified_patch(fixture, code, error):
+    task, source, runner = fixture
+    path = source.parent / "verification"
+    path.mkdir()
+    gateway = ScriptedGateway(code)
+    executor = PlainExecutor(
+        runner,
+        gateway,
+        Limits(model_requests=1, rollout_requests=1),
+        verification_runner=FixtureRunner(path),
+    )
+    if error:
+        with pytest.raises(ExecutionError, match=error):
+            executor.execute(task, source)
+    else:
+        result = executor.execute(task, source)
+        assert b"+4\n" in result.patch
+        assert result.checks[0].returncode == 0
+    assert gateway.roles == ["coding"]
+
+
+def test_capped_harness2_rollouts_leave_shared_budget_for_refinement(fixture):
+    pytest.importorskip("harness2")
+    task, source, runner = fixture
+    path = source.parent / "verification"
+    path.mkdir()
+    gateway = ScriptedGateway("open('number.txt','w').write('4\\n')")
+    executor = Harness2Executor(
+        runner,
+        gateway,
+        Limits(model_requests=7, rollout_requests=1),
+        verification_runner=FixtureRunner(path),
+    )
+    result = executor.execute(task, source)
+    assert result.checks[0].returncode == 0
+    assert len(gateway.roles) == 7
+    assert gateway.roles.count("proposal") == 2
+    assert gateway.roles.count("composition") == 1
+    assert all(
+        "rollout model-turn limit" in item.trajectory
+        for item in result.refinement.candidates
+    )
+
+
 @pytest.mark.parametrize("candidate", [4, 5])
 def test_trusted_verification_runner_is_separate_from_model_workspace(
     fixture, candidate

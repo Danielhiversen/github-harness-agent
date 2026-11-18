@@ -116,6 +116,7 @@ class Limits:
     commands: int = 64
     archive_bytes: int = 67108864
     command_output_bytes: int = 65536
+    rollout_requests: int | None = None
 
     def __post_init__(self):
         if (
@@ -132,6 +133,13 @@ class Limits:
             <= 0
         ):
             raise ValueError("Executor limits must be positive")
+        if self.rollout_requests is not None and (
+            type(self.rollout_requests) is not int
+            or not 1 <= self.rollout_requests <= self.model_requests
+        ):
+            raise ValueError(
+                "rollout_requests must be an integer within the model request budget"
+            )
 
 
 @dataclass(frozen=True)
@@ -319,6 +327,10 @@ class PlainExecutor:
         *,
         verification_runner=None,
     ):
+        if limits.rollout_requests is not None and verification_runner is None:
+            raise ValueError(
+                "rollout_requests requires an explicit verification runner"
+            )
         self.runner = runner
         self.verification_runner = (
             runner if verification_runner is None else verification_runner
@@ -415,13 +427,16 @@ class PlainExecutor:
             trajectory = []
             actor = None
             last = None
-            while True:
+            turns = 0
+            limit = budget.limits.rollout_requests
+            while limit is None or turns < limit:
                 try:
                     completion = budget.complete(
                         self.gateway, role, messages, (RUN_TOOL,)
                     )
                 except _RequestBudgetExceeded as error:
                     budget.reject(error, last, latest=True)
+                turns += 1
                 last = RouteEvidence.from_completion(completion)
                 if not completion.tool_calls:
                     if clarification and completion.content:
@@ -460,6 +475,10 @@ class PlainExecutor:
                             "content": output,
                         }
                     )
+            else:
+                trajectory.append(
+                    "[OBSERVATION] Reached the rollout model-turn limit. Staging the current patch."
+                )
             self._git(workspace, budget, "add", "-A")
             try:
                 patch = self._git(

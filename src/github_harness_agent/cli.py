@@ -37,15 +37,26 @@ def run_worker(store, config, once=False, *, pull: tuple[str, int] | None = None
             raise ValueError(f"pull repository is not configured: {repo}")
         repositories = {repo: repositories[repo]}
     defaults = Limits()
-    limits = {
-        repo: Limits(
-            model_requests=_configured_limit(
-                repo, cfg, "model_requests", defaults.model_requests, 256
-            ),
-            commands=_configured_limit(repo, cfg, "commands", defaults.commands, 512),
+    limits = {}
+    for repo, cfg in repositories.items():
+        model_requests = _configured_limit(
+            repo, cfg, "model_requests", defaults.model_requests, 256
         )
-        for repo, cfg in repositories.items()
-    }
+        rollout_requests = None
+        if "rollout_requests" in cfg:
+            image = cfg.get("verification_image")
+            if not isinstance(image, str) or not image.strip() or image.startswith("-"):
+                raise ValueError(
+                    f"{repo} rollout_requests requires an explicit verification_image"
+                )
+            rollout_requests = _configured_limit(
+                repo, cfg, "rollout_requests", None, model_requests
+            )
+        limits[repo] = Limits(
+            model_requests=model_requests,
+            commands=_configured_limit(repo, cfg, "commands", defaults.commands, 512),
+            rollout_requests=rollout_requests,
+        )
     auth_mode = config.get("github_auth", "app")
     app = account = None
     if auth_mode == "app":
