@@ -6,9 +6,14 @@ from pathlib import Path
 from urllib.parse import quote
 
 from .github import GitHubError, validate_repository
+from .rebase import TargetBase
 
 
 class StaleHead(RuntimeError):
+    pass
+
+
+class TargetMoved(RuntimeError):
     pass
 
 
@@ -40,6 +45,13 @@ class Journal:
             entry["result"] = result
             self._checkpoint()
 
+    def replace_pending(self, key: str, intent: dict) -> None:
+        entry = self._entries[key]
+        if "result" in entry:
+            raise RuntimeError("completed GitHub write cannot be replaced")
+        entry["intent"] = intent
+        self._checkpoint()
+
 
 @dataclass(frozen=True)
 class BranchUpdate:
@@ -49,6 +61,8 @@ class BranchUpdate:
     checkout: Path
     commit: str
     pull: int | None = None
+    target: TargetBase | None = None
+    verified_parent: str | None = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +79,7 @@ class PublishRequest:
     checks: tuple[str, ...]
     limitations: tuple[str, ...] = ()
     ready: bool = False
+    target: TargetBase | None = None
 
 
 @dataclass(frozen=True)
@@ -101,7 +116,31 @@ class Publisher:
             raise
         return remote["object"]["sha"]
 
-    def _ensure_branch(self, request: PublishRequest) -> None:
+    def branch_head(self, repo: str, branch: str) -> str | None:
+        return self._head(repo, branch)
+
+    def target(self, repo: str, ref: str, pull: int | None = None) -> TargetBase:
+        if pull is not None:
+            request = self.github.rest(
+                "GET", f"/repos/{validate_repository(repo)}/pulls/{pull}"
+            )
+            if request["state"] != "open":
+                raise ClosedPull("pull request is closed")
+            base = request["base"]
+            ref = base["ref"]
+            repo = (base.get("repo") or {}).get("full_name", repo)
+        sha = self._head(repo, ref)
+        if sha is None:
+            raise TargetMoved("target ref is unavailable")
+        return TargetBase(repo, ref, sha)
+
+    def _check_target(
+        self, target: TargetBase | None, repo: str, pull: int | None = None
+    ) -> None:
+        if target is not None and self.target(repo, target.ref, pull) != target:
+            raise TargetMoved("target ref changed before the GitHub write")
+
+    def _ensure_branch(self, request: PublishRequest) -> str:
         key = f"ref:{request.repo}:{request.branch}"
         entry = self.journal.get(key)
         intent = {"ref": f"refs/heads/{request.branch}", "sha": request.base_sha}
@@ -111,19 +150,24 @@ class Publisher:
                 raise StaleHead(
                     "issue branch already exists without a matching journal"
                 )
-            self.journal.begin(key, intent)
-            self.journal.finish(key, {"sha": request.base_sha})
-            return
+            original = entry["intent"]["sha"]
+            self.journal.finish(key, {"sha": original})
+            return original
         if entry and entry.get("result"):
             raise StaleHead("issue branch was deleted")
-        self.journal.begin(key, intent)
+        if entry and entry["intent"] != intent and request.target is not None:
+            self.journal.replace_pending(key, intent)
+        else:
+            self.journal.begin(key, intent)
         self.authorize()
+        self._check_target(request.target, request.repo)
         try:
             self.github.rest("POST", f"/repos/{request.repo}/git/refs", json=intent)
         except GitHubError:
             if self._head(request.repo, request.branch) != request.base_sha:
                 raise
         self.journal.finish(key, {"sha": request.base_sha})
+        return request.base_sha
 
     def advance(self, update: BranchUpdate) -> str:
         self.authorize()
@@ -144,9 +188,18 @@ class Publisher:
             return update.commit
         if head != update.expected_head or (entry and entry.get("result")):
             raise StaleHead("branch no longer has the verified expected head")
-        self.journal.begin(
-            key, {"expected": update.expected_head, "sha": update.commit}
-        )
+        intent = {"expected": update.expected_head, "sha": update.commit}
+        kwargs = {}
+        if update.target is not None:
+            intent["base"] = update.target.sha
+            kwargs = {
+                "verified_parent": update.verified_parent,
+                "target_base": update.target.sha,
+                "before_write": lambda: self._check_target(
+                    update.target, repo, update.pull
+                ),
+            }
+        self.journal.begin(key, intent)
         self.authorize()
         try:
             self.github.push(
@@ -155,6 +208,7 @@ class Publisher:
                 update.branch,
                 update.expected_head,
                 update.commit,
+                **kwargs,
             )
         except GitHubError:
             head = self._head(repo, update.branch)
@@ -172,14 +226,16 @@ class Publisher:
             raise ValueError("an issue pull request requires a separate branch")
         if request.ready and not request.checks:
             raise ValueError("a ready pull request requires verification evidence")
-        self._ensure_branch(request)
+        expected_head = self._ensure_branch(request)
         self.advance(
             BranchUpdate(
                 repo,
                 request.branch,
-                request.base_sha,
+                expected_head,
                 request.checkout,
                 request.commit,
+                target=request.target,
+                verified_parent=request.base_sha,
             )
         )
         pull = self._ensure_pull(request)

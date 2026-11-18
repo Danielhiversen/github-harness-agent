@@ -22,6 +22,10 @@ class LimitExceeded(ExecutionError):
     pass
 
 
+class CommandOutputExceeded(LimitExceeded):
+    pass
+
+
 def run_process(argv, timeout, cancelled, *, cwd=None, data=b"", cap=65536):
     """Bound time and captured output independently of the child process."""
     with (
@@ -51,7 +55,7 @@ def run_process(argv, timeout, cancelled, *, cwd=None, data=b"", cap=65536):
                         + os.fstat(stderr.fileno()).st_size
                         > cap
                     ):
-                        raise LimitExceeded(
+                        raise CommandOutputExceeded(
                             "Command output exceeded the configured size"
                         )
                     if process.poll() is not None:
@@ -75,13 +79,18 @@ class _DockerWorkspace:
         self.name = name
 
     def command(self, argv, timeout, cancelled, *, data=b"", cap=65536):
-        return run_process(
+        result = run_process(
             ["docker", "exec", "-i", "--user", "65532:65532", "--", self.name, *argv],
             timeout,
             cancelled,
             data=data,
             cap=cap,
         )
+        if result.returncode and result.stderr.startswith(
+            b"Error response from daemon:"
+        ):
+            raise ExecutionError("Could not execute a command in the disposable worker")
+        return result
 
 
 class DockerRunner:

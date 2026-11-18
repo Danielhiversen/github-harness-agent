@@ -1,11 +1,14 @@
 import base64
 import json
 from datetime import datetime, timezone
+from subprocess import CalledProcessError, CompletedProcess
 
 import httpx
 import pytest
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+from github_harness_agent.github import GitHubError, GitHubNamedAccount
 
 
 @pytest.fixture(scope="module")
@@ -95,3 +98,80 @@ def test_pagination_rejects_off_origin_next_link(private_key):
     )
     with pytest.raises(GitHubError, match="origin"):
         list(app.installation(42).paginate("/repos/a/b/issues"))
+
+
+def test_named_account_scopes_the_credential_and_verifies_it_before_rest(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GH_TOKEN", "wrong-account-environment-token")
+    calls = []
+
+    def read_credential(argv, **kwargs):
+        assert argv == [
+            "gh",
+            "auth",
+            "token",
+            "--hostname",
+            "github.com",
+            "--user",
+            "example-agent",
+        ]
+        assert kwargs["env"]["GH_CONFIG_DIR"] == str(tmp_path)
+        assert "GH_TOKEN" not in kwargs["env"]
+        assert kwargs["capture_output"]
+        return CompletedProcess(argv, 0, "fixture-token\n", "")
+
+    def handle(request):
+        calls.append(request.url.path)
+        assert request.headers["Authorization"] == "Bearer fixture-token"
+        if request.url.path == "/user":
+            return httpx.Response(200, json={"login": "Example-Agent", "id": 12345})
+        return httpx.Response(200, json={"number": 4})
+
+    monkeypatch.setattr("github_harness_agent.github.subprocess.run", read_credential)
+    api = GitHubNamedAccount(
+        "example-agent",
+        str(tmp_path),
+        client=httpx.Client(transport=httpx.MockTransport(handle)),
+    )
+    assert api.commit_identity == (
+        "Example-Agent",
+        "12345+Example-Agent@users.noreply.github.com",
+    )
+    assert api.rest("GET", "/repos/example/project/issues/4") == {"number": 4}
+    assert calls == ["/user", "/repos/example/project/issues/4"]
+
+
+def test_named_account_rejects_wrong_github_login(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "github_harness_agent.github.subprocess.run",
+        lambda argv, **kwargs: CompletedProcess(argv, 0, "fixture-token\n", ""),
+    )
+
+    def handle(request):
+        assert request.url.path == "/user"
+        return httpx.Response(200, json={"login": "unexpected-account"})
+
+    with pytest.raises(GitHubError, match="does not match bot_login"):
+        GitHubNamedAccount(
+            "example-agent",
+            str(tmp_path),
+            client=httpx.Client(transport=httpx.MockTransport(handle)),
+        )
+
+
+def test_failed_named_credential_command_hides_its_output(
+    monkeypatch, tmp_path, capsys
+):
+    def read_credential(argv, **kwargs):
+        raise CalledProcessError(
+            1, argv, output="fixture-token", stderr="fixture-token"
+        )
+
+    monkeypatch.setattr("github_harness_agent.github.subprocess.run", read_credential)
+    with pytest.raises(
+        GitHubError, match="Could not load the configured GitHub account credential"
+    ) as error:
+        GitHubNamedAccount("example-agent", str(tmp_path))
+    assert "fixture-token" not in str(error.value)
+    assert capsys.readouterr() == ("", "")

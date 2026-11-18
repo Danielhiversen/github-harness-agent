@@ -13,10 +13,18 @@ from pathlib import Path, PurePosixPath
 from threading import Lock
 from typing import Any, Protocol
 
-from .worker import Cancelled, DockerRunner, ExecutionError, LimitExceeded, run_process
+from .worker import (
+    Cancelled,
+    CommandOutputExceeded,
+    DockerRunner,
+    ExecutionError,
+    LimitExceeded,
+    run_process,
+)
 
 __all__ = [
     "Cancelled",
+    "AttemptRejected",
     "CheckEvidence",
     "DockerRunner",
     "ExecutionError",
@@ -58,10 +66,30 @@ class Gateway(Protocol):
         messages: Sequence[Mapping[str, Any]],
         tools: Sequence[Mapping[str, Any]] = (),
         timeout: float | None = None,
+        exclude: Sequence[tuple[str, str]] = (),
     ): ...
 
 
 class NeedsClarification(ExecutionError):
+    pass
+
+
+class AttemptRejected(ExecutionError):
+    def __init__(self, message, candidate, route_trace):
+        super().__init__(message)
+        self.candidate = candidate
+        self.route_trace = route_trace
+
+
+class AttemptBudgetRejected(AttemptRejected, LimitExceeded):
+    pass
+
+
+class _RequestBudgetExceeded(LimitExceeded):
+    pass
+
+
+class _CandidateOutputError(ExecutionError):
     pass
 
 
@@ -74,6 +102,7 @@ class TaskSnapshot:
     seed: int = 0
     protected_paths: tuple[str, ...] = ()
     repository_guidance: str = ""
+    excluded_models: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -116,6 +145,17 @@ class RouteEvidence:
     route: str
     model: str
     usage: dict[str, int]
+    configured_model: str | None = None
+
+    @classmethod
+    def from_completion(cls, completion):
+        return cls(
+            completion.role,
+            completion.route,
+            completion.model,
+            completion.usage,
+            getattr(completion, "configured_model", None),
+        )
 
 
 @dataclass(frozen=True)
@@ -148,11 +188,17 @@ class ExecutionResult:
 
 
 class _Budget:
-    def __init__(self, limits: Limits, cancelled: Callable[[], bool]):
+    def __init__(
+        self,
+        limits: Limits,
+        cancelled: Callable[[], bool],
+        excluded_models: tuple[tuple[str, str], ...] = (),
+    ):
         self.limits = limits
         self.cancelled = cancelled
         self.deadline = time.monotonic() + limits.wall_time
         self.routes: list[RouteEvidence] = []
+        self.excluded_models = excluded_models
         self._calls = Counter()
         self._lock = Lock()
 
@@ -168,28 +214,38 @@ class _Budget:
         with self._lock:
             self.remaining()
             if self._calls[kind] >= limit:
-                raise LimitExceeded(f"Task {kind} budget exceeded")
+                raise _RequestBudgetExceeded(f"Task {kind} budget exceeded")
             self._calls[kind] += 1
 
     def complete(self, gateway, role, messages, tools=()):
         self.claim("model request", self.limits.model_requests)
+        options = {"exclude": self.excluded_models} if self.excluded_models else {}
         completion = gateway.complete(
             role=role,
             messages=messages,
             tools=tools,
             timeout=self.remaining(),
+            **options,
         )
         self.remaining()
         with self._lock:
-            self.routes.append(
-                RouteEvidence(
-                    completion.role,
-                    completion.route,
-                    completion.model,
-                    completion.usage,
-                )
-            )
+            self.routes.append(RouteEvidence.from_completion(completion))
         return completion
+
+    def reject(self, error, candidate, *, latest=False):
+        self.remaining()
+        with self._lock:
+            trace = tuple(self.routes)
+        if candidate is None and latest and trace:
+            candidate = trace[-1]
+        if candidate is None or not candidate.configured_model:
+            raise error
+        kind = (
+            AttemptBudgetRejected
+            if isinstance(error, LimitExceeded)
+            else AttemptRejected
+        )
+        raise kind(str(error), candidate, trace) from error
 
 
 def _combined(result):
@@ -248,10 +304,20 @@ class PlainExecutor:
         checkout: Path,
         cancelled: Callable[[], bool] = lambda: False,
     ) -> ExecutionResult:
-        budget = _Budget(self.limits, cancelled)
+        budget = _Budget(self.limits, cancelled, task.excluded_models)
         archive = self._archive(task, checkout, budget)
-        patch, _ = self._rollout(task, archive, budget, SYSTEM_PROMPT, "coding")
-        return self._verify(task, archive, budget, patch)
+        patch, _, actor = self._rollout(task, archive, budget, SYSTEM_PROMPT, "coding")
+        return self._verify(task, archive, budget, patch, actor=actor)
+
+    def verify_patch(
+        self,
+        task: TaskSnapshot,
+        checkout: Path,
+        patch: bytes,
+        cancelled: Callable[[], bool] = lambda: False,
+    ) -> ExecutionResult:
+        budget = _Budget(self.limits, cancelled)
+        return self._verify(task, self._archive(task, checkout, budget), budget, patch)
 
     def _archive(self, task, checkout, budget):
         budget.remaining()
@@ -315,8 +381,16 @@ class PlainExecutor:
                 {"role": "user", "content": task.instructions},
             ]
             trajectory = []
+            actor = None
+            last = None
             while True:
-                completion = budget.complete(self.gateway, role, messages, (RUN_TOOL,))
+                try:
+                    completion = budget.complete(
+                        self.gateway, role, messages, (RUN_TOOL,)
+                    )
+                except _RequestBudgetExceeded as error:
+                    budget.reject(error, last, latest=True)
+                last = RouteEvidence.from_completion(completion)
                 if not completion.tool_calls:
                     if clarification and completion.content:
                         self._check_clarification(completion.content)
@@ -330,9 +404,17 @@ class PlainExecutor:
                     assistant["provider_context"] = provider_context
                 messages.append(assistant)
                 for tool in completion.tool_calls:
-                    budget.claim("command", self.limits.commands)
-                    argv = self._tool_argv(tool)
-                    response = self._command(workspace, budget, argv, checked=False)
+                    try:
+                        budget.claim("command", self.limits.commands)
+                        argv = self._tool_argv(tool)
+                        response = self._command(workspace, budget, argv, checked=False)
+                    except (
+                        _RequestBudgetExceeded,
+                        _CandidateOutputError,
+                        CommandOutputExceeded,
+                    ) as error:
+                        budget.reject(error, last)
+                    actor = last
                     output = _combined(response)
                     trajectory.append(
                         f"[ACTION] {json.dumps(argv)}\n[OBSERVATION] "
@@ -346,21 +428,24 @@ class PlainExecutor:
                         }
                     )
             self._git(workspace, budget, "add", "-A")
-            patch = self._git(
-                workspace,
-                budget,
-                "diff",
-                "--cached",
-                "--binary",
-                "--no-renames",
-                "--no-ext-diff",
-                "--no-textconv",
-                baseline,
-                cap=self.limits.patch_bytes,
-            ).stdout
-            if patch and not clarification:
-                self._check_patch_paths(workspace, task, budget, patch)
-        return patch, "\n".join(trajectory)[-32768:]
+            try:
+                patch = self._git(
+                    workspace,
+                    budget,
+                    "diff",
+                    "--cached",
+                    "--binary",
+                    "--no-renames",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    baseline,
+                    cap=self.limits.patch_bytes,
+                ).stdout
+                if patch and not clarification:
+                    self._check_patch_paths(workspace, task, budget, patch)
+            except (CommandOutputExceeded, _CandidateOutputError) as error:
+                budget.reject(error, actor or last)
+        return patch, "\n".join(trajectory)[-32768:], actor or last
 
     @staticmethod
     def _check_clarification(content):
@@ -394,10 +479,10 @@ class PlainExecutor:
                 return tuple(argv)
         except (ValueError, KeyError, TypeError):
             pass
-        raise ExecutionError("Model provided an invalid run tool call")
+        raise _CandidateOutputError("Model provided an invalid run tool call")
 
     def _check_patch_paths(self, workspace, task, budget, patch):
-        summary = self._git(
+        result = self._git(
             workspace,
             budget,
             "apply",
@@ -405,26 +490,57 @@ class PlainExecutor:
             "-z",
             cap=self.limits.patch_bytes,
             data=patch,
-        ).stdout
-        for entry in summary.rstrip(b"\0").split(b"\0"):
+            checked=False,
+        )
+        self._require_valid_patch(result, "Invalid patch metadata")
+        for entry in result.stdout.rstrip(b"\0").split(b"\0"):
             parts = entry.split(b"\t", 2)
             if len(parts) != 3 or not parts[-1]:
-                raise ExecutionError("Unexpected patch metadata")
+                raise _CandidateOutputError("Unexpected patch metadata")
             path = parts[-1].decode("utf-8", "surrogateescape")
             if _protected(path, task):
-                raise ExecutionError(f"Patch changes protected path: {path}")
+                raise _CandidateOutputError(f"Patch changes protected path: {path}")
 
-    def _verify(self, task, archive, budget, patch, refinement=None):
+    @staticmethod
+    def _require_valid_patch(result, message):
+        if result.returncode:
+            if result.returncode not in {1, 128} or not result.stderr.startswith(
+                b"error:"
+            ):
+                raise ExecutionError("Worker could not validate the generated patch")
+            raise _CandidateOutputError(message)
+
+    def _verify(self, task, archive, budget, patch, refinement=None, *, actor=None):
         if not patch:
-            raise ExecutionError("Executor returned an empty patch")
+            budget.reject(
+                _CandidateOutputError("Executor returned an empty patch"), actor
+            )
         if len(patch) > self.limits.patch_bytes:
-            raise LimitExceeded("Patch exceeded the configured size")
+            budget.reject(
+                CommandOutputExceeded("Patch exceeded the configured size"), actor
+            )
         with self.runner.workspace(
             archive, budget.remaining, budget.cancelled
         ) as workspace:
             self._git(workspace, budget, "init", "-q", "--template=")
             self._git(workspace, budget, "add", "-A", "-f")
-            self._check_patch_paths(workspace, task, budget, patch)
+            try:
+                self._check_patch_paths(workspace, task, budget, patch)
+                check = self._git(
+                    workspace,
+                    budget,
+                    "apply",
+                    "--check",
+                    "--index",
+                    "--binary",
+                    data=patch,
+                    checked=False,
+                )
+                self._require_valid_patch(
+                    check, "Invalid patch did not apply to the pinned checkout"
+                )
+            except (_CandidateOutputError, CommandOutputExceeded) as error:
+                budget.reject(error, actor)
             self._git(workspace, budget, "apply", "--index", "--binary", data=patch)
             checks = []
             for command in task.checks:
@@ -432,9 +548,31 @@ class PlainExecutor:
                 evidence = CheckEvidence(command, result.returncode, _combined(result))
                 checks.append(evidence)
                 if result.returncode:
-                    error = ExecutionError(f"Required check failed: {command[0]}")
-                    error.checks = tuple(checks)
-                    raise error
+                    break
+        if checks[-1].returncode:
+            failed = checks[-1]
+            error = ExecutionError(f"Required check failed: {failed.command[0]}")
+            error.checks = tuple(checks)
+            if (
+                actor is not None
+                and actor.configured_model
+                and 0 < failed.returncode < 125
+            ):
+                with self.runner.workspace(
+                    archive, budget.remaining, budget.cancelled
+                ) as baseline:
+                    self._git(baseline, budget, "init", "-q", "--template=")
+                    self._git(baseline, budget, "add", "-A", "-f")
+                    result = self._command(
+                        baseline, budget, failed.command, checked=False
+                    )
+                if result.returncode == 0:
+                    budget.reject(error, actor)
+                error = ExecutionError(
+                    f"Required check also failed on the baseline: {failed.command[0]}"
+                )
+                error.checks = tuple(checks)
+            raise error
         usage = Counter()
         for route in budget.routes:
             usage.update(route.usage)
@@ -457,7 +595,10 @@ class Harness2Executor(PlainExecutor):
     ) -> ExecutionResult:
         from .harness2_adapter import refine
 
-        budget = _Budget(self.limits, cancelled)
+        budget = _Budget(self.limits, cancelled, task.excluded_models)
         archive = self._archive(task, checkout, budget)
-        patch, evidence = refine(self, task, archive, budget)
-        return self._verify(task, archive, budget, patch, evidence)
+        try:
+            patch, evidence, actor = refine(self, task, archive, budget)
+        except _RequestBudgetExceeded as error:
+            budget.reject(error, None, latest=True)
+        return self._verify(task, archive, budget, patch, evidence, actor=actor)

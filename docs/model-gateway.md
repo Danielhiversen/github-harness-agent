@@ -18,7 +18,20 @@ Set `MODEL_GATEWAY_DEPLOYMENTS` on the gateway to the path of a private JSON fil
 
 Use the model IDs in `provider_manifest.v1.json`. For a cloud route, set `url` to the API base and set `headers` to the provider's authentication headers. The gateway appends `/chat/completions` to OpenAI-compatible bases. For the `google` alias, use the Gemini API version base, such as `https://generativelanguage.googleapis.com/v1beta`, with an `x-goog-api-key` header. It appends the model-specific `generateContent` endpoint.
 
-Set `free_verified` to true after verifying zero-cost model access for the exact endpoint and account. This includes confirming trial credits or free-plan eligibility where applicable. Set `tools` to true for a coding candidate and confirm the tool round trip with the smoke command. Only explicitly deployed, eligible models can receive requests. The gateway tries the incumbent default first, follows the ordered web profile candidate list, then tries any additional deployments in file order. It skips models cooling down after a rate-limit response.
+Set `free_verified` to true after verifying zero-cost model access for the exact endpoint and account. This includes confirming trial credits or free-plan eligibility where applicable. Set `tools` to true for a coding candidate and confirm the tool round trip with the smoke command. For a verified Kilo endpoint that permits requests without credentials, explicitly set `allow_keyless` to true and use empty `headers`. Cloud routes otherwise require their provider credentials. Explicitly configured eligible models are the only candidates for a request.
+
+Generate a deployment template outside the checkout with one row per model. Use `--profile superagent` for the 11 active Super Agent models across Kilo, Ollama and NVIDIA. The default `--profile all` also covers the web profile and reusable catalog aliases. Fill in the provider endpoint and headers on each row, then verify access individually. Template rows start disabled. Paid-capable OpenRouter routers stay recorded in the inventory and are rejected by the gateway.
+
+```sh
+uv run python -m github_harness_agent.providers template --profile superagent
+uv run python -m github_harness_agent.providers template --profile all
+```
+
+Set an integer `quality_priority` per model to choose the order. Higher scores run first, followed by unranked candidates. Ties and unranked choices preserve the web profile default and order, then deployment-file order. Templates place the active Super Agent default, NVIDIA's `poolside/laguna-xs-2.1`, first as a starting preference. Use matched coding replays to adjust priorities by verified patch success, confirmation of structured tool use, and latency. Provider claims and model size alone cannot establish the best route for this checkout. Set `attempt_timeout` in seconds to override the 15-second per-attempt default. The remaining 60-second gateway request budget bounds the entire fallback sequence.
+
+The gateway tries the next eligible model after transport errors, bad statuses, malformed responses, and unusable initial coding responses. A valid initial coding clarification can still be returned to the maintainer. Requests sharing an endpoint and credentials share a rate-limit cooldown and allow one concurrent request. A model with a transport or server failure cools down briefly while healthy routes serve subsequent requests. Gateway fallback applies to a single model exchange. The controller and executor own task-level retries for patches that fail independent checks.
+
+Each completion records the requested `configured_model` and the provider-reported `model`, which can differ when a router selects a backend. Task retries can exclude an exact `(route, configured_model)` pair from further exchanges.
 
 ```sh
 uv run python -m github_harness_agent.providers smoke
@@ -32,10 +45,11 @@ To check the importer against the repository fixtures, run the following command
 ```sh
 uv run python -m github_harness_agent.providers import \
   tests/fixtures/incumbent_provider_profile.json \
-  tests/fixtures/incumbent_provider_catalog.json
+  tests/fixtures/incumbent_provider_catalog.json \
+  tests/fixtures/incumbent_provider_superagent.json
 ```
 
-The incumbent snapshot covers the six web routes and eight reusable catalog aliases observed on November 17, 2026. The incumbent profile uses `allowedModels` to order subagent choices. The gateway uses that order for fallbacks. Some catalog entries are paid-capable routing aliases. The manifest preserves those IDs for parity and the gateway rejects those deployments.
+The incumbent snapshot covers the six web routes, eight reusable catalog aliases, and three active Super Agent routes observed on November 18, 2026. The web profile uses `allowedModels` to order subagent choices. The active Super Agent profile defines a default and contains no ordered fallback setting.
 
 ## Initial live validation
 

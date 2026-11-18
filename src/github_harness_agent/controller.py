@@ -8,20 +8,30 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from .executor import NeedsClarification, TaskSnapshot
+from .executor import AttemptRejected, ExecutionError, NeedsClarification, TaskSnapshot
 from .intake import eligible, maintainer
-from .publish import BranchUpdate, Journal, Publisher, PublishRequest, StaleHead
+from .publish import (
+    BranchUpdate,
+    ClosedPull,
+    Journal,
+    Publisher,
+    PublishRequest,
+    StaleHead,
+    TargetMoved,
+)
+from .rebase import (
+    BOT_IDENTITY,
+    RebaseConflict,
+    TargetBase,
+    branch_parent,
+    git,
+    transplant_patch,
+)
 from .reviews import ReviewItem, collect_reviews, map_feedback, reply_to_review
 from .store import LeaseLost
 
 
-def git(path, *args, data=None):
-    return subprocess.run(
-        ["git", "-C", str(path), *args], input=data, check=True, capture_output=True
-    ).stdout
-
-
-def prepare_commit(path, parent, patch, issue):
+def prepare_commit(path, parent, patch, issue, identity=BOT_IDENTITY):
     # Stage patch directly in the index. No checked-out project code runs here.
     git(path, "read-tree", parent)
     git(path, "apply", "--cached", "--binary", "-", data=patch)
@@ -30,9 +40,9 @@ def prepare_commit(path, parent, patch, issue):
         git(
             path,
             "-c",
-            "user.name=GitHub Harness Agent",
+            f"user.name={identity[0]}",
             "-c",
-            "user.email=agent@users.noreply.github.com",
+            f"user.email={identity[1]}",
             "commit-tree",
             tree,
             "-p",
@@ -43,6 +53,30 @@ def prepare_commit(path, parent, patch, issue):
         .decode()
         .strip()
     )
+
+
+def verified_commit(
+    path, parent, patch, issue, checks, origin, target, identity, previous_base
+):
+    sha = prepare_commit(path, parent, patch, issue, identity)
+    return {
+        "patch": base64.b64encode(patch).decode(),
+        "sha": sha,
+        "object": base64.b64encode(git(path, "cat-file", "commit", sha)).decode(),
+        "checks": [
+            " ".join(check.command) + f" (exit {check.returncode})" for check in checks
+        ],
+        "digest": hashlib.sha256(patch).hexdigest(),
+        "sync": {
+            "target": dataclasses.asdict(target),
+            "origin": origin,
+            "parent": parent,
+            "identity": list(identity),
+            "previous_base": dataclasses.asdict(previous_base)
+            if previous_base
+            else None,
+        },
+    }
 
 
 def review_source(path: Path, parent: str, review_path: str) -> str | None:
@@ -72,6 +106,17 @@ class Controller:
         self.config, self.bot_login = config, bot_login
 
     def run(self, job):
+        try:
+            self._run(job)
+        except TargetMoved:
+            self.store.save(job, "queued", delay=5)
+        except RebaseConflict as error:
+            job["data"]["pause_reason"] = str(error)
+            self.store.save(job, "paused")
+        except ClosedPull:
+            self.store.save(job, "complete")
+
+    def _run(self, job):
         data = job["data"]
         repo, issue = job["repo"], job["issue"]
         api, store, cfg = self.api, self.store, self.config
@@ -84,12 +129,20 @@ class Controller:
             if not eligible(api, repo, current, label):
                 store.cancel(repo, issue)
                 raise LeaseLost()
+            store.check(job)
+
+        def cancelled():
+            try:
+                store.check(job)
+            except LeaseLost:
+                return True
+            return False
 
         authorize()
         journal = Journal(data, lambda: store.save(job))
         publisher = Publisher(api, journal, authorize)
         stage = data["stage"]
-        parent = data["base_sha"]
+        origin = None
         instructions = f"{data['title']}\n\n{data['body']}"
         checks = tuple(tuple(check) for check in cfg["checks"])
         if not checks:
@@ -118,29 +171,76 @@ class Controller:
                 data["feedback"] = [dataclasses.asdict(item) for item in batch.items]
                 data["review_head"] = batch.head
                 data["stage"] = stage = "repair"
+                data.pop("model_attempt_failures", None)
                 store.save(job)
-            parent = data["review_head"]
+            origin = data["review_head"]
 
         if stage not in {"reply", "question"}:
             with tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp)
-                git(path, "init", "-q")
-                api.fetch(repo, path, parent)
-                git(path, "checkout", "--detach", parent)
+                git(path, "init", "-q", "--template=")
+                pull = data["pull"] if stage == "repair" else None
+                latest = publisher.target(repo, data["base"], pull)
+                identity = getattr(api, "commit_identity", None) or BOT_IDENTITY
+                prepared = data.get("prepared")
+                previous_base = None
+                if pull is not None:
+                    previous_base = (
+                        TargetBase(**data["last_target"])
+                        if data.get("last_target")
+                        else (TargetBase(repo, data["base"], data["base_sha"]))
+                    )
+                if prepared is None:
+                    target = latest
+                    parent = branch_parent(
+                        api, path, repo, origin, target, identity, previous_base
+                    )
+                elif sync := prepared.get("sync"):
+                    target = TargetBase(**sync["target"])
+                    identity = tuple(sync["identity"])
+                    previous_base = (
+                        TargetBase(**sync["previous_base"])
+                        if sync.get("previous_base")
+                        else None
+                    )
+                    if sync["origin"] != origin:
+                        raise RebaseConflict(
+                            "stored patch has a different original task branch"
+                        )
+                    parent = branch_parent(
+                        api, path, repo, origin, target, identity, previous_base
+                    )
+                    if parent != sync["parent"]:
+                        raise RebaseConflict(
+                            "could not reproduce the verified rebased parent"
+                        )
+                else:
+                    # Continue jobs prepared before syncing was introduced.
+                    target = TargetBase(repo, data["base"], data["base_sha"])
+                    parent = origin or target.sha
+                    api.fetch(repo, path, parent)
+                git(path, "checkout", "--detach", "--force", parent)
                 guides = git(path, "ls-tree", "--name-only", parent).splitlines()
                 if b"AGENTS.md" in guides:
                     instructions += (
                         "\nRepository instructions:\n"
                         + git(path, "show", parent + ":AGENTS.md").decode()
                     )
+                if prepared is not None and stage == "repair":
+                    instructions += (
+                        "\nReview requests against this commit:\n"
+                        + json.dumps(data["feedback"])
+                    )
                 if "prepared" not in data:
                     if stage == "repair":
                         mapped = []
                         for raw in data["feedback"]:
                             item = ReviewItem(**raw)
-                            if item.outdated and item.path:
+                            if item.path and (item.outdated or parent != origin):
                                 source = review_source(path, parent, item.path)
-                                current = map_feedback(item, source)
+                                current = map_feedback(
+                                    dataclasses.replace(item, outdated=True), source
+                                )
                             else:
                                 current = item
                             if current is not None:
@@ -160,7 +260,7 @@ class Controller:
                                         bot_login=self.bot_login,
                                         question="Could you point me to the line or section on the "
                                         "current pull request that this request applies to?",
-                                        expected_head=parent,
+                                        expected_head=origin,
                                     )
                                 except StaleHead:
                                     data["stage"] = "watch"
@@ -179,6 +279,14 @@ class Controller:
                             "\nReview requests against this commit:\n"
                             + json.dumps(mapped)
                         )
+                    failures = data.get("model_attempt_failures", [])
+                    excluded = tuple(
+                        (
+                            record["candidate"]["route"],
+                            record["candidate"]["configured_model"],
+                        )
+                        for record in failures
+                    )
                     task = TaskSnapshot(
                         repo,
                         parent,
@@ -186,17 +294,41 @@ class Controller:
                         checks,
                         protected_paths=tuple(cfg.get("protected_paths", ())),
                         repository_guidance=cfg.get("reviewed_guidance", ""),
+                        excluded_models=excluded,
                     )
 
-                    def cancelled():
-                        try:
-                            store.check(job)
-                        except LeaseLost:
-                            return True
-                        return False
-
                     try:
+                        if publisher.target(repo, data["base"], pull) != target:
+                            raise TargetMoved("target ref changed before editing")
+                        if (
+                            pull is not None
+                            and publisher.branch_head(repo, branch) != origin
+                        ):
+                            data["stage"] = "watch"
+                            store.save(job, "queued")
+                            return
                         result = self.executor.execute(task, path, cancelled=cancelled)
+                    except AttemptRejected as err:
+                        candidate = err.candidate
+                        if (candidate.route, candidate.configured_model) in excluded:
+                            data["pause_reason"] = (
+                                "gateway selected an excluded coding candidate"
+                            )
+                            store.save(job, "paused")
+                            return
+                        failures.append(
+                            {
+                                "candidate": dataclasses.asdict(candidate),
+                                "reason": str(err),
+                                "trace": [
+                                    dataclasses.asdict(route)
+                                    for route in err.route_trace
+                                ],
+                            }
+                        )
+                        data["model_attempt_failures"] = failures
+                        store.save(job, "queued")
+                        return
                     except NeedsClarification as err:
                         if stage != "repair":
                             raise
@@ -206,30 +338,81 @@ class Controller:
                         data.update(stage="question", question=str(err))
                         store.save(job, "queued")
                         return
-                    payload = base64.b64encode(result.patch).decode()
-                    # Preserve the verified commit object for exact crash recovery.
-                    commit = prepare_commit(path, parent, result.patch, issue)
                     data["prepared"] = {
-                        "patch": payload,
-                        "sha": commit,
-                        "object": base64.b64encode(
-                            git(path, "cat-file", "commit", commit)
-                        ).decode(),
-                        "checks": [
-                            " ".join(check.command) + f" (exit {check.returncode})"
-                            for check in result.checks
-                        ],
+                        **verified_commit(
+                            path,
+                            parent,
+                            result.patch,
+                            issue,
+                            result.checks,
+                            origin,
+                            target,
+                            identity,
+                            previous_base,
+                        ),
                         "trace": [
                             dataclasses.asdict(route) for route in result.route_trace
                         ],
+                        "model_attempt_failures": data.pop(
+                            "model_attempt_failures", []
+                        ),
                         "usage": result.usage,
                         "refinement": dataclasses.asdict(result.refinement)
                         if result.refinement
                         else None,
-                        "digest": hashlib.sha256(result.patch).hexdigest(),
                     }
                     store.save(job)
                 prepared = data["prepared"]
+                latest = publisher.target(repo, data["base"], pull)
+                published_head = publisher.branch_head(repo, branch)
+                if pull is not None and published_head not in {origin, prepared["sha"]}:
+                    del data["prepared"]
+                    data["stage"] = "watch"
+                    store.save(job, "queued")
+                    return
+                if latest != target and published_head != prepared["sha"]:
+                    parent = branch_parent(
+                        api, path, repo, origin, latest, identity, previous_base
+                    )
+                    patch = transplant_patch(
+                        path, parent, base64.b64decode(prepared["patch"])
+                    )
+                    verify_task = TaskSnapshot(
+                        repo,
+                        parent,
+                        instructions,
+                        checks,
+                        protected_paths=tuple(cfg.get("protected_paths", ())),
+                        repository_guidance=cfg.get("reviewed_guidance", ""),
+                    )
+
+                    try:
+                        verified = self.executor.verify_patch(
+                            verify_task,
+                            path,
+                            patch,
+                            cancelled=cancelled,
+                        )
+                    except ExecutionError as error:
+                        store.check(job)
+                        raise RebaseConflict(
+                            "required verification failed after rebasing"
+                        ) from error
+                    target = latest
+                    prepared.update(
+                        verified_commit(
+                            path,
+                            parent,
+                            verified.patch,
+                            issue,
+                            verified.checks,
+                            origin,
+                            target,
+                            identity,
+                            previous_base,
+                        )
+                    )
+                    store.save(job)
                 patch = base64.b64decode(prepared["patch"])
                 git(path, "read-tree", parent)
                 git(path, "apply", "--cached", "--binary", "-", data=patch)
@@ -258,7 +441,7 @@ class Controller:
                         PublishRequest(
                             repo,
                             issue,
-                            data["base"],
+                            target.ref,
                             parent,
                             branch,
                             path,
@@ -267,20 +450,22 @@ class Controller:
                             f"Implements issue #{issue}.",
                             tuple(prepared["checks"]),
                             ready=True,
+                            target=target,
                         )
                     )
                     data.update(pull=published.number, stage="watch")
                 else:
-                    remote_head = pr["head"]["sha"]
-                    if remote_head not in {parent, sha}:
-                        data.pop("prepared")
-                        data["stage"] = "watch"
-                        store.save(job, "queued")
-                        return
                     try:
                         publisher.advance(
                             BranchUpdate(
-                                repo, branch, parent, path, sha, pull=data["pull"]
+                                repo,
+                                branch,
+                                origin,
+                                path,
+                                sha,
+                                pull=data["pull"],
+                                target=target,
+                                verified_parent=parent,
                             )
                         )
                     except StaleHead:
@@ -290,10 +475,18 @@ class Controller:
                         return
                     data.update(stage="reply", round=data["round"] + 1)
                 data["last_commit"] = sha
+                data["last_target"] = dataclasses.asdict(target)
                 data["last_checks"] = prepared["checks"]
                 data["last_evidence"] = {
                     key: prepared[key]
-                    for key in ("trace", "usage", "refinement", "digest")
+                    for key in (
+                        "trace",
+                        "usage",
+                        "refinement",
+                        "digest",
+                        "model_attempt_failures",
+                    )
+                    if key in prepared
                 }
                 del data["prepared"]
                 store.save(job)

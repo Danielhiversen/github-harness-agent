@@ -1,4 +1,4 @@
-"""Controller-only GitHub App authentication, API calls and Git transport."""
+"""Controller-only GitHub authentication, API calls and Git transport."""
 
 import base64
 import json
@@ -43,48 +43,10 @@ def validate_repository(repo: str) -> str:
     return repo
 
 
-class GitHubApp:
-    def __init__(
-        self,
-        app_id,
-        private_key: str | bytes,
-        *,
-        client: httpx.Client | None = None,
-        api_url: str = "https://api.github.com",
-        clock=_utcnow,
-    ):
-        self.app_id = str(app_id)
-        key = private_key.encode() if isinstance(private_key, str) else private_key
-        self._key = serialization.load_pem_private_key(key, password=None)
-        if not isinstance(self._key, rsa.RSAPrivateKey):
-            raise ValueError("GitHub App authentication requires an RSA private key")
+class _GitHubAPI:
+    def __init__(self, client: httpx.Client | None, api_url: str):
         self._http = client or httpx.Client(timeout=20, trust_env=False)
         self._api_url = api_url.rstrip("/")
-        self._clock = clock
-        self._installations: dict[int, GitHubClient] = {}
-        self._lock = threading.Lock()
-
-    def installation(self, installation_id: int) -> "GitHubClient":
-        if type(installation_id) is not int or installation_id <= 0:
-            raise ValueError("invalid GitHub installation ID")
-        with self._lock:
-            client = self._installations.get(installation_id)
-            if client is None:
-                client = GitHubClient(self, installation_id)
-                self._installations[installation_id] = client
-            return client
-
-    def _jwt(self) -> str:
-        now = int(self._clock().timestamp())
-        claims = {"iat": now - 60, "exp": now + 540, "iss": self.app_id}
-        encoded = b".".join(
-            (
-                _base64url(b'{"alg":"RS256","typ":"JWT"}'),
-                _base64url(json.dumps(claims, separators=(",", ":")).encode()),
-            )
-        )
-        signature = self._key.sign(encoded, padding.PKCS1v15(), hashes.SHA256())
-        return (encoded + b"." + _base64url(signature)).decode()
 
     def _request(self, token, method, path, *, params=None, json=None):
         url = urljoin(self._api_url + "/", path)
@@ -114,6 +76,49 @@ class GitHubApp:
                 status=response.status_code,
             )
         return response
+
+
+class GitHubApp(_GitHubAPI):
+    def __init__(
+        self,
+        app_id,
+        private_key: str | bytes,
+        *,
+        client: httpx.Client | None = None,
+        api_url: str = "https://api.github.com",
+        clock=_utcnow,
+    ):
+        super().__init__(client, api_url)
+        self.app_id = str(app_id)
+        key = private_key.encode() if isinstance(private_key, str) else private_key
+        self._key = serialization.load_pem_private_key(key, password=None)
+        if not isinstance(self._key, rsa.RSAPrivateKey):
+            raise ValueError("GitHub App authentication requires an RSA private key")
+        self._clock = clock
+        self._installations: dict[int, GitHubClient] = {}
+        self._lock = threading.Lock()
+
+    def installation(self, installation_id: int) -> "GitHubClient":
+        if type(installation_id) is not int or installation_id <= 0:
+            raise ValueError("invalid GitHub installation ID")
+        with self._lock:
+            client = self._installations.get(installation_id)
+            if client is None:
+                client = GitHubClient(self, installation_id)
+                self._installations[installation_id] = client
+            return client
+
+    def _jwt(self) -> str:
+        now = int(self._clock().timestamp())
+        claims = {"iat": now - 60, "exp": now + 540, "iss": self.app_id}
+        encoded = b".".join(
+            (
+                _base64url(b'{"alg":"RS256","typ":"JWT"}'),
+                _base64url(json.dumps(claims, separators=(",", ":")).encode()),
+            )
+        )
+        signature = self._key.sign(encoded, padding.PKCS1v15(), hashes.SHA256())
+        return (encoded + b"." + _base64url(signature)).decode()
 
 
 def _payload(response):
@@ -213,24 +218,109 @@ class GitHubClient:
         branch: str,
         expected_head: str,
         commit: str,
+        *,
+        verified_parent: str | None = None,
+        target_base: str | None = None,
+        before_write=None,
     ) -> None:
         url = f"https://github.com/{validate_repository(repo)}.git"
         _sha(commit)
         _sha(expected_head)
         ref = f"refs/heads/{branch}"
         _git(checkout, "check-ref-format", ref)
+        parent = _sha(verified_parent) if verified_parent is not None else expected_head
+        if parent != expected_head and target_base is None:
+            raise GitHubError("rebased Git pushes require a verified target commit")
         parent_line = _git(checkout, "rev-list", "--parents", "-n", "1", commit).split()
-        if parent_line != [commit, expected_head]:
+        if parent_line != [commit, parent]:
             raise GitHubError(
-                "verified commit must directly descend from the expected head"
+                "verified commit must directly descend from the verified parent"
             )
+        if target_base is not None:
+            _git(checkout, "merge-base", "--is-ancestor", _sha(target_base), parent)
+        token = self._access_token()
+        if before_write is not None:
+            before_write()
         _git(
             checkout,
             "push",
             f"--force-with-lease={ref}:{expected_head}",
             url,
             f"{commit}:{ref}",
-            token=self._access_token(),
+            token=token,
+        )
+
+
+class GitHubNamedAccount(GitHubClient):
+    def __init__(
+        self,
+        login: str,
+        config_dir: str,
+        *,
+        gh: str = "gh",
+        client: httpx.Client | None = None,
+    ):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", login):
+            raise ValueError(
+                "Named-account mode requires a GitHub user login in bot_login"
+            )
+        if not config_dir or not Path(config_dir).expanduser().is_dir():
+            raise ValueError("Named-account mode requires a dedicated GH_CONFIG_DIR")
+        if gh != "gh" and not Path(gh).is_absolute():
+            raise ValueError("github_cli must be an absolute path or gh")
+        env = {
+            name: os.environ[name]
+            for name in (
+                "PATH",
+                "HOME",
+                "TMPDIR",
+                "XDG_RUNTIME_DIR",
+                "DBUS_SESSION_BUS_ADDRESS",
+            )
+            if name in os.environ
+        }
+        env.update(
+            GH_CONFIG_DIR=str(Path(config_dir).expanduser().resolve()),
+            GH_PROMPT_DISABLED="1",
+        )
+        try:
+            result = subprocess.run(
+                [gh, "auth", "token", "--hostname", "github.com", "--user", login],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+                check=True,
+            )
+        except (subprocess.SubprocessError, OSError):
+            raise GitHubError(
+                "Could not load the configured GitHub account credential"
+            ) from None
+        token = result.stdout.strip()
+        if not re.fullmatch(r"[!-~]+", token):
+            raise GitHubError("GitHub CLI returned an invalid account credential")
+
+        self._api = _GitHubAPI(client, "https://api.github.com")
+        account = _payload(self._api._request(token, "GET", "/user"))
+        actual = account.get("login") if isinstance(account, dict) else None
+        if not isinstance(actual, str) or actual.casefold() != login.casefold():
+            raise GitHubError("Authenticated GitHub account does not match bot_login")
+        user_id = account.get("id")
+        if type(user_id) is not int or user_id <= 0:
+            raise GitHubError(
+                "Authenticated GitHub account did not return a valid user ID"
+            )
+        self.commit_identity = (actual, f"{user_id}+{actual}@users.noreply.github.com")
+        self._token = token
+
+    def _access_token(self) -> str:
+        return self._token
+
+    def _request(self, method, path, *, params=None, json=None):
+        return self._api._request(
+            self._access_token(), method, path, params=params, json=json
         )
 
 

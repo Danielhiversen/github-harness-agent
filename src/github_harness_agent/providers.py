@@ -53,7 +53,9 @@ NON_FREE_ROUTERS = frozenset(
 )
 
 
-def import_profiles(profile: list[dict], catalog: list[dict]) -> dict:
+def import_profiles(
+    profile: list[dict], catalog: list[dict], superagent: list[dict] | None = None
+) -> dict:
     """Whitelist known Cordis plugins and fields. Never copy credential configuration."""
 
     def plugin(entries: list[dict], name: str) -> dict:
@@ -96,28 +98,36 @@ def import_profiles(profile: list[dict], catalog: list[dict]) -> dict:
             }
         return public
 
-    web = routes(profile)
-
-    def selection(entry: dict) -> dict:
+    def selection(entry: dict, providers: dict) -> dict:
         alias, model = entry["provider"], model_id(entry["model"])
-        if alias not in web or model not in {
-            item["id"] for item in web[alias]["models"]
+        if alias not in providers or model not in {
+            item["id"] for item in providers[alias]["models"]
         }:
             raise ValueError("Configured choice references an unknown model")
         return {"provider": alias, "model": model}
 
-    return {
+    def policy(entries: list[dict], providers: dict) -> dict:
+        return {
+            "default": selection(plugin(entries, "agent-default-model"), providers),
+            "fallback": [
+                selection(entry, providers)
+                for entry in plugin(entries, "subagent-model-selection-settings").get(
+                    "allowedModels", []
+                )
+            ],
+        }
+
+    web = routes(profile)
+    manifest = {
         "version": 1,
         "web": web,
         "catalog": routes(catalog),
-        "default": selection(plugin(profile, "agent-default-model")),
-        "fallback": [
-            selection(entry)
-            for entry in plugin(profile, "subagent-model-selection-settings").get(
-                "allowedModels", []
-            )
-        ],
+        **policy(profile, web),
     }
+    if superagent is not None:
+        active = routes(superagent)
+        manifest["superagent"] = {"providers": active, **policy(superagent, active)}
+    return manifest
 
 
 def load_manifest() -> dict:
@@ -135,6 +145,7 @@ class Completion:
     role: str
     usage: dict[str, int]
     provider_context: dict[str, Any] | None = None
+    configured_model: str | None = None
 
 
 class ProviderExhausted(RuntimeError):
@@ -154,6 +165,10 @@ class _Route:
     max_tokens: int
     free_verified: bool
     tools: bool
+    allow_keyless: bool
+    quality_priority: int | None
+    attempt_timeout: float
+    quota_key: tuple
 
 
 def _call(identifier: str, name: str, arguments: Any) -> dict:
@@ -290,7 +305,10 @@ def _decode(
 ) -> Completion:
     context = None
     if route.protocol == "gemini":
-        parts = body["candidates"][0]["content"]["parts"]
+        candidate = body["candidates"][0]
+        if candidate.get("finishReason") not in {None, "STOP"}:
+            raise ValueError("Gemini returned an incomplete completion")
+        parts = candidate["content"]["parts"]
         content = (
             "".join(part.get("text", "") for part in parts if not part.get("thought"))
             or None
@@ -310,7 +328,10 @@ def _decode(
         model = body.get("modelVersion") or route.model
         context = {"route": route.alias, "model": route.model, "parts": parts}
     else:
-        message = body["choices"][0]["message"]
+        choice = body["choices"][0]
+        if choice.get("finish_reason") in {"length", "content_filter", "error"}:
+            raise ValueError("Provider returned an incomplete completion")
+        message = choice["message"]
         content = message.get("content")
         calls = tuple(
             _call(call["id"], call["function"]["name"], call["function"]["arguments"])
@@ -323,14 +344,36 @@ def _decode(
         output_tokens = usage.get("completion_tokens")
         model = body.get("model") or route.model
 
-    allowed_tools = {tool["function"]["name"] for tool in tools}
-    if any(call["function"]["name"] not in allowed_tools for call in calls):
-        raise ValueError("Provider called an undeclared tool")
+    allowed_tools = {
+        tool["function"]["name"]: tool["function"].get("parameters", {})
+        for tool in tools
+    }
+    for call in calls:
+        function = call["function"]
+        name = function["name"]
+        if name not in allowed_tools:
+            raise ValueError("Provider called an undeclared tool")
+        parameters = allowed_tools[name]
+        arguments = json.loads(function["arguments"])
+        properties = parameters.get("properties", {})
+        if not set(parameters.get("required", ())) <= arguments.keys() or (
+            parameters.get("additionalProperties") is False
+            and not arguments.keys() <= properties.keys()
+        ):
+            raise ValueError("Provider returned invalid tool arguments")
+        if name == "run" and "argv" in properties:
+            argv = arguments.get("argv")
+            if (
+                not isinstance(argv, list)
+                or not argv
+                or not all(isinstance(arg, str) for arg in argv)
+            ):
+                raise ValueError("Provider returned an invalid command argument vector")
     if len({call["id"] for call in calls}) != len(calls):
         raise ValueError("Provider returned duplicate call IDs")
     if content is not None and not isinstance(content, str):
         raise ValueError("Invalid message content")
-    if not content and not calls:
+    if not (content and content.strip()) and not calls:
         raise ValueError("Empty completion")
     counts = {
         name: value
@@ -344,7 +387,20 @@ def _decode(
         type(n) is not int or n < 0 for n in counts.values()
     ):
         raise ValueError("Invalid completion metadata")
-    return Completion(content, calls, route.alias, model, role, counts, context)
+    return Completion(
+        content, calls, route.alias, model, role, counts, context, route.model
+    )
+
+
+def _clarification(content: str | None) -> bool:
+    try:
+        decoded = json.loads(content or "")
+    except ValueError:
+        return False
+    if not isinstance(decoded, dict):
+        return False
+    question = decoded.get("clarification")
+    return isinstance(question, str) and bool(question.strip())
 
 
 def _retry_time(value: str | None) -> float:
@@ -352,12 +408,27 @@ def _retry_time(value: str | None) -> float:
     if value:
         try:
             return now + max(1, int(value))
-        except ValueError:
+        except (OverflowError, ValueError):
             try:
                 return max(now + 1, parsedate_to_datetime(value).timestamp())
             except (TypeError, ValueError, OverflowError):
                 pass
     return now + 60
+
+
+def _model_specs(manifest: dict, *, active_only: bool = False) -> dict:
+    active = manifest.get("superagent", {}).get("providers", {})
+    groups = [active] if active_only else [manifest["catalog"], manifest["web"], active]
+    return {
+        (alias, model["id"]): (provider["protocol"], model["max_tokens"])
+        for group in groups
+        for alias, provider in group.items()
+        for model in provider["models"]
+    }
+
+
+def _paid_router(alias: str, model: str) -> bool:
+    return alias.startswith("openrouter") and model in NON_FREE_ROUTERS
 
 
 class ProviderRouter:
@@ -369,52 +440,80 @@ class ProviderRouter:
         client: httpx.Client | None = None,
     ):
         self.client = client or httpx.Client(follow_redirects=False, trust_env=False)
-        self.cooldowns: dict[tuple[str, str], float] = {}
+        self._quota_cooldown: dict[tuple, float] = {}
+        self._model_cooldown: dict[tuple[str, str], float] = {}
+        self._in_flight: set[tuple] = set()
         self._lock = threading.Lock()
         if manifest["version"] != 1:
             raise ValueError("Unsupported provider manifest version")
-        allowed = {
-            (alias, model["id"]): (provider["protocol"], model["max_tokens"])
-            for group in ("catalog", "web")
-            for alias, provider in manifest[group].items()
-            for model in provider["models"]
-        }
+        allowed = _model_specs(manifest)
         configured = {}
         for item in deployments:
             alias, model = item["model"].split("/", 1)
-            if (alias, model) not in allowed or (
-                alias.startswith("openrouter") and model in NON_FREE_ROUTERS
-            ):
+            if (alias, model) not in allowed or _paid_router(alias, model):
                 raise ValueError(
                     "The deployment contains a model outside the free allowlist"
                 )
             if (alias, model) in configured:
                 raise ValueError("Duplicate model deployment")
             url = item.get("url", "")
-            if url and (
-                httpx.URL(url).scheme not in {"http", "https"}
-                or not httpx.URL(url).host
-            ):
+            endpoint = httpx.URL(url)
+            if url and (endpoint.scheme not in {"http", "https"} or not endpoint.host):
                 raise ValueError("Invalid model endpoint")
+            headers = item.get("headers", {})
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    {name.lower(): value for name, value in headers.items()},
+                    sort_keys=True,
+                ).encode()
+            ).digest()
+            priority = item.get("quality_priority")
+            if priority is not None and type(priority) is not int:
+                raise ValueError("quality_priority must be an integer")
+            attempt_timeout = item.get("attempt_timeout", 15)
+            if (
+                type(attempt_timeout) not in {int, float}
+                or not 0 < attempt_timeout <= 60
+            ):
+                raise ValueError(
+                    "attempt_timeout must be above zero and at most 60 seconds"
+                )
+            keyless = item.get("allow_keyless") is True
+            if keyless and alias != "kilo-free":
+                raise ValueError("allow_keyless applies only to the Kilo free route")
             protocol, max_tokens = allowed[alias, model]
             configured[alias, model] = _Route(
                 alias,
                 model,
                 protocol,
                 url.rstrip("/"),
-                item.get("headers", {}),
+                headers,
                 max_tokens,
                 item.get("free_verified") is True,
                 item.get("tools") is True,
+                keyless,
+                priority,
+                attempt_timeout,
+                (endpoint.scheme, endpoint.host, endpoint.port, fingerprint),
             )
         choices = [
             (r["provider"], r["model"])
             for r in [manifest["default"], *manifest["fallback"]]
         ]
-        self.routes = tuple(
+        candidates = [
             configured[key]
             for key in dict.fromkeys([*choices, *configured])
             if key in configured
+        ]
+        self.routes = tuple(
+            sorted(
+                candidates,
+                key=lambda route: (
+                    route.quality_priority is not None,
+                    route.quality_priority or 0,
+                ),
+                reverse=True,
+            )
         )
 
     def complete(
@@ -424,34 +523,59 @@ class ProviderRouter:
         messages: Sequence[Mapping[str, Any]],
         tools: Sequence[Mapping[str, Any]] = (),
         timeout: float | None = None,
+        exclude: Sequence[tuple[str, str]] = (),
     ) -> Completion:
-        return self._complete(self.routes, role, messages, tools, timeout)
+        exclusions = set(exclude)
+        routes = (
+            route
+            for route in self.routes
+            if (route.alias, route.model) not in exclusions
+        )
+        return self._complete(routes, role, messages, tools, timeout)
 
     def _complete(self, routes, role, messages, tools, timeout):
         deadline = time.monotonic() + min(timeout if timeout is not None else 60, 60)
         failures = {}
         retry_times = []
+        needs_initial_tool = (
+            tools
+            and role in {"coding", "probe"}
+            and not any(message.get("role") == "tool" for message in messages)
+        )
         for route in routes:
             key = (route.alias, route.model)
-            with self._lock:
-                cooldown = self.cooldowns.get(key, 0)
-
-            attempt_timeout = min(15, deadline - time.monotonic())
+            attempt_timeout = min(route.attempt_timeout, deadline - time.monotonic())
             if attempt_timeout <= 0:
                 break
             if not route.free_verified:
                 failures[route.alias] = "free eligibility unverified"
                 continue
-            if not route.url or not route.headers and route.alias != "ollama-local":
+            if not route.url or not (
+                route.headers or route.alias == "ollama-local" or route.allow_keyless
+            ):
                 failures[route.alias] = "missing endpoint or credentials"
                 continue
             if tools and not route.tools:
                 failures[route.alias] = "tool capability unverified"
                 continue
-            if cooldown > time.time():
-                failures[route.alias] = "rate limited"
-                retry_times.append(cooldown)
-                continue
+            with self._lock:
+                now = time.time()
+                quota_cooldown = self._quota_cooldown.get(route.quota_key, 0)
+                model_cooldown = self._model_cooldown.get(key, 0)
+                cooldown = max(quota_cooldown, model_cooldown)
+                if cooldown > now:
+                    failures[route.alias] = (
+                        "rate limited"
+                        if quota_cooldown > now
+                        else "temporarily unavailable"
+                    )
+                    retry_times.append(cooldown)
+                    continue
+                if route.quota_key in self._in_flight:
+                    failures[route.alias] = "request in progress"
+                    retry_times.append(now + 1)
+                    continue
+                self._in_flight.add(route.quota_key)
 
             try:
                 if route.protocol == "gemini":
@@ -461,18 +585,34 @@ class ProviderRouter:
                     url = f"{route.url}/chat/completions"
                     payload = _chat_payload(route, messages, tools)
                 response = self.client.post(
-                    url, json=payload, headers=route.headers, timeout=attempt_timeout
+                    url,
+                    json=payload,
+                    headers=route.headers,
+                    timeout=attempt_timeout,
+                    follow_redirects=False,
                 )
-                if response.status_code == 429:
-                    cooldown = _retry_time(response.headers.get("Retry-After"))
+                retry_after = response.headers.get("Retry-After")
+                if (
+                    response.status_code == 429
+                    or response.status_code == 503
+                    and retry_after
+                ):
+                    cooldown = _retry_time(retry_after)
                     with self._lock:
-                        cooldown = max(cooldown, self.cooldowns.get(key, 0))
-                        self.cooldowns[key] = cooldown
+                        self._quota_cooldown[route.quota_key] = cooldown
                     retry_times.append(cooldown)
                     failures[route.alias] = "rate limited"
                     continue
                 response.raise_for_status()
-                return _decode(route, role, response.json(), tools)
+                result = _decode(route, role, response.json(), tools)
+                if (
+                    needs_initial_tool
+                    and not result.tool_calls
+                    and not (role == "coding" and _clarification(result.content))
+                ):
+                    failures[route.alias] = "initial coding response did not use a tool"
+                    continue
+                return result
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
                 failures[route.alias] = {
@@ -480,14 +620,27 @@ class ProviderRouter:
                     403: "account or model ineligible",
                     404: "model unavailable",
                 }.get(status, f"upstream HTTP {status}")
+                if status is not None and status >= 500:
+                    retry_times.append(self._defer_model(key))
             except httpx.TimeoutException:
                 failures[route.alias] = "upstream timeout"
+                retry_times.append(self._defer_model(key))
             except httpx.RequestError:
                 failures[route.alias] = "upstream connection failed"
+                retry_times.append(self._defer_model(key))
             except (AttributeError, IndexError, KeyError, TypeError, ValueError):
                 failures[route.alias] = "malformed request or upstream response"
+            finally:
+                with self._lock:
+                    self._in_flight.remove(route.quota_key)
 
         raise ProviderExhausted(min(retry_times, default=None), failures)
+
+    def _defer_model(self, key: tuple[str, str]) -> float:
+        retry_at = time.time() + 15
+        with self._lock:
+            self._model_cooldown[key] = retry_at
+        return retry_at
 
 
 class _Request(BaseModel):
@@ -495,6 +648,7 @@ class _Request(BaseModel):
     messages: list[dict[str, Any]]
     tools: list[dict[str, Any]] = Field(default_factory=list)
     timeout: float | None = Field(default=None, gt=0, le=60)
+    exclude: list[tuple[str, str]] = Field(default_factory=list, max_length=1000)
 
 
 def create_model_gateway(router: ProviderRouter, token: str) -> FastAPI:
@@ -538,6 +692,7 @@ class ModelGatewayClient:
         messages: Sequence[Mapping[str, Any]],
         tools: Sequence[Mapping[str, Any]] = (),
         timeout: float | None = None,
+        exclude: Sequence[tuple[str, str]] = (),
     ) -> Completion:
         limit = min(timeout if timeout is not None else 60, 60)
         if not math.isfinite(limit) or limit <= 0:
@@ -552,6 +707,7 @@ class ModelGatewayClient:
                     "messages": list(messages),
                     "tools": list(tools),
                     "timeout": limit,
+                    "exclude": list(exclude),
                 },
             )
             if response.status_code == 503:
@@ -593,7 +749,7 @@ def _smoke(router: ProviderRouter) -> int:
                 "smoke",
                 [{"role": "user", "content": "Reply with OK."}],
                 [],
-                15,
+                route.attempt_timeout,
             )
             if route.tools:
                 stage = "tool round trip"
@@ -603,7 +759,9 @@ def _smoke(router: ProviderRouter) -> int:
                         "content": "Call the echo tool exactly once with text set to OK.",
                     }
                 ]
-                result = router._complete((route,), "smoke", messages, [tool], 15)
+                result = router._complete(
+                    (route,), "smoke", messages, [tool], route.attempt_timeout
+                )
                 if len(result.tool_calls) != 1 or json.loads(
                     result.tool_calls[0]["function"]["arguments"]
                 ) != {"text": "OK"}:
@@ -623,9 +781,10 @@ def _smoke(router: ProviderRouter) -> int:
                         "content": "OK",
                     }
                 )
-                if not router._complete(
-                    (route,), "smoke", messages, [tool], 15
-                ).content:
+                final = router._complete(
+                    (route,), "smoke", messages, [tool], route.attempt_timeout
+                )
+                if not final.content or final.tool_calls:
                     raise ValueError("tool probe did not return final text")
             print(f"{route.alias}/{route.model}: {stage} passed")
         except ProviderExhausted as exc:
@@ -639,21 +798,53 @@ def _smoke(router: ProviderRouter) -> int:
     return int(bool(failures))
 
 
+def _deployment_template(manifest: dict, *, active_only: bool) -> list[dict]:
+    default = manifest.get("superagent", {}).get("default", manifest["default"])
+    primary = (default["provider"], default["model"])
+    specs = _model_specs(manifest, active_only=active_only)
+    return [
+        {
+            "model": f"{alias}/{model}",
+            "url": "",
+            "headers": {},
+            "free_verified": False,
+            "tools": False,
+            **({"quality_priority": 1} if (alias, model) == primary else {}),
+        }
+        for alias, model in dict.fromkeys([primary, *specs])
+        if (alias, model) in specs and not _paid_router(alias, model)
+    ]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     ingest = commands.add_parser("import")
     ingest.add_argument("web", type=Path)
     ingest.add_argument("catalog", type=Path)
+    ingest.add_argument("superagent", type=Path, nargs="?")
     serve = commands.add_parser("serve")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", default=8765, type=int)
     commands.add_parser("smoke")
+    template = commands.add_parser("template")
+    template.add_argument("--profile", choices=("all", "superagent"), default="all")
     args = parser.parse_args()
     if args.command == "import":
         profile = yaml.load(args.web.read_text(), Loader=yaml.BaseLoader)
         catalog = yaml.load(args.catalog.read_text(), Loader=yaml.BaseLoader)
-        print(json.dumps(import_profiles(profile, catalog), indent=2))
+        superagent = (
+            yaml.load(args.superagent.read_text(), Loader=yaml.BaseLoader)
+            if args.superagent
+            else None
+        )
+        print(json.dumps(import_profiles(profile, catalog, superagent), indent=2))
+        return 0
+    if args.command == "template":
+        template = _deployment_template(
+            load_manifest(), active_only=args.profile == "superagent"
+        )
+        print(json.dumps(template, indent=2))
         return 0
     deployments = json.loads(Path(os.environ["MODEL_GATEWAY_DEPLOYMENTS"]).read_text())
     router = ProviderRouter(load_manifest(), deployments)

@@ -19,6 +19,14 @@ Use `status` to inspect jobs and `once` to process a single iteration. Shadow mo
 
 The controller revisits submitted review bodies and unresolved threads, checks the reviewer and current head, and records replies. It pauses after three repair rounds, persistent failure or exhausted routes without a retry time. Inspect paused jobs before intervention. To roll back, stop the worker, run `uv run github-harness-agent --config agent.toml fence`, reconcile each open branch and PR, then assign outstanding issues to one owner before restoring incumbent intake.
 
+Before creating an issue branch, the controller fetches the current target branch. It rebases existing task commits against the PR's current target before editing and refreshes the target again before pushing. If the target advanced during execution, the controller rebases the patch and reruns the required checks. A conflicting rebase pauses the task. Pushing with an expected branch head prevents a concurrent contributor's commit from being overwritten.
+
+## Use a dedicated GitHub account
+
+The worker can use an existing GitHub CLI login for a dedicated account with access to the configured repositories. Set the top-level `github_auth` to `"named-account"` and `bot_login` to the account's GitHub login. `installation_id` is required only in App mode. Set `GH_CONFIG_DIR` in the controller service to the dedicated, existing GitHub CLI configuration directory. Place `gh` on the service's `PATH` or set `github_cli` to its absolute executable path. The worker selects the configured account on `github.com` and checks `/user` before polling or leasing work. Set the repository's `worker_runtime` to the Docker runtime installed on the worker host if it differs from `runsc`. [GitHub CLI account selection](https://cli.github.com/manual/gh_auth_token)
+
+Run `work` for polling. For signed webhooks, separately configure an authorized repository webhook and run `serve` with `GITHUB_WEBHOOK_SECRET`. The named-account credential stays in controller process memory after startup. Restart the controller after replacing the GitHub CLI credential.
+
 ## Qualify a replacement
 
 Use the [qualification guide](docs/qualification.md) and [implementation plan](docs/superpowers/plans/2026-11-17-github-agent.md) for matched replay, shadow and canary gates. Offline tests exercise recovery, provider contracts and both executors. Live GitHub, provider, isolation and reviewer-time evidence are additional cutover requirements.

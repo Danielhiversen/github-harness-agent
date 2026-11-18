@@ -67,7 +67,7 @@ class ScriptedGateway:
         self.roles = []
         self.composition_evidence = {}
 
-    def complete(self, *, role, messages, tools=(), timeout=None):
+    def complete(self, *, role, messages, tools=(), timeout=None, exclude=()):
         self.roles.append(role)
         content = "Done"
         calls = ()
@@ -98,6 +98,7 @@ class ScriptedGateway:
             role=role,
             route="fixture",
             model="deterministic",
+            configured_model="fixture-model-id",
             usage={"input_tokens": 1, "output_tokens": 2},
         )
 
@@ -179,6 +180,104 @@ def test_model_request_quota_applies_after_tool_calls(fixture):
     assert gateway.roles == ["coding"]
 
 
+@pytest.mark.parametrize(
+    ("code", "reason"),
+    [
+        (None, "empty patch"),
+        ("open('test_number.py','w').write('pass\\n')", "protected"),
+    ],
+)
+def test_candidate_failure_identifies_actual_configured_model(fixture, code, reason):
+    from github_harness_agent.executor import AttemptRejected
+
+    class RoutedGateway(ScriptedGateway):
+        def complete(self, *, exclude=(), **kwargs):
+            assert exclude == (("other", "different"),)
+            return super().complete(**kwargs)
+
+    task, source, runner = fixture
+    task = replace(task, excluded_models=(("other", "different"),))
+    with pytest.raises(AttemptRejected, match=reason) as error:
+        PlainExecutor(runner, RoutedGateway(code)).execute(task, source)
+    assert error.value.candidate.route == "fixture"
+    assert error.value.candidate.model == "deterministic"
+    assert error.value.candidate.configured_model == "fixture-model-id"
+
+
+def test_model_budget_marks_only_the_consuming_candidate(fixture):
+    from github_harness_agent.executor import AttemptRejected
+
+    task, source, runner = fixture
+    gateway = ScriptedGateway("open('number.txt','w').write('4\\n')")
+    with pytest.raises(AttemptRejected, match="model request") as error:
+        PlainExecutor(runner, gateway, Limits(model_requests=1)).execute(task, source)
+    assert error.value.candidate.configured_model == "fixture-model-id"
+
+
+def test_command_budget_rejects_the_model_asking_for_extra_tools(fixture):
+    from github_harness_agent.executor import AttemptRejected
+
+    class TwoCommands(ScriptedGateway):
+        def complete(self, **kwargs):
+            reply = super().complete(**kwargs)
+            reply.tool_calls += (dict(reply.tool_calls[0], id="extra"),)
+            return reply
+
+    task, source, runner = fixture
+    gateway = TwoCommands("open('number.txt','w').write('4\\n')")
+    with pytest.raises(AttemptRejected, match="command budget") as error:
+        PlainExecutor(runner, gateway, Limits(commands=1)).execute(task, source)
+    assert error.value.candidate.configured_model == "fixture-model-id"
+
+
+def test_invalid_tool_output_rejects_the_candidate_before_running_it(fixture):
+    from github_harness_agent.executor import AttemptRejected
+
+    class MalformedGateway(ScriptedGateway):
+        def complete(self, **kwargs):
+            reply = super().complete(**kwargs)
+            reply.tool_calls[0]["function"]["arguments"] = "not JSON"
+            return reply
+
+    task, source, runner = fixture
+    gateway = MalformedGateway("open('number.txt','w').write('4\\n')")
+    with pytest.raises(AttemptRejected, match="invalid run tool call") as error:
+        PlainExecutor(runner, gateway).execute(task, source)
+    assert error.value.candidate.configured_model == "fixture-model-id"
+    assert (runner.workspaces[0] / "number.txt").read_text() == "3\n"
+
+
+def test_baseline_test_failure_does_not_exclude_model(fixture):
+    from github_harness_agent.executor import AttemptRejected
+
+    task, source, runner = fixture
+    gateway = ScriptedGateway("open('number.txt','w').write('5\\n')")
+    with pytest.raises(ExecutionError, match="baseline") as error:
+        PlainExecutor(runner, gateway).execute(task, source)
+    assert not isinstance(error.value, AttemptRejected)
+    assert len(runner.workspaces) == 3
+
+
+def test_patch_induced_check_failure_can_choose_another_model(fixture):
+    from github_harness_agent.executor import AttemptRejected
+
+    task, source, runner = fixture
+    task = replace(
+        task,
+        checks=(
+            (
+                sys.executable,
+                "-c",
+                "assert open('number.txt').read().strip() != '5'",
+            ),
+        ),
+    )
+    gateway = ScriptedGateway("open('number.txt','w').write('5\\n')")
+    with pytest.raises(AttemptRejected, match="Required check failed") as error:
+        PlainExecutor(runner, gateway).execute(task, source)
+    assert error.value.candidate.configured_model == "fixture-model-id"
+
+
 def test_clarification_propagates_without_verifying_an_empty_patch(fixture):
     class ClarifyingGateway(ScriptedGateway):
         def complete(self, **kwargs):
@@ -213,6 +312,33 @@ def test_harness2_sequential_recursion_uses_distinct_workspaces(fixture):
     assert "[ACTION]" in gateway.composition_evidence["pool/inv1/rollout.md"]
     assert result.refinement.harness_guidance["c1"] == "Inspect the result."
     assert b"+4\n" in result.patch
+
+
+def test_harness2_attributes_empty_patch_to_final_rollout_model(fixture):
+    pytest.importorskip("harness2")
+    from github_harness_agent.executor import AttemptRejected
+
+    class RoutedGateway(ScriptedGateway):
+        finished_base = False
+
+        def complete(self, **kwargs):
+            if kwargs["role"] == "coding" and self.finished_base:
+                self.code = None
+                reply = super().complete(**kwargs)
+                reply.configured_model = "final-model"
+                reply.model = "actual-final-model"
+                return reply
+            reply = super().complete(**kwargs)
+            if kwargs["role"] == "coding" and kwargs["messages"][-1]["role"] == "tool":
+                self.finished_base = True
+            return reply
+
+    task, source, runner = fixture
+    gateway = RoutedGateway("open('number.txt','w').write('4\\n')")
+    with pytest.raises(AttemptRejected, match="empty patch") as error:
+        Harness2Executor(runner, gateway).execute(task, source)
+    assert error.value.candidate.configured_model == "final-model"
+    assert error.value.candidate.model == "actual-final-model"
 
 
 def test_harness2_records_one_proposal_outage_and_uses_available_routes(fixture):

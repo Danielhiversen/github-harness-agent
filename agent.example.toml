@@ -1,4 +1,5 @@
 database = "agent.sqlite3"
+github_auth = "app"
 bot_login = "your-github-app[bot]"
 
 [repositories."example/project"]
@@ -9,4 +10,5 @@ base = "main"
 label = "agent:ready"
 branch_prefix = "agent/"
 worker_image = "your-tested-worker-image"
+worker_runtime = "runsc"
 checks = [["python", "-m", "unittest", "discover"]]

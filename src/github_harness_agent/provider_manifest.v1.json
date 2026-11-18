@@ -1062,5 +1062,123 @@
       "provider": "nvidia-free",
       "model": "poolside/laguna-xs-2.1"
     }
-  ]
+  ],
+  "superagent": {
+    "providers": {
+      "kilo-free": {
+        "protocol": "chat",
+        "models": [
+          {
+            "id": "kilo-auto/free",
+            "input": [
+              "text"
+            ],
+            "context_window": 131072,
+            "max_tokens": 8192
+          }
+        ]
+      },
+      "ollama-local": {
+        "protocol": "chat",
+        "models": [
+          {
+            "id": "gemma4:26b",
+            "input": [
+              "text",
+              "image"
+            ],
+            "context_window": 32768,
+            "max_tokens": 8192
+          },
+          {
+            "id": "qwen2.5-coder:7b",
+            "input": [
+              "text"
+            ],
+            "context_window": 32768,
+            "max_tokens": 8192
+          }
+        ]
+      },
+      "nvidia-free": {
+        "protocol": "chat",
+        "models": [
+          {
+            "id": "google/diffusiongemma-26b-a4b-it",
+            "input": [
+              "text",
+              "image"
+            ],
+            "context_window": 250000,
+            "max_tokens": 16384
+          },
+          {
+            "id": "stepfun-ai/step-5-preview",
+            "input": [
+              "text",
+              "image"
+            ],
+            "context_window": 262144,
+            "max_tokens": 16384
+          },
+          {
+            "id": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+            "input": [
+              "text",
+              "image"
+            ],
+            "context_window": 256000,
+            "max_tokens": 16384
+          },
+          {
+            "id": "meta/muse-glimmer-30b",
+            "input": [
+              "text",
+              "image"
+            ],
+            "context_window": 131072,
+            "max_tokens": 16384
+          },
+          {
+            "id": "nvidia/nemotron-3.5-lightning-30b-a3b",
+            "input": [
+              "text"
+            ],
+            "context_window": 262144,
+            "max_tokens": 16384
+          },
+          {
+            "id": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+            "input": [
+              "text",
+              "image"
+            ],
+            "context_window": 262144,
+            "max_tokens": 8192
+          },
+          {
+            "id": "nvidia/nemotron-3-ultra-550b-a55b",
+            "input": [
+              "text"
+            ],
+            "context_window": 262144,
+            "max_tokens": 16384
+          },
+          {
+            "id": "poolside/laguna-xs-2.1",
+            "input": [
+              "text"
+            ],
+            "context_window": 262144,
+            "max_tokens": 16384
+          }
+        ]
+      }
+    },
+    "default": {
+      "provider": "nvidia-free",
+      "model": "poolside/laguna-xs-2.1"
+    },
+    "fallback": []
+  }
 }

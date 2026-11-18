@@ -18,6 +18,7 @@ from github_harness_agent.providers import (
 FIXTURES = Path(__file__).parent / "fixtures"
 PROFILE = json.loads((FIXTURES / "incumbent_provider_profile.json").read_text())
 CATALOG = json.loads((FIXTURES / "incumbent_provider_catalog.json").read_text())
+SUPERAGENT = json.loads((FIXTURES / "incumbent_provider_superagent.json").read_text())
 KILO = "kilo-free/nvidia/nemotron-3.5-super-vl:free"
 OLLAMA = "ollama-local/gemma4:26b"
 GOOGLE = "google/gemma-4-31b-it"
@@ -58,7 +59,7 @@ def test_import_preserves_exact_parity_without_copying_deployment_values():
         route.update(
             baseURL="https://private.invalid", headers={"Authorization": "fake"}
         )
-    imported = import_profiles(profile, CATALOG)
+    imported = import_profiles(profile, CATALOG, SUPERAGENT)
     assert imported == load_manifest()
     for key, original in [("web", PROFILE), ("catalog", CATALOG)]:
         expected = original[0]["config"]["providers"]
@@ -190,7 +191,8 @@ def test_gemini_tool_round_trip_replays_provider_signature():
 
 def test_gateway_requires_token_and_uses_provider_route():
     router = routed(
-        deployment(OLLAMA), lambda req: httpx.Response(200, json=openai_response())
+        deployment(KILO, OLLAMA),
+        lambda req: httpx.Response(200, json=openai_response()),
     )
     app = create_model_gateway(router, "gateway-token")
     payload = {"role": "plain", "messages": []}
@@ -208,7 +210,10 @@ def test_gateway_requires_token_and_uses_provider_route():
         url = "https://gateway.example.invalid"
         assert http.post(f"{url}/complete", json=payload).status_code == 401
         client = ModelGatewayClient(url, "gateway-token", client=http)
-        assert client.complete(**payload).route == "ollama-local"
+        result = client.complete(**payload, exclude=[tuple(KILO.split("/", 1))])
+        assert result.route == "ollama-local"
+        assert result.configured_model == "gemma4:26b"
+        assert result.model == "actual-model"
 
 
 @pytest.mark.parametrize(
@@ -294,4 +299,213 @@ def test_chat_tool_round_trip():
     )
     assert (
         router.complete(role="coding", messages=messages, tools=tools).content == "ok"
+    )
+
+
+def test_superagent_profile_preserves_active_models_and_default():
+    active = import_profiles(PROFILE, CATALOG, SUPERAGENT)["superagent"]
+    assert active == load_manifest()["superagent"]
+    assert list(active["providers"]) == ["kilo-free", "ollama-local", "nvidia-free"]
+    assert sum(len(r["models"]) for r in active["providers"].values()) == 11
+    assert active["default"] == {
+        "provider": "nvidia-free",
+        "model": "poolside/laguna-xs-2.1",
+    }
+    assert active["fallback"] == []
+
+
+def test_explicit_quality_priority_precedes_incumbent_default():
+    config = deployment(KILO, OLLAMA)
+    config[0]["quality_priority"] = 1
+    config[1]["quality_priority"] = 10
+    calls = []
+
+    def handle(request):
+        calls.append(request.url.host)
+        if request.url.host.startswith("ollama"):
+            return httpx.Response(502)
+        return httpx.Response(200, json=openai_response())
+
+    assert (
+        routed(config, handle).complete(role="plain", messages=[]).route == "kilo-free"
+    )
+    assert calls == ["ollama-local.example.invalid", "kilo-free.example.invalid"]
+
+
+def test_keyless_kilo_uses_only_an_explicitly_verified_route():
+    config = deployment(KILO)
+    config[0].update(headers={}, allow_keyless=True)
+
+    def handle(request):
+        assert "authorization" not in request.headers
+        return httpx.Response(200, json=openai_response())
+
+    assert (
+        routed(config, handle).complete(role="plain", messages=[]).route == "kilo-free"
+    )
+    config[0]["free_verified"] = False
+    with pytest.raises(ProviderExhausted):
+        routed(config, lambda _: pytest.fail("unverified upstream call")).complete(
+            role="plain", messages=[]
+        )
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_provider_cooldown_skips_sibling_models_for_the_same_account(status):
+    config = deployment(KILO, "kilo-free/reflection/beam-free", OLLAMA)
+    calls = []
+
+    def handle(request):
+        calls.append(request.url.host)
+        if request.url.host.startswith("kilo"):
+            return httpx.Response(status, headers={"Retry-After": "60"})
+        return httpx.Response(200, json=openai_response())
+
+    assert (
+        routed(config, handle).complete(role="plain", messages=[]).route
+        == "ollama-local"
+    )
+    assert calls == ["kilo-free.example.invalid", "ollama-local.example.invalid"]
+
+
+@pytest.mark.parametrize(
+    "first_choice",
+    [
+        {"message": {"content": "The work is done."}},
+        {"message": {"content": "truncated"}, "finish_reason": "length"},
+        {
+            "message": {
+                "tool_calls": [
+                    {"id": "bad", "function": {"name": "run", "arguments": "{}"}}
+                ]
+            }
+        },
+        {
+            "message": {
+                "tool_calls": [
+                    {
+                        "id": "bad",
+                        "function": {"name": "run", "arguments": '{"argv":[3]}'},
+                    }
+                ]
+            }
+        },
+    ],
+)
+def test_unusable_initial_coding_completion_falls_back(first_choice):
+    from github_harness_agent.executor import RUN_TOOL
+
+    def handle(request):
+        if request.url.host.startswith("kilo"):
+            return httpx.Response(200, json={"choices": [first_choice]})
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "ok",
+                                    "function": {
+                                        "name": "run",
+                                        "arguments": '{"argv":["ls"]}',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    result = routed(deployment(KILO, OLLAMA), handle).complete(
+        role="coding",
+        messages=[{"role": "user", "content": "Inspect this repo."}],
+        tools=[RUN_TOOL],
+    )
+    assert result.route == "ollama-local"
+    assert json.loads(result.tool_calls[0]["function"]["arguments"]) == {"argv": ["ls"]}
+
+
+def test_initial_coding_completion_accepts_intentional_clarification():
+    from github_harness_agent.executor import RUN_TOOL
+
+    content = '{"clarification": "Which format should the output use?"}'
+    router = routed(
+        deployment(KILO),
+        lambda _: httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": content}}],
+            },
+        ),
+    )
+    assert (
+        router.complete(role="coding", messages=[], tools=[RUN_TOOL]).content == content
+    )
+
+
+def test_concurrent_requests_skip_models_sharing_an_active_account():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    started, release = Event(), Event()
+
+    def handle(request):
+        if request.url.host.startswith("kilo"):
+            started.set()
+            assert release.wait(3)
+        return httpx.Response(200, json=openai_response())
+
+    router = routed(deployment(KILO, "kilo-free/reflection/beam-free", OLLAMA), handle)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(router.complete, role="plain", messages=[])
+        try:
+            assert started.wait(3)
+            assert router.complete(role="plain", messages=[]).route == "ollama-local"
+        finally:
+            release.set()
+        assert first.result().route == "kilo-free"
+
+
+def test_temporary_failure_defers_unhealthy_model_between_requests():
+    calls = []
+
+    def handle(request):
+        calls.append(request.url.host)
+        if request.url.host.startswith("kilo"):
+            return httpx.Response(502)
+        return httpx.Response(200, json=openai_response())
+
+    router = routed(deployment(KILO, OLLAMA), handle)
+    for _ in range(2):
+        assert router.complete(role="plain", messages=[]).route == "ollama-local"
+    assert calls == [
+        "kilo-free.example.invalid",
+        "ollama-local.example.invalid",
+        "ollama-local.example.invalid",
+    ]
+
+
+def test_superagent_template_covers_all_active_models_without_authorizing_requests(
+    monkeypatch, capsys
+):
+    from github_harness_agent.providers import main
+
+    monkeypatch.setattr(
+        "sys.argv", ["providers", "template", "--profile", "superagent"]
+    )
+    assert main() == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert rows[0]["model"] == "nvidia-free/poolside/laguna-xs-2.1"
+    expected = {
+        f"{alias}/{model['id']}"
+        for alias, provider in SUPERAGENT[0]["config"]["providers"].items()
+        for model in provider["models"]
+    }
+    assert {row["model"] for row in rows} == expected
+    assert all(
+        not row["free_verified"] and not row["tools"] and not row["headers"]
+        for row in rows
     )

@@ -1,4 +1,5 @@
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -193,3 +194,68 @@ def test_recovery_checkpoints_ready_transition_after_interruption():
     result = Publisher(github, restarted, lambda: None).publish(request)
     assert result.draft is False
     assert restarted.get("ready:a/b:21")["result"] == {"number": 21}
+
+
+@pytest.mark.parametrize("when", ["create", "push"])
+def test_keeps_moving_base_out_of_external_write(when):
+    from github_harness_agent.publish import (
+        Journal,
+        Publisher,
+        PublishRequest,
+        TargetMoved,
+    )
+    from github_harness_agent.rebase import TargetBase
+
+    class MovingBase(FakeGitHub):
+        base = "c" * 40 if when == "create" else "a" * 40
+
+        def rest(self, method, path, *, json=None):
+            if path.endswith("/git/ref/heads/main"):
+                return {"object": {"sha": self.base}}
+            return super().rest(method, path, json=json)
+
+        def push(
+            self,
+            repo,
+            checkout,
+            branch,
+            expected_head,
+            commit,
+            *,
+            before_write,
+            **kwargs,
+        ):
+            self.base = "c" * 40
+            before_write()
+            super().push(repo, checkout, branch, expected_head, commit)
+
+    github = MovingBase(None)
+    request = PublishRequest(
+        repo="a/b",
+        issue=3,
+        base="main",
+        base_sha="a" * 40,
+        branch="agent/issue-3",
+        checkout=Path("/unused"),
+        commit="b" * 40,
+        title="Fix item",
+        summary="Fix item.",
+        checks=("uv run pytest",),
+        target=TargetBase("a/b", "main", "a" * 40),
+    )
+    data = {}
+    with pytest.raises(TargetMoved):
+        Publisher(github, Journal(data, lambda: None), lambda: None).publish(request)
+    assert github.refs_created == (1 if when == "push" else 0)
+    assert github.pushes == len(github.pulls) == 0
+    updated = replace(
+        request,
+        base_sha="c" * 40,
+        commit="d" * 40,
+        target=TargetBase("a/b", "main", "c" * 40),
+    )
+    recovered = Publisher(
+        github, Journal(deepcopy(data), lambda: None), lambda: None
+    ).publish(updated)
+    assert recovered.head == "d" * 40
+    assert github.refs_created == github.pushes == len(github.pulls) == 1

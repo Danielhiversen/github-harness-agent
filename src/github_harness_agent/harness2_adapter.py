@@ -69,6 +69,7 @@ def refine(executor, task, archive, budget):
                 channels={"proposer": channel, "selector": channel},
             )
             self.errors = {}
+            self.actors = {}
 
         def surface(self):
             return surface
@@ -95,7 +96,7 @@ def refine(executor, task, archive, budget):
             guidance = (harness_dir / PROMPT_FILE).read_text(encoding="utf-8")
             role = "probe" if run_id.startswith(("inv", "dom")) else "coding"
             try:
-                patch, log = executor._rollout(
+                patch, log, actor = executor._rollout(
                     task,
                     archive,
                     budget,
@@ -112,6 +113,7 @@ def refine(executor, task, archive, budget):
                 if run_id.startswith("c"):
                     raise
                 return rollout_dir
+            self.actors[run_id] = actor
             (rollout_dir / "patch.diff").write_bytes(patch)
             (rollout_dir / "trajectory.txt").write_text(
                 log or "[OBSERVATION] No command was run.",
@@ -143,9 +145,11 @@ def refine(executor, task, archive, budget):
             for folder in ("rollouts", "deliverables", "pool", "decisions"):
                 for evidence in sorted((context / folder).rglob("*")):
                     if evidence.is_file() and evidence.suffix in {".md", ".diff"}:
-                        documents[str(evidence.relative_to(context))] = evidence.read_text(
-                            encoding="utf-8",
-                        )[-5000:]
+                        documents[str(evidence.relative_to(context))] = (
+                            evidence.read_text(
+                                encoding="utf-8",
+                            )[-5000:]
+                        )
             messages = [
                 {"role": "system", "content": EDITOR_PROMPT},
                 {
@@ -240,4 +244,4 @@ def refine(executor, task, archive, budget):
             tuple(result.to_dict()["stages"]),
             tuple(candidates),
         )
-        return patch, evidence
+        return patch, evidence, adapter.actors[result.rollouts[adopted].run_id]
