@@ -154,6 +154,35 @@ def test_plain_verifies_patch_in_independent_checkout(fixture):
     assert (source / "number.txt").read_text() == "3\n"
 
 
+@pytest.mark.parametrize("candidate", [4, 5])
+def test_trusted_verification_runner_is_separate_from_model_workspace(
+    fixture, candidate
+):
+    task, source, coding = fixture
+    verification_path = source.parent / "verification"
+    verification_path.mkdir()
+    (verification_path / "trusted.py").write_text(
+        "from pathlib import Path\nassert Path('number.txt').read_text() == '4\\n'\n"
+    )
+    verification = FixtureRunner(verification_path)
+    task = replace(task, checks=((sys.executable, "../trusted.py"),))
+    gateway = ScriptedGateway(
+        "from pathlib import Path\n"
+        "assert not Path('../trusted.py').exists()\n"
+        f"Path('number.txt').write_text('{candidate}\\n')"
+    )
+    executor = PlainExecutor(coding, gateway, verification_runner=verification)
+    if candidate == 4:
+        result = executor.execute(task, source)
+        assert result.checks[0].returncode == 0
+        assert len(verification.workspaces) == 1
+    else:
+        with pytest.raises(ExecutionError, match="failed on the baseline"):
+            executor.execute(task, source)
+        assert len(verification.workspaces) == 2
+    assert len(coding.workspaces) == 1
+
+
 def test_rejects_patch_that_weakens_trusted_check(fixture):
     task, source, runner = fixture
     gateway = ScriptedGateway("open('test_number.py','w').write('pass\\n')")

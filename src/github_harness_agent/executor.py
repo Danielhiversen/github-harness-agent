@@ -311,8 +311,18 @@ def _protected(path: str, task: TaskSnapshot, *, new_test: bool) -> bool:
 
 
 class PlainExecutor:
-    def __init__(self, runner, gateway: Gateway, limits: Limits = Limits()):
+    def __init__(
+        self,
+        runner,
+        gateway: Gateway,
+        limits: Limits = Limits(),
+        *,
+        verification_runner=None,
+    ):
         self.runner = runner
+        self.verification_runner = (
+            runner if verification_runner is None else verification_runner
+        )
         self.gateway = gateway
         self.limits = limits
 
@@ -570,7 +580,7 @@ class PlainExecutor:
             budget.reject(
                 CommandOutputExceeded("Patch exceeded the configured size"), actor
             )
-        with self.runner.workspace(
+        with self.verification_runner.workspace(
             archive, budget.remaining, budget.cancelled
         ) as workspace:
             baseline_tree = self._stage_baseline(workspace, budget)
@@ -608,7 +618,7 @@ class PlainExecutor:
             checks = self._run_checks(workspace, budget, task.checks)
         trusted_passed = checks[-1].returncode == 0
         if new_tests and trusted_passed:
-            with self.runner.workspace(
+            with self.verification_runner.workspace(
                 archive, budget.remaining, budget.cancelled
             ) as workspace:
                 self._stage_baseline(workspace, budget)
@@ -625,7 +635,7 @@ class PlainExecutor:
             ):
                 if trusted_passed:
                     budget.reject(error, actor)
-                with self.runner.workspace(
+                with self.verification_runner.workspace(
                     archive, budget.remaining, budget.cancelled
                 ) as baseline:
                     self._stage_baseline(baseline, budget)

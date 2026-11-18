@@ -215,13 +215,20 @@ class Store:
                 (job["repo"], job["issue"], job["kind"], job["generation"]),
             )
 
-    def claim(self, ttl=900):
+    def claim(self, ttl=900, *, pull: tuple[str, int] | None = None):
         now = self.clock()
+        selection = ""
+        parameters = (now, now)
+        if pull is not None:
+            selection = " AND repo=? AND kind='pull' AND issue=?"
+            parameters += pull
         with self.tx() as db:
             row = db.execute(
-                """SELECT * FROM tasks WHERE (state='queued' AND due<=?)
-                OR (state='running' AND expires<=?) ORDER BY due,repo,kind,issue LIMIT 1""",
-                (now, now),
+                """SELECT * FROM tasks WHERE ((state='queued' AND due<=?)
+                OR (state='running' AND expires<=?))"""
+                + selection
+                + " ORDER BY due,repo,kind,issue LIMIT 1",
+                parameters,
             ).fetchone()
             if row is None:
                 return None

@@ -17,6 +17,12 @@ uv run github-harness-agent --config agent.toml work
 
 Use `status` to inspect jobs and `once` to process a single iteration. Shadow mode saves the patch and evidence in the database without a GitHub write. For a canary, set the mode to `canary`, select a separate pilot label and database, and restart both processes. The incumbent and replacement must have exclusive ownership of their respective issues. A verified patch becomes a draft PR and passes to review after local required checks succeed. Branch protection and merge approval remain with the repository.
 
+Set `model_requests` and `commands` in a repository's configuration to cap model calls and agent tool commands per coding attempt. They default to 40 and 64 and accept integers from 1 to 256 and 1 to 512, respectively.
+
+Set `verification_image` to run required checks in a separate trusted image with the same worker runtime. The verification image needs Git, tar, and the tools and fixtures used by the required checks. The model's tool workspace uses `worker_image`.
+
+To process only an existing adopted PR job, run `uv run github-harness-agent --config agent.toml once --repo example/project --pull 20`. The job must be due or have an expired lease.
+
 The controller revisits submitted review bodies and unresolved threads, checks the reviewer and current head, and records replies. It pauses after three repair rounds, persistent failure or exhausted routes without a retry time. Inspect paused jobs before intervention. To roll back, stop the worker, run `uv run github-harness-agent --config agent.toml fence`, reconcile each open branch and PR, then assign outstanding issues to one owner before restoring incumbent intake.
 
 Before creating an issue branch, the controller fetches the current target branch. It rebases existing task commits against the PR's current target before editing and refreshes the target again before pushing. If the target advanced during execution, the controller rebases the patch and reruns the required checks. A conflicting rebase pauses the task. Pushing with an expected branch head prevents a concurrent contributor's commit from being overwritten.

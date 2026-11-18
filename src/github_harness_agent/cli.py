@@ -13,12 +13,39 @@ from .store import LeaseLost, Store
 from .webhooks import create_app
 
 
-def run_worker(store, config, once=False):
+def _configured_limit(repo, config, key, default, maximum):
+    value = config.get(key, default)
+    if type(value) is not int or not 1 <= value <= maximum:
+        raise ValueError(f"{repo} {key} must be an integer between 1 and {maximum}")
+    return value
+
+
+def run_worker(store, config, once=False, *, pull: tuple[str, int] | None = None):
     from .controller import Controller
-    from .executor import DockerRunner, Harness2Executor, PlainExecutor
+    from .executor import DockerRunner, Harness2Executor, Limits, PlainExecutor
     from .github import GitHubApp, GitHubNamedAccount
     from .providers import ModelGatewayClient, ProviderExhausted
 
+    repositories = config["repositories"]
+    if pull is not None:
+        repo, number = pull
+        if not once or type(number) is not int or not 0 < number <= 2**63 - 1:
+            raise ValueError(
+                "targeted execution requires once and a positive pull number"
+            )
+        if repo not in repositories:
+            raise ValueError(f"pull repository is not configured: {repo}")
+        repositories = {repo: repositories[repo]}
+    defaults = Limits()
+    limits = {
+        repo: Limits(
+            model_requests=_configured_limit(
+                repo, cfg, "model_requests", defaults.model_requests, 256
+            ),
+            commands=_configured_limit(repo, cfg, "commands", defaults.commands, 512),
+        )
+        for repo, cfg in repositories.items()
+    }
     auth_mode = config.get("github_auth", "app")
     app = account = None
     if auth_mode == "app":
@@ -36,7 +63,7 @@ def run_worker(store, config, once=False):
         raise ValueError("github_auth must be app or named-account")
     gateway = ModelGatewayClient.from_env()
     controllers = {}
-    for repo, cfg in config["repositories"].items():
+    for repo, cfg in repositories.items():
         if cfg.get("mode", "shadow") not in {"shadow", "canary"}:
             raise ValueError("mode must be shadow or canary")
         if cfg.get("backend", "plain") not in {"plain", "harness2"}:
@@ -45,18 +72,23 @@ def run_worker(store, config, once=False):
         backend = (
             Harness2Executor if cfg.get("backend") == "harness2" else PlainExecutor
         )
+        runtime = cfg.get("worker_runtime", "runsc")
         executor = backend(
-            DockerRunner(
-                cfg["worker_image"], runtime=cfg.get("worker_runtime", "runsc")
-            ),
+            DockerRunner(cfg["worker_image"], runtime=runtime),
             gateway,
+            limits[repo],
+            verification_runner=(
+                DockerRunner(cfg["verification_image"], runtime=runtime)
+                if "verification_image" in cfg
+                else None
+            ),
         )
         controllers[repo] = Controller(store, api, executor, cfg, config["bot_login"])
     next_sync = 0
     online = set()
     while True:
-        events = store.events()
-        if events or time.monotonic() >= next_sync:
+        events = store.events() if pull is None else ()
+        if pull is None and (events or time.monotonic() >= next_sync):
             failed = set()
             for repo, controller in controllers.items():
                 try:
@@ -92,7 +124,7 @@ def run_worker(store, config, once=False):
                 if payload["repository"]["full_name"] not in failed:
                     store.ack(event["id"])
             next_sync = time.monotonic() + 60
-        job = store.claim(ttl=1800)
+        job = store.claim(ttl=1800, pull=pull)
         if job:
             before = (job["data"]["stage"], job["data"].get("last_commit"))
             try:
@@ -137,6 +169,8 @@ def run_worker(store, config, once=False):
                         after[1] or "pending",
                     )
         if once:
+            if pull is not None and not job:
+                logging.getLogger(__name__).info("No due pull job for %s #%s", *pull)
             return
         if not job:
             time.sleep(3)
@@ -147,10 +181,28 @@ def main():
     logging.getLogger(__name__).setLevel(logging.INFO)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--repo", help="Configured repository for a targeted once run")
+    parser.add_argument(
+        "--pull", type=int, help="Existing pull job number for a targeted once run"
+    )
     parser.add_argument("command", choices=["serve", "work", "once", "status", "fence"])
     args = parser.parse_args()
+    pull = None
+    if args.repo is not None or args.pull is not None:
+        if (
+            args.command != "once"
+            or not args.repo
+            or not args.pull
+            or not 0 < args.pull <= 2**63 - 1
+        ):
+            parser.error(
+                "targeted execution requires once, --repo and a positive --pull number"
+            )
+        pull = (args.repo, args.pull)
     with args.config.open("rb") as f:
         config = tomllib.load(f)
+    if pull is not None and args.repo not in config["repositories"]:
+        parser.error(f"pull repository is not configured: {args.repo}")
     store = Store(config["database"])
     if args.command == "serve":
         app = create_app(
@@ -172,4 +224,4 @@ def main():
             db.execute("""UPDATE tasks SET generation=generation+1,token=NULL,state='paused'
                 WHERE state IN ('running','queued')""")
     else:
-        run_worker(store, config, once=args.command == "once")
+        run_worker(store, config, once=args.command == "once", pull=pull)
