@@ -582,10 +582,12 @@ def test_provider_loss_resumes_saved_edit_in_new_worker(fixture, executor_class)
     store = Store(database, clock=lambda: now[0])
     store.enqueue(task.repository, 8, {"drafts": {}})
     old_lease = job = store.claim(ttl=10)
+    save_lock = Lock()
 
     def persist(draft):
-        job["data"]["drafts"][draft.key] = draft.to_data()
-        store.save(job)
+        with save_lock:
+            job["data"]["drafts"][draft.key] = draft.to_data()
+            store.save(job)
 
     class DisconnectAfterTool(ScriptedGateway):
         def complete(self, **kwargs):
@@ -631,8 +633,15 @@ def test_provider_loss_resumes_saved_edit_in_new_worker(fixture, executor_class)
                 if kwargs["messages"][-1]["role"] == "tool":
                     assert kwargs["messages"][-1]["content"].startswith("exit 0")
                 reply = super().complete(**kwargs)
+                reply.route = "replacement"
+                reply.configured_model = "replacement-model"
                 if reply.tool_calls:
                     resumed.append(True)
+                    extra_file = (
+                        "Path('extra.txt').write_text('Replacement standalone edit\\n')"
+                        if kwargs.get("after_provider")
+                        else "assert Path('extra.txt').read_text() == 'Replacement standalone edit\\n'"
+                    )
                     reply.tool_calls[0]["function"]["arguments"] = json.dumps(
                         {
                             "argv": [
@@ -641,10 +650,31 @@ def test_provider_loss_resumes_saved_edit_in_new_worker(fixture, executor_class)
                                 "import subprocess; from pathlib import Path; "
                                 "assert Path('number.txt').read_text() == '4\\n'; "
                                 "assert Path('notes.txt').read_text() == 'New notes\\n'; "
-                                "assert b'+4' in subprocess.check_output(['git', 'diff', '--', 'number.txt'])",
+                                "assert b'+4' in subprocess.check_output(['git', 'diff', '--', 'number.txt']); "
+                                + extra_file,
                             ],
                         }
                     )
+                    if not kwargs.get("after_provider"):
+                        reply.tool_calls += (
+                            {
+                                "id": "check",
+                                "type": "function",
+                                "function": {
+                                    "name": "run",
+                                    "arguments": json.dumps(
+                                        {
+                                            "argv": [
+                                                sys.executable,
+                                                "-m",
+                                                "pytest",
+                                                "--version",
+                                            ]
+                                        }
+                                    ),
+                                },
+                            },
+                        )
                 return reply
             return super().complete(**kwargs)
 
@@ -658,6 +688,12 @@ def test_provider_loss_resumes_saved_edit_in_new_worker(fixture, executor_class)
     assert len(resumed) == (1 if executor_class is PlainExecutor else 4)
     assert preferred_after == ["fixture"]
     assert b"+New notes" in result.patch
+    assert b"+Replacement standalone edit" in result.patch
+    final_key = "plain/coding" if executor_class is PlainExecutor else "harness2/c1"
+    assert DraftCheckpoint.from_data(job["data"]["drafts"][final_key]).last_editor == (
+        "replacement",
+        "replacement-model",
+    )
     assert result.checks[0].returncode == 0
     assert (source / "number.txt").read_text() == "3\n"
 

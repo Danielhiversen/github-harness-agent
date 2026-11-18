@@ -72,6 +72,12 @@ def refine(executor, task, archive, budget):
             self.errors = {}
             self.actors = {}
             self.seed_draft = None
+            self.resumed_base = task.checkpoints.get("harness2/base")
+
+        def save_resumed_base(self, draft):
+            if task.save_checkpoint is not None:
+                task.save_checkpoint(draft)
+            self.resumed_base = draft
 
         def surface(self):
             return surface
@@ -103,9 +109,16 @@ def refine(executor, task, archive, budget):
                 if self.seed_draft is not None
                 else None
             )
+            rollout_task = task
+            if (
+                run_id == "base"
+                and self.resumed_base is not None
+                and self.resumed_base.patch
+            ):
+                rollout_task = replace(task, save_checkpoint=self.save_resumed_base)
             try:
                 patch, log, actor = executor._rollout(
-                    task,
+                    rollout_task,
                     archive,
                     budget,
                     f"{SYSTEM_PROMPT}\n\n{guidance}",
@@ -231,7 +244,7 @@ def refine(executor, task, archive, budget):
             raise base_error
         if saved_base is not None and saved_base.patch and adapter.delivered(base):
             adapter.seed_draft = replace(
-                saved_base,
+                adapter.resumed_base or saved_base,
                 patch=(base / "patch.diff").read_bytes(),
             )
         result = recursion.run_sequential(
