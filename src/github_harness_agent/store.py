@@ -11,6 +11,18 @@ class LeaseLost(RuntimeError):
     pass
 
 
+PROVIDER_EXHAUSTED = "provider routes exhausted"
+_LEGACY_PROVIDER_PAUSE = """
+state='paused' AND json_extract(data,'$.last_error')=?
+AND json_type(data,'$.retry_at')='null'
+AND json_extract(data,'$.pause_reason') IS NULL
+AND json_extract(data,'$.prepared') IS NULL
+AND COALESCE(json_extract(data,'$.consecutive_failures'),0)=0
+AND COALESCE(json_extract(data,'$.round'),0)<3
+AND json_extract(data,'$.stage') IN ('implement','repair')
+"""
+
+
 _TASK_TABLE = """
 CREATE TABLE IF NOT EXISTS tasks(
     repo TEXT, issue INTEGER, state TEXT, generation INTEGER,
@@ -97,7 +109,7 @@ class Store:
                 (repo, issue),
             )
 
-    def adopt_pull(self, repo, pull, data, branch_prefix):
+    def adopt_pull(self, repo, pull, data, branch_prefix, *, head_sha=None):
         """Assign at most one active job to this PR's exact source branch."""
         with self.tx() as db:
             now = self.clock()
@@ -106,12 +118,13 @@ class Store:
                 (repo, pull),
             ).fetchone()
             active_issue_jobs = db.execute(
-                """SELECT issue,state,expires,data FROM tasks WHERE repo=? AND kind='issue'
+                """SELECT issue,state,expires,due,data FROM tasks WHERE repo=? AND kind='issue'
                    AND state NOT IN ('complete','superseded')""",
                 (repo,),
             )
             replacements = []
             state = "queued"
+            due = now
             for job in active_issue_jobs:
                 original = json.loads(job["data"])
                 owned_pull = original.get("pull")
@@ -139,12 +152,33 @@ class Store:
                         "last_target",
                         "last_evidence",
                         "github_operations",
+                        "last_error",
+                        "retry_at",
+                        "provider_retry_count",
+                        "provider_failures",
+                        "prior_model_attempt_failures",
                     ):
                         if key in original:
                             data[key] = original[key]
                     if original["stage"] == "reply":
                         for key in ("stage", "feedback", "review_head"):
                             data[key] = original[key]
+                    if (
+                        original["stage"] == "repair"
+                        and head_sha
+                        and original.get("review_head") == head_sha
+                        and "feedback" in original
+                    ):
+                        for key in (
+                            "stage",
+                            "feedback",
+                            "review_head",
+                            "model_attempt_failures",
+                        ):
+                            if key in original:
+                                data[key] = original[key]
+                    if original.get("last_error") == PROVIDER_EXHAUSTED:
+                        due = job["due"]
                     if job["state"] == "paused":
                         state = "paused"
                         if "pause_reason" in original:
@@ -190,7 +224,7 @@ class Store:
                 return False
             db.execute(
                 """INSERT INTO tasks VALUES(?,?,?,1,NULL,0,?,?,0,'pull')""",
-                (repo, pull, state, now, json.dumps(data)),
+                (repo, pull, state, due, json.dumps(data)),
             )
             return True
 
@@ -207,12 +241,54 @@ class Store:
                         (repo, row["issue"]),
                     )
 
-    def clear_failures(self, job):
+    def recover_provider_pauses(self, repositories, *, pull=None):
+        """Recover only records paused by the old provider-exhaustion handler."""
+        repositories = tuple(repositories)
+        if not repositories:
+            return 0
+        selection = " AND repo IN (" + ", ".join("?" for _ in repositories) + ")"
+        parameters = repositories
+        if pull is not None:
+            selection += " AND repo=? AND kind='pull' AND issue=?"
+            parameters += pull
+        with self.tx() as db:
+            now = self.clock()
+            return db.execute(
+                """UPDATE tasks SET state='queued',token=NULL,generation=generation+1,due=?,
+                   data=json_set(data,'$.provider_retry_count',1,'$.retry_at',?) WHERE """
+                + _LEGACY_PROVIDER_PAUSE
+                + selection,
+                (now, now, PROVIDER_EXHAUSTED, *parameters),
+            ).rowcount
+
+    def fence(self):
         with self.tx() as db:
             db.execute(
-                """UPDATE tasks SET data=json_remove(data,'$.consecutive_failures')
-                   WHERE repo=? AND issue=? AND kind=? AND generation=? AND token IS NULL""",
-                (job["repo"], job["issue"], job["kind"], job["generation"]),
+                """UPDATE tasks SET generation=generation+1,token=NULL,state='paused',
+                   data=json_set(data,'$.pause_reason','manual fence')
+                   WHERE state IN ('running','queued') OR ("""
+                + _LEGACY_PROVIDER_PAUSE
+                + ")",
+                (PROVIDER_EXHAUSTED,),
+            )
+
+    def clear_failures(self, job, *, progressed=False):
+        with self.tx() as db:
+            db.execute(
+                """UPDATE tasks SET data=CASE WHEN ? OR state IN ('complete','shadow_complete')
+                     THEN json_remove(data,'$.consecutive_failures','$.last_error','$.retry_at',
+                         '$.provider_retry_count','$.provider_failures')
+                     ELSE json_remove(data,'$.consecutive_failures') END
+                   WHERE repo=? AND issue=? AND kind=? AND generation=?
+                     AND attempts=? AND token IS NULL""",
+                (
+                    progressed,
+                    job["repo"],
+                    job["issue"],
+                    job["kind"],
+                    job["generation"],
+                    job["attempts"] + 1,
+                ),
             )
 
     def claim(self, ttl=900, *, pull: tuple[str, int] | None = None):

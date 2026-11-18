@@ -1,6 +1,9 @@
 import asyncio
 import json
+import logging
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -13,6 +16,7 @@ from github_harness_agent.providers import (
     import_profiles,
     load_manifest,
 )
+from github_harness_agent import providers
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -22,6 +26,9 @@ SUPERAGENT = json.loads((FIXTURES / "incumbent_provider_superagent.json").read_t
 KILO = "kilo-free/nvidia/nemotron-3.5-super-vl:free"
 OLLAMA = "ollama-local/gemma4:26b"
 GOOGLE = "google/gemma-4-31b-it"
+OPENROUTER = "openrouter-free/baidu/ernie-5.5-flash-preview:free"
+OPENROUTER_SIBLING = "openrouter/thinkingmachines/inkling-2-small:free"
+GROQ = "groq-free/qwen/qwen3.8-27b"
 
 
 def deployment(*models):
@@ -51,6 +58,209 @@ def openai_response():
         "choices": [{"message": {"content": "ok"}}],
         "usage": {"prompt_tokens": 2, "completion_tokens": 3},
     }
+
+
+def quality_order():
+    config = deployment(OPENROUTER, OPENROUTER_SIBLING, KILO, OLLAMA)
+    config[1]["url"] = config[0]["url"]
+    for priority, item in enumerate(reversed(config), start=1):
+        item["quality_priority"] = priority
+    return config
+
+
+def test_attempts_distinct_accounts_before_a_sibling_and_logs_only_route(caplog):
+    calls = []
+
+    def handle(request):
+        model = json.loads(request.content)["model"]
+        calls.append(model)
+        if model == OPENROUTER_SIBLING.split("/", 1)[1]:
+            return httpx.Response(200, json=openai_response())
+        return httpx.Response(404, text="private-upstream-response")
+
+    router = routed(quality_order(), handle)
+    with caplog.at_level(logging.INFO, logger=providers.__name__):
+        result = router.complete(
+            role="plain", messages=[{"role": "user", "content": "private-task-body"}]
+        )
+    assert result.route == "openrouter"
+    assert calls == [
+        model.split("/", 1)[1]
+        for model in (OPENROUTER, KILO, OLLAMA, OPENROUTER_SIBLING)
+    ]
+    assert "provider=openrouter-free" in caplog.text
+    assert "configured_model=thinkingmachines/inkling-2-small:free" in caplog.text
+    assert "accepted" in caplog.text
+    assert "private-task-body" not in caplog.text
+    assert "private-upstream-response" not in caplog.text
+    assert "Bearer fake" not in caplog.text
+    assert "example.invalid" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("offset", "expected"),
+    [
+        (0, "openrouter-free"),
+        (1, "kilo-free"),
+        (2, "ollama-local"),
+        (3, "openrouter-free"),
+    ],
+)
+def test_offset_rotates_three_accounts_without_removing_primary(offset, expected):
+    router = routed(
+        quality_order(), lambda _: httpx.Response(200, json=openai_response())
+    )
+    assert (
+        router.complete(role="plain", messages=[], provider_offset=offset).route
+        == expected
+    )
+
+
+def test_exclusions_and_retry_offset_do_not_skip_the_next_fresh_account():
+    excluded = [tuple(model.split("/", 1)) for model in (OPENROUTER, KILO)]
+    groq = deployment(GROQ)[0]
+    groq["quality_priority"] = 2
+    calls = []
+
+    def handle(request):
+        calls.append(request.url.host)
+        if not request.url.host.startswith("openrouter"):
+            return httpx.Response(404)
+        return httpx.Response(200, json=openai_response())
+
+    result = routed([*quality_order(), groq], handle).complete(
+        role="plain", messages=[], exclude=excluded, provider_offset=1
+    )
+    assert result.route == "openrouter"
+    assert calls == [
+        "groq-free.example.invalid",
+        "ollama-local.example.invalid",
+        "openrouter-free.example.invalid",
+    ]
+
+
+def test_rotation_counts_only_accounts_available_after_cooldown():
+    calls = []
+
+    def handle(request):
+        calls.append(request.url.host)
+        if request.url.host.startswith("openrouter"):
+            return httpx.Response(429, headers={"Retry-After": "60"})
+        return httpx.Response(200, json=openai_response())
+
+    router = routed(quality_order(), handle)
+    assert router.complete(role="plain", messages=[]).route == "kilo-free"
+    assert (
+        router.complete(role="plain", messages=[], provider_offset=1).route
+        == "ollama-local"
+    )
+    assert calls == [
+        "openrouter-free.example.invalid",
+        "kilo-free.example.invalid",
+        "ollama-local.example.invalid",
+    ]
+
+
+def test_model_cooldown_does_not_hide_its_healthy_sibling_on_a_new_request():
+    def handle(request):
+        model = json.loads(request.content)["model"]
+        if model == OPENROUTER.split("/", 1)[1]:
+            raise httpx.ReadTimeout("fixture")
+        return httpx.Response(200, json=openai_response())
+
+    router = routed(quality_order(), handle)
+    assert router.complete(role="plain", messages=[]).route == "kilo-free"
+    assert router.complete(role="plain", messages=[]).route == "openrouter"
+
+
+def test_tool_continuation_prefers_exact_previous_model_then_distinct_provider():
+    attempts = []
+
+    def handle(request):
+        body = json.loads(request.content)
+        assert all("gateway_route" not in message for message in body["messages"])
+        attempts.append(body["model"])
+        if body["model"] == OPENROUTER_SIBLING.split("/", 1)[1]:
+            return httpx.Response(404)
+        return httpx.Response(200, json=openai_response())
+
+    router = routed(quality_order(), handle)
+    assistant = {
+        "role": "assistant",
+        "gateway_route": OPENROUTER_SIBLING.split("/", 1),
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "run", "arguments": '{"argv":["ls"]}'},
+            }
+        ],
+    }
+    messages = [assistant, {"role": "tool", "tool_call_id": "call-1", "content": "src"}]
+    assert router.complete(role="coding", messages=messages).route == "kilo-free"
+    assert attempts == [model.split("/", 1)[1] for model in (OPENROUTER_SIBLING, KILO)]
+    assert (
+        router.complete(role="proposal", messages=messages).route == "openrouter-free"
+    )
+    malformed = {**assistant, "gateway_route": ["openrouter", None]}
+    assert (
+        router.complete(
+            role="coding", messages=[*messages, malformed, messages[-1]]
+        ).route
+        == "openrouter-free"
+    )
+
+
+def test_exhaustion_identifies_all_excluded_only_if_their_routes_were_eligible():
+    config = deployment(KILO, OLLAMA)
+    config[1]["free_verified"] = False
+    router = routed(config, lambda _: pytest.fail("excluded route reached upstream"))
+    with pytest.raises(ProviderExhausted) as error:
+        router.complete(role="plain", messages=[], exclude=[tuple(KILO.split("/", 1))])
+    assert error.value.failures == {"gateway": "all eligible models excluded"}
+    config[0]["free_verified"] = False
+    router = routed(config, lambda _: pytest.fail("unverified route reached upstream"))
+    with pytest.raises(ProviderExhausted) as error:
+        router.complete(role="plain", messages=[], exclude=[tuple(KILO.split("/", 1))])
+    assert error.value.failures == {
+        "kilo-free": "free eligibility unverified",
+        "ollama-local": "free eligibility unverified",
+    }
+
+
+@pytest.mark.parametrize(
+    ("timeout", "expected"), [(None, [40, 20]), (120, [40, 40, 40])]
+)
+def test_explicit_long_deadline_can_reach_fallback_past_sixty_seconds(
+    monkeypatch, timeout, expected
+):
+    clock = [0.0]
+    monkeypatch.setattr(
+        providers, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time)
+    )
+    config = deployment(OPENROUTER, KILO, OLLAMA)
+    for priority, item in enumerate(reversed(config), start=1):
+        item.update(quality_priority=priority, attempt_timeout=40)
+    attempts = []
+
+    def handle(request):
+        limit = request.extensions["timeout"]["read"]
+        attempts.append(limit)
+        if request.url.host.startswith("ollama"):
+            return httpx.Response(200, json=openai_response())
+        clock[0] += limit
+        raise httpx.ReadTimeout("fixture")
+
+    router = routed(config, handle)
+    if timeout is None:
+        with pytest.raises(ProviderExhausted):
+            router.complete(role="plain", messages=[])
+    else:
+        assert (
+            router.complete(role="plain", messages=[], timeout=timeout).route
+            == "ollama-local"
+        )
+    assert attempts == expected
 
 
 def test_import_preserves_exact_parity_without_copying_deployment_values():
@@ -196,8 +406,10 @@ def test_gateway_requires_token_and_uses_provider_route():
     )
     app = create_model_gateway(router, "gateway-token")
     payload = {"role": "plain", "messages": []}
+    requests = []
 
     async def dispatch(request):
+        requests.append(request)
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app)) as client:
             response = await client.send(request)
             return httpx.Response(
@@ -214,6 +426,28 @@ def test_gateway_requires_token_and_uses_provider_route():
         assert result.route == "ollama-local"
         assert result.configured_model == "gemma4:26b"
         assert result.model == "actual-model"
+        assert (
+            client.complete(**payload, provider_offset=1, timeout=900).route
+            == "ollama-local"
+        )
+        assert json.loads(requests[-1].content)["provider_offset"] == 1
+        assert 890 < json.loads(requests[-1].content)["timeout"] < 900
+        assert requests[-1].extensions["timeout"]["read"] == 900
+        assert client.complete(**payload, timeout=1200).route == "kilo-free"
+        assert json.loads(requests[-1].content)["timeout"] < 900
+        assert requests[-1].extensions["timeout"]["read"] == 900
+        auth = {"Authorization": "Bearer gateway-token"}
+        for invalid in (
+            {"provider_offset": -1},
+            {"provider_offset": True},
+            {"timeout": 901},
+        ):
+            assert (
+                http.post(
+                    f"{url}/complete", json=payload | invalid, headers=auth
+                ).status_code
+                == 422
+            )
 
 
 @pytest.mark.parametrize(

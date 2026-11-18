@@ -1,6 +1,8 @@
 import json
 import sqlite3
 
+import pytest
+
 from github_harness_agent.intake import adopt_open_pulls, reconcile
 from github_harness_agent.store import Store
 
@@ -150,3 +152,51 @@ def test_adoption_closes_and_reopens_existing_job_without_resetting_review_histo
     api.requests = [pull(25, "unlinked/feature")]
     assert adopt_open_pulls(api, store, "owner/repo", {}, "agent-user") == 0
     assert store.claim()["data"]["seen"] == ["review:123"]
+
+
+@pytest.mark.parametrize("same_head", [True, False])
+def test_adoption_preserves_cooldown_and_only_resumes_matching_review_attempt(
+    tmp_path, same_head
+):
+    store = Store(tmp_path / "db", lambda: 100)
+    repo = "owner/repo"
+    github = PullListing([pull(20, "existing/agent")])
+    current_head = github.requests[0]["head"]["sha"]
+    stored_head = current_head if same_head else "f" * 40
+    feedback = [{"key": "active-review"}]
+    excluded = [{"candidate": {"route": "groq-free", "configured_model": "fixture"}}]
+    store.enqueue(
+        repo,
+        5,
+        {
+            "stage": "repair",
+            "pull": 20,
+            "review_head": stored_head,
+            "feedback": feedback,
+            "provider_retry_count": 2,
+            "provider_failures": {"groq-free": "upstream timeout"},
+            "last_error": "provider routes exhausted",
+            "retry_at": 600,
+            "model_attempt_failures": excluded,
+            "prepared": {"sha": "b" * 40},
+        },
+    )
+    store.save(store.claim(), "queued", delay=500)
+    assert adopt_open_pulls(github, store, repo, {}, "agent-user") == 1
+    assert store.claim() is None
+    with store.tx() as db:
+        record = db.execute(
+            "SELECT * FROM tasks WHERE kind='pull' AND issue=20"
+        ).fetchone()
+    assert record["due"] == 600
+    data = json.loads(record["data"])
+    assert data["provider_retry_count"] == 2
+    assert "prepared" not in data
+    if same_head:
+        assert data["stage"] == "repair"
+        assert data["review_head"] == stored_head
+        assert data["feedback"] == feedback
+        assert data["model_attempt_failures"] == excluded
+    else:
+        assert data["stage"] == "watch"
+        assert not {"feedback", "review_head", "model_attempt_failures"} & data.keys()

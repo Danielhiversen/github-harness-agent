@@ -365,12 +365,13 @@ def test_candidate_failure_identifies_actual_configured_model(fixture, code, rea
     from github_harness_agent.executor import AttemptRejected
 
     class RoutedGateway(ScriptedGateway):
-        def complete(self, *, exclude=(), **kwargs):
+        def complete(self, *, exclude=(), provider_offset=0, **kwargs):
             assert exclude == (("other", "different"),)
+            assert provider_offset == 2
             return super().complete(**kwargs)
 
     task, source, runner = fixture
-    task = replace(task, excluded_models=(("other", "different"),))
+    task = replace(task, excluded_models=(("other", "different"),), provider_offset=2)
     with pytest.raises(AttemptRejected, match=reason) as error:
         PlainExecutor(runner, RoutedGateway(code)).execute(task, source)
     assert error.value.candidate.route == "fixture"

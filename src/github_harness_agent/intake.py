@@ -100,7 +100,9 @@ def adopt_open_pulls(api, store, repo, config, bot_login):
             "threads": [],
             "stage": "watch",
         }
-        adopted += store.adopt_pull(repo, number, state, branch_prefix)
+        adopted += store.adopt_pull(
+            repo, number, state, branch_prefix, head_sha=head["sha"]
+        )
     store.complete_missing_pulls(repo, open_pulls)
     return adopted
 

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 import re
 import time
 from collections import Counter
@@ -69,6 +70,7 @@ class Gateway(Protocol):
         tools: Sequence[Mapping[str, Any]] = (),
         timeout: float | None = None,
         exclude: Sequence[tuple[str, str]] = (),
+        provider_offset: int = 0,
     ): ...
 
 
@@ -105,6 +107,7 @@ class TaskSnapshot:
     protected_paths: tuple[str, ...] = ()
     repository_guidance: str = ""
     excluded_models: tuple[tuple[str, str], ...] = ()
+    provider_offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -202,13 +205,13 @@ class _Budget:
         self,
         limits: Limits,
         cancelled: Callable[[], bool],
-        excluded_models: tuple[tuple[str, str], ...] = (),
+        task: TaskSnapshot,
     ):
         self.limits = limits
         self.cancelled = cancelled
         self.deadline = time.monotonic() + limits.wall_time
         self.routes: list[RouteEvidence] = []
-        self.excluded_models = excluded_models
+        self.task = task
         self._calls = Counter()
         self._lock = Lock()
 
@@ -229,7 +232,11 @@ class _Budget:
 
     def complete(self, gateway, role, messages, tools=()):
         self.claim("model request", self.limits.model_requests)
-        options = {"exclude": self.excluded_models} if self.excluded_models else {}
+        options = (
+            {"exclude": self.task.excluded_models} if self.task.excluded_models else {}
+        )
+        if self.task.provider_offset:
+            options["provider_offset"] = self.task.provider_offset
         completion = gateway.complete(
             role=role,
             messages=messages,
@@ -239,7 +246,17 @@ class _Budget:
         )
         self.remaining()
         with self._lock:
-            self.routes.append(RouteEvidence.from_completion(completion))
+            route = RouteEvidence.from_completion(completion)
+            if not self.routes or self.routes[-1].route != route.route:
+                logging.getLogger(__name__).info(
+                    "%s at %.12s received a %s completion from %s/%s",
+                    self.task.repository,
+                    self.task.base_sha,
+                    role,
+                    route.route,
+                    route.configured_model,
+                )
+            self.routes.append(route)
         return completion
 
     def reject(self, error, candidate, *, latest=False):
@@ -344,7 +361,7 @@ class PlainExecutor:
         checkout: Path,
         cancelled: Callable[[], bool] = lambda: False,
     ) -> ExecutionResult:
-        budget = _Budget(self.limits, cancelled, task.excluded_models)
+        budget = _Budget(self.limits, cancelled, task)
         archive = self._archive(task, checkout, budget)
         patch, _, actor = self._rollout(task, archive, budget, SYSTEM_PROMPT, "coding")
         return self._verify(task, archive, budget, patch, actor=actor)
@@ -356,7 +373,7 @@ class PlainExecutor:
         patch: bytes,
         cancelled: Callable[[], bool] = lambda: False,
     ) -> ExecutionResult:
-        budget = _Budget(self.limits, cancelled)
+        budget = _Budget(self.limits, cancelled, task)
         return self._verify(task, self._archive(task, checkout, budget), budget, patch)
 
     def _archive(self, task, checkout, budget):
@@ -447,6 +464,8 @@ class PlainExecutor:
                     "content": completion.content,
                     "tool_calls": list(completion.tool_calls),
                 }
+                if last.configured_model:
+                    assistant["gateway_route"] = [last.route, last.configured_model]
                 if provider_context := getattr(completion, "provider_context", None):
                     assistant["provider_context"] = provider_context
                 messages.append(assistant)
@@ -690,7 +709,7 @@ class Harness2Executor(PlainExecutor):
     ) -> ExecutionResult:
         from .harness2_adapter import refine
 
-        budget = _Budget(self.limits, cancelled, task.excluded_models)
+        budget = _Budget(self.limits, cancelled, task)
         archive = self._archive(task, checkout, budget)
         try:
             patch, evidence, actor = refine(self, task, archive, budget)

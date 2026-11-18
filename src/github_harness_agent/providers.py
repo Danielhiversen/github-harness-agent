@@ -6,15 +6,18 @@ import argparse
 import hashlib
 import hmac
 import json
+import logging
 import math
 import os
 import re
 import threading
 import time
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from email.utils import parsedate_to_datetime
 from importlib.resources import files
+from itertools import zip_longest
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -23,6 +26,10 @@ import httpx
 import yaml
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+DEFAULT_REQUEST_TIMEOUT = 60
+MAX_REQUEST_TIMEOUT = 900
 
 PUBLIC_ALIASES = frozenset(
     {
@@ -431,6 +438,45 @@ def _paid_router(alias: str, model: str) -> bool:
     return alias.startswith("openrouter") and model in NON_FREE_ROUTERS
 
 
+def _completion_timeout(timeout: float | None) -> float:
+    if timeout is None:
+        return DEFAULT_REQUEST_TIMEOUT
+    if type(timeout) not in {int, float}:
+        raise ValueError("timeout must be a number")
+    if (isinstance(timeout, float) and not math.isfinite(timeout)) or timeout <= 0:
+        raise ProviderExhausted(None, {"gateway": "deadline exceeded"})
+    return min(timeout, MAX_REQUEST_TIMEOUT)
+
+
+def _validate_offset(provider_offset: int) -> None:
+    if type(provider_offset) is not int or provider_offset < 0:
+        raise ValueError("provider_offset must be a nonnegative integer")
+
+
+def _tool_route_affinity(
+    role: str,
+    messages: Sequence[Mapping[str, Any]],
+) -> tuple[str, str] | None:
+    if (
+        role not in {"coding", "probe"}
+        or not messages
+        or messages[-1].get("role") != "tool"
+    ):
+        return None
+    assistant = next(
+        (msg for msg in reversed(messages) if msg.get("role") == "assistant"), {}
+    )
+    route = assistant.get("gateway_route")
+    if (
+        assistant.get("tool_calls")
+        and isinstance(route, (list, tuple))
+        and len(route) == 2
+        and all(isinstance(value, str) and value for value in route)
+    ):
+        return route[0], route[1]
+    return None
+
+
 class ProviderRouter:
     def __init__(
         self,
@@ -524,18 +570,108 @@ class ProviderRouter:
         tools: Sequence[Mapping[str, Any]] = (),
         timeout: float | None = None,
         exclude: Sequence[tuple[str, str]] = (),
+        provider_offset: int = 0,
     ) -> Completion:
-        exclusions = set(exclude)
-        routes = (
-            route
-            for route in self.routes
-            if (route.alias, route.model) not in exclusions
+        _validate_offset(provider_offset)
+        return self._complete(
+            self.routes,
+            role,
+            messages,
+            tools,
+            timeout,
+            exclusions=set(exclude),
+            provider_offset=provider_offset,
         )
-        return self._complete(routes, role, messages, tools, timeout)
 
-    def _complete(self, routes, role, messages, tools, timeout):
-        deadline = time.monotonic() + min(timeout if timeout is not None else 60, 60)
+    def _quota_block(self, route: _Route, now: float) -> tuple[str, float] | None:
+        """Read quota state while holding the router lock."""
+        quota_cooldown = self._quota_cooldown.get(route.quota_key, 0)
+        model_cooldown = self._model_cooldown.get((route.alias, route.model), 0)
+        cooldown = max(quota_cooldown, model_cooldown)
+        if cooldown > now:
+            reason = (
+                "rate limited" if quota_cooldown > now else "temporarily unavailable"
+            )
+            return reason, cooldown
+        if route.quota_key in self._in_flight:
+            return "request in progress", now + 1
+        return None
+
+    def _ordered_routes(self, routes, tools, exclusions, provider_offset, affinity):
         failures = {}
+        groups: dict[tuple, list[_Route]] = {}
+        degraded = set()
+        deferred = []
+        preferred = None
+        with self._lock:
+            now = time.time()
+            for route in routes:
+                if not route.free_verified:
+                    failures[route.alias] = "free eligibility unverified"
+                elif not route.url or not (
+                    route.headers
+                    or route.alias == "ollama-local"
+                    or route.allow_keyless
+                ):
+                    failures[route.alias] = "missing endpoint or credentials"
+                elif tools and not route.tools:
+                    failures[route.alias] = "tool capability unverified"
+                elif (route.alias, route.model) in exclusions:
+                    # Leave a slot when rotating so retry offset and an exclusion
+                    # don't both advance past the same provider.
+                    degraded.add(route.quota_key)
+                    groups.setdefault(route.quota_key, [])
+                elif self._quota_block(route, now):
+                    deferred.append(route)
+                else:
+                    group = groups.setdefault(route.quota_key, [])
+                    if (route.alias, route.model) == affinity:
+                        preferred = route
+                    else:
+                        group.append(route)
+
+        if degraded and preferred is None and not any(groups.values()) and not deferred:
+            raise ProviderExhausted(None, {"gateway": "all eligible models excluded"})
+        accounts = list(groups)
+        if preferred is not None:
+            accounts.remove(preferred.quota_key)
+        elif accounts:
+            offset = provider_offset % len(accounts)
+            accounts = accounts[offset:] + accounts[:offset]
+        accounts.sort(key=degraded.__contains__)
+        if preferred is not None:
+            accounts.append(preferred.quota_key)
+        ordered = [
+            route
+            for turn in zip_longest(*(groups[key] for key in accounts))
+            for route in turn
+            if route is not None
+        ]
+        if preferred is not None:
+            ordered.insert(0, preferred)
+        # A cooldown may expire while trying other providers. Check again if
+        # those attempts did not produce a usable completion.
+        return ordered + deferred, failures
+
+    def _complete(
+        self,
+        routes,
+        role,
+        messages,
+        tools,
+        timeout,
+        *,
+        exclusions=frozenset(),
+        provider_offset=0,
+    ):
+        deadline = time.monotonic() + _completion_timeout(timeout)
+        routes, failures = self._ordered_routes(
+            routes,
+            tools,
+            exclusions,
+            provider_offset,
+            _tool_route_affinity(role, messages),
+        )
         retry_times = []
         needs_initial_tool = (
             tools
@@ -546,36 +682,17 @@ class ProviderRouter:
             key = (route.alias, route.model)
             attempt_timeout = min(route.attempt_timeout, deadline - time.monotonic())
             if attempt_timeout <= 0:
+                failures["gateway"] = "deadline exceeded"
                 break
-            if not route.free_verified:
-                failures[route.alias] = "free eligibility unverified"
-                continue
-            if not route.url or not (
-                route.headers or route.alias == "ollama-local" or route.allow_keyless
-            ):
-                failures[route.alias] = "missing endpoint or credentials"
-                continue
-            if tools and not route.tools:
-                failures[route.alias] = "tool capability unverified"
-                continue
             with self._lock:
-                now = time.time()
-                quota_cooldown = self._quota_cooldown.get(route.quota_key, 0)
-                model_cooldown = self._model_cooldown.get(key, 0)
-                cooldown = max(quota_cooldown, model_cooldown)
-                if cooldown > now:
-                    failures[route.alias] = (
-                        "rate limited"
-                        if quota_cooldown > now
-                        else "temporarily unavailable"
-                    )
-                    retry_times.append(cooldown)
-                    continue
-                if route.quota_key in self._in_flight:
-                    failures[route.alias] = "request in progress"
-                    retry_times.append(now + 1)
-                    continue
-                self._in_flight.add(route.quota_key)
+                blocked = self._quota_block(route, time.time())
+                if blocked is None:
+                    self._in_flight.add(route.quota_key)
+            if blocked is not None:
+                reason, retry_at = blocked
+                failures[route.alias] = reason
+                retry_times.append(retry_at)
+                continue
 
             try:
                 if route.protocol == "gemini":
@@ -584,6 +701,11 @@ class ProviderRouter:
                 else:
                     url = f"{route.url}/chat/completions"
                     payload = _chat_payload(route, messages, tools)
+                logger.info(
+                    "Provider attempt provider=%s configured_model=%s",
+                    route.alias,
+                    route.model,
+                )
                 response = self.client.post(
                     url,
                     json=payload,
@@ -612,6 +734,11 @@ class ProviderRouter:
                 ):
                     failures[route.alias] = "initial coding response did not use a tool"
                     continue
+                logger.info(
+                    "Provider accepted provider=%s configured_model=%s",
+                    route.alias,
+                    route.model,
+                )
                 return result
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
@@ -647,8 +774,11 @@ class _Request(BaseModel):
     role: str = Field(min_length=1, max_length=32)
     messages: list[dict[str, Any]]
     tools: list[dict[str, Any]] = Field(default_factory=list)
-    timeout: float | None = Field(default=None, gt=0, le=60)
+    timeout: float | None = Field(
+        default=None, gt=0, le=MAX_REQUEST_TIMEOUT, strict=True
+    )
     exclude: list[tuple[str, str]] = Field(default_factory=list, max_length=1000)
+    provider_offset: int = Field(default=0, ge=0, strict=True)
 
 
 def create_model_gateway(router: ProviderRouter, token: str) -> FastAPI:
@@ -693,21 +823,32 @@ class ModelGatewayClient:
         tools: Sequence[Mapping[str, Any]] = (),
         timeout: float | None = None,
         exclude: Sequence[tuple[str, str]] = (),
+        provider_offset: int = 0,
     ) -> Completion:
-        limit = min(timeout if timeout is not None else 60, 60)
-        if not math.isfinite(limit) or limit <= 0:
-            raise ProviderExhausted(None, {"gateway": "deadline exceeded"})
+        _validate_offset(provider_offset)
+        limit = _completion_timeout(timeout)
+        # Leave time for the gateway to serialize and return an exhausted chain
+        # without extending an explicit task deadline.
+        headroom = min(1, limit / 10)
+        gateway_timeout = limit - headroom if timeout is not None else None
+        receive_timeout = limit if timeout is not None else limit + headroom
         try:
             response = self.client.post(
                 self.url,
                 headers=self.headers,
-                timeout=limit,
+                timeout=httpx.Timeout(
+                    receive_timeout,
+                    connect=min(5, receive_timeout),
+                    pool=min(5, receive_timeout),
+                    write=min(10, receive_timeout),
+                ),
                 json={
                     "role": role,
                     "messages": list(messages),
                     "tools": list(tools),
-                    "timeout": limit,
+                    "timeout": gateway_timeout,
                     "exclude": list(exclude),
+                    "provider_offset": provider_offset,
                 },
             )
             if response.status_code == 503:
@@ -852,10 +993,17 @@ def main() -> int:
         return _smoke(router)
     import uvicorn
 
+    log_config = deepcopy(uvicorn.config.LOGGING_CONFIG)
+    log_config["loggers"][logger.name] = {
+        "handlers": ["default"],
+        "level": "INFO",
+        "propagate": False,
+    }
     uvicorn.run(
         create_model_gateway(router, os.environ["MODEL_GATEWAY_TOKEN"]),
         host=args.host,
         port=args.port,
+        log_config=log_config,
     )
     return 0
 

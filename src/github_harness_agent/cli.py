@@ -2,15 +2,92 @@ import argparse
 import json
 import logging
 import os
+import re
 import time
 import tomllib
+from math import isfinite
 from pathlib import Path
 
 import uvicorn
 
 from .intake import adopt_open_pulls, reconcile
-from .store import LeaseLost, Store
+from .store import PROVIDER_EXHAUSTED, LeaseLost, Store
 from .webhooks import create_app
+
+
+_EXCLUDED_MODELS = "all eligible models excluded"
+_PROVIDER_REASONS = {
+    _EXCLUDED_MODELS,
+    "account or model ineligible",
+    "authenticated gateway request failed",
+    "deadline exceeded",
+    "free eligibility unverified",
+    "initial coding response did not use a tool",
+    "invalid or missing credentials",
+    "malformed request or upstream response",
+    "missing endpoint or credentials",
+    "model unavailable",
+    "rate limited",
+    "request in progress",
+    "temporarily unavailable",
+    "tool capability unverified",
+    "upstream connection failed",
+    "upstream timeout",
+}
+
+
+def _provider_failure_map(failures, aliases):
+    if not isinstance(failures, dict):
+        return {}
+    safe = {}
+    for alias in sorted(aliases):
+        if alias not in failures:
+            continue
+        reason = failures[alias]
+        recognized = isinstance(reason, str) and (
+            reason in _PROVIDER_REASONS
+            or re.fullmatch(r"upstream HTTP [1-5][0-9]{2}", reason)
+        )
+        safe[alias] = reason if recognized else "unclassified failure"
+        if len(safe) == 32:
+            break
+    return safe
+
+
+def _defer_provider(store, job, error, aliases):
+    data = job["data"]
+    previous = data.get("provider_retry_count", 0)
+    count = 1 + previous if type(previous) is int and previous > 0 else 1
+    now = store.clock()
+    delay = min(3600, 30 * 2 ** min(count - 1, 7))
+    try:
+        cooldown = float(error.retry_at) if type(error.retry_at) in {int, float} else 0
+    except OverflowError:
+        cooldown = 0
+    if isfinite(cooldown):
+        delay = max(delay, cooldown - now)
+    data.update(
+        last_error=PROVIDER_EXHAUSTED,
+        provider_retry_count=count,
+        provider_failures=_provider_failure_map(error.failures, aliases),
+        retry_at=now + delay,
+    )
+    if error.failures == {"gateway": _EXCLUDED_MODELS}:
+        failures = data.pop("model_attempt_failures", [])
+        if failures:
+            data["prior_model_attempt_failures"] = [
+                {
+                    "candidate": {
+                        field: value[:160]
+                        for field, value in attempt.get("candidate", {}).items()
+                        if field in {"role", "route", "model", "configured_model"}
+                        and isinstance(value, str)
+                    },
+                    "reason": str(attempt.get("reason", "")).split(":", 1)[0][:160],
+                }
+                for attempt in failures[-16:]
+            ]
+    store.save(job, "queued", delay=delay)
 
 
 def _configured_limit(repo, config, key, default, maximum):
@@ -24,7 +101,7 @@ def run_worker(store, config, once=False, *, pull: tuple[str, int] | None = None
     from .controller import Controller
     from .executor import DockerRunner, Harness2Executor, Limits, PlainExecutor
     from .github import GitHubApp, GitHubNamedAccount
-    from .providers import ModelGatewayClient, ProviderExhausted
+    from .providers import ModelGatewayClient, ProviderExhausted, load_manifest
 
     repositories = config["repositories"]
     if pull is not None:
@@ -73,6 +150,13 @@ def run_worker(store, config, once=False, *, pull: tuple[str, int] | None = None
     else:
         raise ValueError("github_auth must be app or named-account")
     gateway = ModelGatewayClient.from_env()
+    manifest = load_manifest()
+    aliases = {
+        "gateway",
+        *manifest["web"],
+        *manifest["catalog"],
+        *manifest.get("superagent", {}).get("providers", {}),
+    }
     controllers = {}
     for repo, cfg in repositories.items():
         if cfg.get("mode", "shadow") not in {"shadow", "canary"}:
@@ -95,6 +179,7 @@ def run_worker(store, config, once=False, *, pull: tuple[str, int] | None = None
             ),
         )
         controllers[repo] = Controller(store, api, executor, cfg, config["bot_login"])
+    store.recover_provider_pauses(repositories, pull=pull)
     next_sync = 0
     online = set()
     while True:
@@ -143,13 +228,8 @@ def run_worker(store, config, once=False, *, pull: tuple[str, int] | None = None
             except LeaseLost:
                 pass
             except ProviderExhausted as err:
-                job["data"]["last_error"] = "provider routes exhausted"
-                job["data"]["retry_at"] = err.retry_at
                 try:
-                    if err.retry_at is None:
-                        store.save(job, "paused")
-                    else:
-                        store.save(job, "queued", max(1, err.retry_at - time.time()))
+                    _defer_provider(store, job, err, aliases)
                 except LeaseLost:
                     pass
             except Exception as err:
@@ -168,8 +248,15 @@ def run_worker(store, config, once=False, *, pull: tuple[str, int] | None = None
                 except LeaseLost:
                     pass
             else:
-                store.clear_failures(job)
                 after = (job["data"]["stage"], job["data"].get("last_commit"))
+                store.clear_failures(
+                    job,
+                    progressed=(
+                        after[0] in {"watch", "reply"}
+                        or after[1] != before[1]
+                        or "prepared" in job["data"]
+                    ),
+                )
                 if after != before:
                     logging.getLogger(__name__).info(
                         "%s %s #%s entered %s (commit %s)",
@@ -231,8 +318,6 @@ def main():
             ):
                 print(json.dumps(dict(row)))
     elif args.command == "fence":
-        with store.tx() as db:
-            db.execute("""UPDATE tasks SET generation=generation+1,token=NULL,state='paused'
-                WHERE state IN ('running','queued')""")
+        store.fence()
     else:
         run_worker(store, config, once=args.command == "once", pull=pull)

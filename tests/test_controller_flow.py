@@ -125,6 +125,7 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario):
                     raise AttemptRejected("empty patch", candidate, (candidate,))
                 else:
                     assert task.excluded_models == (("fixture", "configured"),)
+                    assert task.provider_offset == 1
             if is_review:
                 feedback = json.loads(
                     task.instructions.split("Review requests against this commit:\n")[1]
@@ -181,6 +182,7 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario):
     if scenario == "fallback":
         assert not api.pulls and api.branch is None
         retry = db.claim()
+        retry["data"]["provider_retry_count"] = 1
         recorded = retry["data"]["model_attempt_failures"][0]
         assert recorded["candidate"]["model"] == "actual"
         assert recorded["reason"] == "empty patch"

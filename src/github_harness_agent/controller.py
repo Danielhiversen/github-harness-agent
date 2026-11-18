@@ -4,6 +4,7 @@ import base64
 import dataclasses
 import hashlib
 import json
+import logging
 import subprocess
 import tempfile
 from pathlib import Path
@@ -209,6 +210,7 @@ class Controller:
                 data["review_head"] = batch.head
                 data["stage"] = stage = "repair"
                 data.pop("model_attempt_failures", None)
+                data.pop("prior_model_attempt_failures", None)
                 store.save(job)
             origin = data["review_head"]
 
@@ -332,6 +334,7 @@ class Controller:
                         protected_paths=tuple(cfg.get("protected_paths", ())),
                         repository_guidance=cfg.get("reviewed_guidance", ""),
                         excluded_models=excluded,
+                        provider_offset=data.get("provider_retry_count", 0),
                     )
 
                     try:
@@ -344,6 +347,14 @@ class Controller:
                             data["stage"] = "watch"
                             store.save(job, "queued")
                             return
+                        logging.getLogger(__name__).info(
+                            "Starting %s %s #%s at %.12s (provider retry %s)",
+                            repo,
+                            job["kind"],
+                            issue,
+                            parent,
+                            task.provider_offset,
+                        )
                         result = self.executor.execute(task, path, cancelled=cancelled)
                     except AttemptRejected as err:
                         candidate = err.candidate
@@ -393,6 +404,9 @@ class Controller:
                         ],
                         "model_attempt_failures": data.pop(
                             "model_attempt_failures", []
+                        ),
+                        "prior_model_attempt_failures": data.pop(
+                            "prior_model_attempt_failures", []
                         ),
                         "usage": result.usage,
                         "refinement": dataclasses.asdict(result.refinement)
@@ -524,6 +538,7 @@ class Controller:
                         "refinement",
                         "digest",
                         "model_attempt_failures",
+                        "prior_model_attempt_failures",
                     )
                     if key in prepared
                 }
