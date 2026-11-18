@@ -464,11 +464,12 @@ def _tool_route_affinity(
     ):
         return None
     assistant = next(
-        (msg for msg in reversed(messages) if msg.get("role") == "assistant"), {}
+        (msg for msg in reversed(messages) if msg.get("role") != "tool"), {}
     )
     route = assistant.get("gateway_route")
     if (
-        assistant.get("tool_calls")
+        assistant.get("role") == "assistant"
+        and assistant.get("tool_calls")
         and isinstance(route, (list, tuple))
         and len(route) == 2
         and all(isinstance(value, str) and value for value in route)

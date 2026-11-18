@@ -276,7 +276,7 @@ def run_worker(store, config, once=False, *, pull: tuple[str, int] | None = None
 
 def main():
     logging.basicConfig()
-    logging.getLogger(__name__).setLevel(logging.INFO)
+    logging.getLogger("github_harness_agent").setLevel(logging.INFO)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--repo", help="Configured repository for a targeted once run")

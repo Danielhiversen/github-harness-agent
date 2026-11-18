@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from github_harness_agent import providers
 from github_harness_agent.providers import (
     ModelGatewayClient,
     ProviderExhausted,
@@ -16,7 +17,6 @@ from github_harness_agent.providers import (
     import_profiles,
     load_manifest,
 )
-from github_harness_agent import providers
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -201,6 +201,13 @@ def test_tool_continuation_prefers_exact_previous_model_then_distinct_provider()
     assert attempts == [model.split("/", 1)[1] for model in (OPENROUTER_SIBLING, KILO)]
     assert (
         router.complete(role="proposal", messages=messages).route == "openrouter-free"
+    )
+    assert (
+        router.complete(
+            role="coding",
+            messages=[*messages, {"role": "user", "content": "New task"}, messages[-1]],
+        ).route
+        == "openrouter-free"
     )
     malformed = {**assistant, "gateway_route": ["openrouter", None]}
     assert (
