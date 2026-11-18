@@ -443,6 +443,20 @@ def test_gateway_requires_token_and_uses_provider_route():
         assert client.complete(**payload, timeout=1200).route == "kilo-free"
         assert json.loads(requests[-1].content)["timeout"] < 900
         assert requests[-1].extensions["timeout"]["read"] == 900
+        attempts = []
+        result = client.complete(
+            **payload, on_attempt=lambda *attempt: attempts.append(attempt)
+        )
+        assert attempts == [tuple(KILO.split("/", 1))]
+        assert result.route == attempts[0][0]
+        assert http.post(f"{url}/complete/observed", json=payload).status_code == 401
+        with pytest.raises(ProviderExhausted) as failure:
+            client.complete(
+                **payload,
+                on_attempt=lambda *unused: None,
+                exclude=[tuple(m.split("/", 1)) for m in (OLLAMA, KILO)],
+            )
+        assert failure.value.failures == {"gateway": "all eligible models excluded"}
         auth = {"Authorization": "Bearer gateway-token"}
         for invalid in (
             {"provider_offset": -1},
@@ -750,3 +764,20 @@ def test_superagent_template_covers_all_active_models_without_authorizing_reques
         not row["free_verified"] and not row["tools"] and not row["headers"]
         for row in rows
     )
+
+
+def test_resumed_editor_account_tried_last_and_remains_eligible():
+    attempts = []
+
+    def upstream(request):
+        alias = request.url.host.split(".")[0]
+        attempts.append(alias)
+        code = 200 if alias == "openrouter-free" else 404
+        return httpx.Response(code, json=openai_response())
+
+    router = routed(quality_order(), upstream)
+    result = router.complete(
+        role="coding", messages=[], after_provider="openrouter-free"
+    )
+    assert result.route == "openrouter-free"
+    assert attempts == ["kilo-free", "ollama-local", "openrouter-free"]

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -70,6 +71,7 @@ def refine(executor, task, archive, budget):
             )
             self.errors = {}
             self.actors = {}
+            self.seed_draft = None
 
         def surface(self):
             return surface
@@ -95,6 +97,12 @@ def refine(executor, task, archive, budget):
             rollout_dir.mkdir(parents=True, exist_ok=True)
             guidance = (harness_dir / PROMPT_FILE).read_text(encoding="utf-8")
             role = "probe" if run_id.startswith(("inv", "dom")) else "coding"
+            key = f"harness2/{run_id}"
+            seed = (
+                replace(self.seed_draft, key=key, guidance=guidance)
+                if self.seed_draft is not None
+                else None
+            )
             try:
                 patch, log, actor = executor._rollout(
                     task,
@@ -103,6 +111,9 @@ def refine(executor, task, archive, budget):
                     f"{SYSTEM_PROMPT}\n\n{guidance}",
                     role,
                     clarification=run_id.startswith("c"),
+                    checkpoint_key=key,
+                    checkpoint_guidance=guidance,
+                    seed_draft=seed,
                 )
             except Exception as exc:
                 self.errors[run_id] = exc
@@ -141,6 +152,19 @@ def refine(executor, task, archive, budget):
             role = "composition" if label.startswith("c") else "proposal"
             context = Path(context_dir)
             workspace = context / "harness"
+            candidate = label.split(".", 1)[0]
+            draft = task.checkpoints.get(f"harness2/{candidate}")
+            if draft is not None and draft.patch and draft.guidance is not None:
+                budget.remaining()
+                (workspace / PROMPT_FILE).write_text(draft.guidance, encoding="utf-8")
+                return Reply(
+                    label=label,
+                    text="<notes>Resuming the saved candidate guidance.</notes>",
+                    ok=True,
+                    attempts=0,
+                    cached=True,
+                    workspace=workspace,
+                )
             documents = {}
             for folder in ("rollouts", "deliverables", "pool", "decisions"):
                 for evidence in sorted((context / folder).rglob("*")):
@@ -199,8 +223,17 @@ def refine(executor, task, archive, budget):
         tree.write_tree(surface, initial, adapter.base_harness())
         task_id = f"{task.base_sha}-{task.seed}"
         base = adapter.execute(task_id, adapter.base_harness(), "base")
-        if isinstance(adapter.errors.get("base"), ProviderExhausted):
-            raise adapter.errors["base"]
+        saved_base = task.checkpoints.get("harness2/base")
+        base_error = adapter.errors.get("base")
+        if base_error and (
+            saved_base is not None or isinstance(base_error, ProviderExhausted)
+        ):
+            raise base_error
+        if saved_base is not None and saved_base.patch and adapter.delivered(base):
+            adapter.seed_draft = replace(
+                saved_base,
+                patch=(base / "patch.diff").read_bytes(),
+            )
         result = recursion.run_sequential(
             task_id,
             1,

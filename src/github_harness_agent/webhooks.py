@@ -4,6 +4,7 @@ import json
 
 from fastapi import FastAPI, HTTPException, Request
 
+from .ci import webhook_ci_failure
 from .store import Store
 
 
@@ -29,7 +30,12 @@ def create_app(store: Store, secret: bytes, repositories: set[str]):
             repo = payload.get("repository", {}).get("full_name")
         except (ValueError, AttributeError):
             raise HTTPException(400)
-        if repo in repositories and event in {
+        failure = webhook_ci_failure(event, payload) if repo in repositories else None
+        if failure:
+            store.receive(
+                delivery, event, {"repository": {"full_name": repo}}, ci_failure=failure
+            )
+        elif repo in repositories and event in {
             "issues",
             "pull_request",
             "pull_request_review",

@@ -6,6 +6,8 @@ import time
 import uuid
 from contextlib import contextmanager
 
+from .activity import ACTIVITY_TABLE
+
 
 class LeaseLost(RuntimeError):
     pass
@@ -41,6 +43,7 @@ class Store:
                 CREATE TABLE IF NOT EXISTS deliveries(
                     id TEXT PRIMARY KEY, payload TEXT, event TEXT, received REAL);
             """)
+            db.execute(ACTIVITY_TABLE)
             columns = db.execute("PRAGMA table_info(tasks)").fetchall()
             if columns and not any(column["name"] == "kind" for column in columns):
                 db.execute("ALTER TABLE tasks RENAME TO issue_tasks")
@@ -62,14 +65,32 @@ class Store:
         finally:
             db.close()
 
-    def receive(self, delivery, event, payload):
+    def receive(self, delivery, event, payload, *, ci_failure=None):
         with self.tx() as db:
-            return bool(
+            now = self.clock()
+            inserted = bool(
                 db.execute(
                     "INSERT OR IGNORE INTO deliveries VALUES(?,?,?,?)",
-                    (delivery, json.dumps(payload), event, self.clock()),
+                    (delivery, json.dumps(payload), event, now),
                 ).rowcount
             )
+            if inserted and ci_failure is not None:
+                sha, key = ci_failure
+                db.execute(
+                    """UPDATE tasks SET due=MIN(due,?) WHERE repo=? AND state='queued'
+                       AND json_extract(data,'$.stage')='watch'
+                       AND json_extract(data,'$.last_commit')=?
+                       AND NOT EXISTS (SELECT 1 FROM json_each(tasks.data,'$.ci_seen') WHERE value=?)
+                       AND NOT EXISTS (SELECT 1 FROM json_each(tasks.data,'$.ci_attempted') WHERE value=?)""",
+                    (
+                        now,
+                        payload["repository"]["full_name"],
+                        sha,
+                        key,
+                        key.removeprefix(f"{sha}:"),
+                    ),
+                )
+            return inserted
 
     def events(self):
         with self.tx() as db:
@@ -143,7 +164,14 @@ class Store:
                     return False
                 replacements.append(job["issue"])
                 if owned_pull == pull and existing is None:
+                    db.execute(
+                        """INSERT OR REPLACE INTO model_activity
+                        SELECT repo,'pull',?,slot,token,role,provider,model,observed FROM model_activity
+                        WHERE repo=? AND kind='issue' AND issue=? AND slot='last_success'""",
+                        (pull, repo, job["issue"]),
+                    )
                     for key in (
+                        "allowed_rounds",
                         "seen",
                         "threads",
                         "round",
@@ -157,6 +185,8 @@ class Store:
                         "provider_retry_count",
                         "provider_failures",
                         "prior_model_attempt_failures",
+                        "ci_seen",
+                        "ci_attempted",
                     ):
                         if key in original:
                             data[key] = original[key]
@@ -174,6 +204,8 @@ class Store:
                             "feedback",
                             "review_head",
                             "model_attempt_failures",
+                            "ci_feedback",
+                            "draft_checkpoints",
                         ):
                             if key in original:
                                 data[key] = original[key]
@@ -185,7 +217,8 @@ class Store:
                             data["pause_reason"] = original["pause_reason"]
             for issue in replacements:
                 db.execute(
-                    """UPDATE tasks SET state='superseded', token=NULL, generation=generation+1
+                    """UPDATE tasks SET state='superseded', token=NULL, generation=generation+1,
+                       data=json_remove(data,'$.draft_checkpoints')
                        WHERE repo=? AND kind='issue' AND issue=?""",
                     (repo, issue),
                 )
@@ -204,6 +237,7 @@ class Store:
                     previous["stage"] = "watch"
                     for key in (
                         "prepared",
+                        "draft_checkpoints",
                         "model_attempt_failures",
                         "feedback",
                         "question",
@@ -308,6 +342,11 @@ class Store:
             ).fetchone()
             if row is None:
                 return None
+            db.execute(
+                """DELETE FROM model_activity WHERE repo=? AND kind=? AND issue=?
+                AND slot!='last_success'""",
+                (row["repo"], row["kind"], row["issue"]),
+            )
             token = uuid.uuid4().hex
             db.execute(
                 """UPDATE tasks SET token=?,state='running',expires=?,attempts=attempts+1
@@ -315,6 +354,26 @@ class Store:
                 (token, now + ttl, row["repo"], row["issue"], row["kind"]),
             )
             return {**dict(row), "data": json.loads(row["data"]), "token": token}
+
+    def observe_model(self, job, call, phase, role, provider, model):
+        key = (job["repo"], job["kind"], job["issue"])
+        with self.tx() as db:
+            now = self.clock()
+            if not db.execute(
+                "SELECT 1 FROM tasks WHERE token=? AND expires>?", (job["token"], now)
+            ).fetchone():
+                raise LeaseLost()
+            if phase in {"end", "success"}:
+                db.execute(
+                    "DELETE FROM model_activity WHERE repo=? AND kind=? AND issue=? AND slot=?",
+                    (*key, call),
+                )
+            if phase != "end":
+                slot = "last_success" if phase == "success" else call
+                db.execute(
+                    "INSERT OR REPLACE INTO model_activity VALUES(?,?,?,?,?,?,?,?,?)",
+                    (*key, slot, job["token"], role, provider, model, now),
+                )
 
     def check(self, job):
         with self.tx() as db:

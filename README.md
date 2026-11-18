@@ -6,7 +6,7 @@ Python GitHub App for taking a maintainer-labeled issue through a verified chang
 1. Install Python 3.12 and uv. Run `uv sync --locked` and `uv run pytest -q`. The locked environment includes the exact upstream Harness2 revision.
 2. Prepare a Linux worker with Docker, the runsc runtime and a trusted image containing the target project's test dependencies. Follow the [worker guide](docs/workers.md).
 3. Set up the [model gateway](docs/model-gateway.md). Run a live smoke test on every route enabled for the pilot. Use only account/model combinations with confirmed free access.
-4. Create a GitHub App and install it on one test repository. Grant repository metadata read, issues read/write, contents read/write and pull requests read/write. Subscribe to Issues, Pull request, Pull request review and Pull request review comment events. Configure its webhook URL to reach the controller's HTTPS reverse proxy at `/webhook`.
+4. Create a GitHub App and install it on one test repository. Grant repository metadata, checks and commit statuses read access, plus issues, contents and pull requests read/write access. Subscribe to Issues, Pull request, Pull request review, Pull request review comment, Check run and Status events. Configure its webhook URL to reach the controller's HTTPS reverse proxy at `/webhook`.
 5. Copy `agent.example.toml` to `agent.toml`. Supply your repository name, installation ID, App bot login, branch convention, trusted worker image and exact check argv lists. Set `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_FILE`, `GITHUB_WEBHOOK_SECRET`, `MODEL_GATEWAY_URL` and `MODEL_GATEWAY_TOKEN` in the appropriate services. Restrict access to the database and its directory because it contains issue text, patches and review history.
 6. Run the two commands below as separate processes from the same directory. Apply the configured label to a test issue from a maintainer account. Set issue dependencies using GitHub's native blocked-by relationship. Cancellation and publication recheck current issue eligibility. The polling fallback also picks up missed webhook events.
 
@@ -26,6 +26,21 @@ With an explicit `verification_image`, set `rollout_requests` to cap model turns
 To process only an existing adopted PR job, run `uv run github-harness-agent --config agent.toml once --repo example/project --pull 20`. The job must be due or have an expired lease.
 
 The controller revisits submitted review bodies and unresolved threads, checks the reviewer and current head, and records replies. Provider failures advance to the next eligible free provider. When all routes fail, the job stays queued for a later attempt with backoff and respects provider cooldowns. On startup the worker recovers jobs that older releases paused for provider exhaustion. Other persistent failures and the three-round review limit can still pause a job. Inspect paused jobs before intervention. To roll back, stop the worker, run `uv run github-harness-agent --config agent.toml fence`, reconcile each open branch and PR, then assign outstanding issues to one owner before restoring incumbent intake.
+
+### Monitor or resume a pull request
+
+```sh
+uv run github-harness-agent --config agent.toml status --repo example/project --pull 20
+uv run github-harness-agent --config agent.toml retry --repo example/project --pull 20
+uv run github-harness-agent --config agent.toml pause --repo example/project --pull 20
+uv run github-harness-agent --config agent.toml resume --repo example/project --pull 20
+```
+
+Status includes the active model calls, last successful model and timestamp, next scheduled poll or retry, blocker, and saved draft names. A call can briefly show an empty provider while the gateway selects a route. Retry advances a queued job to the next worker cycle. Pause applies to a queued job. Resume releases an individual paused job, allowing one more repair round when its limit was reached. These controls preserve the saved draft, branch checks and active worker lease.
+
+The worker saves bounded patches after editing commands. A replacement worker restores the matching draft, including its last command results, and checks it in a fresh workspace before publication. Harness2 keeps each candidate's draft separately. Reviewers can supply long threads and CI diagnostics. The initial prompt contains a bounded excerpt and the worker can request individual pages when it needs more detail.
+
+After a push the controller checks both GitHub Check Runs and individual commit statuses, including CircleCI reports. A new failure on the agent's recorded PR head can schedule a repair without a human review. The controller verifies that the failure and branch head are still current before pushing. Repeated failures are bounded by the repair policy.
 
 Before creating an issue branch, the controller fetches the current target branch. It rebases existing task commits against the PR's current target before editing and refreshes the target again before pushing. If the target advanced during execution, the controller rebases the patch and reruns the required checks. A conflicting rebase pauses the task. Pushing with an expected branch head prevents a concurrent contributor's commit from being overwritten.
 

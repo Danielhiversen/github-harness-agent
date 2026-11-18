@@ -1,0 +1,163 @@
+import pytest
+
+from github_harness_agent.checkpoint import DraftCheckpoint
+from github_harness_agent.controller import draft_scope, restore_drafts
+from github_harness_agent.rebase import BOT_IDENTITY, RebaseConflict, TargetBase, git
+from github_harness_agent.store import Store
+
+
+def commit(path, message):
+    git(path, "add", "-A")
+    git(
+        path,
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        "commit",
+        "-qm",
+        message,
+    )
+    return git(path, "rev-parse", "HEAD").decode().strip()
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_recovering_draft_replays_on_new_base_or_reports_conflict(tmp_path, conflict):
+    source = tmp_path / "source"
+    source.mkdir()
+    git(source, "init", "-q")
+    (source / "draft.txt").write_text("base\n")
+    (source / "context.txt").write_text("original\n")
+    original = commit(source, "base")
+    (source / "draft.txt").write_text("draft\n")
+    (source / "added.txt").write_text("new file\n")
+    git(source, "add", "-A")
+    patch = git(source, "diff", "--cached", "--binary", "--full-index", original)
+    git(source, "reset", "--hard", original)
+    changed_file = "draft.txt" if conflict else "context.txt"
+    (source / changed_file).write_text("human update\n")
+    latest = commit(source, "target advanced")
+
+    class LocalRepository:
+        def fetch(self, _repository, path, sha):
+            git(path, "fetch", "-q", str(source), sha)
+
+    api = LocalRepository()
+    checkout = tmp_path / "worker"
+    checkout.mkdir()
+    git(checkout, "init", "-q")
+    api.fetch("org/repo", checkout, latest)
+    git(checkout, "checkout", "--detach", latest)
+    draft = DraftCheckpoint("plain/coding", original, patch, ("pytest exited 0",))
+    envelope = {
+        "scope": "current review",
+        "head": None,
+        "parent": original,
+        "identity": BOT_IDENTITY,
+        "target": {"repo": "org/repo", "ref": "main", "sha": original},
+        "drafts": {draft.key: draft.to_data()},
+    }
+    args = (api, checkout, "org/repo", None, latest, "current review", envelope)
+    if conflict:
+        with pytest.raises(RebaseConflict, match="saved draft conflicts"):
+            restore_drafts(*args)
+    else:
+        restored = restore_drafts(*args)[draft.key]
+        assert restored.base_sha == latest
+        assert restored.progress == ()
+        git(checkout, "apply", "--index", "--binary", "-", data=restored.patch)
+        assert (checkout / "draft.txt").read_text() == "draft\n"
+        assert (checkout / "added.txt").read_text() == "new file\n"
+        assert (checkout / "context.txt").read_text() == "human update\n"
+
+
+def test_unrelated_review_head_or_feedback_revision_cannot_adopt_saved_draft():
+    job = {
+        "repo": "org/repo",
+        "kind": "pull",
+        "issue": 4,
+        "data": {
+            "title": "",
+            "body": "",
+            "pull": 4,
+            "feedback": [{"key": "review-revision-1"}],
+        },
+    }
+    first_target = TargetBase("org/repo", "main", "a")
+    scope, _ = draft_scope(job, "repair", "head-1", first_target, {})
+    assert (
+        draft_scope(job, "repair", "head-1", TargetBase("org/repo", "main", "b"), {})[0]
+        == scope
+    )
+    assert draft_scope(job, "repair", "head-2", first_target, {})[0] != scope
+    job["data"]["feedback"][0]["key"] = "review-revision-2"
+    updated, _ = draft_scope(job, "repair", "head-1", first_target, {})
+    assert updated != scope
+    assert (
+        restore_drafts(None, None, "org/repo", "head-1", "b", updated, {"scope": scope})
+        == {}
+    )
+
+
+def test_matching_repair_draft_can_follow_issue_job_into_pr_adoption(tmp_path):
+    store = Store(tmp_path / "controller.db")
+    issue = {
+        "stage": "repair",
+        "pull": 34,
+        "review_head": "review-head",
+        "branch": "agent/issue-12",
+        "title": "Issue title",
+        "body": "Issue content",
+        "feedback": [],
+        "ci_feedback": [{"key": "ci-revision-1"}],
+    }
+    target = TargetBase("org/repo", "main", "target-a")
+    issue_job = {"repo": "org/repo", "kind": "issue", "issue": 12, "data": issue}
+    scope, _ = draft_scope(issue_job, "repair", issue["review_head"], target, {})
+    draft = DraftCheckpoint("plain/coding", "original", b"verified fixture patch")
+    issue["draft_checkpoints"] = {
+        "scope": scope,
+        "head": issue["review_head"],
+        "parent": "original",
+        "drafts": {draft.key: draft.to_data()},
+    }
+    store.enqueue("org/repo", 12, issue)
+    assert store.adopt_pull(
+        "org/repo",
+        34,
+        {
+            "stage": "watch",
+            "pull": 34,
+            "branch": issue["branch"],
+            "author": "bot",
+            "linked_issues": [12],
+            "title": "PR title",
+            "body": "PR description",
+        },
+        "agent/",
+        head_sha=issue["review_head"],
+    )
+    adopted = store.claim(pull=("org/repo", 34))
+    assert adopted["data"]["stage"] == "repair"
+    assert draft_scope(adopted, "repair", issue["review_head"], target, {})[0] == scope
+    assert (
+        restore_drafts(
+            None,
+            None,
+            "org/repo",
+            issue["review_head"],
+            "original",
+            scope,
+            adopted["data"]["draft_checkpoints"],
+        )[draft.key]
+        == draft
+    )
+    adopted["data"]["ci_feedback"][0]["key"] = "ci-revision-2"
+    assert draft_scope(adopted, "repair", issue["review_head"], target, {})[0] != scope
+    with store.tx() as db:
+        assert (
+            db.execute(
+                "SELECT json_extract(data, '$.draft_checkpoints') FROM tasks WHERE kind='issue'"
+            ).fetchone()[0]
+            is None
+        )

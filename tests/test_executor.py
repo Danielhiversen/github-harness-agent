@@ -71,7 +71,9 @@ class ScriptedGateway:
         self.roles = []
         self.composition_evidence = {}
 
-    def complete(self, *, role, messages, tools=(), timeout=None, exclude=()):
+    def complete(
+        self, *, role, messages, tools=(), timeout=None, exclude=(), after_provider=None
+    ):
         self.roles.append(role)
         content = "Done"
         calls = ()
@@ -566,5 +568,162 @@ def test_linux_worker_executes_without_controller_credentials(fixture, monkeypat
     result = PlainExecutor(DockerRunner(image), gateway, Limits(wall_time=45)).execute(
         task, source
     )
+    assert b"+4\n" in result.patch
+
+
+@pytest.mark.parametrize("executor_class", [PlainExecutor, Harness2Executor])
+def test_provider_loss_resumes_saved_edit_in_new_worker(fixture, executor_class):
+    from github_harness_agent.checkpoint import DraftCheckpoint
+    from github_harness_agent.store import LeaseLost, Store
+
+    task, source, runner = fixture
+    now = [100]
+    database = source.parent / "checkpoint.db"
+    store = Store(database, clock=lambda: now[0])
+    store.enqueue(task.repository, 8, {"drafts": {}})
+    old_lease = job = store.claim(ttl=10)
+
+    def persist(draft):
+        job["data"]["drafts"][draft.key] = draft.to_data()
+        store.save(job)
+
+    class DisconnectAfterTool(ScriptedGateway):
+        def complete(self, **kwargs):
+            if kwargs["messages"][-1]["role"] == "tool":
+                raise ProviderExhausted(None)
+            return super().complete(**kwargs)
+
+    task = replace(task, save_checkpoint=persist)
+    with pytest.raises(ProviderExhausted):
+        executor_class(
+            runner,
+            DisconnectAfterTool(
+                "open('number.txt','w').write('4\\n'); "
+                "open('notes.txt','w').write('New notes\\n')"
+            ),
+        ).execute(task, source)
+    now[0] += 11
+    store = Store(database, clock=lambda: now[0])
+    job = store.claim()
+    assert job["token"] != old_lease["token"]
+    with pytest.raises(LeaseLost):
+        store.save(old_lease)
+    saved = {
+        key: DraftCheckpoint.from_data(value)
+        for key, value in job["data"]["drafts"].items()
+    }
+    key = "plain/coding" if executor_class is PlainExecutor else "harness2/base"
+    assert b"notes.txt" in saved[key].patch
+    assert saved[key].progress == ("python exited 0",)
+    assert saved[key].last_editor == ("fixture", "fixture-model-id")
+
+    resumed = []
+    preferred_after = []
+
+    class FinishWithoutRepeating(ScriptedGateway):
+        def complete(self, **kwargs):
+            if kwargs.get("after_provider"):
+                preferred_after.append(kwargs["after_provider"])
+            if (
+                kwargs["role"] in {"coding", "probe"}
+                and "Resuming a saved draft" in kwargs["messages"][1]["content"]
+            ):
+                if kwargs["messages"][-1]["role"] == "tool":
+                    assert kwargs["messages"][-1]["content"].startswith("exit 0")
+                reply = super().complete(**kwargs)
+                if reply.tool_calls:
+                    resumed.append(True)
+                    reply.tool_calls[0]["function"]["arguments"] = json.dumps(
+                        {
+                            "argv": [
+                                sys.executable,
+                                "-c",
+                                "import subprocess; from pathlib import Path; "
+                                "assert Path('number.txt').read_text() == '4\\n'; "
+                                "assert Path('notes.txt').read_text() == 'New notes\\n'; "
+                                "assert b'+4' in subprocess.check_output(['git', 'diff', '--', 'number.txt'])",
+                            ],
+                        }
+                    )
+                return reply
+            return super().complete(**kwargs)
+
+    result = executor_class(
+        runner,
+        FinishWithoutRepeating(
+            "open('number.txt','w').write('4\\n'); "
+            "open('notes.txt','w').write('Replacement value\\n')"
+        ),
+    ).execute(replace(task, checkpoints=saved.copy()), source)
+    assert len(resumed) == (1 if executor_class is PlainExecutor else 4)
+    assert preferred_after == ["fixture"]
+    assert b"+New notes" in result.patch
+    assert result.checks[0].returncode == 0
+    assert (source / "number.txt").read_text() == "3\n"
+
+
+def test_rollout_reads_omitted_evidence_and_limits_command_output(fixture):
+    from github_harness_agent.task_context import build_task_context
+
+    task, source, runner = fixture
+    raw = "x" * 3600 + "The missing input is four." + "y" * 3600
+    context = build_task_context(raw)
+    assert "The missing input is four." not in context.instructions
+    task = replace(task, instructions=context.instructions, context=context)
+    calls = []
+
+    class Gateway:
+        def complete(self, *, role, messages, tools, **kwargs):
+            calls.append(messages[-1])
+            assert "read_task_context" in {tool["function"]["name"] for tool in tools}
+            match len(calls):
+                case 1:
+                    action = "read_task_context"
+                    arguments = {"section": "task", "page": 3}
+                case 2:
+                    assert json.loads(messages[-1]["content"])["content"].startswith(
+                        "The missing input is four."
+                    )
+                    action = "run"
+                    arguments = {
+                        "argv": [
+                            sys.executable,
+                            "-c",
+                            (
+                                "open('number.txt','w').write('4\\n'); print('head' + 'x' * 10000 + 'tail')"
+                            ),
+                        ]
+                    }
+                case _:
+                    output = messages[-1]["content"]
+                    assert len(output.encode()) <= 6000
+                    assert output.startswith("exit 0\nhead") and output.endswith(
+                        "tail\n"
+                    )
+                    return SimpleNamespace(
+                        content="Done",
+                        tool_calls=(),
+                        route="fixture",
+                        model="model",
+                        configured_model="model",
+                        role=role,
+                        usage={},
+                    )
+            tool = {
+                "id": str(len(calls)),
+                "type": "function",
+                "function": {"name": action, "arguments": json.dumps(arguments)},
+            }
+            return SimpleNamespace(
+                content=None,
+                tool_calls=(tool,),
+                route="fixture",
+                model="model",
+                configured_model="model",
+                role=role,
+                usage={},
+            )
+
+    result = PlainExecutor(runner, Gateway(), Limits(commands=1)).execute(task, source)
     assert b"+4\n" in result.patch
     assert result.checks[0].returncode == 0

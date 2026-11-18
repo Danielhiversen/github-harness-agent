@@ -7,13 +7,27 @@ import re
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from math import isfinite
 from pathlib import Path, PurePosixPath
 from threading import Lock
 from typing import Any, Protocol
+from uuid import uuid4
 
+from .activity import observed_call
+from .checkpoint import DraftCheckpoint
+from .providers import ProviderExhausted
+from .task_context import (
+    CONTEXT_TOOL,
+    MESSAGE_BYTES,
+    RETRY_MESSAGE_BYTES,
+    TOOL_RESULT_BYTES,
+    TaskContext,
+    compact_messages,
+    context_tool_result,
+    excerpt,
+)
 from .worker import (
     Cancelled,
     CommandOutputExceeded,
@@ -43,6 +57,7 @@ SYSTEM_PROMPT = (
     "in place. Keep the patch focused and preserve existing checks and their configuration. "
     "When the task requests regression coverage, add new test files using the repository's naming convention. "
     "Finish when the patch is ready. "
+    "Use narrow checkout reads for large files and command output. "
     "If the task has conflicting or materially ambiguous requirements, return only a JSON object "
     "with a clarification key containing one concise question for the maintainer."
 )
@@ -71,6 +86,7 @@ class Gateway(Protocol):
         timeout: float | None = None,
         exclude: Sequence[tuple[str, str]] = (),
         provider_offset: int = 0,
+        after_provider: str | None = None,
     ): ...
 
 
@@ -108,6 +124,11 @@ class TaskSnapshot:
     repository_guidance: str = ""
     excluded_models: tuple[tuple[str, str], ...] = ()
     provider_offset: int = 0
+    observe_model: Callable | None = None
+    checkpoint_scope: str = ""
+    checkpoints: Mapping[str, DraftCheckpoint] = field(default_factory=dict)
+    save_checkpoint: Callable[[DraftCheckpoint], None] | None = None
+    context: TaskContext | None = None
 
 
 @dataclass(frozen=True)
@@ -214,6 +235,7 @@ class _Budget:
         self.task = task
         self._calls = Counter()
         self._lock = Lock()
+        self._message_limit = MESSAGE_BYTES
 
     def remaining(self):
         if self.cancelled():
@@ -230,20 +252,43 @@ class _Budget:
                 raise _RequestBudgetExceeded(f"Task {kind} budget exceeded")
             self._calls[kind] += 1
 
-    def complete(self, gateway, role, messages, tools=()):
-        self.claim("model request", self.limits.model_requests)
+    def complete(self, gateway, role, messages, tools=(), *, after_provider=None):
         options = (
             {"exclude": self.task.excluded_models} if self.task.excluded_models else {}
         )
-        if self.task.provider_offset:
+        if after_provider:
+            options["after_provider"] = after_provider
+        elif self.task.provider_offset:
             options["provider_offset"] = self.task.provider_offset
-        completion = gateway.complete(
-            role=role,
-            messages=messages,
-            tools=tools,
-            timeout=self.remaining(),
-            **options,
-        )
+
+        def send(payload):
+            self.claim("model request", self.limits.model_requests)
+            return observed_call(
+                self.task,
+                gateway,
+                role=role,
+                messages=payload,
+                tools=tools,
+                timeout=self.remaining(),
+                **options,
+            )
+
+        with self._lock:
+            message_limit = self._message_limit
+        compact = compact_messages(messages, max_bytes=message_limit, role=role)
+        try:
+            completion = send(compact)
+        except ProviderExhausted as error:
+            if "upstream HTTP 413" not in error.failures.values():
+                raise
+            smaller = compact_messages(
+                messages, max_bytes=RETRY_MESSAGE_BYTES, role=role
+            )
+            if smaller == compact:
+                raise
+            with self._lock:
+                self._message_limit = RETRY_MESSAGE_BYTES
+            completion = send(smaller)
         self.remaining()
         with self._lock:
             route = RouteEvidence.from_completion(completion)
@@ -363,7 +408,14 @@ class PlainExecutor:
     ) -> ExecutionResult:
         budget = _Budget(self.limits, cancelled, task)
         archive = self._archive(task, checkout, budget)
-        patch, _, actor = self._rollout(task, archive, budget, SYSTEM_PROMPT, "coding")
+        patch, _, actor = self._rollout(
+            task,
+            archive,
+            budget,
+            SYSTEM_PROMPT,
+            "coding",
+            checkpoint_key="plain/coding",
+        )
         return self._verify(task, archive, budget, patch, actor=actor)
 
     def verify_patch(
@@ -419,11 +471,12 @@ class PlainExecutor:
             raise ExecutionError(f"Worker command failed: {argv[0]}")
         return result
 
-    def _git(self, workspace, budget, *argv, **kwargs):
+    def _git(self, workspace, budget, *argv, index=None, **kwargs):
+        environment = ("env", f"GIT_INDEX_FILE={index}") if index else ()
         return self._command(
             workspace,
             budget,
-            ("git", "-c", "core.hooksPath=/dev/null", *argv),
+            (*environment, "git", "-c", "core.hooksPath=/dev/null", *argv),
             **kwargs,
         )
 
@@ -432,15 +485,111 @@ class PlainExecutor:
         self._git(workspace, budget, "add", "-A", "-f")
         return self._git(workspace, budget, "write-tree").stdout.strip().decode("ascii")
 
-    def _rollout(self, task, archive, budget, prompt, role, *, clarification=True):
+    def _draft_patch(self, workspace, budget, baseline, *, index=None):
+        return self._git(
+            workspace,
+            budget,
+            "diff",
+            "--cached",
+            "--binary",
+            "--full-index",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            baseline,
+            cap=self.limits.patch_bytes,
+            index=index,
+        ).stdout
+
+    def _restore_draft(self, workspace, task, budget, baseline, draft, guidance):
+        if draft.base_sha != task.base_sha or draft.guidance != guidance:
+            raise ExecutionError(
+                "Saved draft does not match this checkout or candidate guidance"
+            )
+        if len(draft.patch) > self.limits.patch_bytes:
+            raise LimitExceeded("Saved draft exceeded the configured patch size")
+        result = self._git(
+            workspace,
+            budget,
+            "apply",
+            "--index",
+            "--binary",
+            data=draft.patch,
+            checked=False,
+        )
+        if result.returncode:
+            raise ExecutionError("Saved draft no longer applies to this checkout")
+        self._check_patch_paths(workspace, task, budget, baseline)
+        tree = self._git(workspace, budget, "write-tree").stdout.strip().decode("ascii")
+        self._git(workspace, budget, "read-tree", baseline)
+        return tree
+
+    @staticmethod
+    def _command_progress(argv, returncode):
+        test_tools = {"pytest", "ruff", "mypy", "vitest", "mocha", "jest", "unittest"}
+        check = next((arg for arg in argv if arg in test_tools), None)
+        executable = PurePosixPath(argv[0]).name
+        label = check or (
+            executable if executable in {"python", "python3", "git"} else "command"
+        )
+        status = (
+            "exceeded output limit" if returncode is None else f"exited {returncode}"
+        )
+        return f"{label} {status}", check is not None
+
+    def _rollout(
+        self,
+        task,
+        archive,
+        budget,
+        prompt,
+        role,
+        *,
+        clarification=True,
+        checkpoint_key=None,
+        checkpoint_guidance=None,
+        seed_draft=None,
+    ):
         with self.runner.workspace(
             archive, budget.remaining, budget.cancelled
         ) as workspace:
             baseline = self._stage_baseline(workspace, budget)
+            own_draft = task.checkpoints.get(checkpoint_key)
+            draft = own_draft or seed_draft
+            if draft is not None and draft.key != checkpoint_key:
+                raise ExecutionError("Saved draft belongs to a different rollout")
+            staged_tree = baseline
+            progress = []
+            instructions = task.instructions
+            if draft is not None and draft.patch:
+                staged_tree = self._restore_draft(
+                    workspace,
+                    task,
+                    budget,
+                    baseline,
+                    draft,
+                    checkpoint_guidance,
+                )
+                progress.extend(draft.progress)
+                instructions += (
+                    "\n\nResuming a saved draft already applied to this checkout. "
+                    "Inspect the existing diff and preserve valid edits while completing the task. "
+                    "Earlier command outcomes (rerun required checks before finishing): "
+                    + "; ".join(progress)
+                )
+            checkpoint_index = None
+            if checkpoint_key is not None and task.save_checkpoint is not None:
+                checkpoint_index = f".git/gha-draft-index-{uuid4().hex}"
+                self._git(
+                    workspace, budget, "read-tree", staged_tree, index=checkpoint_index
+                )
             messages = [
                 {"role": "system", "content": prompt},
-                {"role": "user", "content": task.instructions},
+                {"role": "user", "content": instructions},
             ]
+            tools = (
+                (RUN_TOOL, CONTEXT_TOOL) if task.context is not None else (RUN_TOOL,)
+            )
             trajectory = []
             actor = None
             last = None
@@ -448,8 +597,15 @@ class PlainExecutor:
             limit = budget.limits.rollout_requests
             while limit is None or turns < limit:
                 try:
+                    last_editor = (
+                        own_draft.last_editor if own_draft and not turns else None
+                    )
                     completion = budget.complete(
-                        self.gateway, role, messages, (RUN_TOOL,)
+                        self.gateway,
+                        role,
+                        messages,
+                        tools,
+                        after_provider=last_editor[0] if last_editor else None,
                     )
                 except _RequestBudgetExceeded as error:
                     budget.reject(error, last, latest=True)
@@ -469,12 +625,30 @@ class PlainExecutor:
                 if provider_context := getattr(completion, "provider_context", None):
                     assistant["provider_context"] = provider_context
                 messages.append(assistant)
+                ran_command = ran_check = False
                 for tool in completion.tool_calls:
+                    if (
+                        task.context is not None
+                        and tool["function"]["name"] == "read_task_context"
+                    ):
+                        try:
+                            budget.claim("context read", 40)
+                        except _RequestBudgetExceeded as error:
+                            budget.reject(error, last)
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool["id"],
+                                "content": context_tool_result(task.context, tool),
+                            }
+                        )
+                        continue
                     try:
                         budget.claim("command", self.limits.commands)
                         argv = self._tool_argv(tool)
                         response = self._command(workspace, budget, argv, checked=False)
                     except CommandOutputExceeded:
+                        returncode = None
                         output = (
                             "Command exceeded the output limit. Select a narrower range or "
                             "redirect output to a workspace file and inspect a slice."
@@ -482,8 +656,17 @@ class PlainExecutor:
                     except (_RequestBudgetExceeded, _CandidateOutputError) as error:
                         budget.reject(error, last)
                     else:
-                        output = f"exit {response.returncode}\n{_combined(response)}"
+                        returncode = response.returncode
+                        output = excerpt(
+                            f"exit {response.returncode}\n{_combined(response)}",
+                            TOOL_RESULT_BYTES,
+                        )
                     actor = last
+                    if task.save_checkpoint is not None:
+                        outcome, is_check = self._command_progress(argv, returncode)
+                        progress = [*progress, outcome][-12:]
+                        ran_command = True
+                        ran_check |= is_check
                     trajectory.append(
                         f"[ACTION] {json.dumps(argv)}\n[OBSERVATION] {output}"
                     )
@@ -494,24 +677,71 @@ class PlainExecutor:
                             "content": output,
                         }
                     )
+                if ran_command and checkpoint_index is not None:
+                    self._git(workspace, budget, "add", "-A", index=checkpoint_index)
+                    tree = (
+                        self._git(
+                            workspace,
+                            budget,
+                            "write-tree",
+                            index=checkpoint_index,
+                        )
+                        .stdout.strip()
+                        .decode("ascii")
+                    )
+                    if tree != staged_tree or (
+                        ran_check and draft is not None and draft.patch
+                    ):
+                        try:
+                            patch = (
+                                draft.patch
+                                if tree == staged_tree
+                                else self._draft_patch(
+                                    workspace,
+                                    budget,
+                                    baseline,
+                                    index=checkpoint_index,
+                                )
+                            )
+                            if patch and tree != staged_tree:
+                                self._check_patch_paths(
+                                    workspace,
+                                    task,
+                                    budget,
+                                    baseline,
+                                    index=checkpoint_index,
+                                )
+                        except (CommandOutputExceeded, _CandidateOutputError):
+                            # Keep the last safe draft while the model fixes transient edits.
+                            pass
+                        else:
+                            editing_route = (
+                                (actor.route, actor.configured_model)
+                                if tree != staged_tree
+                                and actor
+                                and actor.configured_model
+                                else draft.last_editor
+                                if draft is not None
+                                else None
+                            )
+                            draft = DraftCheckpoint(
+                                checkpoint_key,
+                                task.base_sha,
+                                patch,
+                                tuple(progress),
+                                checkpoint_guidance,
+                                editing_route,
+                            )
+                            budget.remaining()
+                            task.save_checkpoint(draft)
+                            staged_tree = tree
             else:
                 trajectory.append(
                     "[OBSERVATION] Reached the rollout model-turn limit. Staging the current patch."
                 )
             self._git(workspace, budget, "add", "-A")
             try:
-                patch = self._git(
-                    workspace,
-                    budget,
-                    "diff",
-                    "--cached",
-                    "--binary",
-                    "--no-renames",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    baseline,
-                    cap=self.limits.patch_bytes,
-                ).stdout
+                patch = self._draft_patch(workspace, budget, baseline)
                 if patch and not clarification:
                     self._check_patch_paths(workspace, task, budget, baseline)
             except (CommandOutputExceeded, _CandidateOutputError) as error:
@@ -552,7 +782,7 @@ class PlainExecutor:
             pass
         raise _CandidateOutputError("Model provided an invalid run tool call")
 
-    def _check_patch_paths(self, workspace, task, budget, baseline):
+    def _check_patch_paths(self, workspace, task, budget, baseline, *, index=None):
         result = self._git(
             workspace,
             budget,
@@ -565,6 +795,7 @@ class PlainExecutor:
             baseline,
             "--",
             cap=self.limits.patch_bytes,
+            index=index,
         )
         entries = result.stdout.split(b"\0")[:-1]
         if not entries or len(entries) % 2:

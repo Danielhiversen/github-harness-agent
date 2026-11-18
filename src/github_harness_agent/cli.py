@@ -10,6 +10,7 @@ from pathlib import Path
 
 import uvicorn
 
+from .activity import control, status
 from .intake import adopt_open_pulls, reconcile
 from .store import PROVIDER_EXHAUSTED, LeaseLost, Store
 from .webhooks import create_app
@@ -283,23 +284,39 @@ def main():
     parser.add_argument(
         "--pull", type=int, help="Existing pull job number for a targeted once run"
     )
-    parser.add_argument("command", choices=["serve", "work", "once", "status", "fence"])
+    parser.add_argument(
+        "command",
+        choices=[
+            "serve",
+            "work",
+            "once",
+            "status",
+            "retry",
+            "resume",
+            "pause",
+            "fence",
+        ],
+    )
     args = parser.parse_args()
     pull = None
-    if args.repo is not None or args.pull is not None:
+    targeted = args.repo is not None or args.pull is not None
+    if args.command in {"pause", "retry", "resume"} or targeted:
         if (
-            args.command != "once"
-            or not args.repo
-            or not args.pull
-            or not 0 < args.pull <= 2**63 - 1
+            not args.repo
+            or args.pull is None
+            and args.command != "status"
+            or (args.pull is not None and not 0 < args.pull <= 2**63 - 1)
+            or args.command not in {"once", "status", "pause", "resume", "retry"}
         ):
             parser.error(
-                "targeted execution requires once, --repo and a positive --pull number"
+                "targeted execution requires once, --repo and a positive --pull number; "
+                "status and per-PR controls also support targeting"
             )
-        pull = (args.repo, args.pull)
+        if args.pull is not None:
+            pull = (args.repo, args.pull)
     with args.config.open("rb") as f:
         config = tomllib.load(f)
-    if pull is not None and args.repo not in config["repositories"]:
+    if args.repo is not None and args.repo not in config["repositories"]:
         parser.error(f"pull repository is not configured: {args.repo}")
     store = Store(config["database"])
     if args.command == "serve":
@@ -311,12 +328,17 @@ def main():
         uvicorn.run(
             app, host=config.get("host", "127.0.0.1"), port=config.get("port", 8080)
         )
-    elif args.command == "status":
-        with store.tx() as db:
-            for row in db.execute(
-                "SELECT repo,kind,issue,state,generation,attempts FROM tasks"
-            ):
-                print(json.dumps(dict(row)))
+    elif args.command in {"status", "pause", "retry", "resume"}:
+        if args.command != "status":
+            try:
+                control(store, args.repo, args.pull, args.command)
+            except ValueError as error:
+                parser.error(str(error))
+        rows = list(status(store, args.repo, args.pull))
+        if args.pull and not rows:
+            parser.error("Pull request has no tracked job")
+        for row in rows:
+            print(json.dumps(row))
     elif args.command == "fence":
         store.fence()
     else:

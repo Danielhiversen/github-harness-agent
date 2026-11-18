@@ -25,6 +25,7 @@ from urllib.parse import quote
 import httpx
 import yaml
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -572,6 +573,7 @@ class ProviderRouter:
         timeout: float | None = None,
         exclude: Sequence[tuple[str, str]] = (),
         provider_offset: int = 0,
+        after_provider: str | None = None,
     ) -> Completion:
         _validate_offset(provider_offset)
         return self._complete(
@@ -582,6 +584,7 @@ class ProviderRouter:
             timeout,
             exclusions=set(exclude),
             provider_offset=provider_offset,
+            after_provider=after_provider,
         )
 
     def _quota_block(self, route: _Route, now: float) -> tuple[str, float] | None:
@@ -654,7 +657,13 @@ class ProviderRouter:
         # those attempts did not produce a usable completion.
         return ordered + deferred, failures
 
-    def _complete(
+    def _complete(self, *args, **kwargs):
+        for event in self._events(*args, **kwargs):
+            if isinstance(event, Completion):
+                return event
+        raise ProviderExhausted(None)
+
+    def _events(
         self,
         routes,
         role,
@@ -664,6 +673,7 @@ class ProviderRouter:
         *,
         exclusions=frozenset(),
         provider_offset=0,
+        after_provider=None,
     ):
         deadline = time.monotonic() + _completion_timeout(timeout)
         routes, failures = self._ordered_routes(
@@ -673,6 +683,10 @@ class ProviderRouter:
             provider_offset,
             _tool_route_affinity(role, messages),
         )
+        if after_provider:
+            # Several public aliases can share a credential and its quota.
+            previous = {r.quota_key for r in self.routes if r.alias == after_provider}
+            routes.sort(key=lambda r: r.quota_key in previous)
         retry_times = []
         needs_initial_tool = (
             tools
@@ -707,6 +721,7 @@ class ProviderRouter:
                     route.alias,
                     route.model,
                 )
+                yield {"provider": route.alias, "model": route.model}
                 response = self.client.post(
                     url,
                     json=payload,
@@ -740,7 +755,8 @@ class ProviderRouter:
                     route.alias,
                     route.model,
                 )
-                return result
+                yield result
+                return
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
                 failures[route.alias] = {
@@ -780,6 +796,7 @@ class _Request(BaseModel):
     )
     exclude: list[tuple[str, str]] = Field(default_factory=list, max_length=1000)
     provider_offset: int = Field(default=0, ge=0, strict=True)
+    after_provider: str | None = Field(default=None, max_length=128)
 
 
 def create_model_gateway(router: ProviderRouter, token: str) -> FastAPI:
@@ -798,6 +815,45 @@ def create_model_gateway(router: ProviderRouter, token: str) -> FastAPI:
             raise HTTPException(
                 503, {"retry_at": exc.retry_at, "failures": exc.failures}
             ) from None
+
+    @app.post("/complete/observed")
+    def observed(payload: _Request, authorization: str = Header(default="")):
+        if not hmac.compare_digest(authorization.encode(), expected):
+            raise HTTPException(401, "Gateway authentication required")
+
+        def stream():
+            events = router._events(
+                router.routes,
+                payload.role,
+                payload.messages,
+                payload.tools,
+                payload.timeout,
+                exclusions=set(payload.exclude),
+                provider_offset=payload.provider_offset,
+                after_provider=payload.after_provider,
+            )
+            try:
+                for event in events:
+                    if isinstance(event, Completion):
+                        yield json.dumps({"completion": asdict(event)}) + "\n"
+                    else:
+                        yield json.dumps({"attempt": event}) + "\n"
+            except ProviderExhausted as error:
+                yield (
+                    json.dumps(
+                        {
+                            "exhausted": {
+                                "retry_at": error.retry_at,
+                                "failures": error.failures,
+                            }
+                        }
+                    )
+                    + "\n"
+                )
+            finally:
+                events.close()
+
+        return StreamingResponse(stream(), media_type="application/x-ndjson")
 
     return app
 
@@ -825,6 +881,8 @@ class ModelGatewayClient:
         timeout: float | None = None,
         exclude: Sequence[tuple[str, str]] = (),
         provider_offset: int = 0,
+        after_provider: str | None = None,
+        on_attempt=None,
     ) -> Completion:
         _validate_offset(provider_offset)
         limit = _completion_timeout(timeout)
@@ -834,29 +892,59 @@ class ModelGatewayClient:
         gateway_timeout = limit - headroom if timeout is not None else None
         receive_timeout = limit if timeout is not None else limit + headroom
         try:
-            response = self.client.post(
-                self.url,
-                headers=self.headers,
-                timeout=httpx.Timeout(
+            request = {
+                "headers": self.headers,
+                "timeout": httpx.Timeout(
                     receive_timeout,
                     connect=min(5, receive_timeout),
                     pool=min(5, receive_timeout),
                     write=min(10, receive_timeout),
                 ),
-                json={
+                "json": {
                     "role": role,
                     "messages": list(messages),
                     "tools": list(tools),
                     "timeout": gateway_timeout,
                     "exclude": list(exclude),
                     "provider_offset": provider_offset,
+                    **({"after_provider": after_provider} if after_provider else {}),
                 },
-            )
-            if response.status_code == 503:
-                details = response.json()["detail"]
-                raise ProviderExhausted(details["retry_at"], details["failures"])
-            response.raise_for_status()
-            result = response.json()
+            }
+            if on_attempt is None:
+                response = self.client.post(self.url, **request)
+                if response.status_code == 503:
+                    details = response.json()["detail"]
+                    raise ProviderExhausted(details["retry_at"], details["failures"])
+                response.raise_for_status()
+                result = response.json()
+            else:
+                with self.client.stream(
+                    "POST", self.url + "/observed", **request
+                ) as response:
+                    if response.status_code in {404, 405}:
+                        # Rollouts can briefly pair a newer worker with the previous gateway.
+                        return self.complete(
+                            role=role,
+                            messages=messages,
+                            tools=tools,
+                            timeout=timeout,
+                            exclude=exclude,
+                            provider_offset=provider_offset,
+                        )
+                    response.raise_for_status()
+                    for line in response.iter_lines():
+                        event = json.loads(line)
+                        if "attempt" in event:
+                            on_attempt(
+                                event["attempt"]["provider"], event["attempt"]["model"]
+                            )
+                        elif "exhausted" in event:
+                            raise ProviderExhausted(**event["exhausted"])
+                        else:
+                            result = event["completion"]
+                            break
+                    else:
+                        raise ValueError("Incomplete gateway response")
             result["tool_calls"] = tuple(result["tool_calls"])
             return Completion(**result)
         except (ValueError, TypeError, KeyError, httpx.HTTPError):

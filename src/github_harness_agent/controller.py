@@ -8,7 +8,10 @@ import logging
 import subprocess
 import tempfile
 from pathlib import Path
+from threading import Lock
 
+from .checkpoint import DraftCheckpoint
+from .ci import CI_BATCH_SIZE, format_ci_feedback, read_ci_report
 from .executor import AttemptRejected, ExecutionError, NeedsClarification, TaskSnapshot
 from .intake import adoptable_pull, eligible, maintainer
 from .publish import (
@@ -30,6 +33,7 @@ from .rebase import (
 )
 from .reviews import ReviewItem, collect_reviews, map_feedback, reply_to_review
 from .store import LeaseLost
+from .task_context import build_task_context, github_history
 
 
 def prepare_commit(path, parent, patch, issue, identity=BOT_IDENTITY, *, adopted=False):
@@ -113,6 +117,89 @@ def acknowledge_feedback(data, item):
         data["threads"].append(item.thread)
 
 
+def draft_scope(job, stage, origin, target, config):
+    data = job["data"]
+    reviews = (
+        sorted(item["key"] for item in data.get("feedback", ()))
+        if stage == "repair"
+        else []
+    )
+    ci_keys = (
+        sorted(item["key"] for item in data.get("ci_feedback", ()))
+        if stage == "repair"
+        else []
+    )
+    owner = ("pull", data["pull"]) if stage == "repair" else (job["kind"], job["issue"])
+    identity = [
+        job["repo"],
+        owner,
+        stage,
+        origin,
+        target.repo,
+        target.ref,
+        reviews,
+        ci_keys,
+        (data["title"], data["body"]) if stage == "implement" else (),
+        config.get("reviewed_guidance", ""),
+        config.get("protected_paths", ()),
+        config.get("checks", ()),
+    ]
+    return hashlib.sha256(json.dumps(identity).encode()).hexdigest(), reviews
+
+
+def restore_drafts(api, checkout, repo, origin, parent, scope, envelope):
+    if envelope.get("scope") != scope:
+        return {}
+    try:
+        old_parent = envelope["parent"]
+        drafts = {
+            key: DraftCheckpoint.from_data(value)
+            for key, value in envelope["drafts"].items()
+        }
+        if envelope["head"] != origin or any(
+            key != draft.key or draft.base_sha != old_parent
+            for key, draft in drafts.items()
+        ):
+            raise ValueError("inconsistent draft metadata")
+        if old_parent == parent or not drafts:
+            return drafts
+        old_target = TargetBase(**envelope["target"])
+        old_base = (
+            TargetBase(**envelope["previous_base"])
+            if envelope.get("previous_base")
+            else None
+        )
+        recreated = branch_parent(
+            api,
+            checkout,
+            repo,
+            origin,
+            old_target,
+            tuple(envelope["identity"]),
+            old_base,
+        )
+        if recreated != old_parent:
+            raise RebaseConflict("could not reproduce the saved draft checkout")
+        try:
+            return {
+                key: dataclasses.replace(
+                    draft,
+                    base_sha=parent,
+                    patch=transplant_patch(checkout, parent, draft.patch),
+                    progress=(),
+                )
+                for key, draft in drafts.items()
+            }
+        except RebaseConflict as error:
+            raise RebaseConflict(
+                "saved draft conflicts with the current target base"
+            ) from error
+        finally:
+            git(checkout, "checkout", "--detach", "--force", parent)
+    except (KeyError, TypeError, ValueError) as error:
+        raise RebaseConflict("saved draft metadata could not be recovered") from error
+
+
 class Controller:
     def __init__(self, store, api, executor, config, bot_login):
         self.store, self.api, self.executor = store, api, executor
@@ -178,16 +265,41 @@ class Controller:
         checks = tuple(tuple(check) for check in cfg["checks"])
         if not checks:
             raise ValueError("Configure at least one trusted check")
+
+        def retire_ci_failures(head):
+            selected = data.get("ci_feedback")
+            if not selected:
+                return False
+            report = read_ci_report(api, repo, head)
+            active = {failure.key for failure in report.failures}
+            retired = {
+                failure["key"]
+                for failure in selected
+                if failure["source"] in report.sources and failure["key"] not in active
+            }
+            if not retired:
+                return False
+            data["ci_feedback"] = [
+                failure for failure in selected if failure["key"] not in retired
+            ]
+            data["ci_seen"] = [
+                key for key in data.get("ci_seen", []) if key not in retired
+            ]
+            data.pop("prepared", None)
+            data.pop("draft_checkpoints", None)
+            return True
+
         if stage != "implement":
             pr = read_pull()
             if adopted:
                 instructions = (
                     "The pull request implementation is already present. Treat its description as "
-                    "background. Change only what the outstanding review requests require, and add "
-                    "the requested regression tests.\n\n"
+                    "background. Change only what the outstanding review requests or CI failures "
+                    "require, and add the requested regression tests.\n\n"
                     f"{pr['title']}\n\n{pr.get('body') or ''}"
                 )
             if stage == "watch":
+                data.pop("draft_checkpoints", None)
                 batch = collect_reviews(
                     api,
                     repo=repo,
@@ -200,18 +312,65 @@ class Controller:
                 )
                 for item in batch.handled:
                     acknowledge_feedback(data, item)
-                if not batch.items:
+                head = data.get("last_commit")
+                ci_feedback = []
+                if (
+                    head
+                    and head == batch.head == pr["head"]["sha"]
+                    and adoptable_pull(pr, repo, self.bot_login, branch)
+                    and publisher.branch_head(repo, branch) == head
+                ):
+                    seen = {
+                        key
+                        for key in data.get("ci_seen", ())
+                        if key.startswith(f"{head}:")
+                    }
+                    attempted = () if batch.items else data.get("ci_attempted", ())
+                    report = read_ci_report(api, repo, head)
+                    ci_feedback = [
+                        failure
+                        for failure in report.failures
+                        if failure.key not in seen and failure.identity not in attempted
+                    ][: max(0, min(CI_BATCH_SIZE, 128 - len(seen)))]
+                if not batch.items and not ci_feedback:
                     store.save(job, "queued", delay=45)
                     return
-                if data["round"] >= 3:
+                if data["round"] >= data.get("allowed_rounds", 3):
+                    data["pause_reason"] = "review repair round limit reached"
                     store.save(job, "paused")
                     return
                 data["feedback"] = [dataclasses.asdict(item) for item in batch.items]
+                data["ci_feedback"] = [dataclasses.asdict(item) for item in ci_feedback]
+                if ci_feedback:
+                    data["ci_seen"] = sorted(seen | {item.key for item in ci_feedback})
                 data["review_head"] = batch.head
                 data["stage"] = stage = "repair"
                 data.pop("model_attempt_failures", None)
                 data.pop("prior_model_attempt_failures", None)
                 store.save(job)
+            elif stage == "repair" and data.get("ci_feedback"):
+                head = data["review_head"]
+                current_branch = publisher.branch_head(repo, branch)
+                pushed = data.get("prepared", {}).get("sha")
+                if not pushed or current_branch != pushed:
+                    if head == data.get("last_commit") == pr["head"][
+                        "sha"
+                    ] == current_branch and adoptable_pull(
+                        pr, repo, self.bot_login, branch
+                    ):
+                        if retire_ci_failures(head) and not (
+                            data["ci_feedback"] or data["feedback"]
+                        ):
+                            data["stage"] = "watch"
+                            store.save(job, "queued", delay=45)
+                            return
+                    else:
+                        data.pop("ci_feedback", None)
+                        data.pop("prepared", None)
+                        data.pop("draft_checkpoints", None)
+                        data["stage"] = "watch"
+                        store.save(job, "queued")
+                        return
             origin = data["review_head"]
 
         if stage not in {"reply", "question"}:
@@ -260,16 +419,33 @@ class Controller:
                     api.fetch(repo, path, parent)
                 git(path, "checkout", "--detach", "--force", parent)
                 guides = git(path, "ls-tree", "--name-only", parent).splitlines()
-                if b"AGENTS.md" in guides:
-                    instructions += (
-                        "\nRepository instructions:\n"
-                        + git(path, "show", parent + ":AGENTS.md").decode()
+                guide = (
+                    git(path, "show", parent + ":AGENTS.md").decode(errors="replace")
+                    if b"AGENTS.md" in guides
+                    else ""
+                )
+
+                def current_context():
+                    feedback = data.get("feedback", ()) if stage == "repair" else ()
+                    failures = (
+                        data.get("model_attempt_failures")
+                        or data.get("prior_model_attempt_failures")
+                        or ()
                     )
-                if prepared is not None and stage == "repair":
-                    instructions += (
-                        "\nReview requests against this commit:\n"
-                        + json.dumps(data["feedback"])
+                    previous = (
+                        failures[-1].get("reason")
+                        if failures
+                        else data.get("last_error")
                     )
+                    return build_task_context(
+                        instructions,
+                        repository_guide=guide,
+                        feedback=feedback,
+                        previous_failure=previous or "",
+                        extra_evidence=format_ci_feedback(data.get("ci_feedback", ())),
+                        history=github_history(api, repo, issue, pull, feedback),
+                    )
+
                 if "prepared" not in data:
                     if stage == "repair":
                         mapped = []
@@ -307,17 +483,13 @@ class Controller:
                                     return
                                 acknowledge_feedback(data, item)
                         data["feedback"] = mapped
-                        if not mapped:
+                        if not mapped and not data.get("ci_feedback"):
                             data["stage"] = "watch"
                             if cfg.get("mode", "shadow") == "shadow":
                                 store.save(job, "shadow_complete")
                             else:
                                 store.save(job, "queued", delay=45)
                             return
-                        instructions += (
-                            "\nReview requests against this commit:\n"
-                            + json.dumps(mapped)
-                        )
                     failures = data.get("model_attempt_failures", [])
                     excluded = tuple(
                         (
@@ -326,15 +498,82 @@ class Controller:
                         )
                         for record in failures
                     )
+                    scope, review_keys = draft_scope(job, stage, origin, target, cfg)
+                    existing = data.get("draft_checkpoints", {})
+                    if existing and existing.get("scope") != scope:
+                        data.pop("draft_checkpoints")
+                        store.save(job)
+                    try:
+                        checkpoints = restore_drafts(
+                            api, path, repo, origin, parent, scope, existing
+                        )
+                    except RebaseConflict as error:
+                        data["retired_draft_checkpoints"] = data.pop(
+                            "draft_checkpoints"
+                        )
+                        raise RebaseConflict(
+                            f"{error}. The previous draft was retired. Use resume to start from the current checkout."
+                        ) from error
+                    saved = {
+                        "scope": scope,
+                        "head": origin,
+                        "reviews": review_keys,
+                        "ci_keys": sorted(
+                            item["key"] for item in data.get("ci_feedback", ())
+                        ),
+                        "target": dataclasses.asdict(target),
+                        "parent": parent,
+                        "identity": identity,
+                        "previous_base": dataclasses.asdict(previous_base)
+                        if previous_base
+                        else None,
+                        "drafts": {
+                            key: draft.to_data() for key, draft in checkpoints.items()
+                        },
+                    }
+                    checkpoint_lock = Lock()
+                    retry_offset = data.get("provider_retry_count", 0)
+                    if (
+                        checkpoints
+                        and job.get("state") == "running"
+                        and not any(draft.last_editor for draft in checkpoints.values())
+                    ):
+                        retry_offset = max(retry_offset, 1)
+
+                    def save_checkpoint(draft):
+                        with checkpoint_lock:
+                            if (
+                                data["stage"] != stage
+                                or draft.base_sha != parent
+                                or data.get("review_head") != origin
+                                and stage == "repair"
+                            ):
+                                raise LeaseLost()
+                            if draft.patch:
+                                saved["drafts"][draft.key] = draft.to_data()
+                            else:
+                                saved["drafts"].pop(draft.key, None)
+                            if saved["drafts"]:
+                                data["draft_checkpoints"] = saved
+                            else:
+                                data.pop("draft_checkpoints", None)
+                            store.save(job)
+
+                    context = current_context()
                     task = TaskSnapshot(
                         repo,
                         parent,
-                        instructions,
+                        context.instructions,
                         checks,
                         protected_paths=tuple(cfg.get("protected_paths", ())),
                         repository_guidance=cfg.get("reviewed_guidance", ""),
                         excluded_models=excluded,
-                        provider_offset=data.get("provider_retry_count", 0),
+                        provider_offset=retry_offset,
+                        checkpoint_scope=scope,
+                        checkpoints=checkpoints,
+                        save_checkpoint=save_checkpoint,
+                        observe_model=lambda *event: store.observe_model(job, *event),
+                        context=context,
                     )
 
                     try:
@@ -344,6 +583,15 @@ class Controller:
                             pull is not None
                             and publisher.branch_head(repo, branch) != origin
                         ):
+                            if checkpoints:
+                                data["retired_draft_checkpoints"] = data.pop(
+                                    "draft_checkpoints"
+                                )
+                                data["stage"] = "watch"
+                                raise RebaseConflict(
+                                    "Pull request head changed. The previous draft was retired. "
+                                    "Use resume to remap outstanding feedback on the current head."
+                                )
                             data["stage"] = "watch"
                             store.save(job, "queued")
                             return
@@ -381,9 +629,20 @@ class Controller:
                         if stage != "repair":
                             raise
                         if cfg.get("mode", "shadow") == "shadow":
+                            data.pop("draft_checkpoints", None)
                             store.save(job, "shadow_complete")
                             return
+                        if not data["feedback"] and data.get("ci_feedback"):
+                            data.pop("ci_feedback")
+                            data.pop("draft_checkpoints", None)
+                            data["stage"] = "watch"
+                            data["ci_diagnostic"] = (
+                                "CI evidence needs maintainer investigation"
+                            )
+                            store.save(job, "queued", delay=45)
+                            return
                         data.update(stage="question", question=str(err))
+                        data.pop("draft_checkpoints", None)
                         store.save(job, "queued")
                         return
                     data["prepared"] = {
@@ -413,6 +672,7 @@ class Controller:
                         if result.refinement
                         else None,
                     }
+                    data.pop("draft_checkpoints", None)
                     store.save(job)
                 prepared = data["prepared"]
                 latest = publisher.target(repo, data["base"], pull)
@@ -422,6 +682,15 @@ class Controller:
                     data["stage"] = "watch"
                     store.save(job, "queued")
                     return
+                if (
+                    pull is not None
+                    and published_head == origin
+                    and retire_ci_failures(origin)
+                ):
+                    if not (data["ci_feedback"] or data["feedback"]):
+                        data["stage"] = "watch"
+                    store.save(job, "queued")
+                    return
                 if latest != target and published_head != prepared["sha"]:
                     parent = branch_parent(
                         api, path, repo, origin, latest, identity, previous_base
@@ -429,10 +698,11 @@ class Controller:
                     patch = transplant_patch(
                         path, parent, base64.b64decode(prepared["patch"])
                     )
+                    context = current_context()
                     verify_task = TaskSnapshot(
                         repo,
                         parent,
-                        instructions,
+                        context.instructions,
                         checks,
                         protected_paths=tuple(cfg.get("protected_paths", ())),
                         repository_guidance=cfg.get("reviewed_guidance", ""),
@@ -489,6 +759,7 @@ class Controller:
                 if cfg.get("mode", "shadow") == "shadow":
                     store.save(job, "shadow_complete")
                     return
+                ci_evidence = []
                 if stage == "implement":
                     published = publisher.publish(
                         PublishRequest(
@@ -526,7 +797,18 @@ class Controller:
                         data["stage"] = "watch"
                         store.save(job, "queued")
                         return
-                    data.update(stage="reply", round=data["round"] + 1)
+                    human_feedback = bool(data["feedback"])
+                    attempted = [] if human_feedback else data.get("ci_attempted", [])
+                    ci_evidence = data.pop("ci_feedback", [])
+                    addressed = [item["identity"] for item in ci_evidence]
+                    data["ci_attempted"] = list(
+                        dict.fromkeys([*attempted, *addressed])
+                    )[-32:]
+                    data.pop("ci_diagnostic", None)
+                    data.update(
+                        stage="reply" if human_feedback else "watch",
+                        round=data["round"] + 1,
+                    )
                 data["last_commit"] = sha
                 data["last_target"] = dataclasses.asdict(target)
                 data["last_checks"] = prepared["checks"]
@@ -542,6 +824,8 @@ class Controller:
                     )
                     if key in prepared
                 }
+                if ci_evidence:
+                    data["last_evidence"]["ci_failures"] = ci_evidence
                 del data["prepared"]
                 store.save(job)
         if data["stage"] in {"reply", "question"}:
