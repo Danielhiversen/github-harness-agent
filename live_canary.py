@@ -41,6 +41,28 @@ router = ProviderRouter(load_manifest(), [dict(model="kilo-free/kilo-auto/free",
 executor = PlainExecutor(DockerRunner("canary-worker",runtime="runc"),router,Limits(wall_time=300,model_requests=40))
 controller = Controller(db,api,executor,config,"github-actions[bot]")
 reconcile(api,db,repo,config)
+from dataclasses import asdict
+from github_harness_agent.reviews import collect_reviews
+from github_harness_agent.intake import maintainer
+import base64
+
+# This hosted runner has a fresh database. Reconstruct only the outstanding reply
+# from the reviewed PR and the verified repair recorded in the previous run.
+job = db.claim()
+assert job["issue"] == 2
+sha = "9bbc03d96393907b74c00d4c6732c8310183fca3"
+pr = api.rest("GET",f"/repos/{repo}/pulls/3")
+assert pr["head"]["sha"] == sha and pr["head"]["ref"] == "canary/issue-2"
+batch = collect_reviews(api,repo=repo,pull=3,bot_login="github-actions[bot]",
+                        authorized=lambda login:maintainer(api,repo,login))
+assert batch.head == sha and len(batch.items)==1
+page = api.rest("GET",f"/repos/{repo}/contents/docs/queue-status.md",params={"ref":sha})
+body = base64.b64decode(page["content"]).decode()
+assert all(x in body for x in ("read-only","while the worker is active","uv run github-harness-agent --config agent.toml status"))
+job["data"].update(stage="reply",round=1,pull=3,last_commit=sha,
+                   last_checks=["Verified the queue-status command and both requested operator details against the committed file."],
+                   review_head=pr["head"]["sha"],feedback=[asdict(i) for i in batch.items])
+db.save(job,"queued")
 deadline = time.monotonic()+900
 attempts=0
 while time.monotonic()<deadline:
