@@ -289,5 +289,16 @@ def refine(executor, task, archive, budget):
             },
             tuple(result.to_dict()["stages"]),
             tuple(candidates),
+            selected_candidate=adopted,
         )
-        return patch, evidence, adapter.actors[result.rollouts[adopted].run_id]
+        resumed_base = (
+            (adapter.seed_draft.patch, adapter.actors["base"])
+            if adapter.seed_draft is not None
+            else None
+        )
+        return (
+            patch,
+            evidence,
+            adapter.actors[result.rollouts[adopted].run_id],
+            resumed_base,
+        )

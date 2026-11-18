@@ -7,7 +7,7 @@ import re
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from math import isfinite
 from pathlib import Path, PurePosixPath
@@ -113,6 +113,10 @@ class _CandidateOutputError(ExecutionError):
     pass
 
 
+class _VerificationRejected(ExecutionError):
+    """A trusted check ran and rejected the candidate."""
+
+
 @dataclass(frozen=True)
 class TaskSnapshot:
     repository: str
@@ -209,6 +213,7 @@ class RefinementEvidence:
     harness_guidance: dict[str, str]
     stages: tuple[dict[str, Any], ...]
     candidates: tuple[CandidateEvidence, ...]
+    selected_candidate: str | None = None
 
 
 @dataclass(frozen=True)
@@ -895,13 +900,11 @@ class PlainExecutor:
                 checks.extend(self._run_checks(workspace, budget, task.checks))
         if checks[-1].returncode:
             failed = checks[-1]
-            error = ExecutionError(f"Required check failed: {failed.command[0]}")
+            rejection = 0 < failed.returncode < 125
+            error_type = _VerificationRejected if rejection else ExecutionError
+            error = error_type(f"Required check failed: {failed.command[0]}")
             error.checks = tuple(checks)
-            if (
-                actor is not None
-                and actor.configured_model
-                and 0 < failed.returncode < 125
-            ):
+            if actor is not None and actor.configured_model and rejection:
                 if trusted_passed:
                     budget.reject(error, actor)
                 with self.verification_runner.workspace(
@@ -913,7 +916,12 @@ class PlainExecutor:
                     )
                 if result.returncode == 0:
                     budget.reject(error, actor)
-                error = ExecutionError(
+                error_type = (
+                    _VerificationRejected
+                    if 0 < result.returncode < 125
+                    else ExecutionError
+                )
+                error = error_type(
                     f"Required check also failed on the baseline: {failed.command[0]}"
                 )
                 error.checks = tuple(checks)
@@ -943,7 +951,47 @@ class Harness2Executor(PlainExecutor):
         budget = _Budget(self.limits, cancelled, task)
         archive = self._archive(task, checkout, budget)
         try:
-            patch, evidence, actor = refine(self, task, archive, budget)
+            patch, evidence, actor, resumed_base = refine(self, task, archive, budget)
         except _RequestBudgetExceeded as error:
             budget.reject(error, None, latest=True)
-        return self._verify(task, archive, budget, patch, evidence, actor=actor)
+        try:
+            return self._verify(task, archive, budget, patch, evidence, actor=actor)
+        except (
+            AttemptRejected,
+            _CandidateOutputError,
+            _VerificationRejected,
+        ) as rejected:
+            if isinstance(rejected, LimitExceeded) or resumed_base is None:
+                raise
+            base_patch, base_actor = resumed_base
+            if patch == base_patch:
+                raise
+            fallback_evidence = replace(
+                evidence,
+                selected_candidate="base",
+                candidates=tuple(
+                    replace(
+                        candidate, error=f"Verification rejected: {rejected}"[:1000]
+                    )
+                    if candidate.label == evidence.selected_candidate
+                    else candidate
+                    for candidate in evidence.candidates
+                ),
+            )
+            try:
+                return self._verify(
+                    task,
+                    archive,
+                    budget,
+                    base_patch,
+                    fallback_evidence,
+                    actor=base_actor,
+                )
+            except (
+                AttemptRejected,
+                _CandidateOutputError,
+                _VerificationRejected,
+            ) as base_error:
+                if isinstance(base_error, LimitExceeded):
+                    raise
+                raise rejected from base_error

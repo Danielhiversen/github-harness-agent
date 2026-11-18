@@ -698,6 +698,79 @@ def test_provider_loss_resumes_saved_edit_in_new_worker(fixture, executor_class)
     assert (source / "number.txt").read_text() == "3\n"
 
 
+@pytest.mark.parametrize(
+    ("resumed", "failure", "baseline_passed"),
+    [(True, 1, False), (True, 1, True), (False, 1, False), (True, 126, False)],
+)
+def test_harness2_falls_back_to_completed_resumed_base_only_on_check_rejection(
+    fixture,
+    resumed,
+    failure,
+    baseline_passed,
+):
+    from github_harness_agent.checkpoint import DraftCheckpoint
+    from github_harness_agent.harness2_adapter import BASE_GUIDANCE
+    from github_harness_agent.rebase import git
+
+    task, source, runner = fixture
+    saved = {}
+    if resumed:
+        (source / "number.txt").write_text("4\n")
+        git(source, "add", "number.txt")
+        patch = git(
+            source, "diff", "--cached", "--binary", "--full-index", task.base_sha
+        )
+        git(source, "reset", "--hard", task.base_sha)
+        draft = DraftCheckpoint(
+            "harness2/base", task.base_sha, patch, guidance=BASE_GUIDANCE
+        )
+        saved[draft.key] = draft
+    accepted = ("3\n", "4\n") if baseline_passed else ("4\n",)
+    task = replace(
+        task,
+        checkpoints=saved,
+        checks=(
+            (
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; import sys; "
+                    f"sys.exit(0 if Path('number.txt').read_text() in {accepted!r} else {failure})"
+                ),
+            ),
+        ),
+    )
+
+    class FinalIntroducesRegression:
+        def complete(self, **kwargs):
+            selected = (
+                kwargs["role"] == "coding"
+                and "Inspect the result." in kwargs["messages"][0]["content"]
+            )
+            value = 99 if selected else 4
+            code = f"open('number.txt', 'w').write('{value}\\n')"
+            return ScriptedGateway(code).complete(**kwargs)
+
+    executor = Harness2Executor(runner, FinalIntroducesRegression())
+    if not resumed or failure == 126:
+        with pytest.raises(ExecutionError, match="Required check"):
+            executor.execute(task, source)
+        return
+
+    result = executor.execute(task, source)
+    assert b"+4\n" in result.patch
+    assert b"+99\n" not in result.patch
+    assert result.checks[0].command == task.checks[0]
+    assert result.checks[0].returncode == 0
+    assert result.refinement.selected_candidate == "base"
+    evidence = {
+        candidate.label: candidate for candidate in result.refinement.candidates
+    }
+    assert evidence["base"].patch_digest == result.patch_digest
+    assert "Required check" in evidence["c1"].error
+    assert result.route_trace
+
+
 def test_rollout_reads_omitted_evidence_and_limits_command_output(fixture):
     from github_harness_agent.task_context import build_task_context
 
