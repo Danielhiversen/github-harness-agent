@@ -119,6 +119,15 @@ class _CandidateOutputError(ExecutionError):
     pass
 
 
+class _ProtectedPatchError(_CandidateOutputError):
+    repair_feedback = (
+        "The candidate changed protected content outside the allowed scope. "
+        "Restore protected regions to the pinned baseline and keep any authorized "
+        "test update limited to the requested region. Put additional tests in a "
+        "separate new test module."
+    )
+
+
 class _VerificationRejected(ExecutionError):
     """A trusted check ran and rejected the candidate."""
 
@@ -756,6 +765,12 @@ class PlainExecutor:
                                     baseline,
                                     index=checkpoint_index,
                                 )
+                        except _ProtectedPatchError as error:
+                            # Keep the previous safe draft and let the model correct the checkout.
+                            if task.verify_base_first:
+                                feedback = f"[PATCH VALIDATION] {error.repair_feedback}"
+                                messages[-1]["content"] += f"\n\n{feedback}"
+                                trajectory.append(feedback)
                         except (CommandOutputExceeded, _CandidateOutputError):
                             # Keep the last safe draft while the model fixes transient edits.
                             pass
@@ -889,7 +904,7 @@ class PlainExecutor:
                 and task.test_update.partition("::")[0] == path
             )
             if _protected(path, task, new_test=new_test, amended_test=amended_test):
-                raise _CandidateOutputError(f"Patch changes protected path: {path}")
+                raise _ProtectedPatchError(f"Patch changes protected path: {path}")
             if amended_test:
                 baseline_blob, amended_blob = (
                     self._git(
@@ -904,7 +919,7 @@ class PlainExecutor:
                     for revision in (f"{baseline}:{path}", f":{path}")
                 )
                 if not valid_test_update(task.test_update, baseline_blob, amended_blob):
-                    raise _CandidateOutputError(
+                    raise _ProtectedPatchError(
                         f"Patch exceeds authorized test update: {path}"
                     )
                 amended_test_path = True

@@ -1101,3 +1101,46 @@ def test_harness2_review_retries_failed_base_with_safe_check_summary(fixture):
     assert "test_number.py::test_number" in base.error
     assert "private-" not in base.error
     assert repaired.patch_digest == result.patch_digest
+
+
+def test_review_protected_test_rejection_retries_from_last_safe_draft(fixture):
+    task, source, runner = fixture
+    saved = {}
+    task = replace(
+        task,
+        verify_base_first=True,
+        test_update="test_number.py::test_number",
+        save_checkpoint=lambda draft: saved.update({draft.key: draft}),
+    )
+
+    class RepairGateway(ScriptedGateway):
+        def complete(self, **kwargs):
+            messages = kwargs["messages"]
+            turn = len(self.roles)
+            if turn == 1:
+                self.code = "open('test_number.py', 'a').write('\\nassert False\\n')"
+                kwargs["messages"] = [{"role": "user", "content": "edit"}]
+            elif turn == 2:
+                assert "restore" in messages[-1]["content"].lower()
+                assert "baseline" in messages[-1]["content"]
+                self.code = None
+            elif turn == 3:
+                assert "separate new test module" in messages[-1]["content"]
+                self.code = (
+                    "from pathlib import Path; assert Path('number.txt').read_text() == '4\\n'; "
+                    "assert 'assert False' not in Path('test_number.py').read_text(); "
+                    "Path('test_regression.py').write_text('def test_regression():\\n    assert True\\n')"
+                )
+            return super().complete(**kwargs)
+
+    gateway = RepairGateway("open('number.txt', 'w').write('4\\n')")
+    result = Harness2Executor(runner, gateway, Limits(model_requests=5)).execute(
+        task, source
+    )
+
+    assert gateway.roles == ["coding"] * 5
+    assert result.refinement.selected_candidate == "repair"
+    assert "baseline" in result.refinement.candidates[0].error
+    assert b"test_number.py" not in result.patch
+    assert b"test_regression.py" in result.patch
+    assert b"test_number.py" not in saved["harness2/base"].patch

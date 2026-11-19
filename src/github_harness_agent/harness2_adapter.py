@@ -13,6 +13,7 @@ from .executor import (
     CandidateEvidence,
     RefinementEvidence,
     SYSTEM_PROMPT,
+    _ProtectedPatchError,
     _VerificationRejected,
 )
 from .providers import ProviderExhausted
@@ -40,8 +41,7 @@ _PYTEST_FAILURE = re.compile(
 )
 
 
-def _check_feedback(task, error):
-    failure = error.__cause__ if isinstance(error, AttemptRejected) else error
+def _check_feedback(task, failure):
     if not isinstance(failure, _VerificationRejected):
         return ""
     failed = failure.checks[-1]
@@ -68,41 +68,65 @@ def verify_review_repair(executor, task, archive, budget):
     prompt = f"{SYSTEM_PROMPT}\n\n{guidance}"
     candidates = []
     seed = None
-    rollout_task = task
+    last_safe = None
+
+    def save_base(draft):
+        nonlocal last_safe
+        task.save_checkpoint(draft)
+        last_safe = draft
+
+    rollout_task = (
+        replace(task, save_checkpoint=save_base)
+        if task.save_checkpoint is not None
+        else task
+    )
 
     for label in ("base", "repair"):
         key = f"harness2/{label}"
-        patch, trajectory, actor = executor._rollout(
-            rollout_task,
-            archive,
-            budget,
-            prompt,
-            "coding",
-            checkpoint_key=key,
-            checkpoint_guidance=guidance,
-            seed_draft=seed,
-        )
-        candidate = CandidateEvidence(
-            label,
-            hashlib.sha256(patch).hexdigest() if patch else None,
-            trajectory[-5000:] or "[OBSERVATION] No command was run.",
-        )
+        candidate = CandidateEvidence(label, None, "")
         try:
+            patch, trajectory, actor = executor._rollout(
+                rollout_task,
+                archive,
+                budget,
+                prompt,
+                "coding",
+                checkpoint_key=key,
+                checkpoint_guidance=guidance,
+                seed_draft=seed,
+            )
+            candidate = CandidateEvidence(
+                label,
+                hashlib.sha256(patch).hexdigest() if patch else None,
+                trajectory[-5000:] or "[OBSERVATION] No command was run.",
+            )
             verified = executor._verify(task, archive, budget, patch, actor=actor)
-        except (AttemptRejected, _VerificationRejected) as error:
-            feedback = _check_feedback(task, error)
-            if not feedback or label == "repair":
+        except (AttemptRejected, _ProtectedPatchError, _VerificationRejected) as error:
+            if label == "repair":
                 raise
+            failure = error.__cause__ if isinstance(error, AttemptRejected) else error
+            if isinstance(failure, _ProtectedPatchError):
+                feedback = failure.repair_feedback
+                # A resumed checkpoint is only eligible if the rollout restored it.
+                safe = last_safe
+                if safe is None and candidate.patch_digest is not None:
+                    safe = task.checkpoints.get("harness2/base")
+                if safe is not None and safe.patch:
+                    seed = replace(safe, key="harness2/repair")
+            else:
+                feedback = _check_feedback(task, failure)
+                if not feedback:
+                    raise
+                seed = DraftCheckpoint(
+                    "harness2/repair", task.base_sha, patch, guidance=guidance
+                )
             candidates.append(replace(candidate, error=feedback))
             rollout_task = replace(
                 task,
                 instructions=(
-                    f"{task.instructions}\n\nIndependent verification of the "
+                    f"{task.instructions}\n\nIndependent validation of the "
                     f"draft failed. {feedback} Inspect and repair the draft."
                 ),
-            )
-            seed = DraftCheckpoint(
-                "harness2/repair", task.base_sha, patch, guidance=guidance
             )
         else:
             candidates.append(candidate)
