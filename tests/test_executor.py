@@ -558,6 +558,102 @@ def test_exact_edit_refuses_to_follow_symlink_parents(tmp_path):
     assert file.read_text() == "initial"
 
 
+def test_rollout_stages_model_edits_without_check_byproducts(fixture):
+    task, source, runner = fixture
+    (source / "tracked runtime.dat").write_text("previous runtime output")
+    (source / "check_suite.py").write_text(
+        "from pathlib import Path\n"
+        "from subprocess import run\n"
+        "Path('generated [1].dat').write_bytes(b'\\x00byproduct')\n"
+        "Path('tracked runtime.dat').write_text('regenerated')\n"
+        "Path('keep.txt').touch()\n"
+        "if not Path('claim.txt').exists():\n"
+        "    Path('claim.txt').write_text('generated')\n"
+        "run(['git', 'add', 'generated [1].dat'], check=True)\n"
+    )
+    subprocess.run(["git", "add", "."], cwd=source, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=f@example.test",
+            "commit",
+            "-qm",
+            "include check fixture",
+        ],
+        cwd=source,
+        check=True,
+    )
+    sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=source, text=True
+    ).strip()
+    receipts = []
+    task = replace(
+        task,
+        base_sha=sha,
+        checks=(
+            (
+                sys.executable,
+                "-c",
+                "from pathlib import Path; "
+                "assert not Path('generated [1].dat').exists(); "
+                "assert not Path('tracked runtime.dat').exists(); "
+                "assert Path('number.txt').read_text() == '4\\n'",
+            ),
+        ),
+        save_checkpoint=receipts.append,
+    )
+    actions = [
+        ("edit_file", {"path": "number.txt", "old_text": "3", "new_text": "4"}),
+        ("edit_file", {"path": "keep.txt", "new_text": "intentional before the check"}),
+        ("run", {"argv": ["rm", "tracked runtime.dat"]}),
+        ("run", {"argv": [sys.executable, "-m", "unittest", "check_suite"]}),
+        (
+            "edit_file",
+            {
+                "path": "claim.txt",
+                "old_text": "generated",
+                "new_text": "intentional after the check",
+            },
+        ),
+    ]
+
+    class CheckGateway(ScriptedGateway):
+        def complete(self, **kwargs):
+            reply = super().complete(**kwargs)
+            turn = len(self.roles)
+            if turn <= len(actions):
+                name, arguments = actions[turn - 1]
+                reply.tool_calls = (
+                    {
+                        "id": f"check-{turn}",
+                        "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(arguments)},
+                    },
+                )
+            return reply
+
+    result = PlainExecutor(runner, CheckGateway(None)).execute(task, source)
+    assert b"generated [1].dat" not in result.patch
+    assert b"deleted file mode" in result.patch
+    assert b"tracked runtime.dat" in result.patch
+    assert b"intentional before the check" in result.patch
+    assert b"intentional after the check" in result.patch
+    assert receipts[-1].patch == result.patch
+    assert all(b"generated [1].dat" not in draft.patch for draft in receipts)
+    assert (runner.workspaces[0] / "generated [1].dat").exists()
+    assert (runner.workspaces[0] / "tracked runtime.dat").exists()
+
+    draft = receipts[-1]
+    actions[:] = [actions[3]]
+    resumed = PlainExecutor(runner, CheckGateway(None)).execute(
+        replace(task, checkpoints={draft.key: draft}), source
+    )
+    assert resumed.patch == result.patch
+
+
 @pytest.mark.parametrize(
     ("limit", "edit_at_cap", "expected_turns"),
     [(None, False, 12), (None, True, 12), (2, True, 2)],

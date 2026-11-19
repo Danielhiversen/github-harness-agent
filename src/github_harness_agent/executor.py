@@ -16,6 +16,7 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from .activity import observed_call
+from .check_artifacts import STAT_FILES_COMMAND, check_label
 from .checkpoint import DraftCheckpoint
 from .file_edit import EDIT_COMMAND, EDIT_TOOL, InvalidEdit, edit_payload
 from .providers import ProviderExhausted
@@ -559,9 +560,7 @@ class PlainExecutor:
         return tree
 
     @staticmethod
-    def _command_progress(argv, returncode):
-        test_tools = {"pytest", "ruff", "mypy", "vitest", "mocha", "jest", "unittest"}
-        check = next((arg for arg in argv if arg in test_tools), None)
+    def _command_progress(argv, returncode, check):
         executable = PurePosixPath(argv[0]).name
         label = check or (
             executable if executable in {"python", "python3", "git"} else "command"
@@ -570,6 +569,78 @@ class PlainExecutor:
             "exceeded output limit" if returncode is None else f"exited {returncode}"
         )
         return f"{label} {status}", check is not None
+
+    def _checkout_paths(self, workspace, budget, index, *selection):
+        result = self._git(
+            workspace,
+            budget,
+            "ls-files",
+            *selection,
+            "-z",
+            index=index,
+        )
+        return set(result.stdout.split(b"\0")[:-1])
+
+    def _check_snapshot(self, workspace, budget, index):
+        try:
+            return (
+                self._checkout_paths(
+                    workspace, budget, index, "--others", "--exclude-standard"
+                ),
+                self._checkout_paths(workspace, budget, index, "--deleted"),
+            )
+        except CommandOutputExceeded as error:
+            raise _CandidateOutputError(
+                "Checkout path inventory exceeded the limit for tracking check output."
+            ) from error
+
+    def _artifact_state(self, workspace, budget, paths):
+        if not paths:
+            return {}
+        paths = sorted(paths)
+        result = self._command(
+            workspace,
+            budget,
+            STAT_FILES_COMMAND,
+            data=b"\0".join(paths) + b"\0",
+            cap=self.limits.patch_bytes,
+        )
+        return {
+            path: state
+            for path, state in zip(paths, result.stdout.splitlines(), strict=True)
+            if state
+        }
+
+    def _stage_rollout(self, workspace, budget, artifacts, *, index=None):
+        if not artifacts:
+            self._git(workspace, budget, "add", "-A", index=index)
+            return
+        paths = sorted(artifacts)
+        pathspec_input = ("--pathspec-from-file=-", "--pathspec-file-nul")
+        # A check may have staged its output or restored a deleted tracked path.
+        # Remove the attributed entries from the index and leave working files intact.
+        self._git(
+            workspace,
+            budget,
+            "--literal-pathspecs",
+            "rm",
+            "--cached",
+            "-qrf",
+            "--ignore-unmatch",
+            *pathspec_input,
+            data=b"\0".join(paths) + b"\0",
+            index=index,
+        )
+        self._git(
+            workspace,
+            budget,
+            "add",
+            "-A",
+            *pathspec_input,
+            data=b".\0"
+            + b"".join(b":(top,exclude,literal)" + path + b"\0" for path in paths),
+            index=index,
+        )
 
     def _rollout(
         self,
@@ -635,6 +706,8 @@ class PlainExecutor:
             if task.context is not None:
                 tools += (CONTEXT_TOOL,)
             trajectory = []
+            artifact_index = None
+            artifacts = {}
             actor = None
             last = None
             turns = 0
@@ -691,6 +764,8 @@ class PlainExecutor:
                         continue
                     is_edit = tool["function"]["name"] == "edit_file"
                     touched = False
+                    checked_command = None
+                    before_check = None
                     try:
                         budget.claim("command", self.limits.commands)
                         if is_edit:
@@ -706,6 +781,22 @@ class PlainExecutor:
                         else:
                             argv = self._tool_argv(tool)
                             action = json.dumps(argv)
+                            checked_command = check_label(argv, task.checks)
+                            if checked_command:
+                                if artifact_index is None:
+                                    artifact_index = (
+                                        f".git/gha-artifact-index-{uuid4().hex}"
+                                    )
+                                    self._git(
+                                        workspace,
+                                        budget,
+                                        "read-tree",
+                                        baseline,
+                                        index=artifact_index,
+                                    )
+                                before_check = self._check_snapshot(
+                                    workspace, budget, artifact_index
+                                )
                             response = self._command(
                                 workspace, budget, argv, checked=False
                             )
@@ -730,11 +821,37 @@ class PlainExecutor:
                     if touched:
                         actor = last
                         ran_command = True
+                        try:
+                            if before_check is not None:
+                                untracked_before, missing_before = before_check
+                                untracked_after, missing_after = self._check_snapshot(
+                                    workspace, budget, artifact_index
+                                )
+                                created = untracked_after - untracked_before
+                                recreated = missing_before - missing_after
+                                artifacts = self._artifact_state(
+                                    workspace,
+                                    budget,
+                                    artifacts.keys() | created | recreated,
+                                )
+                            elif artifacts:
+                                current = self._artifact_state(
+                                    workspace, budget, artifacts
+                                )
+                                artifacts = {
+                                    path: state
+                                    for path, state in artifacts.items()
+                                    if current.get(path) == state
+                                }
+                        except (_CandidateOutputError, CommandOutputExceeded) as error:
+                            budget.reject(error, last)
                     if touched and task.save_checkpoint is not None:
                         outcome, is_check = (
                             ("edit_file updated checkout", False)
                             if is_edit
-                            else self._command_progress(argv, returncode)
+                            else self._command_progress(
+                                argv, returncode, checked_command
+                            )
                         )
                         progress = [*progress, outcome][-12:]
                         ran_check |= is_check
@@ -747,7 +864,9 @@ class PlainExecutor:
                         }
                     )
                 if ran_command and checkpoint_index is not None:
-                    self._git(workspace, budget, "add", "-A", index=checkpoint_index)
+                    self._stage_rollout(
+                        workspace, budget, artifacts, index=checkpoint_index
+                    )
                     tree = (
                         self._git(
                             workspace,
@@ -820,7 +939,9 @@ class PlainExecutor:
                             staged_tree,
                             index=review_index,
                         )
-                        self._git(workspace, budget, "add", "-A", index=review_index)
+                        self._stage_rollout(
+                            workspace, budget, artifacts, index=review_index
+                        )
                         staged_tree = (
                             self._git(
                                 workspace, budget, "write-tree", index=review_index
@@ -837,7 +958,7 @@ class PlainExecutor:
                 trajectory.append(
                     "[OBSERVATION] Reached the rollout model-turn limit. Staging the current patch."
                 )
-            self._git(workspace, budget, "add", "-A")
+            self._stage_rollout(workspace, budget, artifacts)
             try:
                 patch = self._draft_patch(workspace, budget, baseline)
                 if patch and not clarification:
