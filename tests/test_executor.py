@@ -156,6 +156,51 @@ def test_plain_verifies_patch_in_independent_checkout(fixture):
     assert (source / "number.txt").read_text() == "3\n"
 
 
+def test_review_test_update_is_verified_with_the_configured_checks(fixture):
+    task, source, runner = fixture
+    (source / "test_number.py").write_text(
+        "from pathlib import Path\n\n"
+        "def test_number():\n"
+        "    assert Path('number.txt').read_text() == '4\\n'\n\n"
+        "def test_neighbor():\n"
+        "    assert Path('number.txt').stat().st_size == 2\n"
+    )
+    subprocess.run(["git", "add", "test_number.py"], cwd=source, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "commit",
+            "-qm",
+            "existing tests",
+        ],
+        cwd=source,
+        check=True,
+    )
+    sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=source, text=True
+    ).strip()
+    task = replace(
+        task,
+        base_sha=sha,
+        checks=((sys.executable, "-m", "pytest", "-q", "-k", "neighbor"),),
+    )
+    code = (
+        "from pathlib import Path; test = Path('test_number.py'); "
+        'test.write_text(test.read_text().replace("\'4", "\'3"))'
+    )
+    with pytest.raises(ExecutionError, match="protected path"):
+        PlainExecutor(runner, ScriptedGateway(code)).execute(task, source)
+    task = replace(task, test_update="test_number.py::test_number")
+    result = PlainExecutor(runner, ScriptedGateway(code)).execute(task, source)
+    assert len(result.checks) == 2
+    assert all(check.returncode == 0 for check in result.checks)
+    assert b"+    assert Path('number.txt').read_text() == '3\\n'" in result.patch
+
+
 @pytest.mark.parametrize(
     ("code", "error"),
     [
@@ -405,6 +450,161 @@ def test_command_budget_rejects_the_model_asking_for_extra_tools(fixture):
     with pytest.raises(AttemptRejected, match="command budget") as error:
         PlainExecutor(runner, gateway, Limits(commands=1)).execute(task, source)
     assert error.value.candidate.configured_model == "fixture-model-id"
+
+
+class EditGateway(ScriptedGateway):
+    def __init__(self, edits):
+        super().__init__(None)
+        self.edits = iter(edits)
+        self.observations = []
+
+    def complete(self, *, messages, tools, **kwargs):
+        reply = super().complete(messages=messages, tools=tools, **kwargs)
+        assert "edit_file" in {tool["function"]["name"] for tool in tools}
+        if messages[-1]["role"] == "tool":
+            self.observations.append(messages[-1]["content"])
+        if edit := next(self.edits, None):
+            reply.tool_calls = (
+                {
+                    "id": f"edit-{len(self.roles)}",
+                    "type": "function",
+                    "function": {
+                        "name": "edit_file",
+                        "arguments": json.dumps(edit),
+                    },
+                },
+            )
+        return reply
+
+
+def test_exact_edit_retries_then_checkpoints_and_verifies(fixture):
+    task, source, runner = fixture
+    receipts = []
+    gateway = EditGateway(
+        [
+            {"path": "../source/number.txt", "old_text": "3", "new_text": "4"},
+            {"path": "number.txt", "old_text": "missing", "new_text": "4"},
+            {"path": "number.txt", "old_text": "3", "new_text": "4"},
+            {
+                "path": "test_regression.py",
+                "new_text": "from pathlib import Path\n\n\ndef test_new():\n"
+                "    assert Path('number.txt').read_text() == '4\\n'\n",
+            },
+        ],
+    )
+    result = PlainExecutor(runner, gateway).execute(
+        replace(task, save_checkpoint=receipts.append), source
+    )
+    assert b"-3\n+4\n" in result.patch
+    assert b"test_regression.py" in result.patch
+    assert receipts[-1].patch == result.patch
+    assert receipts[-1].last_editor == ("fixture", "fixture-model-id")
+    assert len(receipts) == 2
+    assert "relative checkout file path" in gateway.observations[0]
+    assert "old_text must occur exactly once" in gateway.observations[1]
+    assert (source / "number.txt").read_text() == "3\n"
+    assert not (source / "test_regression.py").exists()
+    assert sorted(path.name for path in runner.workspaces[0].glob(".gha-edit-*")) == []
+
+
+def test_exact_edit_preserves_protected_path_checks(fixture):
+    from github_harness_agent.executor import AttemptRejected
+
+    task, source, runner = fixture
+    receipts = []
+    gateway = EditGateway(
+        [{"path": "test_number.py", "old_text": "== '4", "new_text": "== '3"}]
+    )
+    with pytest.raises(AttemptRejected, match="protected path: test_number.py"):
+        PlainExecutor(runner, gateway).execute(
+            replace(task, save_checkpoint=receipts.append), source
+        )
+    assert receipts == []
+
+
+def test_exact_edit_refuses_to_follow_symlink_parents(tmp_path):
+    from github_harness_agent.file_edit import EDIT_COMMAND
+
+    root = tmp_path / "checkout"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    file = outside / "target.txt"
+    file.write_text("initial")
+    (root / "link").symlink_to(outside, target_is_directory=True)
+    result = FixtureWorkspace(root).command(
+        EDIT_COMMAND,
+        10,
+        lambda: False,
+        data=json.dumps(
+            {"path": "link/target.txt", "old_text": "initial", "new_text": "updated"}
+        ).encode(),
+    )
+    assert result.returncode != 0
+    assert file.read_text() == "initial"
+
+
+@pytest.mark.parametrize(
+    ("limit", "edit_at_cap", "expected_turns"),
+    [(None, False, 12), (None, True, 12), (2, True, 2)],
+)
+def test_review_rollout_bounds_context_reads_and_stages_last_edit(
+    fixture, limit, edit_at_cap, expected_turns
+):
+    from github_harness_agent.executor import AttemptRejected
+    from github_harness_agent.task_context import TaskContext
+
+    class ReviewingGateway(ScriptedGateway):
+        def __init__(self):
+            super().__init__(None)
+            self.first_reminder_turn = None
+
+        def complete(self, *, messages, **kwargs):
+            reply = super().complete(messages=messages, **kwargs)
+            turn = len(self.roles)
+            if (
+                self.first_reminder_turn is None
+                and "still has no draft patch" in messages[0]["content"]
+            ):
+                self.first_reminder_turn = turn
+            name = "read_task_context"
+            arguments = {"section": "sections", "page": 1}
+            if edit_at_cap and turn == expected_turns:
+                name = "edit_file"
+                arguments = {
+                    "path": "number.txt",
+                    "old_text": "3",
+                    "new_text": "4",
+                }
+            reply.tool_calls = (
+                {
+                    "id": f"review-{turn}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(arguments)},
+                },
+            )
+            return reply
+
+    task, source, runner = fixture
+    task = replace(
+        task,
+        verify_base_first=True,
+        context=TaskContext(task.instructions, {"sections": "Review details"}, {}),
+    )
+    gateway = ReviewingGateway()
+    executor = PlainExecutor(
+        runner,
+        gateway,
+        Limits(model_requests=40, rollout_requests=limit),
+        verification_runner=runner,
+    )
+    if edit_at_cap:
+        assert b"-3\n+4\n" in executor.execute(task, source).patch
+    else:
+        with pytest.raises(AttemptRejected, match="empty patch"):
+            executor.execute(task, source)
+    assert len(gateway.roles) == expected_turns
+    assert gateway.first_reminder_turn == (4 if limit is None else None)
 
 
 def test_invalid_tool_output_rejects_the_candidate_before_running_it(fixture):
@@ -836,3 +1036,68 @@ def test_rollout_reads_omitted_evidence_and_limits_command_output(fixture):
     result = PlainExecutor(runner, Gateway(), Limits(commands=1)).execute(task, source)
     assert b"+4\n" in result.patch
     assert result.checks[0].returncode == 0
+
+
+def test_harness2_review_accepts_verified_base_without_proposals(fixture):
+    task, source, runner = fixture
+    verifier = FixtureRunner(source)
+    gateway = ScriptedGateway("open('number.txt','w').write('4\\n')")
+    result = Harness2Executor(
+        runner, gateway, Limits(model_requests=2), verification_runner=verifier
+    ).execute(replace(task, verify_base_first=True), source)
+
+    assert b"+4\n" in result.patch
+    assert len(runner.workspaces) == len(verifier.workspaces) == 1
+    assert gateway.roles == ["coding", "coding"]
+    assert [route.role for route in result.route_trace] == gateway.roles
+    assert result.refinement.selected_candidate == "base"
+    assert result.refinement.candidates[0].patch_digest == result.patch_digest
+    assert result.refinement.stages == ()
+
+
+def test_harness2_review_retries_failed_base_with_safe_check_summary(fixture):
+    task, source, runner = fixture
+    task = replace(
+        task,
+        verify_base_first=True,
+        checks=(
+            (
+                sys.executable,
+                "-c",
+                "import pathlib; "
+                "ok = pathlib.Path('number.txt').read_text() == '4\\n'; "
+                "print('FAILED test_number.py::test_number[private-param] - private-output'); "
+                "raise SystemExit(not ok)",
+                "private-argv",
+            ),
+        ),
+    )
+
+    class RepairGateway(ScriptedGateway):
+        def complete(self, **kwargs):
+            message = kwargs["messages"][-1]
+            if message["role"] == "user" and len(self.roles) == 2:
+                assert "test_number.py::test_number" in message["content"]
+                assert "Required check 1 exited with status 1" in message["content"]
+                assert "private-" not in message["content"]
+                self.code = (
+                    "from pathlib import Path; p = Path('number.txt'); "
+                    "assert p.read_text() == '5\\n'; p.write_text('4\\n')"
+                )
+            return super().complete(**kwargs)
+
+    gateway = RepairGateway("open('number.txt','w').write('5\\n')")
+    verifier = FixtureRunner(source)
+    result = Harness2Executor(
+        runner, gateway, Limits(model_requests=4), verification_runner=verifier
+    ).execute(task, source)
+
+    assert b"+4\n" in result.patch
+    assert gateway.roles == ["coding"] * 4
+    assert len(verifier.workspaces) == 3
+    assert result.refinement.selected_candidate == "repair"
+    base, repaired = result.refinement.candidates
+    assert base.label == "base"
+    assert "test_number.py::test_number" in base.error
+    assert "private-" not in base.error
+    assert repaired.patch_digest == result.patch_digest

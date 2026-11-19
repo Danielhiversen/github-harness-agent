@@ -32,8 +32,9 @@ from .rebase import (
     transplant_patch,
 )
 from .reviews import ReviewItem, collect_reviews, map_feedback, reply_to_review
+from .test_updates import authorized_test_update
 from .store import LeaseLost
-from .task_context import build_task_context, github_history
+from .task_context import build_task_context, github_history, review_source_context
 
 
 def prepare_commit(path, parent, patch, issue, identity=BOT_IDENTITY, *, adopted=False):
@@ -444,6 +445,20 @@ class Controller:
                         previous_failure=previous or "",
                         extra_evidence=format_ci_feedback(data.get("ci_feedback", ())),
                         history=github_history(api, repo, issue, pull, feedback),
+                        source_context=review_source_context(
+                            feedback,
+                            lambda name: review_source(path, parent, name),
+                            test_selector=current_test_update(),
+                        ),
+                    )
+
+                def current_test_update():
+                    if not adopted or stage != "repair" or pr["head"]["sha"] != origin:
+                        return None
+                    return authorized_test_update(
+                        item
+                        for item in data.get("feedback", ())
+                        if item.get("test_update_head") == origin
                     )
 
                 if "prepared" not in data:
@@ -574,6 +589,9 @@ class Controller:
                         save_checkpoint=save_checkpoint,
                         observe_model=lambda *event: store.observe_model(job, *event),
                         context=context,
+                        verify_base_first=stage == "repair"
+                        and bool(data.get("feedback") or data.get("ci_feedback")),
+                        test_update=current_test_update(),
                     )
 
                     try:
@@ -706,6 +724,7 @@ class Controller:
                         checks,
                         protected_paths=tuple(cfg.get("protected_paths", ())),
                         repository_guidance=cfg.get("reviewed_guidance", ""),
+                        test_update=current_test_update(),
                     )
 
                     try:

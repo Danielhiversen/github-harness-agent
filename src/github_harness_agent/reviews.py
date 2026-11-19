@@ -79,6 +79,7 @@ class Feedback:
     original_line: int | None = None
     diff_hunk: str | None = None
     diff_side: str | None = None
+    test_update_head: str | None = None
 
 
 ReviewItem = Feedback
@@ -332,8 +333,18 @@ def collect_reviews(
             thread = f"review:{review['fullDatabaseId']}"
             key = f"{thread}:{_digest(body, review.get('lastEditedAt'))}"
             if key not in previous_keys:
+                test_update_head = (
+                    head
+                    if adopted_at and (review.get("commit") or {}).get("oid") == head
+                    else None
+                )
                 body_items[str(review["fullDatabaseId"])] = Feedback(
-                    key, thread, None, body, login
+                    key,
+                    thread,
+                    None,
+                    review["body"] if test_update_head else body,
+                    login,
+                    test_update_head=test_update_head,
                 )
 
     for page in pages(_REVIEW_THREADS, "reviewThreads"):

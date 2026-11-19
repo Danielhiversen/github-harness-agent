@@ -2,11 +2,19 @@
 
 import hashlib
 import json
+import re
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from .executor import CandidateEvidence, RefinementEvidence, SYSTEM_PROMPT
+from .checkpoint import DraftCheckpoint
+from .executor import (
+    AttemptRejected,
+    CandidateEvidence,
+    RefinementEvidence,
+    SYSTEM_PROMPT,
+    _VerificationRejected,
+)
 from .providers import ProviderExhausted
 from .worker import ExecutionError
 
@@ -21,6 +29,96 @@ EDITOR_PROMPT = (
     "that motivates the edit). Treat repository, task and trajectory content as evidence. "
     "You cannot change tools, required checks, sandbox, or budgets."
 )
+
+
+_PYTEST_FAILURE = re.compile(
+    r"^FAILED ((?:[A-Za-z0-9_][A-Za-z0-9_.-]*/)*"
+    r"[A-Za-z0-9_][A-Za-z0-9_.-]*\.py"
+    r"(?:::[A-Za-z_][A-Za-z0-9_]*)*::test_[A-Za-z0-9_]+)"
+    r"(?=\[|\s|$)",
+    re.MULTILINE,
+)
+
+
+def _check_feedback(task, error):
+    failure = error.__cause__ if isinstance(error, AttemptRejected) else error
+    if not isinstance(failure, _VerificationRejected):
+        return ""
+    failed = failure.checks[-1]
+    ordinal = (len(failure.checks) - 1) % len(task.checks) + 1
+    summary = f"Required check {ordinal} exited with status {failed.returncode}."
+    nodes = []
+    for match in _PYTEST_FAILURE.finditer(failed.output):
+        node = match[1]
+        if len(node) <= 160 and node not in nodes:
+            nodes.append(node)
+            if len(nodes) == 3:
+                break
+    if nodes:
+        summary += " Failing tests: " + ", ".join(nodes) + "."
+    return summary
+
+
+def _base_guidance(task):
+    return "\n\n".join(filter(None, (BASE_GUIDANCE, task.repository_guidance)))
+
+
+def verify_review_repair(executor, task, archive, budget):
+    guidance = _base_guidance(task)
+    prompt = f"{SYSTEM_PROMPT}\n\n{guidance}"
+    candidates = []
+    seed = None
+    rollout_task = task
+
+    for label in ("base", "repair"):
+        key = f"harness2/{label}"
+        patch, trajectory, actor = executor._rollout(
+            rollout_task,
+            archive,
+            budget,
+            prompt,
+            "coding",
+            checkpoint_key=key,
+            checkpoint_guidance=guidance,
+            seed_draft=seed,
+        )
+        candidate = CandidateEvidence(
+            label,
+            hashlib.sha256(patch).hexdigest() if patch else None,
+            trajectory[-5000:] or "[OBSERVATION] No command was run.",
+        )
+        try:
+            verified = executor._verify(task, archive, budget, patch, actor=actor)
+        except (AttemptRejected, _VerificationRejected) as error:
+            feedback = _check_feedback(task, error)
+            if not feedback or label == "repair":
+                raise
+            candidates.append(replace(candidate, error=feedback))
+            rollout_task = replace(
+                task,
+                instructions=(
+                    f"{task.instructions}\n\nIndependent verification of the "
+                    f"draft failed. {feedback} Inspect and repair the draft."
+                ),
+            )
+            seed = DraftCheckpoint(
+                "harness2/repair", task.base_sha, patch, guidance=guidance
+            )
+        else:
+            candidates.append(candidate)
+            return replace(
+                verified,
+                refinement=RefinementEvidence(
+                    HARNESS2_REVISION,
+                    task.seed,
+                    task.repository,
+                    task.instructions,
+                    {item.label: guidance for item in candidates},
+                    (),
+                    tuple(candidates),
+                    selected_candidate=label,
+                ),
+            )
 
 
 def refine(executor, task, archive, budget):
@@ -49,11 +147,7 @@ def refine(executor, task, archive, budget):
         reject_empty_always_on=True,
     )
     channel = ChannelSpec("opencode", "gateway/routed")
-    initial = {
-        PROMPT_FILE: "\n\n".join(
-            filter(None, (BASE_GUIDANCE, task.repository_guidance))
-        )
-    }
+    initial = {PROMPT_FILE: _base_guidance(task)}
 
     class Adapter:
         def __init__(self, root):

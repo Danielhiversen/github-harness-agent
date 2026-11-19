@@ -197,6 +197,55 @@ def github_history(
     return history
 
 
+# Only inspect tracked source files a reviewer explicitly identified. Load them
+# from the pinned Git tree so links or paths in a review cannot escape checkout.
+_REVIEW_FILE = re.compile(r"`([\w./-]+\.py)(?:::(?:[\w.]+::)*[\w.]+)?`")
+
+
+def review_source_context(feedback, read_source, test_selector=None):
+    previews = {}
+    inspected = set()
+    for item in feedback:
+        anchors = [(item.get("path"), item.get("line"))]
+        anchors.extend(
+            (name, 1) for name in _REVIEW_FILE.findall(item.get("body") or "")
+        )
+        if test_selector:
+            anchors.append(
+                (test_selector.split("::")[0], test_selector.split("::")[-1])
+            )
+        for name, line in anchors:
+            if not isinstance(name, str) or not re.fullmatch(
+                r"(?:[\w-]+/)*[\w-]+\.py", name
+            ):
+                continue
+            if name in inspected or len(inspected) >= 8 or len(previews) >= 4:
+                continue
+            inspected.add(name)
+            contents = read_source(name)
+            if not contents:
+                continue
+            lines = contents.splitlines()
+            if isinstance(line, str):
+                line = next(
+                    (
+                        n
+                        for n, source in enumerate(lines, 1)
+                        if source.lstrip().startswith(
+                            (f"def {line}(", f"async def {line}(")
+                        )
+                    ),
+                    1,
+                )
+            center = min(len(lines), max(1, line if type(line) is int else 1))
+            start = max(0, center - 12)
+            end = min(len(lines), max(32, center + 14))
+            previews[name] = f"{name} (lines {start + 1}–{end})\n" + excerpt(
+                "\n".join(lines[start:end]), 1650
+            )
+    return "\n\n".join(previews.values())
+
+
 def build_task_context(
     instructions: str,
     *,
@@ -205,6 +254,7 @@ def build_task_context(
     previous_failure: str = "",
     extra_evidence: str = "",
     history: Mapping[str, HistoryLoader] | None = None,
+    source_context: str = "",
 ) -> TaskContext:
     sources = dict(history or {})
     sections = {"task": instructions}
@@ -258,6 +308,12 @@ def build_task_context(
         preview.append(
             "Review requests against this commit:\n"
             + json.dumps(current, ensure_ascii=False)
+        )
+    if source_context:
+        sections["review-source"] = source_context
+        preview.append(
+            "Source excerpts from the current checkout\n"
+            + excerpt(source_context, 4500)
         )
     sections["sections"] = "\n".join([*sections, *sources])
     return TaskContext("\n\n".join(preview), sections, sources)

@@ -17,7 +17,9 @@ from uuid import uuid4
 
 from .activity import observed_call
 from .checkpoint import DraftCheckpoint
+from .file_edit import EDIT_COMMAND, EDIT_TOOL, InvalidEdit, edit_payload
 from .providers import ProviderExhausted
+from .test_updates import focused_pytest, passed_pytest_report, valid_test_update
 from .task_context import (
     CONTEXT_TOOL,
     MESSAGE_BYTES,
@@ -53,11 +55,13 @@ __all__ = [
 ]
 
 SYSTEM_PROMPT = (
-    "Implement the repository task. Inspect the pinned checkout with the run tool and edit files "
-    "in place. Keep the patch focused and preserve existing checks and their configuration. "
-    "When the task requests regression coverage, add new test files using the repository's naming convention. "
-    "Finish when the patch is ready. "
-    "Use narrow checkout reads for large files and command output. "
+    "Implement the repository task in the pinned checkout. Use run for narrow source reads and "
+    "checks. Use edit_file to replace exact text or create a source or test file; act once you "
+    "have read enough to locate the change. Keep the patch focused and preserve existing checks "
+    "and their configuration. For review repairs, make the requested changes on the current "
+    "branch. Add requested coverage in new test files using the repository's naming convention "
+    "unless the task specifically authorizes an existing test update. "
+    "Inspect git diff and git status, and run the relevant tests before finishing. "
     "If the task has conflicting or materially ambiguous requirements, return only a JSON object "
     "with a clarification key containing one concise question for the maintainer."
 )
@@ -74,6 +78,8 @@ RUN_TOOL = {
         },
     },
 }
+REVIEW_ROLLOUT_TURNS = 12
+REVIEW_EDIT_REMINDER_TURN = 3
 
 
 class Gateway(Protocol):
@@ -133,6 +139,8 @@ class TaskSnapshot:
     checkpoints: Mapping[str, DraftCheckpoint] = field(default_factory=dict)
     save_checkpoint: Callable[[DraftCheckpoint], None] | None = None
     context: TaskContext | None = None
+    verify_base_first: bool = False
+    test_update: str | None = None
 
 
 @dataclass(frozen=True)
@@ -339,7 +347,9 @@ def _test_module(name: str) -> bool:
     )
 
 
-def _protected(path: str, task: TaskSnapshot, *, new_test: bool) -> bool:
+def _protected(
+    path: str, task: TaskSnapshot, *, new_test: bool, amended_test: bool = False
+) -> bool:
     """Preserve existing tests, test infrastructure, and configured protected paths."""
     names = PurePosixPath(path).parts
     test_configs = {
@@ -373,7 +383,7 @@ def _protected(path: str, task: TaskSnapshot, *, new_test: bool) -> bool:
         bool(set(names) & {".git", ".github", ".circleci"})
         or names[-1] in test_configs
         or (
-            not new_test
+            not (new_test or amended_test)
             and (
                 bool(set(names) & {"tests", "test", "__tests__"})
                 or names[-1].startswith("test_")
@@ -588,18 +598,25 @@ class PlainExecutor:
                 self._git(
                     workspace, budget, "read-tree", staged_tree, index=checkpoint_index
                 )
+            if task.test_update is not None:
+                prompt += (
+                    "\nA maintainer authorized this existing test update: "
+                    f"{task.test_update}. Edit only the named test body and keep its assertions active."
+                )
             messages = [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": instructions},
             ]
-            tools = (
-                (RUN_TOOL, CONTEXT_TOOL) if task.context is not None else (RUN_TOOL,)
-            )
+            tools = (RUN_TOOL, EDIT_TOOL)
+            if task.context is not None:
+                tools += (CONTEXT_TOOL,)
             trajectory = []
             actor = None
             last = None
             turns = 0
             limit = budget.limits.rollout_requests
+            if task.verify_base_first and limit is None:
+                limit = min(REVIEW_ROLLOUT_TURNS, budget.limits.model_requests)
             while limit is None or turns < limit:
                 try:
                     last_editor = (
@@ -648,11 +665,31 @@ class PlainExecutor:
                             }
                         )
                         continue
+                    is_edit = tool["function"]["name"] == "edit_file"
+                    touched = False
                     try:
                         budget.claim("command", self.limits.commands)
-                        argv = self._tool_argv(tool)
-                        response = self._command(workspace, budget, argv, checked=False)
+                        if is_edit:
+                            action = "edit_file"
+                            data = edit_payload(tool, self.limits.patch_bytes)
+                            response = self._command(
+                                workspace,
+                                budget,
+                                EDIT_COMMAND,
+                                data=data,
+                                checked=False,
+                            )
+                        else:
+                            argv = self._tool_argv(tool)
+                            action = json.dumps(argv)
+                            response = self._command(
+                                workspace, budget, argv, checked=False
+                            )
+                        touched = not is_edit or response.returncode == 0
+                    except InvalidEdit as error:
+                        output = str(error)
                     except CommandOutputExceeded:
+                        touched = True
                         returncode = None
                         output = (
                             "Command exceeded the output limit. Select a narrower range or "
@@ -666,15 +703,18 @@ class PlainExecutor:
                             f"exit {response.returncode}\n{_combined(response)}",
                             TOOL_RESULT_BYTES,
                         )
-                    actor = last
-                    if task.save_checkpoint is not None:
-                        outcome, is_check = self._command_progress(argv, returncode)
-                        progress = [*progress, outcome][-12:]
+                    if touched:
+                        actor = last
                         ran_command = True
+                    if touched and task.save_checkpoint is not None:
+                        outcome, is_check = (
+                            ("edit_file updated checkout", False)
+                            if is_edit
+                            else self._command_progress(argv, returncode)
+                        )
+                        progress = [*progress, outcome][-12:]
                         ran_check |= is_check
-                    trajectory.append(
-                        f"[ACTION] {json.dumps(argv)}\n[OBSERVATION] {output}"
-                    )
+                    trajectory.append(f"[ACTION] {action}\n[OBSERVATION] {output}")
                     messages.append(
                         {
                             "role": "tool",
@@ -740,6 +780,29 @@ class PlainExecutor:
                             budget.remaining()
                             task.save_checkpoint(draft)
                             staged_tree = tree
+                if task.verify_base_first and turns == REVIEW_EDIT_REMINDER_TURN:
+                    if checkpoint_index is None:
+                        review_index = f".git/gha-review-index-{uuid4().hex}"
+                        self._git(
+                            workspace,
+                            budget,
+                            "read-tree",
+                            staged_tree,
+                            index=review_index,
+                        )
+                        self._git(workspace, budget, "add", "-A", index=review_index)
+                        staged_tree = (
+                            self._git(
+                                workspace, budget, "write-tree", index=review_index
+                            )
+                            .stdout.strip()
+                            .decode("ascii")
+                        )
+                    if staged_tree == baseline:
+                        messages[0]["content"] += (
+                            "\n\nIf the checkout still has no draft patch, make a focused "
+                            "edit for the requested repair with edit_file, then run the relevant checks."
+                        )
             else:
                 trajectory.append(
                     "[OBSERVATION] Reached the rollout model-turn limit. Staging the current patch."
@@ -806,6 +869,7 @@ class PlainExecutor:
         if not entries or len(entries) % 2:
             raise _CandidateOutputError("Unexpected patch metadata")
         new_tests = []
+        amended_test_path = False
         for header, raw_path in zip(entries[::2], entries[1::2], strict=True):
             fields = header.split()
             if len(fields) != 5 or not header.startswith(b":") or not raw_path:
@@ -817,15 +881,40 @@ class PlainExecutor:
                 and mode == b"100644"
                 and _test_module(PurePosixPath(path).name)
             )
-            if _protected(path, task, new_test=new_test):
+            amended_test = (
+                status == b"M"
+                and fields[0] == b":100644"
+                and mode == b"100644"
+                and task.test_update is not None
+                and task.test_update.partition("::")[0] == path
+            )
+            if _protected(path, task, new_test=new_test, amended_test=amended_test):
                 raise _CandidateOutputError(f"Patch changes protected path: {path}")
+            if amended_test:
+                baseline_blob, amended_blob = (
+                    self._git(
+                        workspace,
+                        budget,
+                        "cat-file",
+                        "blob",
+                        revision,
+                        cap=self.limits.patch_bytes,
+                        index=index,
+                    ).stdout
+                    for revision in (f"{baseline}:{path}", f":{path}")
+                )
+                if not valid_test_update(task.test_update, baseline_blob, amended_blob):
+                    raise _CandidateOutputError(
+                        f"Patch exceeds authorized test update: {path}"
+                    )
+                amended_test_path = True
             if mode in {b"120000", b"160000"}:
                 raise _CandidateOutputError(
                     f"Patch adds or changes a symlink or submodule: {path}"
                 )
             if new_test:
                 new_tests.append(path)
-        return new_tests
+        return new_tests, amended_test_path
 
     @staticmethod
     def _require_valid_patch(result, message):
@@ -873,7 +962,7 @@ class PlainExecutor:
                     check, "Invalid patch did not apply to the pinned checkout"
                 )
                 self._git(workspace, budget, "apply", "--index", "--binary", data=patch)
-                new_tests = self._check_patch_paths(
+                new_tests, amended_test = self._check_patch_paths(
                     workspace, task, budget, baseline_tree
                 )
             except (_CandidateOutputError, CommandOutputExceeded) as error:
@@ -891,13 +980,33 @@ class PlainExecutor:
                 )
             checks = self._run_checks(workspace, budget, task.checks)
         trusted_passed = checks[-1].returncode == 0
-        if new_tests and trusted_passed:
+        report = f".git/gha-test-update-{uuid4().hex}.xml"
+        focused = (
+            focused_pytest(task.checks, task.test_update, report)
+            if amended_test
+            else None
+        )
+        if (new_tests or focused) and trusted_passed:
             with self.verification_runner.workspace(
                 archive, budget.remaining, budget.cancelled
             ) as workspace:
                 self._stage_baseline(workspace, budget)
                 self._git(workspace, budget, "apply", "--index", "--binary", data=patch)
-                checks.extend(self._run_checks(workspace, budget, task.checks))
+                if new_tests:
+                    checks.extend(self._run_checks(workspace, budget, task.checks))
+                if focused and checks[-1].returncode == 0:
+                    check = self._run_checks(workspace, budget, (focused,))[0]
+                    if check.returncode == 0:
+                        result = self._command(
+                            workspace, budget, ("cat", report), checked=False
+                        )
+                        if result.returncode or not passed_pytest_report(result.stdout):
+                            check = CheckEvidence(
+                                focused,
+                                1,
+                                "The amended test did not pass as an executed pytest test.",
+                            )
+                    checks.append(check)
         if checks[-1].returncode:
             failed = checks[-1]
             rejection = 0 < failed.returncode < 125
@@ -946,11 +1055,13 @@ class Harness2Executor(PlainExecutor):
         checkout: Path,
         cancelled: Callable[[], bool] = lambda: False,
     ) -> ExecutionResult:
-        from .harness2_adapter import refine
+        from .harness2_adapter import refine, verify_review_repair
 
         budget = _Budget(self.limits, cancelled, task)
         archive = self._archive(task, checkout, budget)
         try:
+            if task.verify_base_first:
+                return verify_review_repair(self, task, archive, budget)
             patch, evidence, actor, resumed_base = refine(self, task, archive, budget)
         except _RequestBudgetExceeded as error:
             budget.reject(error, None, latest=True)

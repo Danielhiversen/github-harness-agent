@@ -52,6 +52,18 @@ Run `work` for polling. For signed webhooks, separately configure an authorized 
 
 In named-account mode, each scan also discovers open pull requests authored by that account with a head branch in the configured repository. The controller adopts each PR for review handling on its existing branch, including PRs created before deployment and PRs without a linked issue. Adoption runs before labeled issue intake. The issue label continues to select new implementation tasks. A review repair uses the PR's current target, rechecks branch ownership and head, and replies on the original PR after verification.
 
+### Repair an outdated test in a review
+
+The review worker reads the reported code from the current checkout. A free model can replace a unique text fragment or create a file using `edit_file`. For actionable review feedback, the worker verifies the first coding draft in a fresh sandbox. A failed check can trigger one more coding pass with the draft and failing test names. Successful drafts proceed through the branch and target checks before the agent pushes to the existing PR.
+
+If an existing Python test enforces behavior that the review changes, a maintainer can authorize a change to that test's body. Include the selector on its own line in the submitted GitHub review body, for example:
+
+```text
+Allow test update: tests/test_training_rows.py::TestBuildDataset::test_saved_run
+```
+
+The selector can also name a module-level test. Explain the corrected behavior and expected regression coverage in the review. The verifier checks the scope of the amendment and runs the configured checks. A PR description, issue, or CI diagnostic cannot grant the exception.
+
 ## Qualify a replacement
 
 Use the [qualification guide](docs/qualification.md) and [implementation plan](docs/superpowers/plans/2026-11-17-github-agent.md) for matched replay, shadow and canary gates. Offline tests exercise recovery, provider contracts and both executors. Live GitHub, provider, isolation and reviewer-time evidence are additional cutover requirements.

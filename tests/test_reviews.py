@@ -207,6 +207,35 @@ def test_adopted_pull_distinguishes_handled_history_from_current_inline_feedback
     }
 
 
+def test_only_current_maintainer_review_body_can_authorize_a_test_update():
+    from dataclasses import asdict
+
+    from github_harness_agent.test_updates import authorized_test_update
+
+    github = ReviewGitHub()
+    directive = "Allow test update: tests/test_examples.py::test_example"
+    github.reviews = [
+        dict(review(11, body=f"    {directive}"), commit={"oid": github.head}),
+        dict(review(12, body=directive), commit={"oid": "b" * 40}),
+        dict(review(13, body=directive, login="visitor"), commit={"oid": github.head}),
+    ]
+    github.pages = [[thread("inline", [comment(20, body=directive)])], []]
+    batch = collect(github, adopted_at="2025-12-31T00:00:00Z")
+    authorized = [
+        asdict(item) for item in batch.items if item.test_update_head == batch.head
+    ]
+    assert [item["thread"] for item in authorized] == ["review:11"]
+    assert authorized_test_update(authorized) is None
+    github.reviews[0]["body"] = directive
+    batch = collect(github, adopted_at="2025-12-31T00:00:00Z")
+    assert (
+        authorized_test_update(
+            asdict(item) for item in batch.items if item.test_update_head == batch.head
+        )
+        == "tests/test_examples.py::test_example"
+    )
+
+
 def test_adopted_pull_uses_exact_agent_reply_with_review_revision_time():
     github = ReviewGitHub()
     github.reviews = [

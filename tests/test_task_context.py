@@ -192,3 +192,28 @@ def test_budget_retries_reported_413_once_with_smaller_context():
     assert lengths[1] < lengths[0] and lengths[1] <= 24576
     assert lengths[2] == lengths[1]
     assert not messages[1]["content"].endswith("[excerpt shortened]")
+
+
+def test_review_source_context_reads_only_named_python_files_and_uses_mapped_line():
+    from github_harness_agent.task_context import review_source_context
+
+    calls = []
+
+    def read(name):
+        calls.append(name)
+        return "\n".join(f"value_{line}" for line in range(1, 81))
+
+    evidence = review_source_context(
+        [
+            {
+                "path": "pkg/join.py",
+                "line": 70,
+                "body": "Also see `tests/test_join.py::test_tie`, `../private.py` and `.env`.",
+            }
+        ],
+        read,
+    )
+    assert calls == ["pkg/join.py", "tests/test_join.py"]
+    assert "value_70" in evidence
+    task = build_task_context("Repair this.", source_context=evidence)
+    assert "Source excerpts from the current checkout" in task.instructions
