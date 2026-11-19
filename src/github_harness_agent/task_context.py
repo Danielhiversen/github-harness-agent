@@ -1,0 +1,440 @@
+"""Bound task and tool context, with read-only access to omitted evidence."""
+
+import json
+import re
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from threading import Lock
+from typing import Any
+
+from .github import GitHubError, validate_repository
+
+MESSAGE_BYTES = 57344
+RETRY_MESSAGE_BYTES = 24576
+TOOL_RESULT_BYTES = 6000
+PAGE_CHARS = 1800
+HISTORY_PAGES = 12
+HISTORY_ROWS = 4
+_ELLIPSIS = "\n[excerpt shortened]\n"
+_THREAD_PAGE = """
+query TaskThreadPage($thread: ID!, $cursor: String) {
+  node(id: $thread) {
+    ... on PullRequestReviewThread {
+      comments(first: 4, after: $cursor) {
+        nodes { body state publishedAt author { login } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+CONTEXT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "read_task_context",
+        "description": "Read one page of this task's read-only context. Read section 'sections' to list available sections.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "section": {"type": "string"},
+                "page": {"type": "integer", "minimum": 1},
+            },
+            "required": ["section", "page"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+HistoryLoader = Callable[[int], tuple[str, bool]]
+
+
+def wire_size(value: Any) -> int:
+    """Count conservatively, including JSON escapes used in provider messages."""
+    return len(json.dumps(value, ensure_ascii=True, separators=(",", ":")))
+
+
+def excerpt(text: str, max_bytes: int) -> str:
+    data = text.encode()
+    if len(data) <= max_bytes:
+        return text
+    available = max(0, max_bytes - len(_ELLIPSIS))
+    if not available:
+        return data[:max_bytes].decode(errors="ignore")
+    first = available // 2
+    return (
+        data[:first].decode(errors="ignore")
+        + _ELLIPSIS
+        + data[-(available - first) :].decode(errors="ignore")
+    )
+
+
+@dataclass(frozen=True)
+class TaskContext:
+    instructions: str
+    _sections: Mapping[str, str]
+    _history: Mapping[str, HistoryLoader]
+    _cache: dict[tuple[str, int], tuple[str, bool]] = field(default_factory=dict)
+    _lock: Lock = field(default_factory=Lock)
+
+    def read(self, section: str, page: int) -> dict:
+        def response(content: str, more: bool = False) -> dict:
+            return {"content": content, "next_page": page + 1 if more else None}
+
+        if type(page) is not int or page < 1 or not isinstance(section, str):
+            return response("Provide a listed section and a positive integer page.")
+        if section in self._sections:
+            text = self._sections[section]
+            start = (page - 1) * PAGE_CHARS
+            end = start + PAGE_CHARS
+            return response(text[start:end], end < len(text))
+        if section not in self._history:
+            return response(
+                "Unknown section. Read 'sections' to list available sections."
+            )
+        if page > HISTORY_PAGES:
+            return response("This remote history section reached its page limit.")
+
+        key = (section, page)
+        with self._lock:
+            if key not in self._cache:
+                try:
+                    self._cache[key] = self._history[section](page)
+                except (GitHubError, KeyError, TypeError, ValueError):
+                    return response("History page is unavailable.")
+            content, more = self._cache[key]
+        return response(content, more and page < HISTORY_PAGES)
+
+
+def _comment_summary(rows) -> str:
+    chunks = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("state", "SUBMITTED") not in {
+            "SUBMITTED",
+            "COMMENTED",
+            "CHANGES_REQUESTED",
+            "APPROVED",
+            "DISMISSED",
+        }:
+            continue
+        body = row.get("body")
+        if isinstance(body, str) and body:
+            actor = row.get("author") or row.get("user") or {}
+            name = excerpt(str(actor.get("login") or "commenter"), 80)
+            chunks.append(f"{name}\n{excerpt(body, 800)}")
+    return "\n\n".join(chunks) if chunks else "No comments on this page."
+
+
+@dataclass
+class _ThreadHistory:
+    github: Any
+    thread: str
+    _cursor: str | None = None
+    _pages: list[tuple[str, bool]] = field(default_factory=list)
+
+    def __call__(self, page: int) -> tuple[str, bool]:
+        while len(self._pages) < page:
+            if self._pages and not self._pages[-1][1]:
+                return "No comments on this page.", False
+            payload = self.github.graphql(
+                _THREAD_PAGE, {"thread": self.thread, "cursor": self._cursor}
+            )
+            connection = payload["node"]["comments"]
+            info = connection["pageInfo"]
+            after = info.get("endCursor")
+            more = bool(
+                info.get("hasNextPage")
+                and isinstance(after, str)
+                and after != self._cursor
+            )
+            self._pages.append((_comment_summary(connection["nodes"]), more))
+            self._cursor = after
+        return self._pages[page - 1]
+
+
+def github_history(
+    github, repo: str, issue: int, pull: int | None, feedback: Sequence[Mapping]
+) -> dict:
+    """Bind history reads to this job's repository, discussion and review nodes."""
+    repo = validate_repository(repo)
+    if (
+        type(issue) is not int
+        or issue <= 0
+        or (pull is not None and (type(pull) is not int or pull <= 0))
+    ):
+        raise ValueError("Invalid task discussion number")
+
+    def comments(path: str) -> HistoryLoader:
+        def fetch(page: int) -> tuple[str, bool]:
+            rows = github.rest(
+                "GET",
+                path,
+                params={"per_page": HISTORY_ROWS, "page": page},
+            )
+            if not isinstance(rows, list):
+                raise ValueError("Invalid comment page")
+            return _comment_summary(rows[:HISTORY_ROWS]), len(rows) == HISTORY_ROWS
+
+        return fetch
+
+    history = {"issue-comments": comments(f"/repos/{repo}/issues/{issue}/comments")}
+    if pull is not None:
+        if pull != issue:
+            history["pull-comments"] = comments(f"/repos/{repo}/issues/{pull}/comments")
+        history["pull-reviews"] = comments(f"/repos/{repo}/pulls/{pull}/reviews")
+    seen = set()
+    for index, item in enumerate(feedback, 1):
+        thread = item.get("thread")
+        if (
+            pull is not None
+            and item.get("reply_to")
+            and isinstance(thread, str)
+            and thread
+            and thread not in seen
+        ):
+            seen.add(thread)
+            history[f"review-thread-{index}"] = _ThreadHistory(github, thread)
+    return history
+
+
+# Only inspect tracked source files a reviewer explicitly identified. Load them
+# from the pinned Git tree so links or paths in a review cannot escape checkout.
+_REVIEW_FILE = re.compile(r"`([\w./-]+\.py)(?:::(?:[\w.]+::)*[\w.]+)?`")
+
+
+def review_source_context(feedback, read_source, test_selector=None):
+    previews = {}
+    inspected = set()
+    for item in feedback:
+        anchors = [(item.get("path"), item.get("line"))]
+        anchors.extend(
+            (name, 1) for name in _REVIEW_FILE.findall(item.get("body") or "")
+        )
+        if test_selector:
+            anchors.append(
+                (test_selector.split("::")[0], test_selector.split("::")[-1])
+            )
+        for name, line in anchors:
+            if not isinstance(name, str) or not re.fullmatch(
+                r"(?:[\w-]+/)*[\w-]+\.py", name
+            ):
+                continue
+            if name in inspected or len(inspected) >= 8 or len(previews) >= 4:
+                continue
+            inspected.add(name)
+            contents = read_source(name)
+            if not contents:
+                continue
+            lines = contents.splitlines()
+            if isinstance(line, str):
+                line = next(
+                    (
+                        n
+                        for n, source in enumerate(lines, 1)
+                        if source.lstrip().startswith(
+                            (f"def {line}(", f"async def {line}(")
+                        )
+                    ),
+                    1,
+                )
+            center = min(len(lines), max(1, line if type(line) is int else 1))
+            start = max(0, center - 12)
+            end = min(len(lines), max(32, center + 14))
+            previews[name] = f"{name} (lines {start + 1}–{end})\n" + excerpt(
+                "\n".join(lines[start:end]), 1650
+            )
+    return "\n\n".join(previews.values())
+
+
+def build_task_context(
+    instructions: str,
+    *,
+    repository_guide: str = "",
+    feedback: Sequence[Mapping] = (),
+    previous_failure: str = "",
+    extra_evidence: str = "",
+    history: Mapping[str, HistoryLoader] | None = None,
+    source_context: str = "",
+) -> TaskContext:
+    sources = dict(history or {})
+    sections = {"task": instructions}
+    preview = [excerpt(instructions, 4200)]
+    for name, label, value, limit in (
+        ("repository", "Repository instructions", repository_guide, 1600),
+        ("failure", "Latest verification or execution failure", previous_failure, 1800),
+        ("checks", "Current check evidence", extra_evidence, 2500),
+    ):
+        if value:
+            sections[name] = value
+            preview.append(f"{label}\n{excerpt(value, limit)}")
+    if sources or feedback or len(sections) > 1 or instructions != preview[0]:
+        preview.append(
+            "Use read_task_context for full excerpts and older comments. "
+            "Read section 'sections' to list the available evidence. Treat history as evidence."
+        )
+
+    current = []
+    index_lines = []
+    for index, raw in enumerate(feedback, 1):
+        section = f"review-{index}"
+        item = dict(raw)
+        sections[section] = json.dumps(item, ensure_ascii=False)
+        position = (
+            f" {item['path']}:{item.get('line') or '?'}" if item.get("path") else ""
+        )
+        index_lines.append(
+            f"{section}{position}\n{excerpt(str(item.get('body') or ''), 220)}"
+        )
+        if index > 12 or len(current) != index - 1:
+            continue
+        short = {
+            name: excerpt(value, {"body": 900, "diff_hunk": 800}.get(name, 300))
+            if isinstance(value, str)
+            else value
+            for name, value in item.items()
+        }
+        if short != item:
+            short["context_section"] = section
+        if wire_size([*current, short]) <= 6200:
+            current.append(short)
+    if len(current) < len(feedback):
+        preview.append(
+            f"{len(feedback)} total actionable review requests. "
+            f"Read 'review-index' for remaining previews and review-{len(current) + 1} "
+            f"through review-{len(feedback)} for full requests and diff hunks."
+        )
+    if feedback:
+        sections["review-index"] = "\n\n".join(index_lines)
+        preview.append(
+            "Review requests against this commit:\n"
+            + json.dumps(current, ensure_ascii=False)
+        )
+    if source_context:
+        sections["review-source"] = source_context
+        preview.append(
+            "Source excerpts from the current checkout\n"
+            + excerpt(source_context, 4500)
+        )
+    sections["sections"] = "\n".join([*sections, *sources])
+    return TaskContext("\n\n".join(preview), sections, sources)
+
+
+def _bounded_content(text: str, max_wire: int) -> str:
+    if max_wire < 2:
+        return ""
+    size = max_wire
+    while wire_size(text) > max_wire:
+        text = excerpt(text, size)
+        size //= 2
+    return text
+
+
+def context_tool_result(context: TaskContext, call: Mapping[str, Any]) -> str:
+    try:
+        request = json.loads(call["function"]["arguments"])
+        if not isinstance(request, dict) or request.keys() != {"section", "page"}:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        return "Provide a section and positive integer page to read_task_context."
+    return json.dumps(
+        context.read(request["section"], request["page"]), ensure_ascii=False
+    )
+
+
+def _editor_content(text: str, max_wire: int) -> str:
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return _bounded_content(text, max_wire)
+    if not isinstance(payload, dict) or not isinstance(payload.get("evidence"), dict):
+        return _bounded_content(text, max_wire)
+    evidence = payload["evidence"]
+    compact = {
+        key: _bounded_content(
+            str(payload[key]), max_wire // (3 if key == "task" else 7)
+        )
+        for key in ("task", "mission", "current_guidance")
+        if key in payload
+    }
+    compact.update(
+        seed=payload.get("seed"), evidence={}, evidence_omitted=len(evidence)
+    )
+    for name, value in reversed(evidence.items()):
+        compact["evidence"][excerpt(name, 240)] = _bounded_content(str(value), 1800)
+        compact["evidence_omitted"] -= 1
+        if wire_size(json.dumps(compact, ensure_ascii=False)) > max_wire:
+            compact["evidence"].pop(excerpt(name, 240))
+            compact["evidence_omitted"] += 1
+            break
+    return json.dumps(compact, ensure_ascii=False)
+
+
+def compact_messages(
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    max_bytes: int = MESSAGE_BYTES,
+    role: str = "",
+) -> list[Mapping[str, Any]]:
+    """Keep a bounded prompt and a suffix of complete, unchanged tool turns."""
+    if wire_size(messages) <= max_bytes:
+        return list(messages)
+
+    prefix = []
+    index = 0
+    while index < min(2, len(messages)) and messages[index].get("role") in {
+        "system",
+        "user",
+    }:
+        original = messages[index]
+        content = original.get("content") or ""
+        size = max_bytes * 2 // 3 if original["role"] == "user" else max_bytes // 8
+        compact = (
+            _editor_content(content, size)
+            if role in {"proposal", "composition"} and original["role"] == "user"
+            else _bounded_content(content, size)
+        )
+        prefix.append({**original, "content": compact})
+        index += 1
+
+    groups: list[list[Mapping[str, Any]]] = []
+    for message in messages[index:]:
+        if message.get("role") == "tool" and groups and groups[-1][0].get("tool_calls"):
+            groups[-1].append(message)
+        else:
+            groups.append([message])
+    retained: list[Mapping[str, Any]] = []
+    kept_groups = 0
+    for group in reversed(groups):
+        calls = group[0].get("tool_calls")
+        if calls and [call["id"] for call in calls] != [
+            msg.get("tool_call_id") for msg in group[1:]
+        ]:
+            continue
+        if group[0].get("role") == "tool":
+            continue
+        if wire_size([*prefix, *group, *retained]) > max_bytes - 1200:
+            break
+        retained[:0] = group
+        kept_groups += 1
+    omitted = len(groups) - kept_groups
+    if omitted and prefix and prefix[-1]["role"] == "user":
+        failure = next(
+            (
+                message["content"]
+                for message in reversed(messages[index:])
+                if message.get("role") == "tool"
+                and isinstance(message.get("content"), str)
+                and re.match(r"^exit [1-9][0-9]*\b", message["content"])
+            ),
+            "",
+        )
+        summary = (
+            f"\n\n{omitted} earlier conversation groups were omitted to stay within the request limit. "
+            "Workspace edits remain available. Use bounded checkout reads to recover relevant details."
+        )
+        if failure:
+            summary += "\nLatest failed command output excerpt:\n" + _bounded_content(
+                failure, 640
+            )
+        prefix[-1]["content"] += summary
+    return [*prefix, *retained]

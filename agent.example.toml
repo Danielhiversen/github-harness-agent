@@ -1,0 +1,18 @@
+database = "agent.sqlite3"
+github_auth = "app"
+bot_login = "your-github-app[bot]"
+
+[repositories."example/project"]
+installation_id = 12345
+mode = "shadow"
+backend = "plain"
+base = "main"
+label = "agent:ready"
+branch_prefix = "agent/"
+worker_image = "your-tested-worker-image"
+# verification_image = "your-trusted-verification-image"
+worker_runtime = "runsc"
+model_requests = 40
+# rollout_requests = 8  # Requires verification_image
+commands = 64
+checks = [["python", "-m", "unittest", "discover"]]

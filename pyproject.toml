@@ -1,0 +1,23 @@
+[project]
+name = "github-harness-agent"
+version = "0.1.0"
+description = "Issue and review controller for isolated coding agents"
+requires-python = ">=3.12,<3.14"
+dependencies = ["fastapi", "httpx", "cryptography", "pyyaml", "uvicorn",
+                "harness2 @ git+https://github.com/google-research/harness2@6868817518876de8fd170c6a8354daca273b6191"]
+
+[project.scripts]
+github-harness-agent = "github_harness_agent.cli:main"
+
+[dependency-groups]
+dev = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+github_harness_agent = ["provider_manifest.v1.json"]
