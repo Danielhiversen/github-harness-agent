@@ -14,6 +14,7 @@ from .executor import (
     RefinementEvidence,
     SYSTEM_PROMPT,
     _ProtectedPatchError,
+    _MissingRegressionTests,
     _VerificationRejected,
 )
 from .providers import ProviderExhausted
@@ -42,6 +43,8 @@ _PYTEST_FAILURE = re.compile(
 
 
 def _check_feedback(task, failure):
+    if isinstance(failure, _MissingRegressionTests):
+        return str(failure)
     if not isinstance(failure, _VerificationRejected):
         return ""
     failed = failure.checks[-1]

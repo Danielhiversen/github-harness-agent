@@ -342,7 +342,7 @@ def collect_reviews(
                     key,
                     thread,
                     None,
-                    review["body"] if test_update_head else body,
+                    review["body"],
                     login,
                     test_update_head=test_update_head,
                 )
@@ -398,7 +398,7 @@ def collect_reviews(
                             key,
                             thread["id"],
                             root,
-                            body,
+                            comment["body"],
                             login,
                             thread["path"],
                             thread["line"],

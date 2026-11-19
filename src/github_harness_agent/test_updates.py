@@ -13,6 +13,16 @@ _DIRECTIVE = re.compile(
     r"::(?:([A-Za-z_][A-Za-z0-9_]*)::)?(test_[A-Za-z0-9_]+)"
 )
 _SKIP_NAMES = {"skip", "skipif", "skipTest", "SkipTest", "xfail", "expectedFailure"}
+_ADD_TESTS = re.compile(
+    r"(?:please\s+)?add\s+(?:(?:a|an|some)\s+)?(?:new\s+)?"
+    r"(?:regression\s+)?(?:tests?\b|(?:test\s+|regression\s+)?coverage\b)",
+    re.IGNORECASE,
+)
+_CONDITIONAL = re.compile(
+    r"\b(?:unless|optional|not necessary)\b|"
+    r"\b(?:only\s+if|if\s+(?:needed|possible|appropriate|necessary|feasible|you\s+can))\b",
+    re.IGNORECASE,
+)
 
 
 def _test_directive(line):
@@ -29,31 +39,54 @@ def _test_directive(line):
     return None
 
 
+def _review_prose(body):
+    fence = ""
+    for line in body.splitlines():
+        stripped = line.lstrip()
+        marker = re.match(r"(`{3,}|~{3,})", stripped)
+        if marker:
+            delimiter = marker[0]
+            if not fence:
+                fence = delimiter
+            elif delimiter.startswith(fence) and not stripped[len(delimiter) :].strip():
+                fence = ""
+            continue
+        if (
+            not fence
+            and not line.startswith(("    ", "\t"))
+            and not stripped.startswith(">")
+        ):
+            yield line
+
+
 def authorized_test_update(feedback: Iterable[Mapping]) -> str | None:
     """Read a single unambiguous directive from collected review bodies."""
-    directives = set()
-    for item in feedback:
-        if not item["key"].startswith("review:") or item["reply_to"] is not None:
-            continue
-        fence = ""
-        for line in item["body"].splitlines():
-            stripped = line.lstrip()
-            marker = re.match(r"(`{3,}|~{3,})", stripped)
-            if marker:
-                delimiter = marker[0]
-                if not fence:
-                    fence = delimiter
-                elif (
-                    delimiter.startswith(fence)
-                    and not stripped[len(delimiter) :].strip()
-                ):
-                    fence = ""
-            if not fence and (selector := _test_directive(line)):
-                directives.add(selector)
+    directives = {
+        selector
+        for item in feedback
+        if item["key"].startswith("review:") and item["reply_to"] is None
+        for line in _review_prose(item["body"])
+        if (selector := _test_directive(line))
+    }
     return next(iter(directives)) if len(directives) == 1 else None
 
 
-def focused_pytest(checks, selector, report):
+def requests_new_tests(body: str) -> bool:
+    """Recognize an affirmative, direct request in a human review item."""
+    body = re.sub(r"<!--.*?(?:-->|\Z)", " ", body, flags=re.DOTALL)
+    for line in _review_prose(body):
+        line = re.sub(r"(`+).*?\1", " ", line)
+        line = re.sub(r"[\"“][^\"”]*[\"”]", " ", line)
+        line = re.sub(r"(?<!\w)'[^']*'", " ", line)
+        line = re.sub(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", "", line)
+        for sentence in re.split(r"(?<=[.!?])\s+", line):
+            sentence = sentence.strip()
+            if _ADD_TESTS.match(sentence) and not _CONDITIONAL.search(sentence):
+                return True
+    return False
+
+
+def focused_pytest(checks, selectors, report):
     """Reuse the configured pytest launcher with an explicit node selection."""
     for command in checks:
         launcher = 0
@@ -79,7 +112,7 @@ def focused_pytest(checks, selector, report):
             prefix = command[: launcher + 3]
         else:
             continue
-        return (*prefix, "-o", "addopts=", f"--junitxml={report}", "--", selector)
+        return (*prefix, "-o", "addopts=", f"--junitxml={report}", "--", *selectors)
     return None
 
 
@@ -140,6 +173,31 @@ def _is_assertion(statement):
     return isinstance(statement, (ast.With, ast.AsyncWith)) and any(
         _call_name(item.context_expr) in {"raises", "assertRaises", "assertRaisesRegex"}
         for item in statement.items
+    )
+
+
+def has_runnable_test(path: str, source: bytes) -> bool:
+    """Check declarations before running the project's verification commands."""
+    if path.endswith("_test.go"):
+        return bool(re.search(rb"(?m)^\s*func\s+Test[A-Z0-9_]\w*\s*\(", source))
+    if path.endswith((".test.js", ".test.ts", ".spec.js", ".spec.ts")):
+        return bool(re.search(rb"(?m)^\s*(?:test|it)(?:\.(?:each|only))?\s*\(", source))
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return False
+    if any(_is_assertion(statement) for statement in tree.body):
+        return True
+    bodies = [
+        tree.body,
+        *(node.body for node in tree.body if isinstance(node, ast.ClassDef)),
+    ]
+    return any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("test")
+        and any(_is_assertion(statement) for statement in ast.walk(node))
+        for body in bodies
+        for node in body
     )
 
 

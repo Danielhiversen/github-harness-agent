@@ -32,7 +32,7 @@ from .rebase import (
     transplant_patch,
 )
 from .reviews import ReviewItem, collect_reviews, map_feedback, reply_to_review
-from .test_updates import authorized_test_update
+from .test_updates import authorized_test_update, requests_new_tests
 from .store import LeaseLost
 from .task_context import build_task_context, github_history, review_source_context
 
@@ -461,6 +461,22 @@ class Controller:
                         if item.get("test_update_head") == origin
                     )
 
+                def needs_new_tests():
+                    return stage == "repair" and any(
+                        requests_new_tests(item["body"])
+                        for item in data.get("feedback", ())
+                    )
+
+                if (
+                    prepared is not None
+                    and needs_new_tests()
+                    and not prepared.get("verified_new_tests")
+                    and publisher.branch_head(repo, branch) == origin
+                ):
+                    data.pop("prepared")
+                    store.save(job, "queued")
+                    return
+
                 if "prepared" not in data:
                     if stage == "repair":
                         mapped = []
@@ -592,6 +608,7 @@ class Controller:
                         verify_base_first=stage == "repair"
                         and bool(data.get("feedback") or data.get("ci_feedback")),
                         test_update=current_test_update(),
+                        require_new_tests=needs_new_tests(),
                     )
 
                     try:
@@ -686,6 +703,7 @@ class Controller:
                             "prior_model_attempt_failures", []
                         ),
                         "usage": result.usage,
+                        "verified_new_tests": task.require_new_tests,
                         "refinement": dataclasses.asdict(result.refinement)
                         if result.refinement
                         else None,
@@ -725,6 +743,7 @@ class Controller:
                         protected_paths=tuple(cfg.get("protected_paths", ())),
                         repository_guidance=cfg.get("reviewed_guidance", ""),
                         test_update=current_test_update(),
+                        require_new_tests=needs_new_tests(),
                     )
 
                     try:

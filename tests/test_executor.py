@@ -200,6 +200,20 @@ def test_review_test_update_is_verified_with_the_configured_checks(fixture):
     assert all(check.returncode == 0 for check in result.checks)
     assert b"+    assert Path('number.txt').read_text() == '3\\n'" in result.patch
 
+    task = replace(task, require_new_tests=True)
+    for empty_module in ("", "; Path('test_new.py').write_text('# TODO: test')"):
+        with pytest.raises(ExecutionError, match="new runnable regression tests"):
+            PlainExecutor(runner, ScriptedGateway(code + empty_module)).execute(
+                task, source
+            )
+
+    new_test = "from pathlib import Path\ndef test_regression():\n    assert Path('number.txt').read_text() == '3\\n'\n"
+    gateway = ScriptedGateway(code + f"; Path('test_new.py').write_text({new_test!r})")
+    result = PlainExecutor(runner, gateway).execute(task, source)
+    assert len(result.checks) == 4
+    assert result.checks[-1].command[-1] == "test_new.py"
+    assert all(check.returncode == 0 for check in result.checks)
+
 
 @pytest.mark.parametrize(
     ("code", "error"),
@@ -1101,6 +1115,35 @@ def test_harness2_review_retries_failed_base_with_safe_check_summary(fixture):
     assert "test_number.py::test_number" in base.error
     assert "private-" not in base.error
     assert repaired.patch_digest == result.patch_digest
+
+
+def test_harness2_review_retries_missing_regression_coverage_from_safe_draft(fixture):
+    task, source, runner = fixture
+    task = replace(task, verify_base_first=True, require_new_tests=True)
+
+    class RepairGateway(ScriptedGateway):
+        def complete(self, **kwargs):
+            message = kwargs["messages"][-1]
+            if message["role"] == "user" and len(self.roles) == 2:
+                assert "new runnable regression tests" in message["content"]
+                self.code = (
+                    "from pathlib import Path; "
+                    "assert Path('number.txt').read_text() == '4\\n'; "
+                    "Path('test_regression.py').write_text("
+                    '"from pathlib import Path\\n'
+                    "assert Path('number.txt').stat().st_size == 2\\n\")"
+                )
+            return super().complete(**kwargs)
+
+    gateway = RepairGateway("open('number.txt','w').write('4\\n')")
+    result = Harness2Executor(runner, gateway, Limits(model_requests=4)).execute(
+        task, source
+    )
+
+    assert b"+4\n" in result.patch
+    assert b"+++ b/test_regression.py" in result.patch
+    assert result.refinement.selected_candidate == "repair"
+    assert "new runnable regression tests" in result.refinement.candidates[0].error
 
 
 def test_review_protected_test_rejection_retries_from_last_safe_draft(fixture):

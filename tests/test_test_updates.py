@@ -1,6 +1,10 @@
 import pytest
 
-from github_harness_agent.test_updates import authorized_test_update, valid_test_update
+from github_harness_agent.test_updates import (
+    authorized_test_update,
+    requests_new_tests,
+    valid_test_update,
+)
 
 
 SELECTOR = "tests/test_module.py::TestModule::test_fixture"
@@ -14,6 +18,38 @@ SOURCE = b"""class TestModule:
     def test_neighbor(self):
         assert condition
 """
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Add regression coverage for the inclusive boundary and for a reading just outside it.",
+        "Preserve the signature. Please add a regression test for what happens if the API returns no data.",
+        "- Add new regression tests for this path.",
+        "1. Add coverage of the edge case.",
+    ],
+)
+def test_detects_direct_regression_requests(body):
+    assert requests_new_tests(body)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "No need to add regression tests.",
+        "Do not add tests.",
+        "Add tests if needed.",
+        "Add new tests unless the existing test already covers this case.",
+        "> Add a regression test.",
+        "    Add new tests.",
+        'I quoted the old review. "Add regression coverage."',
+        "`Example. Add regression coverage.`",
+        "```text\nAdd tests.\n```",
+        "<!--\nAdd tests.\n-->",
+    ],
+)
+def test_ignores_negated_optional_and_quoted_requests(body):
+    assert not requests_new_tests(body)
 
 
 def review(body, *, key="review:123:hash", reply_to=None):

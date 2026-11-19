@@ -62,7 +62,9 @@ If an existing Python test enforces behavior that the review changes, a maintain
 Allow test update: tests/test_training_rows.py::TestBuildDataset::test_saved_run
 ```
 
-The selector can also name a module-level test. Explain the corrected behavior and expected regression coverage in the review. The verifier checks the scope of the amendment and runs the configured checks. A PR description, issue, or CI diagnostic cannot grant the exception.
+The selector can also name a module-level test. The permission applies to the named test on the reviewed commit of an adopted PR. The verifier checks the scope of the amendment and runs the configured checks.
+
+When new coverage is part of the requested fix, say so explicitly in the review, for example `Add regression tests for both boundaries.` The worker asks the model for a new test module and checks for it before publishing. For a configured pytest launcher, it runs the requested tests separately and checks the pytest report. A rejected draft goes back to the model with the reason for rejection.
 
 ## Qualify a replacement
 

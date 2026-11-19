@@ -19,7 +19,12 @@ from .activity import observed_call
 from .checkpoint import DraftCheckpoint
 from .file_edit import EDIT_COMMAND, EDIT_TOOL, InvalidEdit, edit_payload
 from .providers import ProviderExhausted
-from .test_updates import focused_pytest, passed_pytest_report, valid_test_update
+from .test_updates import (
+    focused_pytest,
+    has_runnable_test,
+    passed_pytest_report,
+    valid_test_update,
+)
 from .task_context import (
     CONTEXT_TOOL,
     MESSAGE_BYTES,
@@ -132,6 +137,10 @@ class _VerificationRejected(ExecutionError):
     """A trusted check ran and rejected the candidate."""
 
 
+class _MissingRegressionTests(_VerificationRejected):
+    """A review requires new runnable test coverage."""
+
+
 @dataclass(frozen=True)
 class TaskSnapshot:
     repository: str
@@ -150,6 +159,7 @@ class TaskSnapshot:
     context: TaskContext | None = None
     verify_base_first: bool = False
     test_update: str | None = None
+    require_new_tests: bool = False
 
 
 @dataclass(frozen=True)
@@ -612,6 +622,11 @@ class PlainExecutor:
                     "\nA maintainer authorized this existing test update: "
                     f"{task.test_update}. Edit only the named test body and keep its assertions active."
                 )
+            if task.require_new_tests:
+                prompt += (
+                    "\nThe review requires new runnable regression coverage. "
+                    "Add a new test module for the requested behavior."
+                )
             messages = [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": instructions},
@@ -982,6 +997,26 @@ class PlainExecutor:
                 )
             except (_CandidateOutputError, CommandOutputExceeded) as error:
                 budget.reject(error, actor)
+            if task.require_new_tests and not any(
+                has_runnable_test(
+                    path,
+                    self._git(
+                        workspace,
+                        budget,
+                        "cat-file",
+                        "blob",
+                        f":{path}",
+                        cap=self.limits.patch_bytes,
+                    ).stdout,
+                )
+                for path in new_tests
+            ):
+                budget.reject(
+                    _MissingRegressionTests(
+                        "Add new runnable regression tests for the behavior requested in the review."
+                    ),
+                    actor,
+                )
             if new_tests:
                 self._git(
                     workspace,
@@ -995,13 +1030,13 @@ class PlainExecutor:
                 )
             checks = self._run_checks(workspace, budget, task.checks)
         trusted_passed = checks[-1].returncode == 0
-        report = f".git/gha-test-update-{uuid4().hex}.xml"
-        focused = (
-            focused_pytest(task.checks, task.test_update, report)
-            if amended_test
-            else None
-        )
-        if (new_tests or focused) and trusted_passed:
+        selections = []
+        if amended_test:
+            selections.append((task.test_update,))
+        new_python_tests = tuple(path for path in new_tests if path.endswith(".py"))
+        if task.require_new_tests and new_python_tests:
+            selections.append(new_python_tests)
+        if (new_tests or selections) and trusted_passed:
             with self.verification_runner.workspace(
                 archive, budget.remaining, budget.cancelled
             ) as workspace:
@@ -1009,7 +1044,13 @@ class PlainExecutor:
                 self._git(workspace, budget, "apply", "--index", "--binary", data=patch)
                 if new_tests:
                     checks.extend(self._run_checks(workspace, budget, task.checks))
-                if focused and checks[-1].returncode == 0:
+                for selectors in selections:
+                    if checks[-1].returncode:
+                        break
+                    report = f".git/gha-test-update-{uuid4().hex}.xml"
+                    focused = focused_pytest(task.checks, selectors, report)
+                    if not focused:
+                        continue
                     check = self._run_checks(workspace, budget, (focused,))[0]
                     if check.returncode == 0:
                         result = self._command(
@@ -1019,7 +1060,7 @@ class PlainExecutor:
                             check = CheckEvidence(
                                 focused,
                                 1,
-                                "The amended test did not pass as an executed pytest test.",
+                                "The selected test coverage did not pass as executed pytest tests.",
                             )
                     checks.append(check)
         if checks[-1].returncode:
