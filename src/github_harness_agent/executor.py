@@ -125,6 +125,12 @@ class _CandidateOutputError(ExecutionError):
     pass
 
 
+@dataclass(frozen=True)
+class _CheckArtifact:
+    index_entry: bytes
+    fingerprint: bytes
+
+
 class _ProtectedPatchError(_CandidateOutputError):
     repair_feedback = (
         "The candidate changed protected content outside the allowed scope. "
@@ -608,39 +614,60 @@ class PlainExecutor:
         return {
             path: state
             for path, state in zip(paths, result.stdout.splitlines(), strict=True)
-            if state
         }
 
-    def _stage_rollout(self, workspace, budget, artifacts, *, index=None):
+    def _stage_rollout(
+        self, workspace, budget, artifacts, *, index=None, tracked=False
+    ):
+        mode = "-u" if tracked else "-A"
         if not artifacts:
-            self._git(workspace, budget, "add", "-A", index=index)
+            self._git(workspace, budget, "add", mode, index=index)
             return
         paths = sorted(artifacts)
-        pathspec_input = ("--pathspec-from-file=-", "--pathspec-file-nul")
-        # A check may have staged its output or restored a deleted tracked path.
-        # Remove the attributed entries from the index and leave working files intact.
-        self._git(
-            workspace,
-            budget,
-            "--literal-pathspecs",
-            "rm",
-            "--cached",
-            "-qrf",
-            "--ignore-unmatch",
-            *pathspec_input,
-            data=b"\0".join(paths) + b"\0",
-            index=index,
-        )
         self._git(
             workspace,
             budget,
             "add",
-            "-A",
-            *pathspec_input,
+            mode,
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
             data=b".\0"
             + b"".join(b":(top,exclude,literal)" + path + b"\0" for path in paths),
             index=index,
         )
+        # Restore pre-check entries even if the check itself changed the index.
+        self._git(
+            workspace,
+            budget,
+            "update-index",
+            "-z",
+            "--index-info",
+            data=b"".join(
+                artifacts[path].index_entry + b"\t" + path + b"\0" for path in paths
+            ),
+            index=index,
+        )
+
+    def _check_changed_entries(self, workspace, budget, before_tree, index):
+        result = self._git(
+            workspace,
+            budget,
+            "diff",
+            "--cached",
+            "--raw",
+            "--no-abbrev",
+            "--no-renames",
+            "--no-ext-diff",
+            "-z",
+            before_tree,
+            index=index,
+        )
+        pairs = result.stdout.split(b"\0")[:-1]
+        entries = {}
+        for raw, path in zip(pairs[::2], pairs[1::2], strict=True):
+            old_mode, _, old_oid, _, _ = raw.split()
+            entries[path] = old_mode.removeprefix(b":") + b" " + old_oid
+        return entries
 
     def _rollout(
         self,
@@ -707,6 +734,7 @@ class PlainExecutor:
                 tools += (CONTEXT_TOOL,)
             trajectory = []
             artifact_index = None
+            check_tree_index = None
             artifacts = {}
             actor = None
             last = None
@@ -766,6 +794,7 @@ class PlainExecutor:
                     touched = False
                     checked_command = None
                     before_check = None
+                    before_tree = None
                     try:
                         budget.claim("command", self.limits.commands)
                         if is_edit:
@@ -794,6 +823,29 @@ class PlainExecutor:
                                         baseline,
                                         index=artifact_index,
                                     )
+                                    check_tree_index = (
+                                        f".git/gha-check-tree-{uuid4().hex}"
+                                    )
+                                    self._git(
+                                        workspace,
+                                        budget,
+                                        "read-tree",
+                                        baseline,
+                                        index=check_tree_index,
+                                    )
+                                self._stage_rollout(
+                                    workspace, budget, artifacts, index=check_tree_index
+                                )
+                                before_tree = (
+                                    self._git(
+                                        workspace,
+                                        budget,
+                                        "write-tree",
+                                        index=check_tree_index,
+                                    )
+                                    .stdout.strip()
+                                    .decode("ascii")
+                                )
                                 before_check = self._check_snapshot(
                                     workspace, budget, artifact_index
                                 )
@@ -829,19 +881,38 @@ class PlainExecutor:
                                 )
                                 created = untracked_after - untracked_before
                                 recreated = missing_before - missing_after
-                                artifacts = self._artifact_state(
+                                self._stage_rollout(
                                     workspace,
                                     budget,
-                                    artifacts.keys() | created | recreated,
+                                    artifacts,
+                                    index=check_tree_index,
+                                    tracked=True,
                                 )
+                                entries = self._check_changed_entries(
+                                    workspace, budget, before_tree, check_tree_index
+                                )
+                                absent = b"0 " + b"0" * len(baseline)
+                                for path in created | recreated:
+                                    entries.setdefault(path, absent)
+                                entries.update(
+                                    (path, artifact.index_entry)
+                                    for path, artifact in artifacts.items()
+                                )
+                                states = self._artifact_state(
+                                    workspace, budget, entries
+                                )
+                                artifacts = {
+                                    path: _CheckArtifact(entry, states[path])
+                                    for path, entry in entries.items()
+                                }
                             elif artifacts:
                                 current = self._artifact_state(
                                     workspace, budget, artifacts
                                 )
                                 artifacts = {
-                                    path: state
-                                    for path, state in artifacts.items()
-                                    if current.get(path) == state
+                                    path: artifact
+                                    for path, artifact in artifacts.items()
+                                    if current[path] == artifact.fingerprint
                                 }
                         except (_CandidateOutputError, CommandOutputExceeded) as error:
                             budget.reject(error, last)

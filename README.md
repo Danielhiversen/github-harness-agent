@@ -66,7 +66,7 @@ The selector can also name a module-level test. The permission applies to the na
 
 When new coverage is part of the requested fix, say so explicitly in the review, for example `Add regression tests for both boundaries.` The worker asks the model for a new test module and checks for it before publishing. For a configured pytest launcher, it runs the requested tests separately and checks the pytest report. A rejected draft goes back to the model with the reason for rejection.
 
-During review repair, the worker records which files a recognized check command creates. It leaves those files out of the draft, preserves deletions when a check recreates a deleted file, and includes files the model subsequently edits. This tracking covers configured commands and common test runners invoked directly or through supported wrappers.
+During review repair, the worker snapshots the draft before running a recognized check. If the check creates, overwrites, or recreates a deleted file, the worker preserves the pre-check draft for that path. A subsequent edit by the model can still be committed. This tracking covers configured commands and common test runners invoked directly or through supported wrappers.
 
 ## Qualify a replacement
 

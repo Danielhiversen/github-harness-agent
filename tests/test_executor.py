@@ -558,18 +558,32 @@ def test_exact_edit_refuses_to_follow_symlink_parents(tmp_path):
     assert file.read_text() == "initial"
 
 
+def test_check_classification_preserves_explicit_tool_edits():
+    from github_harness_agent.check_artifacts import check_label
+
+    assert check_label(("uv", "run", "ruff", "format", "--check"), ()) == "ruff"
+    assert check_label(("uv", "run", "ruff", "format"), ()) is None
+    assert check_label(("ruff", "check", "--fix"), ()) is None
+    assert check_label(("jest", "--updateSnapshot"), ()) is None
+
+
 def test_rollout_stages_model_edits_without_check_byproducts(fixture):
     task, source, runner = fixture
     (source / "tracked runtime.dat").write_text("previous runtime output")
+    (source / "overwritten.dat").write_bytes(b"\x00baseline")
+    (source / "claimed-tracked.txt").write_text("baseline")
     (source / "check_suite.py").write_text(
         "from pathlib import Path\n"
         "from subprocess import run\n"
         "Path('generated [1].dat').write_bytes(b'\\x00byproduct')\n"
         "Path('tracked runtime.dat').write_text('regenerated')\n"
-        "Path('keep.txt').touch()\n"
+        "Path('overwritten.dat').write_bytes(b'\\x00rewrite')\n"
+        "Path('number.txt').write_text('rewrite')\n"
+        "Path('claimed-tracked.txt').write_text('generated')\n"
+        "Path('keep.txt').write_text('rewrite')\n"
         "if not Path('claim.txt').exists():\n"
         "    Path('claim.txt').write_text('generated')\n"
-        "run(['git', 'add', 'generated [1].dat'], check=True)\n"
+        "run(['git', 'add', 'generated [1].dat', 'overwritten.dat', 'number.txt'], check=True)\n"
     )
     subprocess.run(["git", "add", "."], cwd=source, check=True)
     subprocess.run(
@@ -600,6 +614,9 @@ def test_rollout_stages_model_edits_without_check_byproducts(fixture):
                 "from pathlib import Path; "
                 "assert not Path('generated [1].dat').exists(); "
                 "assert not Path('tracked runtime.dat').exists(); "
+                "assert Path('overwritten.dat').read_bytes() == b'\\x00baseline'; "
+                "assert Path('keep.txt').read_text() == 'intentional before the check'; "
+                "assert Path('claimed-tracked.txt').read_text() == 'intentional tracked edit'; "
                 "assert Path('number.txt').read_text() == '4\\n'",
             ),
         ),
@@ -616,6 +633,14 @@ def test_rollout_stages_model_edits_without_check_byproducts(fixture):
                 "path": "claim.txt",
                 "old_text": "generated",
                 "new_text": "intentional after the check",
+            },
+        ),
+        (
+            "edit_file",
+            {
+                "path": "claimed-tracked.txt",
+                "old_text": "generated",
+                "new_text": "intentional tracked edit",
             },
         ),
     ]
@@ -637,6 +662,7 @@ def test_rollout_stages_model_edits_without_check_byproducts(fixture):
 
     result = PlainExecutor(runner, CheckGateway(None)).execute(task, source)
     assert b"generated [1].dat" not in result.patch
+    assert b"overwritten.dat" not in result.patch
     assert b"deleted file mode" in result.patch
     assert b"tracked runtime.dat" in result.patch
     assert b"intentional before the check" in result.patch

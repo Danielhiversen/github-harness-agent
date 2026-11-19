@@ -40,9 +40,21 @@ def check_label(argv, configured_checks):
         return check_label(argv, ()) if argv else None
     if re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", executable):
         module = argv[2] if len(argv) >= 3 and argv[1] == "-m" else ""
-        return module if module in CHECK_TOOLS else None
+        return check_label((module, *argv[3:]), ()) if module in CHECK_TOOLS else None
     if executable in {"cargo", "go", "npm", "pnpm", "yarn"} and argv[1:2] == ("test",):
         return executable
+    if executable == "ruff":
+        options = set(argv[1:])
+        if {"--fix", "--fix-only"} & options:
+            return None
+        if argv[1:2] == ("format",) and not {"--check", "--diff"} & options:
+            return None
+    if executable in {"jest", "vitest"} and {
+        "-u",
+        "--update",
+        "--updateSnapshot",
+    } & set(argv[1:]):
+        return None
     return executable if executable in CHECK_TOOLS else None
 
 
