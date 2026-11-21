@@ -189,6 +189,7 @@ def restore_drafts(api, checkout, repo, origin, parent, scope, envelope):
                     base_sha=parent,
                     patch=transplant_patch(checkout, parent, draft.patch),
                     progress=(),
+                    seed_patch_digest=None,
                 )
                 for key, draft in drafts.items()
             }

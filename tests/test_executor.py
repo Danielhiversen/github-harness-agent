@@ -1433,6 +1433,89 @@ def test_harness2_review_retries_missing_regression_coverage_from_safe_draft(fix
     assert "new runnable regression tests" in result.refinement.candidates[0].error
 
 
+@pytest.mark.parametrize(
+    "kind", ["legacy_stale", "known_stale", "legacy_extension", "same_seed"]
+)
+def test_review_repair_checkpoint_keeps_the_current_seed_and_provable_repair_edits(
+    fixture, kind
+):
+    import hashlib
+
+    from github_harness_agent.checkpoint import DraftCheckpoint
+    from github_harness_agent.harness2_adapter import BASE_GUIDANCE
+    from github_harness_agent.rebase import git
+
+    task, source, runner = fixture
+    test_text = (
+        "from pathlib import Path\n\n"
+        "def test_regression():\n"
+        "    assert Path('number.txt').read_text() == '4\\n'\n"
+    )
+
+    def patch(files):
+        for name, content in files.items():
+            (source / name).write_text(content)
+        git(source, "add", "-A")
+        result = git(
+            source, "diff", "--cached", "--binary", "--full-index", task.base_sha
+        )
+        git(source, "reset", "--hard", task.base_sha)
+        return result
+
+    base = patch({"number.txt": "5\n", "test_regression.py": test_text})
+    extends = kind in {"legacy_extension", "same_seed"}
+    old_files = {
+        "number.txt": "5\n" if kind == "legacy_extension" else "4\n",
+        "repair_note.txt": "prior work\n",
+    }
+    if extends:
+        old_files["test_regression.py"] = test_text
+    saved_repair = DraftCheckpoint(
+        "harness2/repair", task.base_sha, patch(old_files), guidance=BASE_GUIDANCE
+    )
+    if kind in {"known_stale", "same_seed"}:
+        saved_repair = replace(
+            saved_repair,
+            seed_patch_digest=hashlib.sha256(
+                base if kind == "same_seed" else b"stale seed"
+            ).hexdigest(),
+        )
+    saved_base = DraftCheckpoint(
+        "harness2/base", task.base_sha, base, guidance=BASE_GUIDANCE
+    )
+    writes = {}
+    task = replace(
+        task,
+        verify_base_first=True,
+        require_new_tests=True,
+        checkpoints={draft.key: draft for draft in (saved_base, saved_repair)},
+        save_checkpoint=lambda draft: writes.update({draft.key: draft}),
+    )
+
+    class RepairGateway(ScriptedGateway):
+        def complete(self, **kwargs):
+            if len(self.roles) == 1:
+                assert "Independent validation" in kwargs["messages"][1]["content"]
+                self.code = (
+                    "from pathlib import Path; "
+                    "assert Path('test_regression.py').is_file(); "
+                    f"assert Path('repair_note.txt').is_file() == {extends}; "
+                    "Path('number.txt').write_text('4\\n'); "
+                    "Path('complete.txt').write_text('repair completed\\n')"
+                )
+            elif len(self.roles) == 2:
+                assert kwargs["messages"][-1]["content"].startswith("exit 0")
+            return super().complete(**kwargs)
+
+    result = Harness2Executor(runner, RepairGateway(None)).execute(task, source)
+    assert b"+++ b/test_regression.py" in result.patch
+    assert (b"+++ b/repair_note.txt" in result.patch) == extends
+    assert result.refinement.selected_candidate == "repair"
+    recorded = writes[saved_repair.key]
+    assert recorded.seed_patch_digest == hashlib.sha256(base).hexdigest()
+    assert DraftCheckpoint.from_data(recorded.to_data()) == recorded
+
+
 def test_review_protected_test_rejection_retries_from_last_safe_draft(fixture):
     task, source, runner = fixture
     saved = {}

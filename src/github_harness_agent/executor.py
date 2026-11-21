@@ -342,10 +342,7 @@ class _Budget:
         try:
             completion = send(compact)
         except ProviderExhausted as error:
-            if (
-                not retry_oversize
-                or "upstream HTTP 413" not in error.failures.values()
-            ):
+            if not retry_oversize or "upstream HTTP 413" not in error.failures.values():
                 raise
             smaller = compact_messages(
                 messages, max_bytes=RETRY_MESSAGE_BYTES, role=role
@@ -814,6 +811,43 @@ class PlainExecutor:
         except (CommandOutputExceeded, UnicodeDecodeError):
             return None
 
+    def _legacy_repair_contains_seed(self, workspace, budget, baseline, repair, seed):
+        if not seed or repair == seed:
+            return True
+        if not repair or len(repair) > self.limits.patch_bytes:
+            return False
+        index = f".git/gha-repair-seed-{uuid4().hex}"
+        self._git(workspace, budget, "read-tree", baseline, index=index)
+        try:
+            applied = self._git(
+                workspace,
+                budget,
+                "apply",
+                "--cached",
+                "--binary",
+                data=repair,
+                index=index,
+                checked=False,
+            )
+            return (
+                applied.returncode == 0
+                and self._git(
+                    workspace,
+                    budget,
+                    "apply",
+                    "--cached",
+                    "--binary",
+                    "--check",
+                    "--reverse",
+                    data=seed,
+                    index=index,
+                    checked=False,
+                ).returncode
+                == 0
+            )
+        except CommandOutputExceeded:
+            return False
+
     def _rollout(
         self,
         task,
@@ -832,6 +866,26 @@ class PlainExecutor:
         ) as workspace:
             baseline = self._stage_baseline(workspace, budget)
             own_draft = task.checkpoints.get(checkpoint_key)
+            seed_digest = None
+            upgraded = False
+            if checkpoint_key == "harness2/repair":
+                seed_patch = seed_draft.patch if seed_draft is not None else b""
+                seed_digest = hashlib.sha256(seed_patch).hexdigest()
+                if own_draft is not None and own_draft.seed_patch_digest != seed_digest:
+                    if (
+                        own_draft.seed_patch_digest is None
+                        and self._legacy_repair_contains_seed(
+                            workspace,
+                            budget,
+                            baseline,
+                            own_draft.patch,
+                            seed_patch,
+                        )
+                    ):
+                        own_draft = replace(own_draft, seed_patch_digest=seed_digest)
+                        upgraded = True
+                    else:
+                        own_draft = None
             draft = own_draft or seed_draft
             if draft is not None and draft.key != checkpoint_key:
                 raise ExecutionError("Saved draft belongs to a different rollout")
@@ -847,6 +901,9 @@ class PlainExecutor:
                     draft,
                     checkpoint_guidance,
                 )
+                if upgraded and task.save_checkpoint is not None:
+                    budget.remaining()
+                    task.save_checkpoint(draft)
                 progress.extend(draft.progress)
                 instructions += (
                     "\n\nResuming a saved draft already applied to this checkout. "
@@ -972,9 +1029,8 @@ class PlainExecutor:
 
             def has_model_turn():
                 return (
-                    (limit is None or turns < limit)
-                    and budget.model_requests_remaining() > 0
-                )
+                    limit is None or turns < limit
+                ) and budget.model_requests_remaining() > 0
 
             while limit is None or turns < limit:
                 if text_batch_applied and not has_model_turn():
@@ -1033,7 +1089,11 @@ class PlainExecutor:
                 if recovery_turn:
                     log_recovery(
                         "native",
-                        "exhausted" if native_error else "accepted" if native_accepted else "invalid",
+                        "exhausted"
+                        if native_error
+                        else "accepted"
+                        if native_accepted
+                        else "invalid",
                         len(calls) if native_accepted else 0,
                     )
                 if recovery_turn and not native_accepted:
@@ -1372,6 +1432,7 @@ class PlainExecutor:
                                 tuple(progress),
                                 checkpoint_guidance,
                                 editing_route,
+                                seed_digest,
                             )
                             budget.remaining()
                             task.save_checkpoint(draft)
