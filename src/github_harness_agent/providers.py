@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import hmac
 import json
@@ -31,6 +32,12 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 DEFAULT_REQUEST_TIMEOUT = 60
 MAX_REQUEST_TIMEOUT = 900
+_OLLAMA_ORIGIN = "http://127.0.0.1:11434"
+_OLLAMA_API = f"{_OLLAMA_ORIGIN}/v1"
+_LOCAL_MODEL_NAME = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
+)
+_LOCAL_ATTEMPT_MAX = 480
 
 PUBLIC_ALIASES = frozenset(
     {
@@ -177,6 +184,7 @@ class _Route:
     quality_priority: int | None
     attempt_timeout: float
     quota_key: tuple
+    local_model_digest: str | None = None
 
 
 def _call(identifier: str, name: str, arguments: Any) -> dict:
@@ -439,6 +447,61 @@ def _paid_router(alias: str, model: str) -> bool:
     return alias.startswith("openrouter") and model in NON_FREE_ROUTERS
 
 
+def _local_spec(item: dict, alias: str, model: str) -> tuple[int, str] | None:
+    if "local_max_tokens" not in item and "local_model_digest" not in item:
+        return None
+    if (
+        alias != "ollama-local"
+        or item.get("url") != _OLLAMA_API
+        or item.get("headers", {}) != {}
+        or item.get("free_verified") is not True
+        or not _LOCAL_MODEL_NAME.fullmatch(model)
+        or "cloud" in re.split(r"[.:_-]", model.casefold())
+    ):
+        raise ValueError(
+            "Local model overrides require a verified loopback Ollama model name and empty headers"
+        )
+    max_tokens = item.get("local_max_tokens")
+    if type(max_tokens) is not int or not 1 <= max_tokens <= 8192:
+        raise ValueError("local_max_tokens must be an integer between 1 and 8192")
+    digest = item.get("local_model_digest")
+    digest = digest.lower().removeprefix("sha256:") if isinstance(digest, str) else ""
+    if not re.fullmatch(r"[a-f0-9]{64}", digest):
+        raise ValueError("local_model_digest must be a full SHA-256 digest")
+    return max_tokens, digest
+
+
+async def _post_pinned_ollama(
+    route: _Route, payload: dict, timeout: float
+) -> httpx.Response | None:
+    if timeout <= 0:
+        raise TimeoutError
+    # An HTTP read timeout only bounds individual reads. Keep one deadline for
+    # the inventory check and the complete local response.
+    async with asyncio.timeout(timeout):
+        async with httpx.AsyncClient(follow_redirects=False, trust_env=False) as client:
+            inventory = await client.get(
+                f"{_OLLAMA_ORIGIN}/api/tags", timeout=min(5, timeout)
+            )
+            inventory.raise_for_status()
+            rows = inventory.json().get("models")
+            if not isinstance(rows, list) or not any(
+                isinstance(row, dict)
+                and (row.get("name") or row.get("model")) == route.model
+                and not (row.get("remote_model") or row.get("remote_host"))
+                and type(row.get("size")) is int
+                and row["size"] > 0
+                and isinstance(row.get("digest"), str)
+                and row["digest"].lower().removeprefix("sha256:")
+                == route.local_model_digest
+                for row in rows
+            ):
+                return None
+            return await client.post(
+                f"{_OLLAMA_API}/chat/completions", json=payload, timeout=timeout
+            )
+
+
 def _completion_timeout(timeout: float | None) -> float:
     if timeout is None:
         return DEFAULT_REQUEST_TIMEOUT
@@ -498,7 +561,10 @@ class ProviderRouter:
         configured = {}
         for item in deployments:
             alias, model = item["model"].split("/", 1)
-            if (alias, model) not in allowed or _paid_router(alias, model):
+            local = _local_spec(item, alias, model)
+            if ((alias, model) not in allowed and local is None) or _paid_router(
+                alias, model
+            ):
                 raise ValueError(
                     "The deployment contains a model outside the free allowlist"
                 )
@@ -519,17 +585,20 @@ class ProviderRouter:
             if priority is not None and type(priority) is not int:
                 raise ValueError("quality_priority must be an integer")
             attempt_timeout = item.get("attempt_timeout", 15)
+            limit = _LOCAL_ATTEMPT_MAX if local is not None else 60
             if (
                 type(attempt_timeout) not in {int, float}
-                or not 0 < attempt_timeout <= 60
+                or not 0 < attempt_timeout <= limit
             ):
                 raise ValueError(
-                    "attempt_timeout must be above zero and at most 60 seconds"
+                    f"attempt_timeout must be above zero and at most {limit} seconds"
                 )
             keyless = item.get("allow_keyless") is True
             if keyless and alias != "kilo-free":
                 raise ValueError("allow_keyless applies only to the Kilo free route")
-            protocol, max_tokens = allowed[alias, model]
+            protocol, max_tokens = (
+                allowed[alias, model] if local is None else ("chat", local[0])
+            )
             configured[alias, model] = _Route(
                 alias,
                 model,
@@ -543,6 +612,7 @@ class ProviderRouter:
                 priority,
                 attempt_timeout,
                 (endpoint.scheme, endpoint.host, endpoint.port, fingerprint),
+                local[1] if local is not None else None,
             )
         choices = [
             (r["provider"], r["model"])
@@ -722,13 +792,25 @@ class ProviderRouter:
                     route.model,
                 )
                 yield {"provider": route.alias, "model": route.model}
-                response = self.client.post(
-                    url,
-                    json=payload,
-                    headers=route.headers,
-                    timeout=attempt_timeout,
-                    follow_redirects=False,
-                )
+                if route.local_model_digest is not None:
+                    response = asyncio.run(
+                        _post_pinned_ollama(
+                            route,
+                            payload,
+                            min(attempt_timeout, deadline - time.monotonic()),
+                        )
+                    )
+                    if response is None:
+                        failures[route.alias] = "model unavailable"
+                        continue
+                else:
+                    response = self.client.post(
+                        url,
+                        json=payload,
+                        headers=route.headers,
+                        timeout=attempt_timeout,
+                        follow_redirects=False,
+                    )
                 retry_after = response.headers.get("Retry-After")
                 if (
                     response.status_code == 429
@@ -766,7 +848,7 @@ class ProviderRouter:
                 }.get(status, f"upstream HTTP {status}")
                 if status is not None and status >= 500:
                     retry_times.append(self._defer_model(key))
-            except httpx.TimeoutException:
+            except (httpx.TimeoutException, TimeoutError):
                 failures[route.alias] = "upstream timeout"
                 retry_times.append(self._defer_model(key))
             except httpx.RequestError:

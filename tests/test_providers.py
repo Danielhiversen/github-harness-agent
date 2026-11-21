@@ -781,3 +781,145 @@ def test_resumed_editor_account_tried_last_and_remains_eligible():
     )
     assert result.route == "openrouter-free"
     assert attempts == ["kilo-free", "ollama-local", "openrouter-free"]
+
+
+LOCAL_ALIAS = "ollama-local/harness-review-coder:30b"
+LOCAL_MODEL = "harness-review-coder:30b"
+LOCAL_URL = "http://127.0.0.1:11434/v1"
+LOCAL_DIGEST = "a9" * 32
+
+
+def pinned_local(**overrides):
+    return {
+        "model": LOCAL_ALIAS,
+        "url": LOCAL_URL,
+        "headers": {},
+        "free_verified": True,
+        "tools": True,
+        "local_max_tokens": 4096,
+        "local_model_digest": f"sha256:{LOCAL_DIGEST}",
+        "attempt_timeout": 480,
+        **overrides,
+    }
+
+
+def local_inventory(**overrides):
+    return {
+        "models": [
+            {"name": LOCAL_MODEL, "digest": LOCAL_DIGEST, "size": 300000, **overrides}
+        ]
+    }
+
+
+def mock_async_local(monkeypatch, handler):
+    client = httpx.AsyncClient
+    monkeypatch.setattr(
+        providers.httpx,
+        "AsyncClient",
+        lambda **kwargs: client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+
+
+def test_pinned_unlisted_ollama_model_uses_loopback_inventory_and_completion(
+    monkeypatch,
+):
+    calls = []
+
+    async def handle(request):
+        calls.append(request.method)
+        if request.method == "GET":
+            assert str(request.url) == "http://127.0.0.1:11434/api/tags"
+            return httpx.Response(200, json=local_inventory())
+        assert str(request.url) == f"{LOCAL_URL}/chat/completions"
+        assert "authorization" not in request.headers
+        body = json.loads(request.content)
+        assert body["model"] == LOCAL_MODEL
+        assert body["max_tokens"] == 4096
+        assert 110 < request.extensions["timeout"]["read"] <= 120
+        return httpx.Response(200, json={**openai_response(), "model": LOCAL_MODEL})
+
+    mock_async_local(monkeypatch, handle)
+    router = ProviderRouter(load_manifest(), [pinned_local()])
+    assert calls == []
+    result = router.complete(role="plain", messages=[], timeout=120)
+    assert (result.route, result.model) == ("ollama-local", LOCAL_MODEL)
+    assert calls == ["GET", "POST"]
+    assert LOCAL_MODEL not in {
+        item["id"] for item in load_manifest()["web"]["ollama-local"]["models"]
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"url": "http://localhost:11434/v1"},
+        {"url": "http://127.0.0.1:11434/v1?model=cloud"},
+        {"url": "http://127.0.0.1:11435/v1"},
+        {"headers": {"Authorization": "Bearer test"}},
+        {"model": "kilo-free/harness-review-coder:30b"},
+        {"model": "ollama-local/namespace/coder:30b"},
+        {"model": "ollama-local/harness-review-coder:cloud"},
+        {"model": "ollama-local/harness-review-coder:30b-cloud"},
+        {"model": "ollama-local/harness-review-coder-cloud:30b"},
+        {"model": "ollama-local/harness-review-coder"},
+        {"local_max_tokens": 0},
+        {"local_max_tokens": True},
+        {"local_max_tokens": 8193},
+        {"local_model_digest": "short"},
+        {"local_model_digest": None},
+        {"free_verified": False},
+        {"attempt_timeout": 481},
+    ],
+)
+def test_unlisted_local_model_requires_explicit_bounded_loopback_settings(overrides):
+    with pytest.raises(ValueError):
+        ProviderRouter(load_manifest(), [pinned_local(**overrides)])
+
+
+@pytest.mark.parametrize(
+    "inventory",
+    [
+        {"models": []},
+        local_inventory(digest="1" * 64),
+        local_inventory(remote_model="remote"),
+        local_inventory(remote_host="https://example.invalid"),
+        local_inventory(size=0),
+    ],
+)
+def test_ollama_inventory_pin_failure_skips_local_completion(monkeypatch, inventory):
+    async def handle(request):
+        assert request.method == "GET"
+        return httpx.Response(200, json=inventory)
+
+    mock_async_local(monkeypatch, handle)
+    router = ProviderRouter(load_manifest(), [pinned_local()])
+    with pytest.raises(ProviderExhausted) as error:
+        router.complete(role="plain", messages=[])
+    assert error.value.failures == {"ollama-local": "model unavailable"}
+
+
+def test_pinned_ollama_absolute_deadline_cancels_local_request(monkeypatch):
+    cancelled = []
+
+    async def handle(request):
+        if request.method == "GET":
+            return httpx.Response(200, json=local_inventory())
+        try:
+            await asyncio.sleep(15)
+        finally:
+            cancelled.append(True)
+
+    mock_async_local(monkeypatch, handle)
+    router = ProviderRouter(load_manifest(), [pinned_local()])
+    with pytest.raises(ProviderExhausted) as error:
+        router.complete(role="plain", messages=[], timeout=0.1)
+    assert cancelled
+    assert error.value.failures == {"ollama-local": "upstream timeout"}
+
+
+@pytest.mark.parametrize("model", [KILO, OLLAMA])
+def test_long_attempt_timeout_remains_unavailable_to_unpinned_routes(model):
+    config = deployment(model)
+    config[0]["attempt_timeout"] = 480
+    with pytest.raises(ValueError, match="at most 60"):
+        ProviderRouter(load_manifest(), config)
