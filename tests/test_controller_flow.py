@@ -116,6 +116,7 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario):
             assert not cancelled()
             is_review = "Review requests" in task.instructions
             assert task.verify_base_first is is_review
+            assert task.inline_review_threads == int(is_review)
             if scenario == "fallback":
                 if is_review:
                     assert task.excluded_models == ()

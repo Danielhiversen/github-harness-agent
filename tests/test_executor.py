@@ -680,12 +680,31 @@ def test_rollout_stages_model_edits_without_check_byproducts(fixture):
     assert resumed.patch == result.patch
 
 
+def with_resumed_number_edit(task):
+    from github_harness_agent.checkpoint import DraftCheckpoint
+
+    draft = DraftCheckpoint(
+        "plain/coding",
+        task.base_sha,
+        b"diff --git a/number.txt b/number.txt\n"
+        b"--- a/number.txt\n+++ b/number.txt\n@@ -1 +1 @@\n-3\n+4\n",
+    )
+    return replace(task, checkpoints={draft.key: draft})
+
+
 @pytest.mark.parametrize(
-    ("limit", "edit_at_cap", "expected_turns"),
-    [(None, False, 12), (None, True, 12), (2, True, 2)],
+    ("limit", "threads", "edit_turn", "resumed", "model_limit", "expected_turns"),
+    [
+        (None, 4, None, False, 40, 12),
+        (None, 1, 12, False, 40, 12),
+        (None, 4, 12, False, 40, 20),
+        (None, 4, 12, False, 14, 14),
+        (None, 4, None, True, 40, 12),
+        (2, 4, 2, False, 40, 2),
+    ],
 )
 def test_review_rollout_bounds_context_reads_and_stages_last_edit(
-    fixture, limit, edit_at_cap, expected_turns
+    fixture, limit, threads, edit_turn, resumed, model_limit, expected_turns
 ):
     from github_harness_agent.executor import AttemptRejected
     from github_harness_agent.task_context import TaskContext
@@ -705,7 +724,7 @@ def test_review_rollout_bounds_context_reads_and_stages_last_edit(
                 self.first_reminder_turn = turn
             name = "read_task_context"
             arguments = {"section": "sections", "page": 1}
-            if edit_at_cap and turn == expected_turns:
+            if turn == edit_turn:
                 name = "edit_file"
                 arguments = {
                     "path": "number.txt",
@@ -725,22 +744,126 @@ def test_review_rollout_bounds_context_reads_and_stages_last_edit(
     task = replace(
         task,
         verify_base_first=True,
+        inline_review_threads=threads,
         context=TaskContext(task.instructions, {"sections": "Review details"}, {}),
     )
+    if resumed:
+        task = with_resumed_number_edit(task)
     gateway = ReviewingGateway()
     executor = PlainExecutor(
         runner,
         gateway,
-        Limits(model_requests=40, rollout_requests=limit),
+        Limits(model_requests=model_limit, rollout_requests=limit),
         verification_runner=runner,
     )
-    if edit_at_cap:
+    if edit_turn or resumed:
         assert b"-3\n+4\n" in executor.execute(task, source).patch
     else:
         with pytest.raises(AttemptRejected, match="empty patch"):
             executor.execute(task, source)
     assert len(gateway.roles) == expected_turns
-    assert gateway.first_reminder_turn == (4 if limit is None else None)
+    assert gateway.first_reminder_turn == (4 if limit is None and not resumed else None)
+
+
+@pytest.mark.parametrize(
+    ("limit", "model_limit", "expected_calls"),
+    [(None, 40, 2), (None, 1, 1), (4, 40, 1)],
+)
+def test_empty_review_prose_reminds_once_without_spending_reserved_budget(
+    fixture, limit, model_limit, expected_calls
+):
+    from github_harness_agent.executor import AttemptRejected
+
+    class ProseGateway(ScriptedGateway):
+        def complete(self, *, messages, **kwargs):
+            reminder = "The checkout still has no patch"
+            assert messages[0]["content"].count(reminder) == bool(self.roles)
+            return super().complete(messages=messages, **kwargs)
+
+    task, source, runner = fixture
+    gateway = ProseGateway(None)
+    executor = PlainExecutor(
+        runner,
+        gateway,
+        Limits(model_requests=model_limit, rollout_requests=limit),
+        verification_runner=runner,
+    )
+    with pytest.raises(AttemptRejected, match="empty patch"):
+        executor.execute(replace(task, verify_base_first=True), source)
+    assert len(gateway.roles) == expected_calls
+
+
+@pytest.mark.parametrize(
+    ("review", "limit", "model_limit", "create_test", "focused_turns", "calls"),
+    [
+        (True, None, 40, True, 1, 3),
+        (True, None, 40, False, 1, 3),
+        (True, None, 2, True, 1, 2),
+        (True, None, 1, True, 0, 1),
+        (True, 4, 40, True, 0, 1),
+        (False, None, 40, True, 0, 1),
+    ],
+)
+def test_review_finish_can_focus_once_on_missing_regression_tests(
+    fixture, review, limit, model_limit, create_test, focused_turns, calls
+):
+    from github_harness_agent.executor import AttemptRejected
+
+    class RegressionGateway(ScriptedGateway):
+        def __init__(self):
+            super().__init__(None)
+            self.focused = 0
+
+        def complete(self, *, messages, tools, **kwargs):
+            reply = super().complete(messages=messages, tools=tools, **kwargs)
+            names = [tool["function"]["name"] for tool in tools]
+            if names != ["edit_file"]:
+                assert names == ["run", "edit_file"]
+                assert "This turn is for" not in messages[0]["content"]
+                return reply
+            self.focused += 1
+            assert (
+                "create a runnable new test file with edit_file"
+                in messages[0]["content"]
+            )
+            if create_test:
+                reply.tool_calls = (
+                    {
+                        "id": "regression",
+                        "type": "function",
+                        "function": {
+                            "name": "edit_file",
+                            "arguments": json.dumps(
+                                {
+                                    "path": "test_regression.py",
+                                    "new_text": "from pathlib import Path\n\n\n"
+                                    "def test_number_file():\n"
+                                    "    assert Path('number.txt').read_text() == '4\\n'\n",
+                                }
+                            ),
+                        },
+                    },
+                )
+            return reply
+
+    task, source, runner = fixture
+    task = with_resumed_number_edit(
+        replace(task, verify_base_first=review, require_new_tests=True)
+    )
+    gateway = RegressionGateway()
+    executor = PlainExecutor(
+        runner,
+        gateway,
+        Limits(model_requests=model_limit, rollout_requests=limit),
+        verification_runner=runner,
+    )
+    if create_test and focused_turns:
+        assert b"test_regression.py" in executor.execute(task, source).patch
+    else:
+        with pytest.raises(AttemptRejected, match="Add new runnable regression tests"):
+            executor.execute(task, source)
+    assert gateway.focused == focused_turns
+    assert len(gateway.roles) == calls
 
 
 def test_invalid_tool_output_rejects_the_candidate_before_running_it(fixture):

@@ -87,6 +87,8 @@ RUN_TOOL = {
 }
 REVIEW_ROLLOUT_TURNS = 12
 REVIEW_EDIT_REMINDER_TURN = 3
+REVIEW_EXTRA_TURNS_PER_THREAD = 3
+REVIEW_MAX_EXTRA_TURNS = 8
 
 
 class Gateway(Protocol):
@@ -166,6 +168,7 @@ class TaskSnapshot:
     save_checkpoint: Callable[[DraftCheckpoint], None] | None = None
     context: TaskContext | None = None
     verify_base_first: bool = False
+    inline_review_threads: int = 0
     test_update: str | None = None
     require_new_tests: bool = False
     pull_checks: tuple[tuple[str, ...], ...] = ()
@@ -292,6 +295,10 @@ class _Budget:
             if self._calls[kind] >= limit:
                 raise _RequestBudgetExceeded(f"Task {kind} budget exceeded")
             self._calls[kind] += 1
+
+    def model_requests_remaining(self):
+        with self._lock:
+            return self.limits.model_requests - self._calls["model request"]
 
     def complete(self, gateway, role, messages, tools=(), *, after_provider=None):
         options = (
@@ -671,6 +678,79 @@ class PlainExecutor:
             entries[path] = old_mode.removeprefix(b":") + b" " + old_oid
         return entries
 
+    def _review_tree(self, workspace, budget, baseline, artifacts):
+        index = f".git/gha-review-index-{uuid4().hex}"
+        self._git(workspace, budget, "read-tree", baseline, index=index)
+        self._stage_rollout(workspace, budget, artifacts, index=index)
+        tree = self._git(workspace, budget, "write-tree", index=index)
+        return index, tree.stdout.strip().decode("ascii")
+
+    def _review_source_progress(
+        self, workspace, task, budget, baseline, initial_tree, artifacts
+    ):
+        try:
+            index, tree = self._review_tree(workspace, budget, baseline, artifacts)
+            if tree in {baseline, initial_tree}:
+                return False
+            self._check_patch_paths(workspace, task, budget, baseline, index=index)
+            if not self._draft_patch(workspace, budget, baseline, index=index):
+                return False
+            diff = self._git(
+                workspace,
+                budget,
+                "diff",
+                "--cached",
+                "--numstat",
+                "--no-renames",
+                "--no-ext-diff",
+                "-z",
+                initial_tree,
+                index=index,
+                cap=self.limits.patch_bytes,
+            )
+        except (_CandidateOutputError, CommandOutputExceeded):
+            return False
+        for item in diff.stdout.split(b"\0")[:-1]:
+            added, removed, filename = item.split(b"\t", 2)
+            path = PurePosixPath(filename.decode("utf-8", "surrogateescape"))
+            if (
+                added.isdigit()
+                and removed.isdigit()
+                and (added, removed) != (b"0", b"0")
+                and not _test_module(path.name)
+                and not {"tests", "test", "__tests__"}.intersection(path.parts)
+            ):
+                return True
+        return False
+
+    def _has_runnable_new_tests(self, workspace, budget, paths, *, index=None):
+        return any(
+            has_runnable_test(
+                path,
+                self._git(
+                    workspace,
+                    budget,
+                    "cat-file",
+                    "blob",
+                    f":{path}",
+                    index=index,
+                    cap=self.limits.patch_bytes,
+                ).stdout,
+            )
+            for path in paths
+        )
+
+    def _review_missing_tests(self, workspace, task, budget, baseline, index):
+        try:
+            paths, _ = self._check_patch_paths(
+                workspace, task, budget, baseline, index=index
+            )
+            return not self._has_runnable_new_tests(
+                workspace, budget, paths, index=index
+            )
+        except (_CandidateOutputError, CommandOutputExceeded):
+            return False
+
     def _rollout(
         self,
         task,
@@ -711,6 +791,7 @@ class PlainExecutor:
                     "Earlier command outcomes (rerun required checks before finishing): "
                     + "; ".join(progress)
                 )
+            initial_tree = staged_tree
             checkpoint_index = None
             if checkpoint_key is not None and task.save_checkpoint is not None:
                 checkpoint_index = f".git/gha-draft-index-{uuid4().hex}"
@@ -732,7 +813,8 @@ class PlainExecutor:
                     "\n\nThe operator configured these extra acceptance checks for this PR. "
                     "Run available checks in the coding workspace and use their results to "
                     "complete all outstanding review requests. The independent verifier "
-                    "will rerun them before publication.\n" + json.dumps(task.pull_checks)
+                    "will rerun them before publication.\n"
+                    + json.dumps(task.pull_checks)
                 )
             messages = [
                 {"role": "system", "content": prompt},
@@ -749,9 +831,37 @@ class PlainExecutor:
             last = None
             turns = 0
             limit = budget.limits.rollout_requests
-            if task.verify_base_first and limit is None:
-                limit = min(REVIEW_ROLLOUT_TURNS, budget.limits.model_requests)
+            automatic_review = task.verify_base_first and limit is None
+            if automatic_review:
+                limit = min(
+                    REVIEW_ROLLOUT_TURNS, max(1, budget.model_requests_remaining())
+                )
+            # Keep room for the existing repair candidate when a fresh base draft
+            # finishes with missing tests and the shared request budget is small.
+            focused_request_minimum = (
+                3
+                if checkpoint_key == "harness2/base" and initial_tree == baseline
+                else 1
+            )
+            retried_empty_finish = False
+            focused_test_requested = False
+            focus_next_turn = False
             while limit is None or turns < limit:
+                focused_test_turn = focus_next_turn
+                focus_next_turn = False
+                request_messages = messages
+                if focused_test_turn:
+                    request_messages = [
+                        {
+                            **messages[0],
+                            "content": messages[0]["content"]
+                            + "\n\nThis turn is for the review's missing regression tests. "
+                            "Use the reviewed behavior and existing repository conventions to "
+                            "create a runnable new test file with edit_file. Supply its path "
+                            "and complete new_text. Omit old_text to create the file.",
+                        },
+                        *messages[1:],
+                    ]
                 try:
                     last_editor = (
                         own_draft.last_editor if own_draft and not turns else None
@@ -759,8 +869,8 @@ class PlainExecutor:
                     completion = budget.complete(
                         self.gateway,
                         role,
-                        messages,
-                        tools,
+                        request_messages,
+                        (EDIT_TOOL,) if focused_test_turn else tools,
                         after_provider=last_editor[0] if last_editor else None,
                     )
                 except _RequestBudgetExceeded as error:
@@ -770,6 +880,39 @@ class PlainExecutor:
                 if not completion.tool_calls:
                     if clarification and completion.content:
                         self._check_clarification(completion.content)
+                    can_continue = (
+                        automatic_review
+                        and turns < limit
+                        and budget.model_requests_remaining() > 0
+                    )
+                    if can_continue and focused_test_turn:
+                        continue
+                    if can_continue and (
+                        not retried_empty_finish
+                        or (task.require_new_tests and not focused_test_requested)
+                    ):
+                        index, tree = self._review_tree(
+                            workspace, budget, baseline, artifacts
+                        )
+                        if tree == baseline and not retried_empty_finish:
+                            retried_empty_finish = True
+                            messages[0]["content"] += (
+                                "\n\nThe checkout still has no patch. Make a concrete edit "
+                                "for the review request using edit_file before finishing."
+                            )
+                            continue
+                        if (
+                            tree != baseline
+                            and task.require_new_tests
+                            and not focused_test_requested
+                            and budget.model_requests_remaining()
+                            >= focused_request_minimum
+                            and self._review_missing_tests(
+                                workspace, task, budget, baseline, index
+                            )
+                        ):
+                            focused_test_requested = focus_next_turn = True
+                            continue
                     break
                 assistant = {
                     "role": "assistant",
@@ -783,6 +926,15 @@ class PlainExecutor:
                 messages.append(assistant)
                 ran_command = ran_check = False
                 for tool in completion.tool_calls:
+                    if focused_test_turn and tool["function"]["name"] != "edit_file":
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool["id"],
+                                "content": "Use edit_file to create a new test module.",
+                            }
+                        )
+                        continue
                     if (
                         task.context is not None
                         and tool["function"]["name"] == "read_task_context"
@@ -809,6 +961,17 @@ class PlainExecutor:
                         if is_edit:
                             action = "edit_file"
                             data = edit_payload(tool, self.limits.patch_bytes)
+                            if focused_test_turn:
+                                edit = json.loads(data)
+                                path = edit["path"]
+                                if (
+                                    edit.get("old_text") is not None
+                                    or not _test_module(PurePosixPath(path).name)
+                                    or _protected(path, task, new_test=True)
+                                ):
+                                    raise InvalidEdit(
+                                        "Create a new allowed test module and omit old_text."
+                                    )
                             response = self._command(
                                 workspace,
                                 budget,
@@ -1011,29 +1174,35 @@ class PlainExecutor:
                             staged_tree = tree
                 if task.verify_base_first and turns == REVIEW_EDIT_REMINDER_TURN:
                     if checkpoint_index is None:
-                        review_index = f".git/gha-review-index-{uuid4().hex}"
-                        self._git(
-                            workspace,
-                            budget,
-                            "read-tree",
-                            staged_tree,
-                            index=review_index,
-                        )
-                        self._stage_rollout(
-                            workspace, budget, artifacts, index=review_index
-                        )
-                        staged_tree = (
-                            self._git(
-                                workspace, budget, "write-tree", index=review_index
-                            )
-                            .stdout.strip()
-                            .decode("ascii")
+                        _, staged_tree = self._review_tree(
+                            workspace, budget, baseline, artifacts
                         )
                     if staged_tree == baseline:
                         messages[0]["content"] += (
                             "\n\nIf the checkout still has no draft patch, make a focused "
                             "edit for the requested repair with edit_file, then run the relevant checks."
                         )
+                if (
+                    automatic_review
+                    and turns == REVIEW_ROLLOUT_TURNS
+                    and task.inline_review_threads > 1
+                    and (remaining := budget.model_requests_remaining()) > 0
+                    and self._review_source_progress(
+                        workspace, task, budget, baseline, initial_tree, artifacts
+                    )
+                ):
+                    limit += min(
+                        remaining,
+                        REVIEW_MAX_EXTRA_TURNS,
+                        REVIEW_EXTRA_TURNS_PER_THREAD
+                        * (task.inline_review_threads - 1),
+                    )
+                    messages[0]["content"] += (
+                        "\n\nThe draft now contains a source edit. Use the remaining "
+                        "turns to address the outstanding inline review requests."
+                    )
+                if focused_test_turn and not budget.model_requests_remaining():
+                    break
             else:
                 trajectory.append(
                     "[OBSERVATION] Reached the rollout model-turn limit. Staging the current patch."
@@ -1198,19 +1367,8 @@ class PlainExecutor:
                 )
             except (_CandidateOutputError, CommandOutputExceeded) as error:
                 budget.reject(error, actor)
-            if task.require_new_tests and not any(
-                has_runnable_test(
-                    path,
-                    self._git(
-                        workspace,
-                        budget,
-                        "cat-file",
-                        "blob",
-                        f":{path}",
-                        cap=self.limits.patch_bytes,
-                    ).stdout,
-                )
-                for path in new_tests
+            if task.require_new_tests and not self._has_runnable_new_tests(
+                workspace, budget, new_tests
             ):
                 budget.reject(
                     _MissingRegressionTests(

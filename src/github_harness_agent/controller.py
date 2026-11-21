@@ -664,6 +664,17 @@ class Controller:
                         context=context,
                         verify_base_first=stage == "repair"
                         and bool(data.get("feedback") or data.get("ci_feedback")),
+                        inline_review_threads=len(
+                            {
+                                item["thread"]
+                                for item in data.get("feedback", ())
+                                if item.get("thread")
+                                and item.get("path")
+                                and item.get("reply_to")
+                            }
+                        )
+                        if stage == "repair"
+                        else 0,
                         test_update=current_test_update(),
                         require_new_tests=needs_new_tests(),
                         pull_checks=tuple(map(tuple, pull_checks)),
