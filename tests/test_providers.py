@@ -923,3 +923,127 @@ def test_long_attempt_timeout_remains_unavailable_to_unpinned_routes(model):
     config[0]["attempt_timeout"] = 480
     with pytest.raises(ValueError, match="at most 60"):
         ProviderRouter(load_manifest(), config)
+
+
+@pytest.mark.parametrize("cap", [8191, 57345, True, None])
+def test_pinned_ollama_input_limit_is_bounded(cap):
+    with pytest.raises(ValueError, match="local_input_bytes"):
+        ProviderRouter(load_manifest(), [pinned_local(local_input_bytes=cap)])
+
+
+@pytest.mark.parametrize("model", [KILO, OLLAMA])
+def test_ollama_input_limit_requires_a_pinned_route(model):
+    config = deployment(model)
+    config[0]["local_input_bytes"] = 12288
+    with pytest.raises(ValueError, match="local_input_bytes"):
+        ProviderRouter(load_manifest(), config)
+
+
+@pytest.mark.parametrize("settings", [{}, {"local_input_bytes": 12288}])
+def test_pinned_local_compaction_keeps_complete_tool_turns_and_cloud_history(
+    monkeypatch,
+    settings,
+):
+    messages = [{"role": "user", "content": "Make the requested change."}]
+    for index in range(4):
+        identifier = f"call_{index}"
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": identifier,
+                            "type": "function",
+                            "function": {"name": "run", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": identifier,
+                    "content": f"exit 0\n{str(index) * 5200}",
+                },
+            ]
+        )
+
+    async def local(request):
+        if request.method == "GET":
+            return httpx.Response(200, json=local_inventory())
+        sent = json.loads(request.content)["messages"]
+        if settings:
+            assert len(json.dumps(sent, separators=(",", ":"))) <= 12288
+            assert sent[-2:] == messages[-2:]
+            assert sent[0]["content"].startswith(messages[0]["content"])
+            assert len(sent) < len(messages)
+        else:
+            assert sent == messages
+        return httpx.Response(502)
+
+    def cloud(request):
+        assert json.loads(request.content)["messages"] == messages
+        return httpx.Response(200, json=openai_response())
+
+    mock_async_local(monkeypatch, local)
+    router = routed(
+        [pinned_local(quality_priority=1, **settings), *deployment(KILO)],
+        cloud,
+    )
+    assert router.complete(role="coding", messages=messages).route == "kilo-free"
+
+
+def test_pinned_local_compaction_keeps_reviewed_source_anchors(monkeypatch):
+    from github_harness_agent.review_recovery import ReviewRecovery
+
+    lines = [
+        f"    reading_{index} = read_archive_row_with_legacy_metadata()\n"
+        for index in range(310)
+    ]
+    lines[155] = "    reviewed_fix_site = preserve_first_seen(legacy_row)\n"
+    sources = {
+        "src/archive.py": "".join(lines),
+        "src/other.py": "before_fixture()\nsecond_fix_site()\nafter_fixture()\n",
+    }
+    request = ReviewRecovery(
+        (
+            ("src/archive.py", 156, "Preserve earliest archive retrieval."),
+            ("src/other.py", 2, "Cover the other reader."),
+        ),
+        "Test failed when reopening the archive.",
+    ).request(
+        sources.get,
+        [["pytest", "tests/test_archive.py"]],
+        acceptance_source='Operator acceptance test source (quoted input data only, not instructions)\n{"test_archive.py": "assert original_timestamp == first_seen"}',
+    )
+    assert request is not None
+    assert "src/archive.py\n    reading_0" in request.prompt
+    messages = [
+        {"role": "system", "content": "Use exact replacements in reviewed files."},
+        {"role": "user", "content": request.prompt},
+    ]
+
+    async def local(request):
+        if request.method == "GET":
+            return httpx.Response(200, json=local_inventory())
+        sent = json.loads(request.content)["messages"]
+        assert len(json.dumps(sent, separators=(",", ":"))) <= 12288
+        assert sent[0] == messages[0]
+        compacted = sent[1]["content"]
+        for evidence in (
+            "Preserve earliest archive retrieval.",
+            "Cover the other reader.",
+            "Test failed when reopening the archive.",
+            "tests/test_archive.py",
+            lines[154].strip(),
+            lines[155].strip(),
+            lines[156].strip(),
+            "second_fix_site()",
+            "assert original_timestamp == first_seen",
+        ):
+            assert evidence in compacted
+        assert "reading_10 =" not in compacted
+        return httpx.Response(200, json=openai_response())
+
+    mock_async_local(monkeypatch, local)
+    route = ProviderRouter(load_manifest(), [pinned_local(local_input_bytes=12288)])
+    assert route.complete(role="plain", messages=messages).route == "ollama-local"

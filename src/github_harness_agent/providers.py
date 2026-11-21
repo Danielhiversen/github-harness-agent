@@ -29,6 +29,8 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from .task_context import MESSAGE_BYTES, compact_messages, wire_size
+
 logger = logging.getLogger(__name__)
 DEFAULT_REQUEST_TIMEOUT = 60
 MAX_REQUEST_TIMEOUT = 900
@@ -185,6 +187,7 @@ class _Route:
     attempt_timeout: float
     quota_key: tuple
     local_model_digest: str | None = None
+    local_input_bytes: int | None = None
 
 
 def _call(identifier: str, name: str, arguments: Any) -> dict:
@@ -570,6 +573,15 @@ class ProviderRouter:
                 )
             if (alias, model) in configured:
                 raise ValueError("Duplicate model deployment")
+            local_input_bytes = item.get("local_input_bytes")
+            if "local_input_bytes" in item and (
+                local is None
+                or type(local_input_bytes) is not int
+                or not 8192 <= local_input_bytes <= MESSAGE_BYTES
+            ):
+                raise ValueError(
+                    f"local_input_bytes requires a digest-pinned loopback route and an integer between 8192 and {MESSAGE_BYTES}"
+                )
             url = item.get("url", "")
             endpoint = httpx.URL(url)
             if url and (endpoint.scheme not in {"http", "https"} or not endpoint.host):
@@ -613,6 +625,7 @@ class ProviderRouter:
                 attempt_timeout,
                 (endpoint.scheme, endpoint.host, endpoint.port, fingerprint),
                 local[1] if local is not None else None,
+                local_input_bytes,
             )
         choices = [
             (r["provider"], r["model"])
@@ -785,7 +798,21 @@ class ProviderRouter:
                     payload = _gemini_payload(route, messages, tools)
                 else:
                     url = f"{route.url}/chat/completions"
-                    payload = _chat_payload(route, messages, tools)
+                    route_messages = messages
+                    if route.local_input_bytes is not None:
+                        route_messages = compact_messages(
+                            messages,
+                            max_bytes=route.local_input_bytes,
+                            role=role,
+                            review_windows=True,
+                        )
+                    payload = _chat_payload(route, route_messages, tools)
+                    if (
+                        route.local_input_bytes is not None
+                        and wire_size(payload["messages"]) > route.local_input_bytes
+                    ):
+                        failures[route.alias] = "local input limit exceeded"
+                        continue
                 logger.info(
                     "Provider attempt provider=%s configured_model=%s",
                     route.alias,

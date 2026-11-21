@@ -373,11 +373,80 @@ def _editor_content(text: str, max_wire: int) -> str:
     return json.dumps(compact, ensure_ascii=False)
 
 
+def _review_file_windows(source: str, anchors: list[int], budget: int) -> str:
+    if wire_size(source) <= budget or re.match(r"^Lines \d+–\d+\n", source):
+        return _bounded_content(source, budget)
+    lines = source.splitlines(keepends=True)
+    windows = []
+    per_anchor = budget // len(anchors) - 40
+    for line in anchors:
+        if not 1 <= line <= len(lines):
+            continue
+        start, end = max(0, line - 7), min(len(lines), line + 6)
+        before = _bounded_content("".join(lines[start : line - 1]), per_anchor // 3)
+        anchor = _bounded_content(lines[line - 1], per_anchor // 3)
+        after = _bounded_content("".join(lines[line:end]), per_anchor // 3)
+        windows.append(f"Lines {start + 1}–{end}\n{before}{anchor}{after}")
+    return "\n\n".join(windows) if windows else _bounded_content(source, budget)
+
+
+def _review_content(text: str, max_wire: int) -> str:
+    if wire_size(text) <= max_wire:
+        return text
+    prefix, marker, sources = text.partition("\nCurrent reviewed files\n")
+    if not marker or "\nOutstanding review\n" not in prefix:
+        return _bounded_content(text, max_wire)
+    sources, acceptance_marker, acceptance = sources.partition(
+        "\n\nOperator acceptance test source "
+    )
+    anchors: dict[str, list[int]] = {}
+    for path, line in re.findall(r"(?m)^- ([^\n:]+):(\d{1,9}) ", prefix):
+        positions = anchors.setdefault(path, [])
+        if len(positions) < 3 and int(line) not in positions:
+            positions.append(int(line))
+    if not anchors:
+        return _bounded_content(text, max_wire)
+    pieces = re.split(
+        r"(?:^|\n\n)(" + "|".join(re.escape(path) for path in anchors) + r")\n",
+        sources,
+    )
+    if len(pieces) < 3 or pieces[0]:
+        return _bounded_content(text, max_wire)
+
+    review, rejection_marker, rejection = prefix.partition(
+        "\n\nMost recent rejection\n"
+    )
+    rejection, checks_marker, checks = rejection.partition(
+        "\n\nChecks still required\n"
+    )
+    diagnosis = _bounded_content(rejection_marker + rejection, max_wire // 8)
+    check_list = _bounded_content(checks_marker + checks, max_wire // 8)
+    prefix = (
+        _bounded_content(review, max_wire // 2 - wire_size(diagnosis + check_list))
+        + diagnosis
+        + check_list
+    )
+    suffix = _bounded_content(acceptance_marker + acceptance, max_wire // 5)
+    names = pieces[1::2]
+    labels = marker + "\n\n".join(name + "\n" for name in names)
+    remaining = max_wire - wire_size(prefix) - wire_size(suffix) - wire_size(labels)
+    if remaining < 320 * len(names):
+        return _bounded_content(text, max_wire)
+    compacted = "\n\n".join(
+        path
+        + "\n"
+        + _review_file_windows(source, anchors[path], remaining // len(names))
+        for path, source in zip(names, pieces[2::2], strict=True)
+    )
+    return prefix + marker + compacted + suffix
+
+
 def compact_messages(
     messages: Sequence[Mapping[str, Any]],
     *,
     max_bytes: int = MESSAGE_BYTES,
     role: str = "",
+    review_windows: bool = False,
 ) -> list[Mapping[str, Any]]:
     """Keep a bounded prompt and a suffix of complete, unchanged tool turns."""
     if wire_size(messages) <= max_bytes:
@@ -392,12 +461,14 @@ def compact_messages(
         original = messages[index]
         content = original.get("content") or ""
         size = max_bytes * 2 // 3 if original["role"] == "user" else max_bytes // 8
-        compact = (
-            _editor_content(content, size)
-            if role in {"proposal", "composition"} and original["role"] == "user"
-            else _bounded_content(content, size)
-        )
-        prefix.append({**original, "content": compact})
+        compact = _bounded_content
+        if original["role"] == "user":
+            if role in {"proposal", "composition"}:
+                compact = _editor_content
+            elif review_windows:
+                compact = _review_content
+        compacted = compact(content, size)
+        prefix.append({**original, "content": compacted})
         index += 1
 
     groups: list[list[Mapping[str, Any]]] = []
