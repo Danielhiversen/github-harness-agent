@@ -31,6 +31,7 @@ from .rebase import (
     git,
     transplant_patch,
 )
+from .review_recovery import plan_recovery
 from .reviews import ReviewItem, collect_reviews, map_feedback, reply_to_review
 from .test_updates import authorized_test_update, requests_new_tests
 from .store import LeaseLost
@@ -579,6 +580,10 @@ class Controller:
                                 store.save(job, "queued", delay=45)
                             return
                     failures = data.get("model_attempt_failures", [])
+                    rejections = (
+                        *data.get("prior_model_attempt_failures", ()),
+                        *failures,
+                    )
                     excluded = tuple(
                         (
                             record["candidate"]["route"],
@@ -678,6 +683,13 @@ class Controller:
                         test_update=current_test_update(),
                         require_new_tests=needs_new_tests(),
                         pull_checks=tuple(map(tuple, pull_checks)),
+                        review_recovery=plan_recovery(
+                            data.get("feedback", ()),
+                            len(rejections),
+                            rejections[-1].get("reason") or "",
+                        )
+                        if stage == "repair" and rejections
+                        else None,
                     )
 
                     try:

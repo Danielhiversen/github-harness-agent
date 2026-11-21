@@ -19,6 +19,7 @@ from .activity import observed_call
 from .check_artifacts import STAT_FILES_COMMAND, check_label
 from .checkpoint import DraftCheckpoint
 from .file_edit import EDIT_COMMAND, EDIT_TOOL, InvalidEdit, edit_payload
+from .review_recovery import ReviewRecovery
 from .providers import ProviderExhausted
 from .test_updates import (
     failing_pytest_nodes,
@@ -172,6 +173,7 @@ class TaskSnapshot:
     test_update: str | None = None
     require_new_tests: bool = False
     pull_checks: tuple[tuple[str, ...], ...] = ()
+    review_recovery: ReviewRecovery | None = None
 
 
 @dataclass(frozen=True)
@@ -533,7 +535,25 @@ class PlainExecutor:
     def _stage_baseline(self, workspace, budget):
         self._git(workspace, budget, "init", "-q", "--template=")
         self._git(workspace, budget, "add", "-A", "-f")
-        return self._git(workspace, budget, "write-tree").stdout.strip().decode("ascii")
+        # Give Git tools in the disposable checkout a HEAD for status and diffs.
+        self._git(
+            workspace,
+            budget,
+            "-c",
+            "user.name=Harness Agent",
+            "-c",
+            "user.email=workspace@localhost",
+            "commit",
+            "--allow-empty",
+            "--no-gpg-sign",
+            "-qm",
+            "Pinned workspace baseline",
+        )
+        return (
+            self._git(workspace, budget, "rev-parse", "HEAD^{tree}")
+            .stdout.strip()
+            .decode("ascii")
+        )
 
     def _draft_patch(self, workspace, budget, baseline, *, index=None):
         return self._git(
@@ -751,6 +771,33 @@ class PlainExecutor:
         except (_CandidateOutputError, CommandOutputExceeded):
             return False
 
+    def _read_recovery_source(self, workspace, budget, task, tree, path):
+        if _protected(path, task, new_test=False):
+            return None
+        lookup = self._git(
+            workspace,
+            budget,
+            "--literal-pathspecs",
+            "ls-tree",
+            tree,
+            "--",
+            path,
+        )
+        if lookup.stdout.split(b" ", 1)[0] not in {b"100644", b"100755"}:
+            return None
+        try:
+            raw = self._git(
+                workspace,
+                budget,
+                "cat-file",
+                "blob",
+                f"{tree}:{path}",
+                cap=512 * 1024,
+            ).stdout
+            return raw.decode() if b"\0" not in raw else None
+        except (CommandOutputExceeded, UnicodeDecodeError):
+            return None
+
     def _rollout(
         self,
         task,
@@ -792,6 +839,36 @@ class PlainExecutor:
                     + "; ".join(progress)
                 )
             initial_tree = staged_tree
+            recovery = None
+            if task.review_recovery is not None and checkpoint_key in {
+                "plain/coding",
+                "harness2/base",
+            }:
+                add_test = False
+                if (
+                    task.require_new_tests
+                    and "runnable regression test"
+                    in task.review_recovery.previous_failure.casefold()
+                ):
+                    if initial_tree == baseline:
+                        add_test = True
+                    else:
+                        index, _ = self._review_tree(workspace, budget, baseline, {})
+                        new_tests, _ = self._check_patch_paths(
+                            workspace,
+                            task,
+                            budget,
+                            baseline,
+                            index=index,
+                        )
+                        add_test = not new_tests
+                recovery = task.review_recovery.request(
+                    lambda path: self._read_recovery_source(
+                        workspace, budget, task, initial_tree, path
+                    ),
+                    (*task.checks, *task.pull_checks),
+                    require_test=add_test,
+                )
             checkpoint_index = None
             if checkpoint_key is not None and task.save_checkpoint is not None:
                 checkpoint_index = f".git/gha-draft-index-{uuid4().hex}"
@@ -847,10 +924,16 @@ class PlainExecutor:
             focused_test_requested = False
             focus_next_turn = False
             while limit is None or turns < limit:
+                recovery_turn = recovery if turns == 0 else None
                 focused_test_turn = focus_next_turn
                 focus_next_turn = False
                 request_messages = messages
-                if focused_test_turn:
+                if recovery_turn:
+                    request_messages = [
+                        messages[0],
+                        {"role": "user", "content": recovery_turn.prompt},
+                    ]
+                elif focused_test_turn:
                     request_messages = [
                         {
                             **messages[0],
@@ -870,14 +953,25 @@ class PlainExecutor:
                         self.gateway,
                         role,
                         request_messages,
-                        (EDIT_TOOL,) if focused_test_turn else tools,
+                        (EDIT_TOOL,) if focused_test_turn or recovery_turn else tools,
                         after_provider=last_editor[0] if last_editor else None,
                     )
                 except _RequestBudgetExceeded as error:
                     budget.reject(error, last, latest=True)
+                except ProviderExhausted:
+                    if (
+                        not recovery_turn
+                        or (limit is not None and turns + 1 >= limit)
+                        or not budget.model_requests_remaining()
+                    ):
+                        raise
+                    turns += 1
+                    continue
                 turns += 1
                 last = RouteEvidence.from_completion(completion)
                 if not completion.tool_calls:
+                    if recovery_turn:
+                        continue
                     if clarification and completion.content:
                         self._check_clarification(completion.content)
                     can_continue = (
@@ -924,8 +1018,27 @@ class PlainExecutor:
                 if provider_context := getattr(completion, "provider_context", None):
                     assistant["provider_context"] = provider_context
                 messages.append(assistant)
+                invalid_recovery = recovery_turn and not recovery_turn.accepts(
+                    completion.tool_calls,
+                    self.limits.patch_bytes,
+                    lambda path, content: (
+                        _test_module(PurePosixPath(path).name)
+                        and not _protected(path, task, new_test=True)
+                        and has_runnable_test(path, content)
+                    ),
+                )
                 ran_command = ran_check = False
                 for tool in completion.tool_calls:
+                    if invalid_recovery:
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool["id"],
+                                "content": "The recovery batch requires exact edits to the listed existing files "
+                                "and the permitted new runnable test when requested.",
+                            }
+                        )
+                        continue
                     if focused_test_turn and tool["function"]["name"] != "edit_file":
                         messages.append(
                             {
@@ -1367,15 +1480,9 @@ class PlainExecutor:
                 )
             except (_CandidateOutputError, CommandOutputExceeded) as error:
                 budget.reject(error, actor)
-            if task.require_new_tests and not self._has_runnable_new_tests(
+            missing_tests = task.require_new_tests and not self._has_runnable_new_tests(
                 workspace, budget, new_tests
-            ):
-                budget.reject(
-                    _MissingRegressionTests(
-                        "Add new runnable regression tests for the behavior requested in the review."
-                    ),
-                    actor,
-                )
+            )
             if new_tests:
                 self._git(
                     workspace,
@@ -1387,6 +1494,17 @@ class PlainExecutor:
                     "--",
                     *new_tests,
                 )
+            if missing_tests:
+                reason = "Add new runnable regression tests for the behavior requested in the review."
+                if task.pull_checks:
+                    evidence = self._run_checks(workspace, budget, task.pull_checks)
+                    if evidence[-1].returncode:
+                        names = failing_pytest_nodes(evidence[-1].output)
+                        if names:
+                            reason += " The current draft also fails: " + ", ".join(
+                                names
+                            )
+                budget.reject(_MissingRegressionTests(reason), actor)
             checks = self._run_checks(workspace, budget, task.checks)
         trusted_passed = checks[-1].returncode == 0
         selections = []

@@ -907,6 +907,35 @@ def test_pull_acceptance_failure_can_choose_another_model_on_a_red_baseline(fixt
     assert len(runner.workspaces) == 2
 
 
+def test_missing_review_test_reports_independent_behavior_failure(fixture):
+    task, source, runner = fixture
+    check = (
+        "python3",
+        "-c",
+        "print('FAILED ../oracle/test_case.py::test_boundary'); raise SystemExit(1)",
+    )
+    task = replace(task, require_new_tests=True, pull_checks=(check,))
+    with pytest.raises(
+        ExecutionError,
+        match="new runnable regression tests.*test_case.py::test_boundary",
+    ):
+        PlainExecutor(
+            runner, ScriptedGateway("open('number.txt','w').write('5\\n')")
+        ).execute(task, source)
+
+
+def test_coding_workspace_git_status_is_clean_and_head_is_diffable(fixture):
+    task, source, runner = fixture
+    code = (
+        "import subprocess; from pathlib import Path; "
+        "assert not subprocess.check_output(['git','status','--porcelain']); "
+        "Path('number.txt').write_text('4\\n'); "
+        "assert subprocess.check_output(['git','diff','--name-only','HEAD']).strip() == b'number.txt'"
+    )
+    result = PlainExecutor(runner, ScriptedGateway(code)).execute(task, source)
+    assert b"+4" in result.patch
+
+
 def test_patch_induced_check_failure_can_choose_another_model(fixture):
     from github_harness_agent.executor import AttemptRejected
 
