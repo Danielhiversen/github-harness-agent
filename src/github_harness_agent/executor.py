@@ -167,6 +167,7 @@ class TaskSnapshot:
     verify_base_first: bool = False
     test_update: str | None = None
     require_new_tests: bool = False
+    pull_checks: tuple[tuple[str, ...], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1262,7 +1263,7 @@ class PlainExecutor:
             error = error_type(f"Required check failed: {failed.command[0]}")
             error.checks = tuple(checks)
             if actor is not None and actor.configured_model and rejection:
-                if trusted_passed:
+                if trusted_passed or failed.command in task.pull_checks:
                     budget.reject(error, actor)
                 with self.verification_runner.workspace(
                     archive, budget.remaining, budget.cancelled

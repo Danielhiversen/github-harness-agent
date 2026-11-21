@@ -42,7 +42,7 @@ The worker saves bounded patches after editing commands. A replacement worker re
 
 After a push the controller checks both GitHub Check Runs and individual commit statuses, including CircleCI reports. A new failure on the agent's recorded PR head can schedule a repair without a human review. The controller verifies that the failure and branch head are still current before pushing. Repeated failures are bounded by the repair policy.
 
-Before creating an issue branch, the controller fetches the current target branch. It rebases existing task commits against the PR's current target before editing and refreshes the target again before pushing. If the target advanced during execution, the controller rebases the patch and reruns the required checks. A conflicting rebase pauses the task. Pushing with an expected branch head prevents a concurrent contributor's commit from being overwritten.
+Before creating an issue branch, the controller fetches the current target branch. It rebases existing task commits against the PR's current target before editing and refreshes the target again before pushing. If replaying the commits conflicts, the controller compares the final PR tree and the target with their common ancestor. It can replay the combined result as a single commit on the target when Git can merge the final changes or the target already covers the conflicting ignore rules or pytest discovery paths. Ambiguous conflicts pause the job for a maintainer. If the target advances during execution, the controller rebases the patch and reruns the required checks. Pushing with an expected branch head protects concurrent contributors' commits.
 
 ## Use a dedicated GitHub account
 

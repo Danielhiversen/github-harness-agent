@@ -217,3 +217,20 @@ def test_review_source_context_reads_only_named_python_files_and_uses_mapped_lin
     assert "value_70" in evidence
     task = build_task_context("Repair this.", source_context=evidence)
     assert "Source excerpts from the current checkout" in task.instructions
+
+
+def test_separate_review_locations_in_one_file_use_one_tree_read():
+    from github_harness_agent.task_context import review_source_context
+
+    reads = []
+
+    def read(path):
+        reads.append(path)
+        return "\n".join(f"line {n}" for n in range(1, 201))
+
+    feedback = [{"path": "matcher.py", "line": n} for n in (20, 20, 60, 100, 140)]
+    context = review_source_context(feedback, read)
+    assert reads == ["matcher.py"]
+    assert context.count("matcher.py (lines ") == 4
+    for n in (20, 60, 100, 140):
+        assert f"\nline {n}\n" in context

@@ -221,6 +221,18 @@ class Controller:
         data = job["data"]
         repo, issue = job["repo"], job["issue"]
         api, store, cfg = self.api, self.store, self.config
+        pull_checks = cfg.get("pull_checks", {}).get(str(data.get("pull")), [])
+        if pull_checks:
+            if not isinstance(pull_checks, list) or not all(
+                isinstance(cmd, list)
+                and cmd
+                and all(isinstance(arg, str) and arg for arg in cmd)
+                for cmd in pull_checks
+            ):
+                raise ValueError(
+                    "Each pull check must be a nonempty command argument list"
+                )
+            cfg = {**cfg, "checks": [*cfg["checks"], *pull_checks]}
         adopted = job.get("kind") == "pull"
         label = cfg.get("label", "agent:ready")
         branch = (
@@ -259,6 +271,7 @@ class Controller:
         journal = Journal(data, lambda: store.save(job))
         publisher = Publisher(api, journal, authorize)
         stage = data["stage"]
+        resumed_repair = stage == "repair"
         if adopted and (stage == "implement" or data["pull"] != issue):
             raise ValueError("adopted jobs can only review their existing pull request")
         origin = None
@@ -266,6 +279,23 @@ class Controller:
         checks = tuple(tuple(check) for check in cfg["checks"])
         if not checks:
             raise ValueError("Configure at least one trusted check")
+
+        def review_batch():
+            try:
+                return collect_reviews(
+                    api,
+                    repo=repo,
+                    pull=data["pull"],
+                    bot_login=self.bot_login,
+                    authorized=lambda user: maintainer(api, repo, user),
+                    known_threads=data["threads"],
+                    seen=data["seen"],
+                    adopted_at=data["adopted_at"] if adopted else None,
+                )
+            except StaleHead as error:
+                raise TargetMoved(
+                    "pull request head changed while collecting feedback"
+                ) from error
 
         def retire_ci_failures(head):
             selected = data.get("ci_feedback")
@@ -301,16 +331,7 @@ class Controller:
                 )
             if stage == "watch":
                 data.pop("draft_checkpoints", None)
-                batch = collect_reviews(
-                    api,
-                    repo=repo,
-                    pull=data["pull"],
-                    bot_login=self.bot_login,
-                    authorized=lambda user: maintainer(api, repo, user),
-                    known_threads=data["threads"],
-                    seen=data["seen"],
-                    adopted_at=data["adopted_at"] if adopted else None,
-                )
+                batch = review_batch()
                 for item in batch.handled:
                     acknowledge_feedback(data, item)
                 head = data.get("last_commit")
@@ -372,6 +393,40 @@ class Controller:
                         data["stage"] = "watch"
                         store.save(job, "queued")
                         return
+            if resumed_repair and "prepared" not in data:
+                batch = review_batch()
+                if batch.head != data["review_head"]:
+                    data["stage"] = "watch"
+                    data.pop("ci_feedback", None)
+                    if "draft_checkpoints" in data:
+                        data["retired_draft_checkpoints"] = data.pop(
+                            "draft_checkpoints"
+                        )
+                        raise RebaseConflict(
+                            "Pull request head changed. The previous draft was retired. "
+                            "Use resume to remap outstanding feedback on the current head."
+                        )
+                    store.save(job, "queued")
+                    return
+                if batch.head != pr["head"]["sha"]:
+                    raise TargetMoved("pull request head views do not agree yet")
+                previous_keys = {item["key"] for item in data.get("feedback", ())}
+                current_keys = {item.key for item in batch.items}
+                if current_keys != previous_keys:
+                    if "draft_checkpoints" in data:
+                        data["retired_draft_checkpoints"] = data.pop(
+                            "draft_checkpoints"
+                        )
+                    data.pop("model_attempt_failures", None)
+                    data.pop("prior_model_attempt_failures", None)
+                for item in batch.handled:
+                    acknowledge_feedback(data, item)
+                data["feedback"] = [dataclasses.asdict(item) for item in batch.items]
+                if not data["feedback"] and not data.get("ci_feedback"):
+                    data["stage"] = "watch"
+                    store.save(job, "queued", delay=45)
+                    return
+                store.save(job)
             origin = data["review_head"]
 
         if stage not in {"reply", "question"}:
@@ -469,8 +524,10 @@ class Controller:
 
                 if (
                     prepared is not None
-                    and needs_new_tests()
-                    and not prepared.get("verified_new_tests")
+                    and (
+                        (needs_new_tests() and not prepared.get("verified_new_tests"))
+                        or prepared.get("pull_checks", []) != pull_checks
+                    )
                     and publisher.branch_head(repo, branch) == origin
                 ):
                     data.pop("prepared")
@@ -609,6 +666,7 @@ class Controller:
                         and bool(data.get("feedback") or data.get("ci_feedback")),
                         test_update=current_test_update(),
                         require_new_tests=needs_new_tests(),
+                        pull_checks=tuple(map(tuple, pull_checks)),
                     )
 
                     try:
@@ -704,6 +762,7 @@ class Controller:
                         ),
                         "usage": result.usage,
                         "verified_new_tests": task.require_new_tests,
+                        "pull_checks": pull_checks,
                         "refinement": dataclasses.asdict(result.refinement)
                         if result.refinement
                         else None,
@@ -744,6 +803,7 @@ class Controller:
                         repository_guidance=cfg.get("reviewed_guidance", ""),
                         test_update=current_test_update(),
                         require_new_tests=needs_new_tests(),
+                        pull_checks=tuple(map(tuple, pull_checks)),
                     )
 
                     try:

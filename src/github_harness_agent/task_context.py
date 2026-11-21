@@ -204,7 +204,7 @@ _REVIEW_FILE = re.compile(r"`([\w./-]+\.py)(?:::(?:[\w.]+::)*[\w.]+)?`")
 
 def review_source_context(feedback, read_source, test_selector=None):
     previews = {}
-    inspected = set()
+    files = {}
     for item in feedback:
         anchors = [(item.get("path"), item.get("line"))]
         anchors.extend(
@@ -219,13 +219,15 @@ def review_source_context(feedback, read_source, test_selector=None):
                 r"(?:[\w-]+/)*[\w-]+\.py", name
             ):
                 continue
-            if name in inspected or len(inspected) >= 8 or len(previews) >= 4:
+            if len(previews) >= 4:
+                break
+            if name not in files:
+                if len(files) >= 8:
+                    continue
+                files[name] = (read_source(name) or "").splitlines()
+            lines = files[name]
+            if not lines:
                 continue
-            inspected.add(name)
-            contents = read_source(name)
-            if not contents:
-                continue
-            lines = contents.splitlines()
             if isinstance(line, str):
                 line = next(
                     (
@@ -240,8 +242,9 @@ def review_source_context(feedback, read_source, test_selector=None):
             center = min(len(lines), max(1, line if type(line) is int else 1))
             start = max(0, center - 12)
             end = min(len(lines), max(32, center + 14))
-            previews[name] = f"{name} (lines {start + 1}–{end})\n" + excerpt(
-                "\n".join(lines[start:end]), 1650
+            previews[name, start, end] = (
+                f"{name} (lines {start + 1}–{end})\n"
+                + excerpt("\n".join(lines[start:end]), 1650)
             )
     return "\n\n".join(previews.values())
 
@@ -300,8 +303,9 @@ def build_task_context(
     if len(current) < len(feedback):
         preview.append(
             f"{len(feedback)} total actionable review requests. "
-            f"Read 'review-index' for remaining previews and review-{len(current) + 1} "
-            f"through review-{len(feedback)} for full requests and diff hunks."
+            f"Read review-{len(current) + 1} through review-{len(feedback)} for their full "
+            "requests and diff hunks. Additional review requests:\n"
+            + excerpt("\n\n".join(index_lines[len(current) :]), 2100)
         )
     if feedback:
         sections["review-index"] = "\n\n".join(index_lines)

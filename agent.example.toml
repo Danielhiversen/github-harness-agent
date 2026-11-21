@@ -16,3 +16,5 @@ model_requests = 40
 # rollout_requests = 8  # Requires verification_image
 commands = 64
 checks = [["python", "-m", "unittest", "discover"]]
+# Additional operator-owned acceptance checks for a particular PR.
+# pull_checks."42" = [["python", "-m", "pytest", "/opt/review-checks/test_contract.py"]]

@@ -771,6 +771,19 @@ def test_baseline_test_failure_does_not_exclude_model(fixture):
     assert len(runner.workspaces) == 3
 
 
+def test_pull_acceptance_failure_can_choose_another_model_on_a_red_baseline(fixture):
+    from dataclasses import replace
+    from github_harness_agent.executor import AttemptRejected
+
+    task, source, runner = fixture
+    gateway = ScriptedGateway("open('number.txt','w').write('5\\n')")
+    with pytest.raises(AttemptRejected, match="Required check failed"):
+        PlainExecutor(runner, gateway).execute(
+            replace(task, pull_checks=task.checks), source
+        )
+    assert len(runner.workspaces) == 2
+
+
 def test_patch_induced_check_failure_can_choose_another_model(fixture):
     from github_harness_agent.executor import AttemptRejected
 

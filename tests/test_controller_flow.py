@@ -356,6 +356,7 @@ def test_adopted_job_repairs_only_the_existing_branch_without_issue_eligibility(
         def execute(self, task, path, *, cancelled):
             assert "implementation is already present" in task.instructions
             assert "Outstanding fix" in task.instructions
+            assert task.checks == (("test",), ("verify-review",))
             assert (path / "value").read_text() == "existing work\n"
             (path / "value").write_text("reviewed work\n")
             if revoke:
@@ -380,7 +381,12 @@ def test_adopted_job_repairs_only_the_existing_branch_without_issue_eligibility(
     )
     store = Store(tmp_path / "db", lambda: 100)
     api = API()
-    config = {"base": "configured-but-unused", "checks": [["test"]], "mode": "canary"}
+    config = {
+        "base": "configured-but-unused",
+        "checks": [["test"]],
+        "mode": "canary",
+        "pull_checks": {"25": [["verify-review"]], "26": [["unrelated-check"]]},
+    }
     assert adopt_open_pulls(api, store, "owner/repo", config, "agent-user") == 1
     Controller(store, api, Executor(), config, "agent-user").run(store.claim())
     if revoke:
