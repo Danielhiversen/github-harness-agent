@@ -84,6 +84,7 @@ def test_targeted_once_uses_repo_limits_and_runs_only_exact_eligible_pull(
     class Controller:
         def __init__(self, store, api, backend, config, bot_login):
             assert backend.limits.model_requests == 120
+            assert backend.limits.wall_time == 2700
             assert backend.limits.commands == 200
             assert backend.limits.rollout_requests == 24
             assert backend.runner.image == "worker:test"
@@ -114,6 +115,7 @@ def test_targeted_once_uses_repo_limits_and_runs_only_exact_eligible_pull(
                 "verification_image": "verify:test",
                 "worker_runtime": "runc",
                 "model_requests": 120,
+                "wall_time": 2700,
                 "commands": 200,
                 "rollout_requests": 24,
             },
@@ -135,6 +137,7 @@ def test_targeted_once_uses_repo_limits_and_runs_only_exact_eligible_pull(
         ("model_requests", True),
         ("model_requests", 0),
         ("model_requests", 257),
+        ("wall_time", 3601),
         ("commands", 4.5),
         ("commands", -1),
         ("commands", 513),

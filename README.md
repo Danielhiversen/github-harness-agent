@@ -17,7 +17,7 @@ uv run github-harness-agent --config agent.toml work
 
 Use `status` to inspect jobs and `once` to process a single iteration. Shadow mode saves the patch and evidence in the database without a GitHub write. For a canary, set the mode to `canary`, select a separate pilot label and database, and restart both processes. The incumbent and replacement must have exclusive ownership of their respective issues. A verified patch becomes a draft PR and passes to review after local required checks succeed. Branch protection and merge approval remain with the repository.
 
-Set `model_requests` and `commands` in a repository's configuration to cap model calls and agent tool commands per coding attempt. They default to 40 and 64 and accept integers from 1 to 256 and 1 to 512, respectively.
+Set `model_requests` and `commands` in a repository's configuration to cap model calls and agent tool commands per coding attempt. They default to 40 and 64 and accept integers from 1 to 256 and 1 to 512, respectively. Set `wall_time` to cap an attempt in seconds. It defaults to 900 and accepts integers from 1 to 3600.
 
 Set `verification_image` to run required checks in a separate trusted image with the same worker runtime. The verification image needs Git, tar, and the tools and fixtures used by the required checks. The model's tool workspace uses `worker_image`.
 
