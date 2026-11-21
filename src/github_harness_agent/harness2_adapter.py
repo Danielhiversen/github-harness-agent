@@ -2,7 +2,6 @@
 
 import hashlib
 import json
-import re
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -18,6 +17,7 @@ from .executor import (
     _VerificationRejected,
 )
 from .providers import ProviderExhausted
+from .test_updates import failing_pytest_nodes
 from .worker import ExecutionError
 
 HARNESS2_REVISION = "6868817518876de8fd170c6a8354daca273b6191"
@@ -33,15 +33,6 @@ EDITOR_PROMPT = (
 )
 
 
-_PYTEST_FAILURE = re.compile(
-    r"^FAILED ((?:[A-Za-z0-9_][A-Za-z0-9_.-]*/)*"
-    r"[A-Za-z0-9_][A-Za-z0-9_.-]*\.py"
-    r"(?:::[A-Za-z_][A-Za-z0-9_]*)*::test_[A-Za-z0-9_]+)"
-    r"(?=\[|\s|$)",
-    re.MULTILINE,
-)
-
-
 def _check_feedback(task, failure):
     if isinstance(failure, _MissingRegressionTests):
         return str(failure)
@@ -50,13 +41,7 @@ def _check_feedback(task, failure):
     failed = failure.checks[-1]
     ordinal = (len(failure.checks) - 1) % len(task.checks) + 1
     summary = f"Required check {ordinal} exited with status {failed.returncode}."
-    nodes = []
-    for match in _PYTEST_FAILURE.finditer(failed.output):
-        node = match[1]
-        if len(node) <= 160 and node not in nodes:
-            nodes.append(node)
-            if len(nodes) == 3:
-                break
+    nodes = failing_pytest_nodes(failed.output)
     if nodes:
         summary += " Failing tests: " + ", ".join(nodes) + "."
     return summary

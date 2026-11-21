@@ -26,6 +26,7 @@ SOURCE = b"""class TestModule:
         "Add regression coverage for the inclusive boundary and for a reading just outside it.",
         "Preserve the signature. Please add a regression test for what happens if the API returns no data.",
         "- Add new regression tests for this path.",
+        "Please cover the partial response with a fixture.",
         "1. Add coverage of the edge case.",
     ],
 )
@@ -33,11 +34,26 @@ def test_detects_direct_regression_requests(body):
     assert requests_new_tests(body)
 
 
+def test_failure_names_from_external_verifier_are_bounded_and_portable():
+    from github_harness_agent.test_updates import failing_pytest_nodes
+
+    output = (
+        "FAILED ../opt/oracle/test_extra.py::test_retry[parameter]\n"
+        "FAILED /opt/oracle/test_extra.py::test_retry[second]\n"
+        "FAILED tests/test_unit.py::Case::test_parse - AssertionError\n"
+    )
+    assert failing_pytest_nodes(output) == [
+        "test_extra.py::test_retry",
+        "tests/test_unit.py::Case::test_parse",
+    ]
+
+
 @pytest.mark.parametrize(
     "body",
     [
         "No need to add regression tests.",
         "Do not add tests.",
+        "We discussed whether to cover the retry with a fixture.",
         "Add tests if needed.",
         "Add new tests unless the existing test already covers this case.",
         "> Add a regression test.",

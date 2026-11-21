@@ -21,6 +21,7 @@ from .checkpoint import DraftCheckpoint
 from .file_edit import EDIT_COMMAND, EDIT_TOOL, InvalidEdit, edit_payload
 from .providers import ProviderExhausted
 from .test_updates import (
+    failing_pytest_nodes,
     focused_pytest,
     has_runnable_test,
     passed_pytest_report,
@@ -726,6 +727,13 @@ class PlainExecutor:
                     "\nThe review requires new runnable regression coverage. "
                     "Add a new test module for the requested behavior."
                 )
+            if task.pull_checks:
+                instructions += (
+                    "\n\nThe operator configured these extra acceptance checks for this PR. "
+                    "Run available checks in the coding workspace and use their results to "
+                    "complete all outstanding review requests. The independent verifier "
+                    "will rerun them before publication.\n" + json.dumps(task.pull_checks)
+                )
             messages = [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": instructions},
@@ -1260,7 +1268,12 @@ class PlainExecutor:
             failed = checks[-1]
             rejection = 0 < failed.returncode < 125
             error_type = _VerificationRejected if rejection else ExecutionError
-            error = error_type(f"Required check failed: {failed.command[0]}")
+            reason = f"Required check failed: {failed.command[0]}"
+            if failed.command in task.pull_checks:
+                nodes = failing_pytest_nodes(failed.output)
+                if nodes:
+                    reason += ". Failing tests: " + ", ".join(nodes)
+            error = error_type(reason)
             error.checks = tuple(checks)
             if actor is not None and actor.configured_model and rejection:
                 if trusted_passed or failed.command in task.pull_checks:

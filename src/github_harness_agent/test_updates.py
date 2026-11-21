@@ -7,6 +7,25 @@ from collections.abc import Iterable, Mapping
 from pathlib import PurePosixPath
 
 
+def failing_pytest_nodes(output: str) -> list[str]:
+    """Return bounded test names without parameters, tracebacks or external directories."""
+    nodes = []
+    for match in re.finditer(
+        r"^FAILED (/?(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_][A-Za-z0-9_.-]*\.py)"
+        r"((?:::[A-Za-z_][A-Za-z0-9_]*)*::test_[A-Za-z0-9_]+)(?=\[|\s|$)",
+        output,
+        re.MULTILINE,
+    ):
+        path = PurePosixPath(match[1])
+        prefix = path.name if path.is_absolute() or ".." in path.parts else str(path)
+        node = prefix + match[2]
+        if len(node) <= 160 and node not in nodes:
+            nodes.append(node)
+        if len(nodes) == 4:
+            break
+    return nodes
+
+
 _DIRECTIVE = re.compile(
     r"Allow test update: ((?:(?:[A-Za-z0-9_][A-Za-z0-9_.-]*)/)*"
     r"[A-Za-z0-9_][A-Za-z0-9_.-]*\.py)"
@@ -81,7 +100,14 @@ def requests_new_tests(body: str) -> bool:
         line = re.sub(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", "", line)
         for sentence in re.split(r"(?<=[.!?])\s+", line):
             sentence = sentence.strip()
-            if _ADD_TESTS.match(sentence) and not _CONDITIONAL.search(sentence):
+            fixture_coverage = re.match(
+                r"(?:please\s+)?cover\s+.+?\s+with\s+(?:a\s+|an?\s+\w+\s+)?fixtures?\b",
+                sentence,
+                re.IGNORECASE,
+            )
+            if (
+                _ADD_TESTS.match(sentence) or fixture_coverage
+            ) and not _CONDITIONAL.search(sentence):
                 return True
     return False
 
