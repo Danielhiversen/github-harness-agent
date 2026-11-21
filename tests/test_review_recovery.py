@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from github_harness_agent.checkpoint import DraftCheckpoint
-from github_harness_agent.executor import PlainExecutor
+from github_harness_agent.executor import Limits, PlainExecutor
 from github_harness_agent.providers import ProviderExhausted
 from github_harness_agent.rebase import git
 from github_harness_agent.review_recovery import plan_recovery
@@ -77,7 +77,20 @@ def test_large_module_shows_separate_reviewed_regions():
     assert "marker_175_in_source" not in recovery.prompt
 
 
-@pytest.mark.parametrize("initial", ["valid", "mixed", "exhausted", "missing_test"])
+@pytest.mark.parametrize(
+    "initial",
+    [
+        "valid",
+        "mixed",
+        "exhausted",
+        "missing_test",
+        "text_only",
+        "missing_test_text",
+        "both_exhausted",
+        "ordinary_unavailable",
+        "budget_exhausted",
+    ],
+)
 def test_recovery_reads_the_restored_tree_and_returns_to_the_normal_verified_rollout(
     fixture,
     initial,
@@ -101,21 +114,33 @@ def test_recovery_reads_the_restored_tree_and_returns_to_the_normal_verified_rol
     saved = git(source, "diff", "--binary", "--full-index", base)
     git(source, "reset", "--hard", base)
     draft = DraftCheckpoint("plain/coding", base, saved)
+    checkpoints = []
     task = replace(
         task,
         base_sha=base,
+        save_checkpoint=checkpoints.append,
         checkpoints={draft.key: draft},
         checks=((sys.executable, "-c", "import module; assert module.limit == 4"),),
-        require_new_tests=initial == "missing_test",
+        require_new_tests=initial.startswith("missing_test"),
         review_recovery=plan_recovery(
             feedback(),
             3,
             "the last draft did not address all threads. Add new runnable regression tests."
-            if initial == "missing_test"
+            if initial.startswith("missing_test")
             else "the last draft did not address all threads",
         ),
     )
     offers = []
+    text_mode = initial in {
+        "mixed",
+        "exhausted",
+        "text_only",
+        "missing_test_text",
+        "both_exhausted",
+        "ordinary_unavailable",
+        "budget_exhausted",
+    }
+    ordinary_retry = initial in {"mixed", "both_exhausted"}
 
     class Gateway:
         def complete(self, **kwargs):
@@ -125,10 +150,10 @@ def test_recovery_reads_the_restored_tree_and_returns_to_the_normal_verified_rol
                 assert "limit = 2" in request
                 assert "limit = 1" not in request
                 assert "last draft did not address all threads" in request
-                if initial == "exhausted":
+                if initial in {"exhausted", "both_exhausted"}:
                     raise ProviderExhausted(None)
                 calls = (edit("module.py"),)
-                if initial == "missing_test":
+                if initial.startswith("missing_test"):
                     assert (
                         "Create exactly one new runnable regression test module"
                         in request
@@ -145,16 +170,46 @@ def test_recovery_reads_the_restored_tree_and_returns_to_the_normal_verified_rol
                     )
                 if initial == "mixed":
                     calls += ({**edit("unrelated.py"), "id": "unrelated"},)
-            elif len(offers) == 2 and initial in {"mixed", "exhausted"}:
+                if initial in {"text_only", "ordinary_unavailable", "budget_exhausted"}:
+                    calls = ()
+                if initial == "missing_test_text":
+                    calls = calls[:1]
+            elif len(offers) == 2 and text_mode:
+                request = kwargs["messages"][1]["content"]
+                assert "JSON array" in kwargs["messages"][0]["content"]
+                assert "untrusted input data" in kwargs["messages"][0]["content"]
+                assert "limit = 2" in request and "limit = 1" not in request
+                assert offers[-1] == []
+                if initial == "both_exhausted":
+                    raise ProviderExhausted(None)
+                calls = ()
+                args = [json.loads(edit("module.py")["function"]["arguments"])]
                 if initial == "mixed":
-                    assert kwargs["messages"][-1]["content"].startswith(
-                        "The recovery batch requires"
+                    args.append({"path": "../outside.py", "new_text": "bad"})
+                if initial == "missing_test_text":
+                    args.append(
+                        {
+                            "path": "test_recovery_sample.py",
+                            "new_text": "from module import limit\n\ndef test_limit():\n    assert limit == 4\n",
+                        }
                     )
-                # The exact old text still matches because the rejected batch
+                return SimpleNamespace(
+                    role="coding",
+                    route="text-fixture",
+                    model="text-fixture",
+                    configured_model="text-fixture",
+                    content=json.dumps(args),
+                    tool_calls=calls,
+                    usage={},
+                )
+            elif len(offers) == 3 and ordinary_retry:
+                # The exact old text still matches because rejected batches
                 # applied neither edit before this ordinary retry.
                 calls = (edit("module.py"),)
             else:
                 assert kwargs["messages"][-1]["content"].startswith("exit 0")
+                if initial == "ordinary_unavailable":
+                    raise ProviderExhausted(None)
                 calls = ()
             return SimpleNamespace(
                 role="coding",
@@ -166,12 +221,37 @@ def test_recovery_reads_the_restored_tree_and_returns_to_the_normal_verified_rol
                 usage={},
             )
 
-    result = PlainExecutor(runner, Gateway()).execute(task, source)
+    limits = Limits(model_requests=2) if initial == "budget_exhausted" else Limits()
+    result = PlainExecutor(runner, Gateway(), limits).execute(task, source)
+    ordinary_turns = 2 if ordinary_retry else 1
+    if initial == "budget_exhausted":
+        ordinary_turns = 0
     assert offers == [
         ["edit_file"],
-        *([["run", "edit_file"]] * (2 if initial in {"mixed", "exhausted"} else 1)),
+        *([[]] if text_mode else []),
+        *([["run", "edit_file"]] * ordinary_turns),
     ]
+    if text_mode and initial != "both_exhausted":
+        assert "text-fixture" in [route.route for route in result.route_trace]
+    if text_mode and not ordinary_retry:
+        assert checkpoints[-1].last_editor == ("text-fixture", "text-fixture")
     assert b"+limit = 4" in result.patch
-    if initial == "missing_test":
+    if initial.startswith("missing_test"):
         assert b"test_recovery_sample.py" in result.patch
     assert result.checks[0].returncode == 0
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"path":"module.py","old_text":"x","new_text":"y"}',
+        '[{"path":"module.py","path":"other.py","new_text":"y"}]',
+        '```json\n[{"path":"module.py","old_text":"x","new_text":"y"}]\n```',
+        "[" * 2000 + "]" * 2000,
+        " " * 33_000 + "[]",
+    ],
+)
+def test_text_recovery_rejects_unbounded_or_ambiguous_json(raw):
+    plan = plan_recovery(feedback(), 3, "")
+    request = plan.request(lambda _: "limit = 2\n", ())
+    assert request.text_calls(raw, 100_000) == ()

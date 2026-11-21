@@ -19,7 +19,7 @@ from .activity import observed_call
 from .check_artifacts import STAT_FILES_COMMAND, check_label
 from .checkpoint import DraftCheckpoint
 from .file_edit import EDIT_COMMAND, EDIT_TOOL, InvalidEdit, edit_payload
-from .review_recovery import ReviewRecovery
+from .review_recovery import TEXT_RECOVERY_SYSTEM, ReviewRecovery
 from .providers import ProviderExhausted
 from .test_updates import (
     failing_pytest_nodes,
@@ -302,7 +302,16 @@ class _Budget:
         with self._lock:
             return self.limits.model_requests - self._calls["model request"]
 
-    def complete(self, gateway, role, messages, tools=(), *, after_provider=None):
+    def complete(
+        self,
+        gateway,
+        role,
+        messages,
+        tools=(),
+        *,
+        after_provider=None,
+        retry_oversize=True,
+    ):
         options = (
             {"exclude": self.task.excluded_models} if self.task.excluded_models else {}
         )
@@ -329,7 +338,10 @@ class _Budget:
         try:
             completion = send(compact)
         except ProviderExhausted as error:
-            if "upstream HTTP 413" not in error.failures.values():
+            if (
+                not retry_oversize
+                or "upstream HTTP 413" not in error.failures.values()
+            ):
                 raise
             smaller = compact_messages(
                 messages, max_bytes=RETRY_MESSAGE_BYTES, role=role
@@ -923,7 +935,24 @@ class PlainExecutor:
             retried_empty_finish = False
             focused_test_requested = False
             focus_next_turn = False
+            text_batch_applied = False
+
+            def valid_recovery_test(path, content):
+                return (
+                    _test_module(PurePosixPath(path).name)
+                    and not _protected(path, task, new_test=True)
+                    and has_runnable_test(path, content)
+                )
+
+            def has_model_turn():
+                return (
+                    (limit is None or turns < limit)
+                    and budget.model_requests_remaining() > 0
+                )
+
             while limit is None or turns < limit:
+                if text_batch_applied and not has_model_turn():
+                    break
                 recovery_turn = recovery if turns == 0 else None
                 focused_test_turn = focus_next_turn
                 focus_next_turn = False
@@ -945,6 +974,7 @@ class PlainExecutor:
                         },
                         *messages[1:],
                     ]
+                native_error = None
                 try:
                     last_editor = (
                         own_draft.last_editor if own_draft and not turns else None
@@ -958,20 +988,60 @@ class PlainExecutor:
                     )
                 except _RequestBudgetExceeded as error:
                     budget.reject(error, last, latest=True)
-                except ProviderExhausted:
-                    if (
-                        not recovery_turn
-                        or (limit is not None and turns + 1 >= limit)
-                        or not budget.model_requests_remaining()
-                    ):
+                except ProviderExhausted as error:
+                    if not recovery_turn:
+                        if text_batch_applied:
+                            break
                         raise
-                    turns += 1
-                    continue
+                    native_error = error
+                    completion = None
                 turns += 1
-                last = RouteEvidence.from_completion(completion)
-                if not completion.tool_calls:
-                    if recovery_turn:
+                calls = ()
+                if completion is not None:
+                    last = RouteEvidence.from_completion(completion)
+                    calls = completion.tool_calls
+                text_recovery = False
+                if recovery_turn and not recovery_turn.accepts(
+                    calls, self.limits.patch_bytes, valid_recovery_test
+                ):
+                    if not has_model_turn():
+                        if native_error is not None:
+                            raise native_error
                         continue
+                    turns += 1
+                    try:
+                        completion = budget.complete(
+                            self.gateway,
+                            role,
+                            [
+                                {
+                                    **messages[0],
+                                    "content": (
+                                        messages[0]["content"] + "\n\n" + TEXT_RECOVERY_SYSTEM
+                                    ),
+                                },
+                                {"role": "user", "content": recovery_turn.prompt},
+                            ],
+                            retry_oversize=False,
+                        )
+                    except _RequestBudgetExceeded as error:
+                        budget.reject(error, last, latest=True)
+                    except ProviderExhausted:
+                        if not has_model_turn():
+                            raise
+                        continue
+                    last = RouteEvidence.from_completion(completion)
+                    if completion.tool_calls:
+                        continue
+                    calls = recovery_turn.text_calls(
+                        completion.content, self.limits.patch_bytes
+                    )
+                    if not recovery_turn.accepts(
+                        calls, self.limits.patch_bytes, valid_recovery_test
+                    ):
+                        continue
+                    text_recovery = True
+                if not calls:
                     if clarification and completion.content:
                         self._check_clarification(completion.content)
                     can_continue = (
@@ -1010,35 +1080,20 @@ class PlainExecutor:
                     break
                 assistant = {
                     "role": "assistant",
-                    "content": completion.content,
-                    "tool_calls": list(completion.tool_calls),
+                    "content": None if text_recovery else completion.content,
+                    "tool_calls": list(calls),
                 }
-                if last.configured_model:
+                # These calls were generated locally from text. Keep the actual
+                # route in budget and checkpoint evidence without native affinity.
+                if last.configured_model and not text_recovery:
                     assistant["gateway_route"] = [last.route, last.configured_model]
-                if provider_context := getattr(completion, "provider_context", None):
+                provider_context = getattr(completion, "provider_context", None)
+                if provider_context and not text_recovery:
                     assistant["provider_context"] = provider_context
                 messages.append(assistant)
-                invalid_recovery = recovery_turn and not recovery_turn.accepts(
-                    completion.tool_calls,
-                    self.limits.patch_bytes,
-                    lambda path, content: (
-                        _test_module(PurePosixPath(path).name)
-                        and not _protected(path, task, new_test=True)
-                        and has_runnable_test(path, content)
-                    ),
-                )
                 ran_command = ran_check = False
-                for tool in completion.tool_calls:
-                    if invalid_recovery:
-                        messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tool["id"],
-                                "content": "The recovery batch requires exact edits to the listed existing files "
-                                "and the permitted new runnable test when requested.",
-                            }
-                        )
-                        continue
+                successful_text_edits = 0
+                for tool in calls:
                     if focused_test_turn and tool["function"]["name"] != "edit_file":
                         messages.append(
                             {
@@ -1155,6 +1210,8 @@ class PlainExecutor:
                             f"exit {response.returncode}\n{_combined(response)}",
                             TOOL_RESULT_BYTES,
                         )
+                    if text_recovery and touched and returncode == 0:
+                        successful_text_edits += 1
                     if touched:
                         actor = last
                         ran_command = True
@@ -1219,6 +1276,8 @@ class PlainExecutor:
                             "content": output,
                         }
                     )
+                if text_recovery:
+                    text_batch_applied = successful_text_edits == len(calls)
                 if ran_command and checkpoint_index is not None:
                     self._stage_rollout(
                         workspace, budget, artifacts, index=checkpoint_index
