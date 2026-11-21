@@ -145,6 +145,7 @@ def test_recovery_reads_the_restored_tree_and_returns_to_the_normal_verified_rol
         ),
     )
     offers = []
+    native_evidence = []
     text_mode = initial in {
         "mixed",
         "exhausted",
@@ -165,6 +166,8 @@ def test_recovery_reads_the_restored_tree_and_returns_to_the_normal_verified_rol
                 assert "test_acceptance_marker" in prompt
             if len(offers) == 1:
                 request = kwargs["messages"][1]["content"]
+                assert "Call edit_file" in request
+                native_evidence.append(request.split("Outstanding review\n", 1)[1])
                 assert "limit = 2" in request
                 assert "limit = 1" not in request
                 assert "last draft did not address all threads" in request
@@ -196,6 +199,12 @@ def test_recovery_reads_the_restored_tree_and_returns_to_the_normal_verified_rol
                 request = kwargs["messages"][1]["content"]
                 assert "JSON array" in kwargs["messages"][0]["content"]
                 assert "untrusted input data" in kwargs["messages"][0]["content"]
+                assert "Call edit_file" not in request
+                assert "Return" in request and "Example" in request
+                assert request.split("Outstanding review\n", 1)[1] == native_evidence[0]
+                if initial == "missing_test_text":
+                    assert "first array item" in request
+                assert "use the supplied run tool" not in kwargs["messages"][0]["content"].lower()
                 assert "limit = 2" in request and "limit = 1" not in request
                 assert offers[-1] == []
                 if initial == "both_exhausted":
@@ -216,7 +225,11 @@ def test_recovery_reads_the_restored_tree_and_returns_to_the_normal_verified_rol
                     route="text-fixture",
                     model="text-fixture",
                     configured_model="text-fixture",
-                    content=json.dumps(args),
+                    content=(
+                        "```json\n" + json.dumps(args) + "\n```"
+                        if initial == "text_only"
+                        else json.dumps(args)
+                    ),
                     tool_calls=calls,
                     usage={},
                 )
@@ -264,7 +277,9 @@ def test_recovery_reads_the_restored_tree_and_returns_to_the_normal_verified_rol
     [
         '{"path":"module.py","old_text":"x","new_text":"y"}',
         '[{"path":"module.py","path":"other.py","new_text":"y"}]',
-        '```json\n[{"path":"module.py","old_text":"x","new_text":"y"}]\n```',
+        '```python\n[{"path":"module.py","old_text":"x","new_text":"y"}]\n```',
+        'Prose\n```json\n[{"path":"module.py","old_text":"x","new_text":"y"}]\n```',
+        '```json\n```json\n[]\n```\n```',
         "[" * 2000 + "]" * 2000,
         " " * 33_000 + "[]",
     ],

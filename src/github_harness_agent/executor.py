@@ -1047,13 +1047,8 @@ class PlainExecutor:
                             self.gateway,
                             role,
                             [
-                                {
-                                    **messages[0],
-                                    "content": (
-                                        messages[0]["content"] + "\n\n" + TEXT_RECOVERY_SYSTEM
-                                    ),
-                                },
-                                {"role": "user", "content": recovery_turn.prompt},
+                                {"role": "system", "content": TEXT_RECOVERY_SYSTEM},
+                                {"role": "user", "content": recovery_turn.text_prompt},
                             ],
                             retry_oversize=False,
                         )
