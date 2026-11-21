@@ -21,6 +21,7 @@ from .check_diagnostics import check_failure_summary
 from .checkpoint import DraftCheckpoint
 from .file_edit import EDIT_COMMAND, EDIT_TOOL, InvalidEdit, edit_payload
 from .review_recovery import (
+    RECOVERY_EDIT_TOOL,
     TEXT_RECOVERY_SYSTEM,
     ReviewRecovery,
     operator_acceptance_context,
@@ -315,6 +316,7 @@ class _Budget:
         *,
         after_provider=None,
         retry_oversize=True,
+        review_windows=False,
     ):
         options = (
             {"exclude": self.task.excluded_models} if self.task.excluded_models else {}
@@ -338,14 +340,19 @@ class _Budget:
 
         with self._lock:
             message_limit = self._message_limit
-        compact = compact_messages(messages, max_bytes=message_limit, role=role)
+        compact = compact_messages(
+            messages, max_bytes=message_limit, role=role, review_windows=review_windows
+        )
         try:
             completion = send(compact)
         except ProviderExhausted as error:
             if not retry_oversize or "upstream HTTP 413" not in error.failures.values():
                 raise
             smaller = compact_messages(
-                messages, max_bytes=RETRY_MESSAGE_BYTES, role=role
+                messages,
+                max_bytes=RETRY_MESSAGE_BYTES,
+                role=role,
+                review_windows=review_windows,
             )
             if smaller == compact:
                 raise
@@ -1039,12 +1046,15 @@ class PlainExecutor:
                 focused_test_turn = focus_next_turn
                 focus_next_turn = False
                 request_messages = messages
+                request_tools = tools
                 if recovery_turn:
+                    request_tools = (RECOVERY_EDIT_TOOL,)
                     request_messages = [
                         messages[0],
                         {"role": "user", "content": recovery_turn.prompt},
                     ]
                 elif focused_test_turn:
+                    request_tools = (EDIT_TOOL,)
                     request_messages = [
                         {
                             **messages[0],
@@ -1065,8 +1075,9 @@ class PlainExecutor:
                         self.gateway,
                         role,
                         request_messages,
-                        (EDIT_TOOL,) if focused_test_turn or recovery_turn else tools,
+                        request_tools,
                         after_provider=last_editor[0] if last_editor else None,
+                        review_windows=bool(recovery_turn),
                     )
                 except _RequestBudgetExceeded as error:
                     budget.reject(error, last, latest=True)
@@ -1083,9 +1094,14 @@ class PlainExecutor:
                     last = RouteEvidence.from_completion(completion)
                     calls = completion.tool_calls
                 text_recovery = False
-                native_accepted = recovery_turn and recovery_turn.accepts(
-                    calls, self.limits.patch_bytes, valid_recovery_test
+                recovery_calls = (
+                    recovery_turn.normalize_calls(
+                        calls, self.limits.patch_bytes, valid_recovery_test
+                    )
+                    if recovery_turn
+                    else ()
                 )
+                native_accepted = bool(recovery_calls)
                 if recovery_turn:
                     log_recovery(
                         "native",
@@ -1111,6 +1127,7 @@ class PlainExecutor:
                                 {"role": "user", "content": recovery_turn.text_prompt},
                             ],
                             retry_oversize=False,
+                            review_windows=True,
                         )
                     except _RequestBudgetExceeded as error:
                         budget.reject(error, last, latest=True)
@@ -1126,9 +1143,10 @@ class PlainExecutor:
                     calls = recovery_turn.text_calls(
                         completion.content, self.limits.patch_bytes
                     )
-                    if not recovery_turn.accepts(
+                    recovery_calls = recovery_turn.normalize_calls(
                         calls, self.limits.patch_bytes, valid_recovery_test
-                    ):
+                    )
+                    if not recovery_calls:
                         log_recovery("text", "invalid")
                         continue
                     log_recovery("text", "accepted", len(calls))
@@ -1185,7 +1203,7 @@ class PlainExecutor:
                 messages.append(assistant)
                 ran_command = ran_check = False
                 successful_text_edits = 0
-                for tool in calls:
+                for tool in recovery_calls if recovery_turn else calls:
                     if focused_test_turn and tool["function"]["name"] != "edit_file":
                         messages.append(
                             {

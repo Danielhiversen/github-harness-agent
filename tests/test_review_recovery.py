@@ -45,6 +45,14 @@ def edit(path, old="limit = 2", new="limit = 4"):
     }
 
 
+def span_edit(path):
+    call = edit(path)
+    call["function"]["arguments"] = json.dumps(
+        {"path": path, "span_id": "S1", "new_text": "limit = 4\n"}
+    )
+    return call
+
+
 def test_recovery_needs_repeated_rejections_and_distinct_review_threads():
     items = feedback()
     assert plan_recovery(items, 2, "") is None
@@ -167,6 +175,7 @@ def test_recovery_reads_the_restored_tree_and_returns_to_the_normal_verified_rol
             if len(offers) == 1:
                 request = kwargs["messages"][1]["content"]
                 assert "Call edit_file" in request
+                assert "span_id" in kwargs["tools"][0]["function"]["parameters"]["properties"]
                 native_evidence.append(request.split("Outstanding review\n", 1)[1])
                 assert "limit = 2" in request
                 assert "limit = 1" not in request
@@ -189,6 +198,8 @@ def test_recovery_reads_the_restored_tree_and_returns_to_the_normal_verified_rol
                             "id": "new-test",
                         },
                     )
+                if initial == "valid":
+                    calls = (span_edit("module.py"),)
                 if initial == "mixed":
                     calls += ({**edit("unrelated.py"), "id": "unrelated"},)
                 if initial in {"text_only", "ordinary_unavailable", "budget_exhausted"}:
@@ -210,7 +221,9 @@ def test_recovery_reads_the_restored_tree_and_returns_to_the_normal_verified_rol
                 if initial == "both_exhausted":
                     raise ProviderExhausted(None)
                 calls = ()
-                args = [json.loads(edit("module.py")["function"]["arguments"])]
+                args = [json.loads(
+                    (span_edit if initial == "text_only" else edit)("module.py")["function"]["arguments"]
+                )]
                 if initial == "mixed":
                     args.append({"path": "../outside.py", "new_text": "bad"})
                 if initial == "missing_test_text":
@@ -238,6 +251,7 @@ def test_recovery_reads_the_restored_tree_and_returns_to_the_normal_verified_rol
                 # applied neither edit before this ordinary retry.
                 calls = (edit("module.py"),)
             else:
+                assert "span_id" not in kwargs["tools"][1]["function"]["parameters"]["properties"]
                 assert kwargs["messages"][-1]["content"].startswith("exit 0")
                 if initial == "ordinary_unavailable":
                     raise ProviderExhausted(None)
@@ -351,3 +365,62 @@ def test_repair_feedback_identifies_failed_operator_acceptance_check(fixture):
         "Operator acceptance check 1 exited with status 1. "
         "Failing tests: test_example.py::test_needed."
     )
+
+
+def test_span_handles_bind_exact_reviewed_source_to_path():
+    source = "def configure():\n    limit = 2\n    return limit\n"
+    items = feedback()
+    items[1]["line"] = 3
+    request = plan_recovery(items, 3, "").request(lambda _: source, ())
+    assert '"span_id": "S1"' in request.prompt
+    assert '"start_line": 1, "end_line": 3' in request.text_prompt
+    args = {"path": "module.py", "span_id": "S1", "new_text": source.replace("2", "4")}
+    calls = request.text_calls(json.dumps([args]), 1000)
+    normalized = request.normalize_calls(calls, 1000)
+    assert json.loads(normalized[0]["function"]["arguments"])["old_text"] == source
+    for invalid in (
+        {**args, "path": "other.py"},
+        {**args, "span_id": "unknown"},
+        {**args, "old_text": source},
+    ):
+        assert not request.normalize_calls(
+            request.text_calls(json.dumps([invalid]), 1000), 1000
+        )
+
+
+def test_compacted_local_recovery_retains_span_handle_and_complete_preview():
+    from github_harness_agent.task_context import compact_messages, wire_size
+
+    items = feedback()
+    source = "def configure():\n    limit = 2\n    return limit\n\n"
+    source += "".join(f"payload_{i} = '{'x' * 120}'\n" for i in range(160))
+    recovery = plan_recovery(items, 3, "").request(
+        lambda _: source,
+        (("pytest",),),
+        acceptance_source="Operator acceptance test source (quoted data)\n" + "y" * 8500,
+    )
+    messages = compact_messages(
+        [{"role": "system", "content": "Edit"}, {"role": "user", "content": recovery.prompt}],
+        max_bytes=12 * 1024,
+        role="coding",
+        review_windows=True,
+    )
+    assert wire_size(messages) <= 12 * 1024
+    assert '"span_id": "S1"' in messages[1]["content"]
+    assert '"start_line": 1, "end_line": 3' in messages[1]["content"]
+    assert json.dumps("def configure():\n    limit = 2\n    return limit\n") in messages[1]["content"]
+
+
+def test_stale_span_leaves_checkout_file_unchanged(fixture):
+    from github_harness_agent.file_edit import EDIT_COMMAND, edit_payload
+
+    _, source, runner = fixture
+    request = plan_recovery(feedback(), 3, "").request(lambda _: "limit = 2\n", ())
+    call, = request.normalize_calls([span_edit("module.py")], 1000)
+    archive = git(source, "archive", "HEAD")
+    with runner.workspace(archive, lambda: 30, lambda: False) as workspace:
+        module = workspace.root / "module.py"
+        module.write_text("limit = 3\n")
+        result = workspace.command(EDIT_COMMAND, 30, lambda: False, data=edit_payload(call, 1000))
+        assert result.returncode != 0
+        assert module.read_text() == "limit = 3\n"

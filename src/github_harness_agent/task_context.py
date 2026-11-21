@@ -399,6 +399,7 @@ def _review_content(text: str, max_wire: int) -> str:
     sources, acceptance_marker, acceptance = sources.partition(
         "\n\nOperator acceptance test source "
     )
+    sources, span_marker, spans = sources.partition("\n\nReviewed source spans\n")
     anchors: dict[str, list[int]] = {}
     for path, line in re.findall(r"(?m)^- ([^\n:]+):(\d{1,9}) ", prefix):
         positions = anchors.setdefault(path, [])
@@ -430,6 +431,14 @@ def _review_content(text: str, max_wire: int) -> str:
     names = pieces[1::2]
     labels = marker + "\n\n".join(name + "\n" for name in names)
     remaining = max_wire - wire_size(prefix) - wire_size(suffix) - wire_size(labels)
+    span_budget = min(max_wire // 4, remaining - 320 * len(names))
+    span_evidence = ""
+    for span in spans.splitlines():
+        candidate = (span_evidence + "\n" if span_evidence else span_marker) + span
+        if wire_size(candidate) <= span_budget:
+            span_evidence = candidate
+    if span_evidence:
+        remaining -= wire_size(span_evidence)
     if remaining < 320 * len(names):
         return _bounded_content(text, max_wire)
     compacted = "\n\n".join(
@@ -438,7 +447,7 @@ def _review_content(text: str, max_wire: int) -> str:
         + _review_file_windows(source, anchors[path], remaining // len(names))
         for path, source in zip(names, pieces[2::2], strict=True)
     )
-    return prefix + marker + compacted + suffix
+    return prefix + marker + compacted + span_evidence + suffix
 
 
 def compact_messages(
