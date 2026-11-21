@@ -900,7 +900,7 @@ def test_pull_acceptance_failure_can_choose_another_model_on_a_red_baseline(fixt
 
     task, source, runner = fixture
     gateway = ScriptedGateway("open('number.txt','w').write('5\\n')")
-    with pytest.raises(AttemptRejected, match="Required check failed"):
+    with pytest.raises(AttemptRejected, match="Operator acceptance check 1 exited"):
         PlainExecutor(runner, gateway).execute(
             replace(task, pull_checks=task.checks), source
         )
@@ -909,11 +909,14 @@ def test_pull_acceptance_failure_can_choose_another_model_on_a_red_baseline(fixt
 
 def test_missing_review_test_reports_independent_behavior_failure(fixture):
     task, source, runner = fixture
-    check = (
-        "python3",
-        "-c",
-        "print('FAILED ../oracle/test_case.py::test_boundary'); raise SystemExit(1)",
+    acceptance = source.parent / "oracle" / "test_case.py"
+    acceptance.parent.mkdir()
+    acceptance.write_text(
+        "from pathlib import Path\n"
+        "def test_boundary():\n"
+        "    assert Path('number.txt').read_text() == '4\\n'\n"
     )
+    check = (sys.executable, "-m", "pytest", "-q", str(acceptance))
     task = replace(task, require_new_tests=True, pull_checks=(check,))
     with pytest.raises(
         ExecutionError,
@@ -951,7 +954,7 @@ def test_patch_induced_check_failure_can_choose_another_model(fixture):
         ),
     )
     gateway = ScriptedGateway("open('number.txt','w').write('5\\n')")
-    with pytest.raises(AttemptRejected, match="Required check failed") as error:
+    with pytest.raises(AttemptRejected, match="Required check 1 exited") as error:
         PlainExecutor(runner, gateway).execute(task, source)
     assert error.value.candidate.configured_model == "fixture-model-id"
 
@@ -1357,21 +1360,32 @@ def test_harness2_review_accepts_verified_base_without_proposals(fixture):
 
 
 def test_harness2_review_retries_failed_base_with_safe_check_summary(fixture):
+    from github_harness_agent.rebase import git
+
     task, source, runner = fixture
+    (source / "test_number.py").write_text(
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.mark.parametrize('expected', [pytest.param('4\\n', id='private-param')])\n"
+        "def test_number(expected):\n"
+        "    assert Path('number.txt').read_text() == expected\n"
+    )
+    git(source, "add", "test_number.py")
+    git(
+        source,
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "-qm",
+        "test fixture",
+    )
+    base = git(source, "rev-parse", "HEAD").decode().strip()
     task = replace(
         task,
+        base_sha=base,
         verify_base_first=True,
-        checks=(
-            (
-                sys.executable,
-                "-c",
-                "import pathlib; "
-                "ok = pathlib.Path('number.txt').read_text() == '4\\n'; "
-                "print('FAILED test_number.py::test_number[private-param] - private-output'); "
-                "raise SystemExit(not ok)",
-                "private-argv",
-            ),
-        ),
+        checks=((sys.executable, "-m", "pytest", "-q", "test_number.py"),),
     )
 
     class RepairGateway(ScriptedGateway):
@@ -1402,6 +1416,53 @@ def test_harness2_review_retries_failed_base_with_safe_check_summary(fixture):
     assert "test_number.py::test_number" in base.error
     assert "private-" not in base.error
     assert repaired.patch_digest == result.patch_digest
+
+
+def test_verified_uv_ruff_failure_survives_into_the_repair_turn(fixture):
+    from github_harness_agent.executor import AttemptRejected
+
+    task, source, runner = fixture
+    launcher = source.parent / "uv"
+    launcher.write_text('#!/bin/sh\nshift 2\nexec "$@"\n')
+    launcher.chmod(0o755)
+    ruff = source.parent / "ruff"
+    ruff.write_text(
+        "#!/usr/bin/env python3\n"
+        "from pathlib import Path\n"
+        "if Path('number.txt').read_text() == '5\\n':\n"
+        "    print('RUF001 private-message')\n"
+        "    print(' --> /tmp/confidential-root/catalog.py:148:22')\n"
+        "    print('148 | private-source')\n"
+        "    raise SystemExit(1)\n"
+    )
+    ruff.chmod(0o755)
+    task = replace(
+        task, checks=((str(launcher), "run", "--no-sync", str(ruff), "check"),)
+    )
+    draft = "open('number.txt','w').write('5\\n')"
+    with pytest.raises(AttemptRejected) as rejected:
+        PlainExecutor(runner, ScriptedGateway(draft)).execute(task, source)
+    summary = str(rejected.value)
+    assert (
+        summary
+        == "Required check 1 exited with status 1. ruff diagnostics: RUF001 catalog.py:148:22."
+    )
+
+    class RepairGateway(ScriptedGateway):
+        def complete(self, **kwargs):
+            if len(self.roles) == 2:
+                assert summary in kwargs["messages"][1]["content"]
+                assert "private-" not in kwargs["messages"][1]["content"]
+                assert "confidential-root" not in kwargs["messages"][1]["content"]
+                self.code = "open('number.txt','w').write('4\\n')"
+            return super().complete(**kwargs)
+
+    result = Harness2Executor(runner, RepairGateway(draft)).execute(
+        replace(task, verify_base_first=True),
+        source,
+    )
+    assert result.refinement.candidates[0].error == summary
+    assert result.refinement.selected_candidate == "repair"
 
 
 def test_harness2_review_retries_missing_regression_coverage_from_safe_draft(fixture):

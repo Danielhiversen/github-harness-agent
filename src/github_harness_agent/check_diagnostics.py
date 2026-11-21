@@ -1,0 +1,103 @@
+"""Summarize recognized check diagnostics without returning raw command output."""
+
+import re
+from pathlib import PurePosixPath
+
+from .check_artifacts import check_label
+from .test_updates import failing_pytest_nodes
+
+_RULE = r"[A-Z]{1,8}[0-9]{2,5}"
+_POSITION = r"[1-9][0-9]{0,6}"
+_LOCATION = rf"(.{{1,512}}?):({_POSITION}):({_POSITION})"
+_RUFF_SHORT = re.compile(rf"^{_LOCATION}: +({_RULE})(?:\s|$)")
+_RUFF_HEADER = re.compile(rf"^({_RULE})(?:\s|$)")
+_RUFF_ARROW = re.compile(rf"^\s*-->\s+{_LOCATION}\s*$")
+_MYPY = re.compile(
+    rf"^(.{{1,512}}?):({_POSITION})(?::({_POSITION}))?: (?:error|warning): "
+    r".* +\[([a-z][a-z0-9-]{0,47})\]\s*$"
+)
+_SAFE_PATH = re.compile(r"[A-Za-z0-9_. -]+(?:/[A-Za-z0-9_. -]+)*")
+_ANSI_COLOR = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _format_identifier(code, path, line, column):
+    normalized = PurePosixPath(path.replace("\\", "/"))
+    if (
+        normalized.is_absolute()
+        or ".." in normalized.parts
+        or re.match(r"^[A-Za-z]:", path)
+    ):
+        path = normalized.name
+    else:
+        path = str(normalized)
+    if len(path) <= 120 and normalized.suffix and _SAFE_PATH.fullmatch(path):
+        return f"{code} {path}:{line}" + (f":{column}" if column else "")
+    return None
+
+
+def _ruff_matches(output):
+    rule = None
+    for line in output.splitlines():
+        if match := _RUFF_SHORT.match(line):
+            path, row, column, code = match.groups()
+            yield _format_identifier(code, path, row, column)
+            rule = None
+        elif rule and (match := _RUFF_ARROW.match(line)):
+            yield _format_identifier(rule, *match.groups())
+            rule = None
+        elif line and not line[0].isspace():
+            match = _RUFF_HEADER.match(line)
+            rule = match[1] if match else None
+
+
+def check_details(command, output):
+    tool = check_label(tuple(command), ()) if command else None
+    if tool not in {"ruff", "mypy", "pytest"}:
+        return ""
+    if len(output) > 65536:
+        output = output[:32768] + "\n" + output[-32768:]
+    output = _ANSI_COLOR.sub("", output)
+    if tool == "pytest":
+        nodes = failing_pytest_nodes(output)
+        return (
+            "Failing tests: " + ", ".join(nodes) + "."
+            if nodes
+            else "Check tool: pytest."
+        )
+    if tool == "mypy":
+        matches = (
+            _format_identifier(f"[{code}]", path, row, column)
+            for line in output.splitlines()
+            if (match := _MYPY.match(line))
+            for path, row, column, code in (match.groups(),)
+        )
+    else:
+        matches = _ruff_matches(output)
+    identifiers = []
+    for item in matches:
+        if item and item not in identifiers:
+            identifiers.append(item)
+            if len(identifiers) == 4:
+                break
+    return (
+        f"{tool} diagnostics: " + ", ".join(identifiers) + "."
+        if identifiers
+        else f"Check tool: {tool}."
+    )
+
+
+def check_failure_summary(task, checks, *, baseline_failed=False):
+    failed = checks[-1]
+    if failed.command in task.pull_checks:
+        label = (
+            f"Operator acceptance check {task.pull_checks.index(failed.command) + 1}"
+        )
+    else:
+        label = f"Required check {(len(checks) - 1) % len(task.checks) + 1}"
+    summary = f"{label} exited with status {failed.returncode}."
+    details = check_details(failed.command, failed.output)
+    if details:
+        summary += f" {details}"
+    if baseline_failed:
+        summary += " The check also failed on the baseline."
+    return summary

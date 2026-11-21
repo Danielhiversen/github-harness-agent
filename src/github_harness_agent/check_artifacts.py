@@ -13,6 +13,17 @@ CHECK_TOOLS = {
     "unittest",
     "vitest",
 }
+_UV_RUN_VALUE_OPTIONS = frozenset(
+    (
+        "-C -P -f -i -p -w --allow-insecure-host --cache-dir --color --config-file "
+        "--config-setting --config-settings-package --default-index --env-file --exclude-newer "
+        "--exclude-newer-package --extra --extra-index-url --find-links --fork-strategy --group "
+        "--index --index-strategy --index-url --keyring-provider --link-mode "
+        "--no-binary-package --no-build-isolation-package --no-build-package --no-extra --no-group "
+        "--only-group --package --prerelease --python-platform --refresh-package "
+        "--reinstall-package --resolution --upgrade-package --with --with-editable --with-requirements"
+    ).split()
+)
 
 
 def check_label(argv, configured_checks):
@@ -30,13 +41,15 @@ def check_label(argv, configured_checks):
         "run",
     ):
         argv = argv[2:]
+        value_options = {"--directory", "--project", "--python"}
+        if executable == "uv":
+            value_options |= _UV_RUN_VALUE_OPTIONS
         # Skip runner options while looking for the actual check executable.
         while argv and argv[0].startswith("-"):
-            argv = (
-                argv[2:]
-                if argv[0] in {"--directory", "--project", "--python"}
-                else argv[1:]
-            )
+            if argv[0] == "--":
+                argv = argv[1:]
+                break
+            argv = argv[2:] if argv[0] in value_options else argv[1:]
         return check_label(argv, ()) if argv else None
     if re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", executable):
         module = argv[2] if len(argv) >= 3 and argv[1] == "-m" else ""

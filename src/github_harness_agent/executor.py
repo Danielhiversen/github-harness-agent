@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from .activity import observed_call
 from .check_artifacts import STAT_FILES_COMMAND, check_label
+from .check_diagnostics import check_failure_summary
 from .checkpoint import DraftCheckpoint
 from .file_edit import EDIT_COMMAND, EDIT_TOOL, InvalidEdit, edit_payload
 from .review_recovery import (
@@ -26,7 +27,6 @@ from .review_recovery import (
 )
 from .providers import ProviderExhausted
 from .test_updates import (
-    failing_pytest_nodes,
     focused_pytest,
     has_runnable_test,
     passed_pytest_report,
@@ -1651,11 +1651,7 @@ class PlainExecutor:
                 if task.pull_checks:
                     evidence = self._run_checks(workspace, budget, task.pull_checks)
                     if evidence[-1].returncode:
-                        names = failing_pytest_nodes(evidence[-1].output)
-                        if names:
-                            reason += " The current draft also fails: " + ", ".join(
-                                names
-                            )
+                        reason += " " + check_failure_summary(task, evidence)
                 budget.reject(_MissingRegressionTests(reason), actor)
             checks = self._run_checks(workspace, budget, task.checks)
         trusted_passed = checks[-1].returncode == 0
@@ -1696,12 +1692,7 @@ class PlainExecutor:
             failed = checks[-1]
             rejection = 0 < failed.returncode < 125
             error_type = _VerificationRejected if rejection else ExecutionError
-            reason = f"Required check failed: {failed.command[0]}"
-            if failed.command in task.pull_checks:
-                nodes = failing_pytest_nodes(failed.output)
-                if nodes:
-                    reason += ". Failing tests: " + ", ".join(nodes)
-            error = error_type(reason)
+            error = error_type(check_failure_summary(task, checks))
             error.checks = tuple(checks)
             if actor is not None and actor.configured_model and rejection:
                 if trusted_passed or failed.command in task.pull_checks:
@@ -1721,7 +1712,7 @@ class PlainExecutor:
                     else ExecutionError
                 )
                 error = error_type(
-                    f"Required check also failed on the baseline: {failed.command[0]}"
+                    check_failure_summary(task, checks, baseline_failed=True)
                 )
                 error.checks = tuple(checks)
             raise error

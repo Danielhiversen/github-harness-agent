@@ -6,6 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from .check_diagnostics import check_failure_summary
 from .checkpoint import DraftCheckpoint
 from .executor import (
     AttemptRejected,
@@ -17,7 +18,6 @@ from .executor import (
     _VerificationRejected,
 )
 from .providers import ProviderExhausted
-from .test_updates import failing_pytest_nodes
 from .worker import ExecutionError
 
 HARNESS2_REVISION = "6868817518876de8fd170c6a8354daca273b6191"
@@ -38,18 +38,7 @@ def _check_feedback(task, failure):
         return str(failure)
     if not isinstance(failure, _VerificationRejected):
         return ""
-    failed = failure.checks[-1]
-    if failed.command in task.pull_checks:
-        ordinal = task.pull_checks.index(failed.command) + 1
-        label = "Operator acceptance check"
-    else:
-        ordinal = (len(failure.checks) - 1) % len(task.checks) + 1
-        label = "Required check"
-    summary = f"{label} {ordinal} exited with status {failed.returncode}."
-    nodes = failing_pytest_nodes(failed.output)
-    if nodes:
-        summary += " Failing tests: " + ", ".join(nodes) + "."
-    return summary
+    return check_failure_summary(task, failure.checks)
 
 
 def _base_guidance(task):
