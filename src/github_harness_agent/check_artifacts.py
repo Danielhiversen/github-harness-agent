@@ -46,6 +46,8 @@ def check_label(argv, configured_checks):
             value_options |= _UV_RUN_VALUE_OPTIONS
         # Skip runner options while looking for the actual check executable.
         while argv and argv[0].startswith("-"):
+            if executable == "uv" and argv[0] in {"-s", "--script", "--gui-script"}:
+                return None
             if argv[0] == "--":
                 argv = argv[1:]
                 break

@@ -74,3 +74,4 @@ def test_unknown_checks_return_only_ordinal_and_exit_status():
     assert (
         check_details(("uv", "run", "--with", "pytest", "custom"), failed.output) == ""
     )
+    assert check_details(("uv", "run", "--script", "pytest"), failed.output) == ""
