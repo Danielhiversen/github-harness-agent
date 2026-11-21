@@ -67,11 +67,20 @@ def run_process(argv, timeout, cancelled, *, cwd=None, data=b"", cap=65536):
                         os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+                    except PermissionError:
+                        # Some sandboxes permit signals to our child by PID
+                        # while denying process-group signals.
+                        process.kill()
         stdout.seek(0)
         stderr.seek(0)
-        return subprocess.CompletedProcess(
-            argv, process.returncode, stdout.read(cap), stderr.read(cap)
-        )
+        # A short-lived process can finish writing between the size sample
+        # and poll(). Check the combined limit again without reading more than
+        # one extra byte or returning truncated output as a success.
+        out = stdout.read(cap + 1)
+        err = stderr.read(cap + 1 - len(out))
+        if len(out) + len(err) > cap:
+            raise CommandOutputExceeded("Command output exceeded the configured size")
+        return subprocess.CompletedProcess(argv, process.returncode, out, err)
 
 
 class _DockerWorkspace:
