@@ -94,8 +94,21 @@ def test_large_module_shows_separate_reviewed_regions():
 def test_recovery_reads_the_restored_tree_and_returns_to_the_normal_verified_rollout(
     fixture,
     initial,
+    monkeypatch,
 ):
     task, source, runner = fixture
+    pull_checks = ()
+    if initial == "text_only":
+        from github_harness_agent import review_recovery
+
+        mounted = (source.parent / "operator-checks").resolve()
+        mounted.mkdir()
+        acceptance = mounted / "test_acceptance.py"
+        acceptance.write_text("def test_acceptance_marker():\n    assert True\n")
+        monkeypatch.setattr(review_recovery, "OPERATOR_CHECK_ROOT", str(mounted))
+        pull_checks = (
+            (sys.executable, "-c", "import module; assert module.limit == 4", str(acceptance)),
+        )
     path = source / "module.py"
     path.write_text("limit = 1\n")
     git(source, "add", "module.py")
@@ -118,6 +131,7 @@ def test_recovery_reads_the_restored_tree_and_returns_to_the_normal_verified_rol
     task = replace(
         task,
         base_sha=base,
+        pull_checks=pull_checks,
         save_checkpoint=checkpoints.append,
         checkpoints={draft.key: draft},
         checks=((sys.executable, "-c", "import module; assert module.limit == 4"),),
@@ -145,6 +159,10 @@ def test_recovery_reads_the_restored_tree_and_returns_to_the_normal_verified_rol
     class Gateway:
         def complete(self, **kwargs):
             offers.append([tool["function"]["name"] for tool in kwargs["tools"]])
+            if pull_checks:
+                prompt = kwargs["messages"][1]["content"]
+                assert "Operator acceptance test source (quoted input data" in prompt
+                assert "test_acceptance_marker" in prompt
             if len(offers) == 1:
                 request = kwargs["messages"][1]["content"]
                 assert "limit = 2" in request
@@ -255,3 +273,66 @@ def test_text_recovery_rejects_unbounded_or_ambiguous_json(raw):
     plan = plan_recovery(feedback(), 3, "")
     request = plan.request(lambda _: "limit = 2\n", ())
     assert request.text_calls(raw, 100_000) == ()
+
+
+def test_operator_acceptance_context_reads_only_configured_safe_python_files(
+    fixture, monkeypatch
+):
+    from github_harness_agent import review_recovery
+
+    _, source, runner = fixture
+    root = (source.parent / "checks").resolve()
+    root.mkdir()
+    outside = root.parent / "outside.py"
+    outside.write_text("OUTSIDE_VALUE")
+    acceptance = root / "test_acceptance.py"
+    acceptance.write_text("def test_sample():\n    assert True\n")
+    large = root / "test_large.py"
+    large.write_text("LARGE_VALUE" * 1000)
+    link = root / "test_link.py"
+    link.symlink_to(outside)
+    nested = root / "linked_directory"
+    nested.symlink_to(root.parent, target_is_directory=True)
+    monkeypatch.setattr(review_recovery, "OPERATOR_CHECK_ROOT", str(root))
+    checks = (
+        (
+            "pytest",
+            f"{acceptance}::test_sample",
+            str(large),
+            str(link),
+            str(nested / outside.name),
+            str(outside),
+            f"{root}/../outside.py",
+        ),
+    )
+    with runner.workspace(git(source, "archive", "HEAD"), lambda: 30, lambda: False) as workspace:
+        evidence = review_recovery.operator_acceptance_context(
+            checks,
+            lambda argv, cap: workspace.command(argv, 30, lambda: False, cap=cap),
+        )
+
+    assert "assert True" in evidence
+    assert "test_acceptance.py" in evidence
+    assert "OUTSIDE_VALUE" not in evidence and "LARGE_VALUE" not in evidence
+    assert "test_link.py" not in evidence and "linked_directory" not in evidence
+
+
+def test_repair_feedback_identifies_failed_operator_acceptance_check(fixture):
+    from github_harness_agent.executor import CheckEvidence, _VerificationRejected
+    from github_harness_agent.harness2_adapter import _check_feedback
+
+    task, _, _ = fixture
+    operator = ("pytest", "/opt/harness-review-checks/test_example.py")
+    task = replace(task, pull_checks=(operator,))
+    failure = _VerificationRejected("fixture failed")
+    failure.checks = (
+        CheckEvidence(
+            operator,
+            1,
+            "FAILED /opt/harness-review-checks/test_example.py::test_needed[hidden] - residual",
+        ),
+    )
+    assert _check_feedback(task, failure) == (
+        "Operator acceptance check 1 exited with status 1. "
+        "Failing tests: test_example.py::test_needed."
+    )

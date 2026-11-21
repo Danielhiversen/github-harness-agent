@@ -19,7 +19,11 @@ from .activity import observed_call
 from .check_artifacts import STAT_FILES_COMMAND, check_label
 from .checkpoint import DraftCheckpoint
 from .file_edit import EDIT_COMMAND, EDIT_TOOL, InvalidEdit, edit_payload
-from .review_recovery import TEXT_RECOVERY_SYSTEM, ReviewRecovery
+from .review_recovery import (
+    TEXT_RECOVERY_SYSTEM,
+    ReviewRecovery,
+    operator_acceptance_context,
+)
 from .providers import ProviderExhausted
 from .test_updates import (
     failing_pytest_nodes,
@@ -851,6 +855,17 @@ class PlainExecutor:
                     + "; ".join(progress)
                 )
             initial_tree = staged_tree
+            acceptance_source = ""
+            if task.pull_checks:
+                try:
+                    acceptance_source = operator_acceptance_context(
+                        task.pull_checks,
+                        lambda argv, cap: self._command(
+                            workspace, budget, argv, cap=cap, checked=False
+                        ),
+                    )
+                except (CommandOutputExceeded, OSError):
+                    pass
             recovery = None
             if task.review_recovery is not None and checkpoint_key in {
                 "plain/coding",
@@ -880,6 +895,7 @@ class PlainExecutor:
                     ),
                     (*task.checks, *task.pull_checks),
                     require_test=add_test,
+                    acceptance_source=acceptance_source,
                 )
             checkpoint_index = None
             if checkpoint_key is not None and task.save_checkpoint is not None:
@@ -905,6 +921,8 @@ class PlainExecutor:
                     "will rerun them before publication.\n"
                     + json.dumps(task.pull_checks)
                 )
+                if acceptance_source:
+                    instructions += "\n\n" + acceptance_source
             messages = [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": instructions},
@@ -942,6 +960,14 @@ class PlainExecutor:
                     _test_module(PurePosixPath(path).name)
                     and not _protected(path, task, new_test=True)
                     and has_runnable_test(path, content)
+                )
+
+            def log_recovery(mode, outcome, count=0):
+                logging.getLogger(__name__).info(
+                    "Stalled review recovery mode=%s outcome=%s edit_count=%d",
+                    mode,
+                    outcome,
+                    count,
                 )
 
             def has_model_turn():
@@ -1001,9 +1027,16 @@ class PlainExecutor:
                     last = RouteEvidence.from_completion(completion)
                     calls = completion.tool_calls
                 text_recovery = False
-                if recovery_turn and not recovery_turn.accepts(
+                native_accepted = recovery_turn and recovery_turn.accepts(
                     calls, self.limits.patch_bytes, valid_recovery_test
-                ):
+                )
+                if recovery_turn:
+                    log_recovery(
+                        "native",
+                        "exhausted" if native_error else "accepted" if native_accepted else "invalid",
+                        len(calls) if native_accepted else 0,
+                    )
+                if recovery_turn and not native_accepted:
                     if not has_model_turn():
                         if native_error is not None:
                             raise native_error
@@ -1027,11 +1060,13 @@ class PlainExecutor:
                     except _RequestBudgetExceeded as error:
                         budget.reject(error, last, latest=True)
                     except ProviderExhausted:
+                        log_recovery("text", "exhausted")
                         if not has_model_turn():
                             raise
                         continue
                     last = RouteEvidence.from_completion(completion)
                     if completion.tool_calls:
+                        log_recovery("text", "invalid")
                         continue
                     calls = recovery_turn.text_calls(
                         completion.content, self.limits.patch_bytes
@@ -1039,7 +1074,9 @@ class PlainExecutor:
                     if not recovery_turn.accepts(
                         calls, self.limits.patch_bytes, valid_recovery_test
                     ):
+                        log_recovery("text", "invalid")
                         continue
+                    log_recovery("text", "accepted", len(calls))
                     text_recovery = True
                 if not calls:
                     if clarification and completion.content:

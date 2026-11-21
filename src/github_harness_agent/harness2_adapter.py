@@ -39,8 +39,13 @@ def _check_feedback(task, failure):
     if not isinstance(failure, _VerificationRejected):
         return ""
     failed = failure.checks[-1]
-    ordinal = (len(failure.checks) - 1) % len(task.checks) + 1
-    summary = f"Required check {ordinal} exited with status {failed.returncode}."
+    if failed.command in task.pull_checks:
+        ordinal = task.pull_checks.index(failed.command) + 1
+        label = "Operator acceptance check"
+    else:
+        ordinal = (len(failure.checks) - 1) % len(task.checks) + 1
+        label = "Required check"
+    summary = f"{label} {ordinal} exited with status {failed.returncode}."
     nodes = failing_pytest_nodes(failed.output)
     if nodes:
         summary += " Failing tests: " + ", ".join(nodes) + "."
