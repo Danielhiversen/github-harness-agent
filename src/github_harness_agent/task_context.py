@@ -8,6 +8,7 @@ from threading import Lock
 from typing import Any
 
 from .github import GitHubError, validate_repository
+from .review_definitions import DEFINITION_ENDING
 
 MESSAGE_BYTES = 57344
 RETRY_MESSAGE_BYTES = 24576
@@ -462,12 +463,9 @@ def compact_focused_review(messages, *, max_bytes):
         return None
     context, checkout_marker, _ = text.partition("\nCurrent checkout:\n")
     goal, _, _ = context.partition("\nOther reviewer feedback:\n")
-    ending = "Respond with exact SEARCH/REPLACE blocks only."
-    if (
-        not checkout_marker
-        or "\nFocused source from " not in goal
-        or not text.endswith(ending)
-    ):
+    endings = ("Respond with exact SEARCH/REPLACE blocks only.", DEFINITION_ENDING)
+    ending = next((value for value in endings if text.endswith(value)), None)
+    if not checkout_marker or "\nFocused source from " not in goal or ending is None:
         return None
     test_path = next(
         (

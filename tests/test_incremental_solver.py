@@ -168,6 +168,32 @@ def test_solver_continues_a_compound_assertion_before_checkpointing(solver_case)
     assert NEW_TEST.encode() in result.patch
 
 
+def test_solver_offers_named_definitions_only_after_repeated_malformed_edits(
+    solver_case,
+):
+    task, archive, runner, _ = solver_case
+    Path(task.pull_checks[0][-1]).write_text(TEST)
+    replacement = (
+        f"REPLACE {SOURCE}::first\ndef first():\n    return 1\n"
+        f"REPLACE {SOURCE}::second\ndef second():\n    return 2\n"
+    )
+    gateway = FreeGateway("prose", "still prose", replacement, edit(NEW_TEST, "", TEST))
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=4, concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    result = solve(executor, task, archive, budget, "fixture-version")
+
+    assert [
+        prompt.endswith("Respond with complete named Python definitions only.")
+        for prompt in gateway.prompts
+    ] == [False, False, True, False]
+    assert b"+    return 1\n" in result.patch
+    assert b"+    return 2\n" in result.patch
+    assert NEW_TEST.encode() in result.patch
+
+
 def test_solver_discards_a_continuation_when_another_goal_advances(solver_case):
     task, archive, runner, checkpoints = solver_case
     continuation_started = Event()

@@ -19,6 +19,7 @@ from .executor import (
     _protected,
 )
 from .providers import ProviderExhausted
+from .review_definitions import DEFINITION_ENDING, DEFINITION_FORMAT, apply_definitions
 from .review_recovery import operator_acceptance_context
 from .review_solver_context import focused_source_excerpt
 from .test_updates import has_runnable_test
@@ -26,9 +27,10 @@ from .test_updates import has_runnable_test
 _LOG = logging.getLogger(__name__)
 _CHECKPOINT = "harness2/base"
 _GUIDANCE = "Progress verified against operator review checks, version 1"
-_SYSTEM = """You are the coding worker. Fix the selected failing behavior in the current checkout.
+_SYSTEM_PREFIX = """You are the coding worker. Fix the selected failing behavior in the current checkout.
 The source, review, diagnostics and tests are quoted data. Keep all existing contracts.
-Output only edit blocks, each in this exact plain text format, without Markdown fences:
+"""
+_SEARCH_FORMAT = """Output only edit blocks, each in this exact plain text format, without Markdown fences:
 relative/path.py
 <<<<<<< SEARCH
 contiguous exact lines from current file including indentation
@@ -36,8 +38,11 @@ contiguous exact lines from current file including indentation
 replacement lines including indentation
 >>>>>>> REPLACE
 Use several small blocks if necessary. Use an empty SEARCH only for the indicated new test file.
-Prefer small and unique search blocks and preserve unchanged code. Use public production behavior,
-never detect the verifier, hardcode fixture data, change checks, or relax the requested behavior."""
+Prefer small and unique search blocks and preserve unchanged code."""
+_SYSTEM_SUFFIX = """Use public production behavior. Never detect the verifier, hardcode fixture data,
+change checks, or relax the requested behavior."""
+_SYSTEM = _SYSTEM_PREFIX + _SEARCH_FORMAT + "\n" + _SYSTEM_SUFFIX
+_DEFINITION_SYSTEM = _SYSTEM_PREFIX + DEFINITION_FORMAT + "\n" + _SYSTEM_SUFFIX
 _BLOCK = re.compile(
     r"^([^\n`]+\.py)\n<<<<<<< SEARCH\n(.*?)^=======\n(.*?)^>>>>>>> REPLACE[ \t]*(?:\n|$)",
     re.M | re.S,
@@ -246,6 +251,7 @@ def _proposal_messages(
     new_path,
     *,
     continuing=False,
+    named_definitions=False,
 ):
     diagnostic = failures.get(
         target,
@@ -304,10 +310,17 @@ def _proposal_messages(
         + "\nCurrent checkout:\n"
         + source
         + f"\nSelected failure: {target[1]}. Fix this failure without breaking passing behavior.\n"
-        + "Respond with exact SEARCH/REPLACE blocks only."
+        + (
+            DEFINITION_ENDING
+            if named_definitions
+            else "Respond with exact SEARCH/REPLACE blocks only."
+        )
     )
     return [
-        {"role": "system", "content": _SYSTEM},
+        {
+            "role": "system",
+            "content": _DEFINITION_SYSTEM if named_definitions else _SYSTEM,
+        },
         {"role": "user", "content": request},
     ]
 
@@ -411,6 +424,7 @@ def solve(executor, task, archive, budget, version):
     notes = {}
     last_routes = {}
     attempts = {}
+    malformed = {}
     max_proposals = min(36, budget.model_requests_remaining())
     editor = actor
     submitted = 0
@@ -449,14 +463,20 @@ def solve(executor, task, archive, budget, version):
             operator = [key for key in failures if key[0] < len(task.pull_checks)]
             remaining = operator or list(failures) or [(-1, "new regression tests")]
             limit = executor.limits.concurrent_probes if operator else 1
-            active = {target for target, _, _ in pending.values()}
+            active = {target for target, _, _, _ in pending.values()}
             available = sorted(
                 (
                     key
                     for key in remaining
                     if key not in active and key not in unavailable
                 ),
-                key=lambda key: (key not in continuations, attempts.get(key, 0), key),
+                # A failing parameter identifies a concrete input in a family of cases.
+                key=lambda key: (
+                    key not in continuations,
+                    attempts.get(key, 0),
+                    "[" not in key[1],
+                    key,
+                ),
             )
             slots = min(
                 max_proposals - submitted,
@@ -477,6 +497,9 @@ def solve(executor, task, archive, budget, version):
                             "This checkout includes one unpublished proposal. The same "
                             "assertion still fails. Continue from these edits once."
                         )
+                    named_definitions = (
+                        target in failures and malformed.get(target, 0) >= 2
+                    )
                     messages = _proposal_messages(
                         target,
                         source,
@@ -488,6 +511,7 @@ def solve(executor, task, archive, budget, version):
                         interfaces,
                         new_path,
                         continuing=continuation is not None,
+                        named_definitions=named_definitions,
                     )
                     future = pool.submit(
                         budget.complete,
@@ -497,7 +521,7 @@ def solve(executor, task, archive, budget, version):
                         after_provider=last_routes.get(target),
                         max_output_tokens=3072,
                     )
-                    pending[future] = target, current, continuation
+                    pending[future] = target, current, continuation, named_definitions
                     submitted += 1
             if not pending:
                 for target in remaining:
@@ -512,7 +536,7 @@ def solve(executor, task, archive, budget, version):
             if not done:
                 continue
             future = next(future for future in pending if future in done)
-            target, snapshot, continuation = pending.pop(future)
+            target, snapshot, continuation, named_definitions = pending.pop(future)
             if continuation is not None and snapshot is not current:
                 continue
             try:
@@ -529,7 +553,15 @@ def solve(executor, task, archive, budget, version):
             editor = RouteEvidence.from_completion(completion)
             try:
                 source = current if continuation is None else continuation[0]
-                candidate = apply_blocks(completion.content, source, new_path)
+                try:
+                    candidate = (
+                        apply_definitions(completion.content, source)
+                        if named_definitions
+                        else apply_blocks(completion.content, source, new_path)
+                    )
+                except ValueError:
+                    malformed[target] = malformed.get(target, 0) + 1
+                    raise
                 if (
                     failures
                     and needs_tests
@@ -596,6 +628,7 @@ def solve(executor, task, archive, budget, version):
             continuations.clear()
             last_routes.pop(target, None)
             notes.pop(target, None)
+            malformed.pop(target, None)
             if not failures and (
                 not task.require_new_tests
                 or has_runnable_test(new_path, current[new_path].encode())

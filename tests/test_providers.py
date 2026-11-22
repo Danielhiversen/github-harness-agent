@@ -124,6 +124,36 @@ def test_focused_review_retries_an_oversized_413_once_before_fallback(
         assert timeout == calls[0][2] - elapsed
 
 
+def test_compact_groq_reasoning_leaves_output_for_the_actual_edit():
+    calls = []
+
+    def handle(request):
+        calls.append(json.loads(request.content))
+        return (
+            httpx.Response(413)
+            if len(calls) == 1
+            else httpx.Response(200, json=openai_response())
+        )
+
+    router = routed(deployment("groq-free/openai/gpt-oss-120b"), handle)
+    request = (
+        "Selected failure: test_case\nFocused source from module.py:\nvalue = value + 1\n"
+        "Other reviewer feedback:\n"
+        + ("other " * 5000)
+        + "\nCurrent checkout:\nmodule.py\nRespond with exact SEARCH/REPLACE blocks only."
+    )
+    router.complete(
+        role="coding",
+        messages=[
+            {"role": "system", "content": "Edit."},
+            {"role": "user", "content": request},
+        ],
+        max_output_tokens=3072,
+    )
+    assert calls[1]["max_tokens"] == 2600
+    assert calls[1]["reasoning_effort"] == "low"
+
+
 def quality_order():
     config = deployment(OPENROUTER, OPENROUTER_SIBLING, KILO, OLLAMA)
     config[1]["url"] = config[0]["url"]

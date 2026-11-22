@@ -831,9 +831,17 @@ class ProviderRouter:
                     builder = _chat_payload
                     route_messages = messages
                     if route.local_input_bytes is not None:
-                        focused = compact_focused_review(messages, max_bytes=route.local_input_bytes) if (
-                            role == "coding" and not tools and max_output_tokens is not None
-                        ) else None
+                        focused = (
+                            compact_focused_review(
+                                messages, max_bytes=route.local_input_bytes
+                            )
+                            if (
+                                role == "coding"
+                                and not tools
+                                and max_output_tokens is not None
+                            )
+                            else None
+                        )
                         route_messages = focused or compact_messages(
                             messages,
                             max_bytes=route.local_input_bytes,
@@ -889,12 +897,25 @@ class ProviderRouter:
                             route_messages, max_bytes=_FOCUSED_RETRY_INPUT_BYTES
                         )
                         if compact is not None and time.monotonic() < attempt_deadline:
+                            groq_reasoning = (
+                                route.alias == "groq-free"
+                                and route.model
+                                in {"openai/gpt-oss-120b", "openai/gpt-oss-20b"}
+                            )
                             retry_payload = builder(
                                 route,
                                 compact,
                                 tools,
-                                min(max_tokens, _FOCUSED_RETRY_OUTPUT_TOKENS),
+                                min(
+                                    max_tokens,
+                                    2600
+                                    if groq_reasoning
+                                    else _FOCUSED_RETRY_OUTPUT_TOKENS,
+                                ),
                             )
+                            if groq_reasoning:
+                                # Groq counts hidden reasoning against the completion cap.
+                                retry_payload["reasoning_effort"] = "low"
                             logger.info(
                                 "Provider retrying compact review provider=%s configured_model=%s",
                                 route.alias,
