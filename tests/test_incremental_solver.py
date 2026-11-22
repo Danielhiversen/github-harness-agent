@@ -16,6 +16,7 @@ from github_harness_agent.executor import (
     AttemptRejected,
     Limits,
     PlainExecutor,
+    ReviewRoundExhausted,
     TaskSnapshot,
     _Budget,
 )
@@ -72,6 +73,31 @@ class FreeGateway:
             configured_model="stand-in/free",
             usage={},
         )
+
+
+def test_round_preference_is_used_for_only_the_first_model_request(solver_case):
+    task, _, _, _ = solver_case
+    task = replace(task, retry_after_provider="previous-provider")
+    preferred = []
+
+    class Gateway(FreeGateway):
+        def complete(self, **kwargs):
+            preferred.append(kwargs.get("after_provider"))
+            return super().complete(**kwargs)
+
+    gateway = Gateway("first", "second", "third")
+    budget = _Budget(Limits(model_requests=3), lambda: False, task)
+    messages = [{"role": "user", "content": "Review."}]
+    budget.complete(gateway, "coding", messages, max_output_tokens=3072)
+    budget.complete(gateway, "coding", messages, max_output_tokens=3072)
+    budget.complete(
+        gateway,
+        "coding",
+        messages,
+        max_output_tokens=3072,
+        after_provider="chosen-for-goal",
+    )
+    assert preferred == ["previous-provider", None, "chosen-for-goal"]
 
 
 @pytest.fixture
@@ -683,12 +709,17 @@ def test_solver_checkpoints_later_straight_line_assertion_only(
     )
     budget = _Budget(executor.limits, lambda: False, task)
 
-    with pytest.raises(AttemptRejected, match="outstanding checks still fail"):
+    with pytest.raises(
+        AttemptRejected, match="outstanding checks still fail"
+    ) as rejection:
         solve(executor, task, archive, budget, "fixture-version")
 
     if branch_between:
+        assert not isinstance(rejection.value, ReviewRoundExhausted)
         assert not checkpoints
     else:
+        assert isinstance(rejection.value, ReviewRoundExhausted)
+        assert len(rejection.value.route_trace) == 1
         assert len(checkpoints) == 1
         assert b"+    return 1\n" in checkpoints[0].patch
         assert b"+    return 2\n" not in checkpoints[0].patch

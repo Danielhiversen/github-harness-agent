@@ -410,6 +410,51 @@ def test_all_excluded_retries_after_resetting_only_active_candidate_exclusions(
     ]
 
 
+def test_aggregate_review_exhaustion_uses_existing_retry_ceiling(monkeypatch, tmp_path):
+    from github_harness_agent.executor import (
+        REVIEW_ROUND_EXHAUSTED,
+        ReviewRoundExhausted,
+    )
+
+    def run(store, job):
+        raise ReviewRoundExhausted(REVIEW_ROUND_EXHAUSTED, None, ())
+
+    repo, now, store, config = _provider_test_worker(monkeypatch, tmp_path, run)
+    _seed_retry_pull(store, repo, 20)
+    for attempt in range(1, 6):
+        cli.run_worker(store, config, once=True, pull=(repo, 20))
+        job = _stored_job(store, "pull", 20)
+        assert job["state"] == ("paused" if attempt == 5 else "queued")
+        assert job["data"]["consecutive_failures"] == attempt
+        assert job["data"]["last_error"] == REVIEW_ROUND_EXHAUSTED
+        assert job["due"] >= now[0] + 30
+        now[0] = job["due"]
+
+
+def test_provider_reset_preserves_aggregate_round_trace(monkeypatch, tmp_path):
+    from github_harness_agent.executor import REVIEW_ROUND_EXHAUSTED
+
+    aggregate = {
+        "kind": "review_round_exhausted",
+        "reason": REVIEW_ROUND_EXHAUSTED,
+        "last_route": "route-two",
+        "trace": [{"route": "route-one"}, {"route": "route-two"}],
+    }
+
+    def run(store, job):
+        job["data"]["model_attempt_failures"] = [aggregate]
+        raise providers.ProviderExhausted(
+            None, {"gateway": "all eligible models excluded"}
+        )
+
+    repo, _, store, config = _provider_test_worker(monkeypatch, tmp_path, run)
+    _seed_retry_pull(store, repo, 20)
+    cli.run_worker(store, config, once=True, pull=(repo, 20))
+    data = _stored_job(store, "pull", 20)["data"]
+    assert data["prior_model_attempt_failures"] == [aggregate]
+    assert "model_attempt_failures" not in data
+
+
 def test_worker_recovers_only_legacy_provider_pauses_within_lease_scope(
     monkeypatch, tmp_path
 ):

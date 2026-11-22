@@ -12,7 +12,14 @@ from threading import Lock
 
 from .checkpoint import DraftCheckpoint, SolverRecovery
 from .ci import CI_BATCH_SIZE, format_ci_feedback, read_ci_report
-from .executor import AttemptRejected, ExecutionError, NeedsClarification, TaskSnapshot
+from .executor import (
+    AttemptRejected,
+    ExecutionError,
+    NeedsClarification,
+    ReviewRoundExhausted,
+    TaskSnapshot,
+    is_review_round_record,
+)
 from .intake import adoptable_pull, eligible, maintainer
 from .publish import (
     BranchUpdate,
@@ -608,7 +615,14 @@ class Controller:
                             record["candidate"]["configured_model"],
                         )
                         for record in failures
+                        if not is_review_round_record(record)
                     )
+                    retry_after_provider = None
+                    if rejections and is_review_round_record(rejections[-1]):
+                        last_round = rejections[-1]
+                        retry_after_provider = last_round.get(
+                            "last_route"
+                        ) or last_round.get("candidate", {}).get("route")
                     scope, review_keys = draft_scope(job, stage, origin, target, cfg)
                     existing = data.get("draft_checkpoints", {})
                     if existing and existing.get("scope") != scope:
@@ -701,6 +715,7 @@ class Controller:
                         repository_guidance=cfg.get("reviewed_guidance", ""),
                         excluded_models=excluded,
                         provider_offset=retry_offset,
+                        retry_after_provider=retry_after_provider,
                         checkpoint_scope=scope,
                         checkpoints=checkpoints,
                         save_checkpoint=save_checkpoint,
@@ -763,6 +778,24 @@ class Controller:
                         result = self.executor.execute(task, path, cancelled=cancelled)
                     except AttemptRejected as err:
                         candidate = err.candidate
+                        trace = [dataclasses.asdict(route) for route in err.route_trace]
+                        if isinstance(err, ReviewRoundExhausted):
+                            last_route = candidate or (
+                                err.route_trace[-1] if err.route_trace else None
+                            )
+                            failures.append(
+                                {
+                                    "kind": "review_round_exhausted",
+                                    "last_route": last_route.route
+                                    if last_route
+                                    else None,
+                                    "reason": str(err),
+                                    "trace": trace,
+                                }
+                            )
+                            data["model_attempt_failures"] = failures
+                            store.save(job)
+                            raise
                         if (candidate.route, candidate.configured_model) in excluded:
                             data["pause_reason"] = (
                                 "gateway selected an excluded coding candidate"
@@ -773,10 +806,7 @@ class Controller:
                             {
                                 "candidate": dataclasses.asdict(candidate),
                                 "reason": str(err),
-                                "trace": [
-                                    dataclasses.asdict(route)
-                                    for route in err.route_trace
-                                ],
+                                "trace": trace,
                             }
                         )
                         data["model_attempt_failures"] = failures

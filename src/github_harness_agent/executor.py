@@ -128,6 +128,22 @@ class AttemptBudgetRejected(AttemptRejected, LimitExceeded):
     pass
 
 
+REVIEW_ROUND_EXHAUSTED = (
+    "Review solver retained verified progress; outstanding checks still fail"
+)
+
+
+class ReviewRoundExhausted(AttemptRejected):
+    """A completed proposal round retained a verified partial draft."""
+
+
+def is_review_round_record(record):
+    return (
+        record.get("kind") == "review_round_exhausted"
+        or record.get("reason") == REVIEW_ROUND_EXHAUSTED
+    )
+
+
 class _RequestBudgetExceeded(LimitExceeded):
     pass
 
@@ -186,6 +202,7 @@ class TaskSnapshot:
     repair_failure: tuple["CheckEvidence", ...] = field(default=(), repr=False)
     solver_recovery: SolverRecovery | None = None
     save_solver_recovery: Callable[[SolverRecovery | None, bool], None] | None = None
+    retry_after_provider: str | None = None
 
 
 @dataclass(frozen=True)
@@ -309,6 +326,7 @@ class _Budget:
             if self._calls[kind] >= limit:
                 raise _RequestBudgetExceeded(f"Task {kind} budget exceeded")
             self._calls[kind] += 1
+            return self._calls[kind]
 
     def model_requests_remaining(self):
         with self._lock:
@@ -342,7 +360,13 @@ class _Budget:
             options["max_output_tokens"] = max_output_tokens
 
         def send(payload):
-            self.claim("model request", self.limits.model_requests)
+            request_number = self.claim("model request", self.limits.model_requests)
+            if (
+                request_number == 1
+                and self.task.retry_after_provider
+                and not after_provider
+            ):
+                options["after_provider"] = self.task.retry_after_provider
             remaining = self.remaining()
             return observed_call(
                 self.task,
@@ -406,6 +430,12 @@ class _Budget:
             else AttemptRejected
         )
         raise kind(str(error), candidate, trace) from error
+
+    def exhaust_review_round(self, editor):
+        self.remaining()
+        with self._lock:
+            trace = tuple(self.routes)
+        raise ReviewRoundExhausted(REVIEW_ROUND_EXHAUSTED, editor, trace)
 
 
 def _combined(result):

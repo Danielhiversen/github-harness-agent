@@ -1304,9 +1304,11 @@ def solve(executor, task, archive, budget, version):
         retain_recovery()
     if test_rejection is not None:
         raise test_rejection
+    if patch and (submitted >= max_proposals or not budget.model_requests_remaining()):
+        budget.exhaust_review_round(editor)
     budget.reject(
         _CandidateOutputError(
-            "Review solver retained verified progress; outstanding checks still fail"
+            "Review solver could not complete a repair; outstanding checks still fail"
         ),
         editor,
     )

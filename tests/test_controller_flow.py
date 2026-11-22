@@ -7,7 +7,14 @@ import pytest
 
 from github_harness_agent import controller
 from github_harness_agent.controller import Controller, git
-from github_harness_agent.executor import AttemptRejected, CheckEvidence, RouteEvidence
+from github_harness_agent.checkpoint import DraftCheckpoint
+from github_harness_agent.executor import (
+    REVIEW_ROUND_EXHAUSTED,
+    AttemptRejected,
+    CheckEvidence,
+    ReviewRoundExhausted,
+    RouteEvidence,
+)
 from github_harness_agent.intake import adopt_open_pulls, reconcile
 from github_harness_agent.reviews import Feedback, ReviewBatch
 from github_harness_agent.store import Store
@@ -16,7 +23,10 @@ from test_intake import pull
 from test_publish import FakeGitHub
 
 
-@pytest.mark.parametrize("scenario", ["stable", "moving", "conflict", "fallback"])
+@pytest.mark.parametrize(
+    "scenario",
+    ["stable", "moving", "conflict", "fallback", "aggregate", "aggregate-legacy"],
+)
 def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario):
     move_target = scenario in {"moving", "conflict"}
     repo = tmp_path / "project"
@@ -37,6 +47,10 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario):
     base = git(repo, "rev-parse", "HEAD").decode().strip()
     target = {"main": base, "release": base}
     move_at_push = scenario == "moving"
+    aggregate = scenario.startswith("aggregate")
+    prior = RouteEvidence("coding", "earlier", "actual", {}, "earlier-model")
+    last = RouteEvidence("coding", "latest", "actual", {}, "latest-model")
+    individual = RouteEvidence("coding", "individual", "actual", {}, "individual-model")
 
     def commit_file(parent, name, contents, author="T"):
         git(repo, "checkout", "--detach", parent)
@@ -129,6 +143,25 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario):
                     assert task.excluded_models == (("fixture", "configured"),)
                     assert task.provider_offset == 1
             if is_review:
+                if aggregate and task.retry_after_provider is None:
+                    (path / "value").write_text("two\n")
+                    task.save_checkpoint(
+                        DraftCheckpoint(
+                            "harness2/base",
+                            task.base_sha,
+                            git(path, "diff"),
+                            last_editor=(last.route, last.configured_model),
+                        )
+                    )
+                    raise ReviewRoundExhausted(
+                        REVIEW_ROUND_EXHAUSTED, last, (prior, last)
+                    )
+                if aggregate:
+                    assert task.retry_after_provider == last.route
+                    assert task.excluded_models == (
+                        (individual.route, individual.configured_model),
+                    )
+                    assert b"+two" in task.checkpoints["harness2/base"].patch
                 feedback = json.loads(
                     task.instructions.split("Review requests against this commit:\n")[1]
                 )
@@ -250,6 +283,46 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario):
 
     monkeypatch.setattr(controller, "reply_to_review", reply)
     clock[0] += 46
+    if aggregate:
+        job = db.claim()
+        with pytest.raises(ReviewRoundExhausted):
+            run(job)
+        history = job["data"]["model_attempt_failures"]
+        recorded = history[0]
+        assert recorded["kind"] == "review_round_exhausted"
+        assert recorded["reason"] == REVIEW_ROUND_EXHAUSTED
+        assert recorded["last_route"] == last.route
+        assert [route["route"] for route in recorded["trace"]] == [
+            prior.route,
+            last.route,
+        ]
+        assert "candidate" not in recorded
+        if scenario == "aggregate-legacy":
+            recorded = {
+                "candidate": {
+                    "route": last.route,
+                    "configured_model": last.configured_model,
+                },
+                "reason": REVIEW_ROUND_EXHAUSTED,
+                "trace": recorded["trace"],
+            }
+        history[:] = [
+            {
+                "candidate": {
+                    "route": individual.route,
+                    "configured_model": individual.configured_model,
+                }
+            },
+            recorded,
+        ]
+        db.save(job, "queued", delay=30)
+        assert db.claim() is None
+        clock[0] += 30
+        monkeypatch.setattr(
+            controller,
+            "collect_reviews",
+            lambda *a, **kw: ReviewBatch(first, (item,)),
+        )
     run(db.claim())
     if scenario == "conflict":
         assert not replies
@@ -289,6 +362,8 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario):
     assert replies[0]["question"] and replies[0]["expected_head"] == first
     with db.tx() as conn:
         state = json.loads(conn.execute("SELECT data FROM tasks").fetchone()[0])
+    if aggregate:
+        assert state["last_evidence"]["model_attempt_failures"][-1] == recorded
     assert (
         state["seen"] == ["ambiguous-revision", "review-revision"]
         and state["stage"] == "watch"

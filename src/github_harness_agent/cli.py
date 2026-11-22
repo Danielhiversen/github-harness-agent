@@ -74,10 +74,19 @@ def _defer_provider(store, job, error, aliases):
         retry_at=now + delay,
     )
     if error.failures == {"gateway": _EXCLUDED_MODELS}:
+        from .executor import is_review_round_record
+
         failures = data.pop("model_attempt_failures", [])
         if failures:
+            previous_rounds = [
+                item
+                for item in data.get("prior_model_attempt_failures", ())
+                if is_review_round_record(item)
+            ]
             data["prior_model_attempt_failures"] = [
-                {
+                attempt
+                if is_review_round_record(attempt)
+                else {
                     "candidate": {
                         field: value[:160]
                         for field, value in attempt.get("candidate", {}).items()
@@ -86,7 +95,7 @@ def _defer_provider(store, job, error, aliases):
                     },
                     "reason": str(attempt.get("reason", "")).split(":", 1)[0][:160],
                 }
-                for attempt in failures[-16:]
+                for attempt in [*previous_rounds, *failures][-16:]
             ]
     store.save(job, "queued", delay=delay)
 
@@ -100,7 +109,13 @@ def _configured_limit(repo, config, key, default, maximum):
 
 def run_worker(store, config, once=False, *, pull: tuple[str, int] | None = None):
     from .controller import Controller
-    from .executor import DockerRunner, Harness2Executor, Limits, PlainExecutor
+    from .executor import (
+        DockerRunner,
+        Harness2Executor,
+        Limits,
+        PlainExecutor,
+        ReviewRoundExhausted,
+    )
     from .github import GitHubApp, GitHubNamedAccount
     from .providers import ModelGatewayClient, ProviderExhausted, load_manifest
 
@@ -244,7 +259,11 @@ def run_worker(store, config, once=False, *, pull: tuple[str, int] | None = None
                     job["issue"],
                     type(err).__name__,
                 )
-                job["data"]["last_error"] = type(err).__name__
+                job["data"]["last_error"] = (
+                    str(err)
+                    if isinstance(err, ReviewRoundExhausted)
+                    else type(err).__name__
+                )
                 count = job["data"].get("consecutive_failures", 0) + 1
                 job["data"]["consecutive_failures"] = count
                 delay = max(30, min(3600, 2 ** min(count, 10)))
