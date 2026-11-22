@@ -62,6 +62,7 @@ from .review_definitions import (
 )
 from .review_guard_probe import stock_guard_diagnostic
 from .review_guard_order import swap_traced_filters
+from .review_parameter_use import lost_iteration_argument
 from .review_guards import guarded_sources
 from .review_mock_replay import (
     compact_observations,
@@ -2845,6 +2846,12 @@ def solve(executor, task, archive, budget, version):
                     # complete method only when both exact definitions fit.
                     if stock_fixture and (plan or advice is not None):
                         named_definitions = localized_retry is not None
+                    if target in operator:
+                        parameter_note = lost_iteration_argument(
+                            _fixture_excerpt(fixtures, target[1], selected_only=True), original, source
+                        )
+                        if parameter_note:
+                            mock_detail = "\n".join(filter(None, (mock_detail, parameter_note)))
                     messages = _proposal_messages(
                         target,
                         source,
