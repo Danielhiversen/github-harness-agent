@@ -227,3 +227,73 @@ def test_replay_reports_bounded_counter_locations_only(tmp_path, case, expected)
         (workspace / "tests/test_service.py").read_text() == test
         for workspace in runner.workspaces
     )
+
+
+@pytest.mark.parametrize(
+    ("selected_line", "changed_test_path", "expected"),
+    [
+        ("unset", False, False),
+        ("matching", False, True),
+        ("matching", True, False),
+        ("wrong", False, False),
+    ],
+)
+def test_counter_replay_pairs_fresh_objects_at_the_selected_occurrence(
+    tmp_path, selected_line, changed_test_path, expected
+):
+    before = """class Collector:
+    def __init__(self):
+        self.summary = {"processed_count": 0, "other_count": 1}
+
+    def process(self, mode):
+        self._tick(mode)
+        return self.summary
+
+    def _tick(self, mode):
+        self.summary["processed_count"] += 1 if mode != 9 else 7
+
+def invoke(mode):
+    return Collector().process(mode)
+"""
+    after = before.replace(
+        "1 if mode != 9 else 7", "2 if mode == 2 else (1 if mode != 9 else 7)"
+    )
+    if changed_test_path:
+        after = after.replace(
+            "        self._tick(mode)",
+            '        self._tick(mode)\n        if mode == 2:\n            self.summary["other_count"] = 0',
+        )
+    test = """from service import invoke
+
+def test_invoke():
+    for mode in (1, 2):
+        result = invoke(mode)
+        if result["other_count"]:
+            placeholder = 1
+        assert result["processed_count"] == 1
+    assert invoke(9)["processed_count"] == 7
+"""
+    line = test.splitlines().index('        assert result["processed_count"] == 1') + 1
+    runner = FixtureRunner(tmp_path)
+    executor = PlainExecutor(runner, None, Limits(), verification_runner=runner)
+    task = TaskSnapshot("org/fixture", "1" * 40, "Exercise processing.", (_COMMAND,))
+    budget = _Budget(executor.limits, lambda: False, task)
+    detail = mock_call_diagnostic(
+        executor,
+        task,
+        _archive(before, test),
+        budget,
+        _COMMAND,
+        _NODE,
+        patch_for({"service.py": before}, {"service.py": after}),
+        reviewed_paths=("service.py",),
+        failure_line={"matching": line, "wrong": line + 1}.get(selected_line),
+    )
+    if expected:
+        assert f"{_NODE} line {line}" in detail
+        assert "evaluation 2" in detail
+        assert "0 -> 1" in detail and "0 -> 2" in detail
+        assert "0 -> 7" not in detail and "processed_count" not in detail
+        assert "Collector._tick" in detail
+    else:
+        assert detail == ""

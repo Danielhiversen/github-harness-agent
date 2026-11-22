@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 from . import review_counter_trace, review_mock_probe
 from .review_prefix_replay import _interpreter
-from .review_solver_context import _STOCK_NODE
+from .review_solver_context import _STOCK_NODE, _tracked_stock_test
 from .worker import Cancelled, ExecutionError, LimitExceeded
 
 _PLANNING_RESERVE = 30
@@ -19,7 +19,16 @@ _DETAIL_BYTES = 900
 
 
 def _readout(
-    executor, task, archive, budget, interpreter, node, patch, expected, paths
+    executor,
+    task,
+    archive,
+    budget,
+    interpreter,
+    node,
+    patch,
+    expected,
+    paths,
+    failure_line,
 ):
     deadline = time.monotonic() + _REPLAY_SECONDS
 
@@ -64,7 +73,7 @@ def _readout(
                     "_counter_module = {'__name__': '_stock_counter_probe'}\n"
                     f"exec({counter_source!r}, _counter_module)\n" + program
                 )
-                parameters = (node, json.dumps(paths))
+                parameters = (node, json.dumps(paths), json.dumps(failure_line))
                 cap = review_mock_probe.COUNTER_REPORT_BYTES
             result = ws.command(
                 (*interpreter, "-I", "-B", "-c", program, *parameters),
@@ -93,7 +102,8 @@ def _readout(
     )
     counter = envelope["counter"]
     if traces is None or (
-        counter is not None and not review_counter_trace.valid_report(counter, paths)
+        counter is not None
+        and not review_counter_trace.valid_report(counter, paths, failure_line)
     ):
         return None
     return traces, counter
@@ -151,14 +161,12 @@ def _counter_paths(task, runner, reviewed_paths, test_path):
     )[:3]
 
 
-def _counter_difference(baseline, candidate):
-    if (
-        baseline is None
-        or candidate is None
-        or baseline[0] != candidate[0]
-        or baseline[1]
-        or not candidate[1]
-    ):
+def _counter_difference(baseline, candidate, node):
+    if baseline is None or candidate is None or baseline[0] != candidate[0]:
+        return ""
+    line, failed, windows = candidate
+    _, base_failed, base_windows = baseline
+    if base_failed is not None or failed is None or failed >= len(base_windows):
         return ""
 
     def signature(events):
@@ -167,7 +175,13 @@ def _counter_difference(baseline, candidate):
             for stack, before, after in events
         )
 
-    old, new = baseline[2], candidate[2]
+    for index in range(failed + 1):
+        pinned, draft = base_windows[index], windows[index]
+        if pinned is None or draft is None or pinned[0] != draft[0]:
+            return ""
+        if index < failed and signature(pinned[1]) != signature(draft[1]):
+            return ""
+    old, new = base_windows[failed][1], windows[failed][1]
     old_sig, new_sig = signature(old), signature(new)
     if old_sig == new_sig:
         return ""
@@ -206,19 +220,32 @@ def _counter_difference(baseline, candidate):
     ]
     return (
         "Auxiliary mapping counter changes (quoted advisory data). "
-        "The pinned case passed and the draft failed at its numeric assertion. "
+        f"The pinned case passed and the draft failed at {node} line {line} (evaluation {failed + 1}). "
         "Locations show where the probe observed each change, with reviewed callers.\n"
         + "\n".join(rows)
     )
 
 
 def mock_call_diagnostic(
-    executor, task, archive, budget, command, node, patch, *, reviewed_paths=None
+    executor,
+    task,
+    archive,
+    budget,
+    command,
+    node,
+    patch,
+    *,
+    reviewed_paths=None,
+    failure_line=None,
 ):
     node = node.removeprefix("/work/").removeprefix("./")
     base_node, bracket, parameter = node.partition("[")
     if (
         not patch
+        or (
+            failure_line is not None
+            and (type(failure_line) is not int or not 1 <= failure_line <= 128 * 1024)
+        )
         or command not in task.checks
         or command in task.pull_checks
         or len(node) > 512
@@ -238,15 +265,26 @@ def mock_call_diagnostic(
     paths = _counter_paths(
         task, executor.verification_runner, reviewed_paths, base_node.partition("::")[0]
     )
+    if paths and _tracked_stock_test(archive, _STOCK_NODE.fullmatch(base_node)) is None:
+        paths = ()
     if paths and PurePosixPath(interpreter[0]).name == "uv":
         interpreter = ("env", "UV_OFFLINE=1", *interpreter)
     baseline = _readout(
-        executor, task, archive, budget, interpreter, node, b"", 0, paths
+        executor, task, archive, budget, interpreter, node, b"", 0, paths, failure_line
     )
     if baseline is None or (not any(baseline[0].values()) and baseline[1] is None):
         return ""
     candidate = _readout(
-        executor, task, archive, budget, interpreter, node, patch, 1, paths
+        executor,
+        task,
+        archive,
+        budget,
+        interpreter,
+        node,
+        patch,
+        1,
+        paths,
+        failure_line,
     )
     if candidate is None:
         return ""
@@ -254,7 +292,7 @@ def mock_call_diagnostic(
         filter(
             None,
             (
-                _counter_difference(baseline[1], candidate[1]),
+                _counter_difference(baseline[1], candidate[1], base_node),
                 _differences(baseline[0], candidate[0]),
             ),
         )

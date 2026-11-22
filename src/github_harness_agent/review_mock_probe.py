@@ -136,12 +136,14 @@ def decode_traces(output):
     return traces
 
 
-def _run_pytest(node, counter_paths=()):
+def _run_pytest(node, counter_paths=(), failure_line=None):
     import pytest
 
     path = Path(node.split("::", 1)[0]).resolve()
     counter = (
-        globals()["_counter_module"]["CounterTrace"](path, node, counter_paths)
+        globals()["_counter_module"]["CounterTrace"](
+            path, node, counter_paths, failure_line
+        )
         if counter_paths
         else None
     )
@@ -230,12 +232,12 @@ def _run_pytest(node, counter_paths=()):
     return 4, None, None
 
 
-def _main(node, counter_paths=()):
+def _main(node, counter_paths=(), failure_line=None):
     # Keep all test output, even native stdout/stderr, out of the report stream.
     with os.fdopen(os.dup(1), "w") as report, open(os.devnull, "wb") as sink:
         os.dup2(sink.fileno(), 1)
         os.dup2(sink.fileno(), 2)
-        status, traces, counter = _run_pytest(node, counter_paths)
+        status, traces, counter = _run_pytest(node, counter_paths, failure_line)
         if traces is not None or counter is not None:
             data, cap = traces, REPORT_BYTES
             if counter_paths:
@@ -244,10 +246,19 @@ def _main(node, counter_paths=()):
                     COUNTER_REPORT_BYTES,
                 )
             payload = json.dumps(data, separators=(",", ":"), allow_nan=False)
+            # Baseline windows after the selected candidate occurrence are optional.
+            if counter is not None and counter[1] is None:
+                while len(payload) > cap and len(counter[2]) > 1:
+                    counter[2].pop()
+                    payload = json.dumps(data, separators=(",", ":"), allow_nan=False)
+            if counter_paths and len(payload) > cap:
+                # Preserve the mock channel if the optional counter report is too large.
+                data["counter"] = None
+                payload = json.dumps(data, separators=(",", ":"), allow_nan=False)
             if len(payload) <= cap:
                 report.write(payload)
         return status
 
 
 if __name__ == "__main__":
-    sys.exit(_main(sys.argv[1], json.loads(sys.argv[2]) if len(sys.argv) > 2 else ()))
+    sys.exit(_main(sys.argv[1], *map(json.loads, sys.argv[2:])))

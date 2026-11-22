@@ -1,12 +1,14 @@
 """Observe one selected pytest mapping counter without serializing mappings."""
 
 import ast
+import hashlib
 import re
 from itertools import islice
 from pathlib import Path
 from types import GetSetDescriptorType
 
 MAX_EVENTS = 8
+MAX_WINDOWS = 4
 MAX_STACK = 3
 MAX_PATH = 120
 _NAME = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", re.ASCII)
@@ -23,7 +25,7 @@ def count(value):
     return type(value) is int and 0 <= value <= 10_000_000
 
 
-def _assertion(path, node):
+def _assertion(path, node, failure_line):
     try:
         with path.open("rb") as source:
             raw = source.read(128 * 1024 + 1)
@@ -42,6 +44,7 @@ def _assertion(path, node):
         scope = matches[0]
     if not isinstance(scope, ast.FunctionDef):
         return None
+    rows = raw.splitlines()
     pending = list(scope.body)
     matches = []
     while pending:
@@ -50,6 +53,11 @@ def _assertion(path, node):
             continue
         if not isinstance(item, ast.Assert):
             pending.extend(ast.iter_child_nodes(item))
+            continue
+        if (
+            failure_line is not None
+            and not item.lineno <= failure_line <= item.end_lineno
+        ) or rows[item.lineno - 1][: item.col_offset].strip():
             continue
         match item.test:
             case ast.Compare(left=left, ops=[ast.Eq()], comparators=[right]):
@@ -93,18 +101,59 @@ def _mapping_count(mapping, key):
 
 
 class CounterTrace:
-    def __init__(self, path, node, reviewed_paths):
+    def __init__(self, path, node, reviewed_paths, failure_line=None):
         self.path = path
-        self.assertion = _assertion(path, node)
+        self.failure_line = failure_line
+        self.assertion = _assertion(path, node, failure_line)
         self.paths = {}
         for name in reviewed_paths:
             self.paths[name] = self.paths[str(Path(name).resolve())] = name
+        self.windows = []
+        self.actual = None
+        self.samples = 0
+        self._reset_window()
+
+    def _reset_window(self):
         self.events = []
         self.mappings = {}
         self.changed = None
-        self.actual = None
-        self.seen_assert = self.visited = self.overflow = False
-        self.samples = 0
+        self.rows = []
+        self.digest = None
+        self.failed = self.visited = self.overflow = False
+
+    def _close_window(self):
+        counts = (
+            (self.mappings[self.changed][1],)
+            if self.changed is not None
+            else tuple(value for _, value in self.mappings.values())
+        )
+        window = (self.digest, self.failed, self.events, counts)
+        self.windows.append(window if self.visited and not self.overflow else None)
+        self._reset_window()
+
+    def _test_location(self, frame, event, _value):
+        if len(self.windows) >= MAX_WINDOWS:
+            return None
+        start, end = self.assertion[:2]
+        row = frame.f_lineno
+        if event == "exception" and self.digest is not None and start <= row <= end:
+            self.failed = True
+        if event == "return":
+            if self.digest is not None:
+                self._close_window()
+            return None
+        if event == "line":
+            if self.digest is not None and not start <= row <= end:
+                self._close_window()
+            if self.digest is None:
+                if len(self.rows) == 256:
+                    self.overflow = True
+                else:
+                    self.rows.append(row)
+                if row == start:
+                    path = ",".join(map(str, self.rows)).encode()
+                    self.digest = hashlib.sha256(path).hexdigest()
+        return self._test_location
 
     def _locations(self, frame, row):
         locations = []
@@ -171,17 +220,15 @@ class CounterTrace:
             return None
 
         def dispatch(frame, event, _value):
-            if self.overflow or event != "call":
+            if event != "call":
                 return None
             if frame.f_code is code:
-
-                def test_location(frame, event, _value):
-                    if event == "line" and frame.f_lineno == self.assertion[0]:
-                        self.seen_assert = True
-                    return test_location
-
-                return test_location
-            if frame.f_code.co_filename not in self.paths:
+                return self._test_location
+            if (
+                self.overflow
+                or len(self.windows) >= MAX_WINDOWS
+                or frame.f_code.co_filename not in self.paths
+            ):
                 return None
             previous = frame.f_lineno
             self._sample(frame, previous)
@@ -211,6 +258,7 @@ class CounterTrace:
         if (
             crash is None
             or not start <= crash.lineno <= end
+            or (self.failure_line is not None and crash.lineno != self.failure_line)
             or Path(crash.path).resolve() != self.path
         ):
             return
@@ -224,34 +272,58 @@ class CounterTrace:
                 self.actual = actual
 
     def report(self):
-        if (
-            self.assertion is None
-            or not self.seen_assert
-            or not self.visited
-            or self.overflow
-        ):
+        if self.assertion is None or not self.windows:
             return None
-        target = self.assertion[3] if self.actual is None else self.actual
-        if self.changed is not None:
-            aligned = self.mappings[self.changed][1] == target
-        else:
-            aligned = any(value == target for _, value in self.mappings.values())
-        if not aligned:
+        failed = len(self.windows) - 1 if self.actual is not None else None
+        windows = []
+        for index, window in enumerate(self.windows):
+            if window is None:
+                windows.append(None)
+                continue
+            digest, had_exception, events, counts = window
+            is_failure = index == failed
+            target = self.actual if is_failure else self.assertion[3]
+            valid = had_exception == is_failure and counts.count(target) == 1
+            windows.append([digest, events] if valid else None)
+        if failed is not None and windows[failed] is None:
             return None
-        return [self.assertion[0], self.actual is not None, self.events]
+        return (
+            [self.failure_line or self.assertion[0], failed, windows]
+            if any(windows)
+            else None
+        )
 
 
-def valid_report(data, paths):
+def valid_report(data, paths, failure_line=None):
     if type(data) is not list or len(data) != 3:
         return False
-    line, mismatch, events = data
+    line, failed, windows = data
     if (
         type(line) is not int
         or not 1 <= line <= 128 * 1024
-        or type(mismatch) is not bool
+        or (failure_line is not None and line != failure_line)
+        or type(windows) is not list
+        or not 1 <= len(windows) <= MAX_WINDOWS
+        or (
+            failed is not None
+            and (type(failed) is not int or failed != len(windows) - 1)
+        )
+        or (failed is not None and windows[failed] is None)
     ):
         return False
-    if type(events) is not list or len(events) > MAX_EVENTS:
+    return all(window is None or _valid_window(window, paths) for window in windows)
+
+
+def _valid_window(window, paths):
+    if type(window) is not list or len(window) != 2:
+        return False
+    digest, events = window
+    if (
+        type(digest) is not str
+        or not re.fullmatch(r"[a-f0-9]{64}", digest)
+        or type(events) is not list
+        or len(events) > MAX_EVENTS
+    ):
         return False
     for event in events:
         if type(event) is not list or len(event) != 3:

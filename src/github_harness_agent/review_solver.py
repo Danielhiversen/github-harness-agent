@@ -65,6 +65,7 @@ from .review_solver_context import (
     focused_check_excerpt,
     focused_source_excerpt,
     stock_assertion_progress,
+    stock_assertion_failure_line,
     stock_failure_site,
     stock_pytest_excerpt,
 )
@@ -1708,7 +1709,10 @@ def solve(executor, task, archive, budget, version):
                     )
                     if plan and stock_fixture and patch and target not in mock_diagnostics:
                         traces = mock_call_diagnostic(
-                            executor, task, archive, budget, check_command, target[1], patch
+                            executor, task, archive, budget, check_command, target[1], patch,
+                            failure_line=stock_assertion_failure_line(
+                                target[1], diagnostics[target]
+                            ),
                         )
                         counterfactual = stock_guard_diagnostic(
                             executor, task, archive, budget, check_command, target[1],
@@ -1722,6 +1726,9 @@ def solve(executor, task, archive, budget, version):
                         tentative_trace = mock_call_diagnostic(
                             executor, task, archive, budget, check_command, target[1],
                             patch_for(original, source),
+                            failure_line=stock_assertion_failure_line(
+                                target[1], diagnostics[target]
+                            ),
                         )
                         saved_trace = "Observations from before the unpublished edit:\n" + mock_detail
                         mock_detail = (

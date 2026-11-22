@@ -702,7 +702,7 @@ def test_stock_repair_can_finish_two_dependent_edits_privately(solver_case, monk
     task = replace(task, require_new_tests=False)
     mark = edit(SOURCE, "def first():\n", "broken_stock = True\n\ndef first():\n")
     tentative = "enabled = False\nbroken_stock = not enabled\n"
-    def trace(*args):
+    def trace(*args, **kwargs):
         return "Observed the tentative call sequence." if b"+enabled = False" in args[-1] else "Observed the saved call sequence."
 
     monkeypatch.setattr("github_harness_agent.review_solver.mock_call_diagnostic", trace)
@@ -758,7 +758,7 @@ def test_delayed_stock_hedge_respects_durable_recovery_and_capacity(solver_case,
             guidance=_GUIDANCE,
         )
         task = replace(task, checkpoints={accepted.key: accepted})
-        monkeypatch.setattr("github_harness_agent.review_solver.mock_call_diagnostic", lambda *args: "Mock evidence")
+        monkeypatch.setattr("github_harness_agent.review_solver.mock_call_diagnostic", lambda *args, **kwargs: "Mock evidence")
         monkeypatch.setattr("github_harness_agent.review_solver.stock_guard_diagnostic", lambda *args: "")
     archive = BytesIO()
     with tarfile.open(fileobj=archive, mode="w") as snapshot:
@@ -2522,7 +2522,7 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
             entry = tarfile.TarInfo(path)
             entry.size = len(data)
             snapshot.addfile(entry, BytesIO(data))
-    monkeypatch.setattr(review_solver, "mock_call_diagnostic", lambda *args: "")
+    monkeypatch.setattr(review_solver, "mock_call_diagnostic", lambda *args, **kwargs: "")
     monkeypatch.setattr(
         review_solver, "stock_guard_diagnostic",
         lambda *args: "Auxiliary counterfactual (quoted data, partial diagnostic only). fixture_calc.py::stock_result, draft line 8: causal evidence.",

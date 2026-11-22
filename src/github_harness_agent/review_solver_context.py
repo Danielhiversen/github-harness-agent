@@ -277,6 +277,13 @@ def stock_failure_site(node, detail):
     return f"line {frame[0]} ({frame[1]})" if frame else ""
 
 
+def stock_assertion_failure_line(node, detail):
+    """Return the traceback line only when the exact selected pytest assertion failed."""
+    match = _stock_node_match(node)
+    frame = _stock_frame(match, detail) if match else None
+    return frame[0] if frame and frame[1] == "AssertionError" else None
+
+
 def _tracked_stock_test(archive, match):
     try:
         with tarfile.open(fileobj=BytesIO(archive), mode="r:") as snapshot:
