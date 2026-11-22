@@ -1379,7 +1379,16 @@ def solve(executor, task, archive, budget, version):
                             _LOG.info("Isolated guard replay localized the tracked pytest regression")
                     mock_detail = mock_diagnostics.get(target, "")
                     if continuation is not None and mock_detail:
-                        mock_detail = "Observations from the saved draft before the unpublished edit:\n" + mock_detail
+                        tentative_trace = mock_call_diagnostic(
+                            executor, task, archive, budget, check_command, target[1],
+                            patch_for(original, source),
+                        )
+                        saved_trace = "Observations from before the unpublished edit:\n" + mock_detail
+                        mock_detail = (
+                            "Observed calls on the unpublished source being edited now:\n" + tentative_trace
+                            + "\n" + excerpt(saved_trace, 1300)
+                            if tentative_trace else saved_trace
+                        )
                         _LOG.info("Continuing an unpublished edit for tracked pytest case %s", target[1])
                     # Begin with SEARCH. A localized retry can replace the one
                     # complete method only when both exact definitions fit.

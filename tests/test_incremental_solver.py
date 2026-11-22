@@ -698,7 +698,10 @@ def test_stock_repair_can_finish_two_dependent_edits_privately(solver_case, monk
     task = replace(task, require_new_tests=False)
     mark = edit(SOURCE, "def first():\n", "broken_stock = True\n\ndef first():\n")
     tentative = "enabled = False\nbroken_stock = not enabled\n"
-    monkeypatch.setattr("github_harness_agent.review_solver.mock_call_diagnostic", lambda *args: "Observed differing calls.")
+    def trace(*args):
+        return "Observed the tentative call sequence." if b"+enabled = False" in args[-1] else "Observed the saved call sequence."
+
+    monkeypatch.setattr("github_harness_agent.review_solver.mock_call_diagnostic", trace)
     monkeypatch.setattr("github_harness_agent.review_solver.stock_guard_diagnostic", lambda *args: "")
     monkeypatch.setattr("github_harness_agent.review_solver.request_coding_advice", lambda *args: None)
     gateway = FreeGateway(
@@ -711,6 +714,7 @@ def test_stock_repair_can_finish_two_dependent_edits_privately(solver_case, monk
     executor = PlainExecutor(runner, gateway, Limits(model_requests=8, concurrent_probes=1))
     result = solve(executor, task, archive, _Budget(executor.limits, lambda: False, task), "fixture")
     assert "one unpublished proposal" in gateway.prompts[-1]
+    assert "Observed the tentative call sequence." in gateway.prompts[-1]
     assert b"+enabled = True\n" in result.patch
     assert not any(b"+enabled = False" in checkpoint.patch for checkpoint in checkpoints)
     assert all(check.returncode == 0 for check in result.checks)
