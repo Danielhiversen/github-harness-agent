@@ -1553,6 +1553,15 @@ def solve(executor, task, archive, budget, version):
                             else apply_blocks(completion.content, source, new_path)
                         )
                 except ValueError:
+                    if stock_fixtures.get((target, failures.get(target))):
+                        raw = completion.content or ""
+                        _LOG.info(
+                            "Rejected tracked-test edit format, characters=%d search_markers=%d "
+                            "replace_markers=%d named_headers=%d diff_hunks=%d",
+                            len(raw), raw.count("<<<<<<< SEARCH"), raw.count(">>>>>>> REPLACE"),
+                            len(re.findall(r"(?m)^REPLACE ", raw)),
+                            len(re.findall(r"(?m)^@@ ", raw)),
+                        )
                     count_model_failure(rotation_key, snapshot, editor)
                     if fresh_advice is not None:
                         retry_advice[target] = fresh_advice
