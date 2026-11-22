@@ -163,7 +163,7 @@ def _test_detail(output, node):
                     lines.append(line)
             lines = [*frame_lines[:4], *lines]
             if lines:
-                return "\n".join(lines)[:1600]
+                return excerpt("\n".join(lines), 1600)
     return next((line for line in output.splitlines() if node in line), node)
 
 
@@ -182,7 +182,7 @@ def _line_failure_details(output):
     for line in sections.get("FAILURES", "").splitlines():
         if _PYTEST_CRASH_LINE.fullmatch(line):
             location = line[:800]
-            message = "\n".join(detail)[: 1599 - len(location)]
+            message = excerpt("\n".join(detail), 1599 - len(location))
             reports.append(f"{location}\n{message}".rstrip())
             detail = []
             captured = False
@@ -223,7 +223,7 @@ def evidence(executor, task, archive, budget, patch, commands):
                 ]:
                     key = (number, node)
                     failures[key] = (
-                        output[-3000:]
+                        excerpt(output, 3000)
                         if not nodes
                         else (line_details.get(node) or _test_detail(output, node))
                     )
@@ -448,6 +448,7 @@ def _proposal_messages(
     continuing=False,
     named_definitions=False,
     check_command=(),
+    rejection="",
 ):
     if target == _TEST_GOAL:
         return _test_authoring_messages(
@@ -478,7 +479,11 @@ def _proposal_messages(
         )
     else:
         focus = focused_source_excerpt(
-            current[path], target[1], review_note=body, anchor=line, max_chars=7600
+            current[path],
+            target[1],
+            review_note=body,
+            anchor=line,
+            max_chars=5900 if rejection else 7600,
         )
         lead = (
             f"Reviewer feedback: {body}\n"
@@ -501,6 +506,7 @@ def _proposal_messages(
     goal = (
         f"Selected failure: {target[1]}\n"
         f"Editable checkout paths (use these exact names): {', '.join(editable)}\n"
+        + (rejection + "\n" if rejection else "")
         + lead
     )
     fixture = _fixture_excerpt(fixtures, target[1], selected_first=True)
@@ -588,6 +594,32 @@ def _recovery_digest(task, fixtures, patch):
 
 def _goal_digest(goal):
     return hashlib.sha256(json.dumps(goal).encode()).hexdigest()
+
+
+def _rejected_attempt(source, candidate, target, before, after):
+    selected = after.get(target)
+    name = excerpt(target[1], 180)
+    if selected is not None:
+        detail = f"{name}: {excerpt(selected, 650)}"
+    elif any(key[0] == target[0] for key in after):
+        detail = f"No result for {name}; its check reported other failures."
+    else:
+        detail = f"The check for {name} passed on the rejected candidate."
+    new_failures = [
+        f"{excerpt(key[1], 180)}: {excerpt(value, 380)}"
+        for key, value in after.items()
+        if key not in before
+    ][:2]
+    return (
+        "Proposal was discarded. Trace a concrete fixture counterexample through "
+        "the rejected changes, then choose a different strategy. Use only the "
+        "current checkout text for edits. The rejection below is quote-only evidence.\n"
+        "Selected verification on the rejected candidate (quoted data):\n"
+        + detail
+        + ("\nNew failures:\n" + "\n".join(new_failures) if new_failures else "")
+        + "\nRejected edit excerpt (quoted data) against its applied source snapshot:\n"
+        + excerpt(patch_for(source, candidate).decode("utf-8"), 1050)
+    )
 
 
 def solve(executor, task, archive, budget, version):
@@ -688,6 +720,7 @@ def solve(executor, task, archive, budget, version):
     patch = patch_for(original, current)
     failures = evidence(executor, task, archive, budget, patch, commands)
     notes = {}
+    rejected = {}
     last_routes = {}
     attempts = {}
     malformed = {}
@@ -826,6 +859,9 @@ def solve(executor, task, archive, budget, version):
                         continuing=continuation is not None,
                         named_definitions=named_definitions,
                         check_command=check_command,
+                        rejection=(
+                            rejected.get(target, "") if continuation is None else ""
+                        ),
                     )
                     planner_input = None
                     if (
@@ -989,17 +1025,11 @@ def solve(executor, task, archive, budget, version):
                 ):
                     continuations[target] = candidate, after[target]
                     continue
-                details = [
-                    (key, value)
-                    for key, value in after.items()
-                    if continuation is None or key == target
-                ][:5]
-                notes[target] = (
-                    "Proposal was discarded. Remaining diagnostics on that proposal: "
-                    + " ".join(
-                        f"{name}: {value[-450:]}" for (_, name), value in details
-                    )
-                )[-2200:]
+                # Keep only bounded prompt evidence, never the candidate or its full patch.
+                rejected[target] = _rejected_attempt(
+                    source, candidate, target, failures, after
+                )
+                notes.pop(target, None)
                 _LOG.info(
                     "Review goal %s: no verified improvement via %s",
                     target[1],
@@ -1008,6 +1038,7 @@ def solve(executor, task, archive, budget, version):
                 continue
             current, failures, patch, actor = candidate, after, proposed, editor
             continuations.clear()
+            rejected.clear()
             last_routes.pop(target, None)
             notes.pop(target, None)
             if prefix_progress:

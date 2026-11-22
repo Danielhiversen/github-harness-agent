@@ -26,6 +26,7 @@ from github_harness_agent.review_recovery import ReviewRecovery
 from github_harness_agent.task_context import compact_focused_review
 from github_harness_agent.review_solver import (
     _GUIDANCE,
+    _rejected_attempt,
     _line_failure_details,
     apply_blocks,
     evidence,
@@ -386,7 +387,10 @@ def test_stalled_implementation_uses_bounded_advice_then_normal_verification(
                 assert request["max_output_tokens"] <= 512
                 assert "fixture_calc.py::second" in prompt
                 assert "def test_results():" in prompt
-                assert "def second():" not in prompt
+                assert (
+                    "def second():"
+                    not in prompt.split("Qualified-symbol inventory (quoted):", 1)[1]
+                )
                 content = planner_reply
             else:
                 content = next(coding)
@@ -427,6 +431,98 @@ def test_stalled_implementation_uses_bounded_advice_then_normal_verification(
     assert all(b"+    return 4\n" not in draft.patch for draft in checkpoints)
     assert all(check.returncode == 0 for check in result.checks)
     assert budget.model_requests_remaining() == 0
+
+
+def test_rejected_edit_evidence_reaches_coder_and_planner_without_persistence(
+    solver_case,
+):
+    task, archive, runner, checkpoints = solver_case
+    Path(task.pull_checks[0][-1]).write_text(TEST)
+    prompts = []
+    broken = edit(SOURCE, "def first():\n", "broken_stock = True\n\ndef first():\n")
+    changed = edit(SOURCE, "    return -1\n", "    return 0\n")
+    coding = iter((broken, broken + changed, FIRST + SECOND, edit(NEW_TEST, "", TEST)))
+
+    class Gateway:
+        def complete(self, *, role, messages, **request):
+            prompts.append((role, messages))
+            content = (
+                '{"strategy": "Fix the result without a global flag.", "symbols": ["fixture_calc.py::first"]}'
+                if role == "planning"
+                else next(coding)
+            )
+            return SimpleNamespace(
+                role=role,
+                route="stand-in-free",
+                model="fixture-coder",
+                configured_model="stand-in/free",
+                content=content,
+                usage={},
+            )
+
+    executor = PlainExecutor(
+        runner, Gateway(), Limits(model_requests=5, concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+    result = solve(executor, task, archive, budget, "fixture-version")
+
+    assert [role for role, _ in prompts] == [
+        "coding",
+        "coding",
+        "planning",
+        "coding",
+        "coding",
+    ]
+    for _, messages in prompts[1:4]:
+        prompt = messages[-1]["content"]
+        assert "Rejected edit excerpt (quoted data)" in prompt
+        assert "Trace a concrete fixture counterexample" in prompt
+        assert "choose a different strategy" in prompt
+        assert "current checkout text for edits" in prompt
+        assert "+broken_stock = True" in prompt
+        assert "test_existing" in prompt
+        assert "test_results" in prompt
+    for _, messages in prompts[2:4]:
+        prompt = messages[-1]["content"]
+        assert "-    return -1" in prompt
+        assert "+    return 0" in prompt
+    _, coding_messages = prompts[3]
+    large = [
+        coding_messages[0],
+        {
+            **coding_messages[1],
+            "content": coding_messages[1]["content"].replace(
+                "\nCurrent checkout:\n",
+                "\nCurrent checkout:\n" + "supplemental context\n" * 2000,
+            ),
+        },
+    ]
+    compacted = compact_focused_review(large, max_bytes=12 * 1024)
+    assert "+broken_stock = True" in compacted[-1]["content"]
+    assert "Rejected edit excerpt" not in prompts[-1][1][-1]["content"]
+    assert all(b"broken_stock" not in draft.patch for draft in checkpoints)
+    assert b"broken_stock" not in result.patch
+    assert budget.model_requests_remaining() == 0
+
+
+def test_rejection_preserves_both_ends_of_long_diagnostics():
+    target = (0, "tests/test_sample.py::test_goal")
+    regression = (1, "tests/test_stock.py::test_stock")
+    omitted = "context " * 800
+    evidence = _rejected_attempt(
+        {SOURCE: "first = 0\n"},
+        {SOURCE: "first = 1\n"},
+        target,
+        {target: "previous assertion"},
+        {
+            target: f"Assertion at start {omitted} assertion at end",
+            regression: f"Check location {omitted} stock tail",
+        },
+    )
+    assert "Assertion at start" in evidence and "assertion at end" in evidence
+    assert "Check location" in evidence and "stock tail" in evidence
+    assert "-first = 0\n+first = 1\n" in evidence
+    assert len(evidence) < 2000
 
 
 @pytest.mark.parametrize("branch_between", (False, True))
