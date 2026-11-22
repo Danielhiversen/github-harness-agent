@@ -136,6 +136,19 @@ def ordinary_unused_import_failure(command, output):
     )
 
 
+def static_error_message(command, output):
+    """Use the verifier's error line without including its source context."""
+    tool = check_label(command, ())
+    for line in _ANSI_COLOR.sub("", output).splitlines():
+        if tool == "mypy" and _MYPY.fullmatch(line) and ": error: " in line:
+            return line.split(": error: ", 1)[1]
+        if tool == "ruff" and (
+            match := _RUFF_SHORT.match(line) or _RUFF_HEADER.match(line)
+        ):
+            return line[match.end() :].strip()
+    return ""
+
+
 def check_failure_summary(task, checks, *, baseline_failed=False):
     failures = []
     for index, failed in enumerate(checks):

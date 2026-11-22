@@ -1,4 +1,5 @@
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,7 @@ from github_harness_agent.review_solver import (
     _PytestRun,
     _RegressionRepair,
     _qualified_stock_operator_cases,
+    _retry_stock_repair,
 )
 
 PYTEST = (sys.executable, "-m", "pytest", "test_operator.py")
@@ -110,6 +112,41 @@ def test_only_dependency_seed_prioritizes_behavior_ahead_of_unused_imports():
     assert pinned.next_target(command_order) == behavior
     assert mixed.next_target(command_order) == mypy
     assert static_only.next_target(command_order) == ruff
+
+
+def test_dependency_retry_rotates_only_after_two_checked_stalls():
+    first = (0, "test_operator.py::test_case_0")
+    second = (0, "test_operator.py::test_case_1")
+    ruff = (1, "check 2 (exit 1)")
+    mypy = (2, "check 3 (exit 1)")
+    checks = (PYTEST, RUFF, MYPY)
+    seed = _RegressionRepair(
+        origin=(3, "tests/test_stock.py::test_stock"),
+        sources={},
+        failures={},
+        gained=set(),
+        introduced={first, second},
+        stock_origin=True,
+        dependency_seed=True,
+        static_failures={ruff: 1},
+        unused_import_checks=frozenset({1}),
+    )
+    retry = _retry_stock_repair(seed, first, "checked", False, checked=True)
+    assert retry.next_target(checks) == first
+    final = _retry_stock_repair(retry, first, "checked again", False, checked=True)
+    assert final.next_target(checks) == second
+    assert replace(final, introduced={first}).next_target(checks) == first
+    assert (
+        replace(final, static_failures={ruff: 1, mypy: 1}).next_target(checks) == mypy
+    )
+    assert replace(final, unused_import_checks=frozenset()).next_target(checks) == ruff
+    assert (
+        replace(final, dependency_seed=False, static_failures={}).next_target(checks)
+        == first
+    )
+    invalid = _retry_stock_repair(retry, first, "malformed", True)
+    assert invalid.next_target(checks) == first
+    assert _retry_stock_repair(final, second, "exhausted", False, checked=True) is None
 
 
 @pytest.mark.parametrize(

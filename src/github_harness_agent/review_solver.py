@@ -14,9 +14,11 @@ from dataclasses import dataclass, field, replace
 from . import review_recovery
 from .check_artifacts import check_label
 from .check_diagnostics import (
+    check_details,
     check_locations,
     ordinary_static_locations,
     ordinary_unused_import_failure,
+    static_error_message,
 )
 from .checkpoint import (
     PRIVATE_PATCH_BYTES,
@@ -933,6 +935,8 @@ class _RegressionRepair:
     retries: int = 0
     retry_note: str = ""
     retry_named: bool = False
+    retry_target: tuple[int, str] | None = None
+    stalled_edits: int = 0
     static_failures: dict[tuple[int, str], int] = field(default_factory=dict)
     stock_collection_id: str | None = None
     dependency_seed: bool = False
@@ -948,17 +952,29 @@ class _RegressionRepair:
                 static,
                 key=lambda key: (check_label(commands[key[0]], ()) != "mypy", key),
             )
+        if (
+            self.dependency_seed
+            and self.stock_origin
+            and self.retries == _STOCK_REPAIR_RETRIES
+            and self.stalled_edits == _STOCK_REPAIR_RETRIES
+            and self.retry_target in self.introduced
+            and len(self.introduced) > 1
+        ):
+            return min(self.introduced - {self.retry_target})
         return min(self.introduced)
 
 
-def _retry_stock_repair(repair, note, named_definitions):
+def _retry_stock_repair(repair, target, note, named_definitions, *, checked=False):
     if repair.retries >= _STOCK_REPAIR_RETRIES:
         return None
+    streak = repair.stalled_edits + 1 if repair.retry_target == target else 1
     return replace(
         repair,
         retries=repair.retries + 1,
         retry_note=note,
         retry_named=named_definitions,
+        retry_target=target,
+        stalled_edits=streak if checked else 0,
     )
 
 
@@ -1368,6 +1384,72 @@ def solve(executor, task, archive, budget, version):
             and _qualified_stock_operator_cases(
                 pytest_runs, runs, operator_failures, task.pull_checks, operator_cases,
                 dependency_seed=dependency_seed,
+            )
+        )
+
+    def private_retry_feedback(repair, target, after, runs, static_runs):
+        novel = next((key for key in after if key not in repair.failures), None)
+        key = novel or target
+        if key not in after:
+            return ""
+        number, node = key
+        command, diagnostic = commands[number], after[key]
+        tool = check_label(command, ())
+        scope = "review" if number < len(task.pull_checks) else "repository"
+        title = f"{scope} check {number + 1}"
+        detail = fixture = ""
+        run = runs.get(number)
+        review_case = scope == "review" and _trusted_operator_node(
+            node, command, operator_cases
+        )
+        repository_case = scope == "repository" and _named_operator_cases(
+            {key}, commands
+        )
+        if (review_case or repository_case) and run is not None and node in run.failed:
+            path, _, selection = node.partition("::")
+            path = path.removeprefix("/work/").removeprefix("./")
+            if review_case or path.startswith(("/", "../")):
+                path = path.rsplit("/", 1)[-1]
+            title = f"{scope} pytest case {excerpt(f'{path}::{selection}', 170)}"
+            errors = [
+                line[2:].strip()
+                for line in diagnostic.splitlines()
+                if line.startswith("E ")
+            ]
+            detail = "\n".join(errors[:2])
+            if not detail:
+                detail = next(
+                    (
+                        line.rsplit(": ", 1)[-1]
+                        for line in diagnostic.splitlines()
+                        if _PYTEST_CRASH_LINE.fullmatch(line)
+                    ),
+                    "",
+                )
+            if novel and review_case:
+                fixture = _fixture_excerpt(fixtures, node, selected_only=True)
+            elif novel and repository_case:
+                fixture = stock_pytest_excerpt(archive, command, node, diagnostic)
+        elif tool in {"mypy", "ruff"}:
+            title = f"{tool} check {number + 1}"
+            if number in static_runs:
+                detail = (
+                    check_details(command, diagnostic)
+                    + " "
+                    + static_error_message(command, diagnostic)
+                )
+        heading = (
+            "New failure from the rejected edit"
+            if novel
+            else "Selected case on the rejected edit"
+        )
+        return (
+            f"\n{heading} (quoted verification): {title}"
+            + (f"\n{excerpt(detail, 260)}" if detail else "")
+            + (
+                f"\nPreserved fixture (quoted, read-only):\n{excerpt(fixture, 420)}"
+                if fixture
+                else ""
             )
         )
 
@@ -2299,7 +2381,7 @@ def solve(executor, task, archive, budget, version):
                     if repair is not None:
                         regression_repair = None
                         source, diagnostics = repair.sources, repair.failures
-                        note = repair.retry_note
+                        note = repair.retry_note if repair.retry_target == target else ""
                         _LOG.info(
                             "Verifying private repair of %d review case(s) and %d static check(s)",
                             len(repair.introduced),
@@ -2349,6 +2431,7 @@ def solve(executor, task, archive, budget, version):
                     if repair is not None and repair.stock_origin:
                         named_definitions = (
                             repair.retry_named
+                            and repair.retry_target == target
                             and check_label(check_command, ()) != "ruff"
                         )
                     localized_retry = (
@@ -2743,6 +2826,7 @@ def solve(executor, task, archive, budget, version):
                 if repair is not None and repair.stock_origin:
                     regression_repair = _retry_stock_repair(
                         repair,
+                        target,
                         notes[target]
                         + ". Use the unchanged stock-passing draft and follow the requested edit format.",
                         not named_definitions,
@@ -2880,15 +2964,33 @@ def solve(executor, task, archive, budget, version):
                     if not improved:
                         reason = (
                             "The selected case still fails on the proposed edit."
-                            if verified
+                            if verified and target in after
                             else "The edit regressed a passing check or could not be verified."
+                        )
+                        stock_failed = sum(
+                            number >= len(task.pull_checks)
+                            and check_label(commands[number], ()) == "pytest"
+                            for number, _ in after
+                        )
+                        static_failed = {
+                            number for number, _ in after
+                            if check_label(commands[number], ()) in {"ruff", "mypy"}
+                        }
+                        _LOG.info(
+                            "Private stock repair rejected for %s (%d stock failures, %d review failures, %d static checks)",
+                            excerpt(target[1].partition("[")[0].rsplit("/", 1)[-1], 160),
+                            stock_failed,
+                            sum(number not in static_failed for number, _ in new_operator),
+                            len(static_failed),
                         )
                         regression_repair = _retry_stock_repair(
                             repair,
+                            target,
                             reason
-                            + " Try a different fix against the unchanged stock-passing draft. "
-                            + excerpt(after.get(target, ""), 240),
+                            + " Try a different fix against the unchanged stock-passing draft."
+                            + private_retry_feedback(repair, target, after, after_runs, static_runs),
                             named_definitions,
+                            checked=True,
                         )
                         if regression_repair is not None:
                             continue
@@ -2913,6 +3015,8 @@ def solve(executor, task, archive, budget, version):
                             retry_note="",
                             retry_named=False,
                             excluded_models=(),
+                            retry_target=None,
+                            stalled_edits=0,
                             static_failures=pending_static,
                             unused_import_checks=frozenset(unused_import_checks),
                         )

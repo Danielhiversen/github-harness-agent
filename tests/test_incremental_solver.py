@@ -1470,14 +1470,27 @@ def test_solver_combines_only_verified_disjoint_stock_edits(solver_case, monkeyp
 
 
 @pytest.mark.parametrize(
-    "followup", (
-        "repair", "lose_stock", "operator_remains", "partial_stock",
-        "malformed", "no_improvement", "retry_limit", "four_cases",
-    )
+    "followup",
+    (
+        "repair",
+        "lose_stock",
+        "operator_remains",
+        "partial_stock",
+        "malformed",
+        "no_improvement",
+        "retry_limit",
+        "four_cases",
+        "stock_regression_retry",
+        "review_regression_retry",
+        "static_regression_retry",
+    ),
 )
-def test_private_repair_reconciles_a_stock_gain_without_storing_regressions(solver_case, followup):
+def test_private_repair_reconciles_a_stock_gain_without_storing_regressions(
+    solver_case, followup, monkeypatch, caplog
+):
     task, _, runner, checkpoints = solver_case
     task = replace(task, require_new_tests=False)
+    caplog.set_level("INFO", logger="github_harness_agent.review_solver")
     extra_operator = (
         "from fixture_calc import third, ultimate\n\n"
         "def test_third():\n    assert third() == -5\n\n"
@@ -1488,13 +1501,43 @@ def test_private_repair_reconciles_a_stock_gain_without_storing_regressions(solv
     Path(task.pull_checks[0][-1]).write_text(
         "from fixture_calc import first, second\n\n"
         "def test_first():\n    assert first() == -1\n\n"
-        "def test_second():\n    assert second() == -2\n\n" + extra_operator
+        "def test_second():\n    assert second() == -2\n\n"
+        + extra_operator
+        + (
+            "from fixture_calc import stock_guard\n\n"
+            "def test_passing_review_guard():\n    assert stock_guard() == 0\n"
+            if followup == "review_regression_retry"
+            else ""
+        )
     )
+    if followup == "static_regression_retry":
+        ruff = ("ruff", "check", ".")
+        task = replace(task, checks=(*task.checks, ruff))
+        original_command = FixtureWorkspace.command
+
+        def command(workspace, argv, *args, **kwargs):
+            if tuple(argv) != ruff:
+                return original_command(workspace, argv, *args, **kwargs)
+            source = (workspace.root / SOURCE).read_text()
+            output = b""
+            if "unbound_name" in source:
+                row = next(
+                    row
+                    for row, line in enumerate(source.splitlines(), 1)
+                    if "unbound_name" in line
+                )
+                output = f"{SOURCE}:{row}:5: F821 Undefined name `unbound_name`\nFound 1 error.\n".encode()
+            return SimpleNamespace(
+                returncode=int(bool(output)), stdout=output, stderr=b""
+            )
+
+        monkeypatch.setattr(FixtureWorkspace, "command", command)
     archive = BytesIO()
     with tarfile.open(fileobj=archive, mode="w") as snapshot:
         for path, content in {
             SOURCE: (
-                BASE_SOURCE + "\ndef stock():\n    return -3\n\ndef stock_guard():\n    return 0\n"
+                BASE_SOURCE
+                + "\ndef stock():\n    return -3\n\ndef stock_guard():\n    return 0\n"
                 + "\ndef third():\n    return -5\n\ndef ultimate():\n    return -6\n"
             ),
             "tests/test_existing.py": (
@@ -1519,7 +1562,10 @@ def test_private_repair_reconciles_a_stock_gain_without_storing_regressions(solv
     followups = {
         "repair": (restore_first, restore_second),
         "lose_stock": (restore_first + restore_second + break_stock_guard,),
-        "operator_remains": (restore_first, edit(SOURCE, "    return 2\n", "    return 4\n")),
+        "operator_remains": (
+            restore_first,
+            edit(SOURCE, "    return 2\n", "    return 4\n"),
+        ),
         "partial_stock": ("An incomplete edit",),
         "malformed": (
             "An incomplete edit",
@@ -1532,6 +1578,22 @@ def test_private_repair_reconciles_a_stock_gain_without_storing_regressions(solv
             restore_second,
         ),
         "retry_limit": ("An incomplete edit",) * 4,
+        "stock_regression_retry": (
+            restore_first + break_stock_guard,
+            restore_first,
+            restore_second,
+        ),
+        "review_regression_retry": (
+            restore_first + break_stock_guard,
+            restore_first,
+            restore_second,
+        ),
+        "static_regression_retry": (
+            restore_first
+            + edit(SOURCE, "    return -5\n", "    unbound_name\n    return -5\n"),
+            restore_first,
+            restore_second,
+        ),
         "four_cases": (
             restore_first,
             restore_second,
@@ -1556,7 +1618,12 @@ def test_private_repair_reconciles_a_stock_gain_without_storing_regressions(solv
     )
     budget = _Budget(executor.limits, lambda: False, task)
 
-    if followup in {"repair", "malformed", "no_improvement", "four_cases"}:
+    if followup in {
+        "repair",
+        "malformed",
+        "no_improvement",
+        "four_cases",
+    } or followup.endswith("_regression_retry"):
         result = solve(executor, task, archive.getvalue(), budget, "fixture-version")
         assert b"+    return 3\n" in result.patch
         assert b"+    return 1\n" not in result.patch
@@ -1575,13 +1642,21 @@ def test_private_repair_reconciles_a_stock_gain_without_storing_regressions(solv
         assert "test_stock_goal" in gateway.prompts[-1].splitlines()[0]
         assert "Private regression repair" not in gateway.prompts[-1]
         if followup == "retry_limit":
-            assert sum("Private regression repair" in prompt for prompt in gateway.prompts) == 3
+            assert (
+                sum("Private regression repair" in prompt for prompt in gateway.prompts)
+                == 3
+            )
     else:
         cases = {
             "malformed": ("test_first", "test_first", "test_second"),
             "no_improvement": ("test_first", "test_first", "test_second"),
             "four_cases": ("test_first", "test_second", "test_third", "test_ultimate"),
-        }.get(followup, ("test_first", "test_second"))
+        }.get(
+            followup,
+            ("test_first", "test_first", "test_second")
+            if followup.endswith("_regression_retry")
+            else ("test_first", "test_second"),
+        )
         for prompt, case in zip(gateway.prompts[1:], cases, strict=False):
             assert case in prompt.splitlines()[0]
             assert "Private regression repair" in prompt
@@ -1590,10 +1665,37 @@ def test_private_repair_reconciles_a_stock_gain_without_storing_regressions(solv
     if followup == "malformed":
         assert after_provider[2] == "provider-2"
         assert "No complete edit blocks" in gateway.prompts[2]
-        assert gateway.prompts[2].endswith("Respond with complete named Python definitions only.")
+        assert gateway.prompts[2].endswith(
+            "Respond with complete named Python definitions only."
+        )
     if followup == "no_improvement":
         assert after_provider[2] == "provider-2"
         assert "The selected case still fails" in gateway.prompts[2]
+    if followup.endswith("_regression_retry"):
+        note = (
+            gateway.prompts[2]
+            .split("Last proposal feedback for this goal:", 1)[1]
+            .split("\nFixture for this goal:", 1)[0]
+        )
+        assert "New failure from the rejected edit" in note
+        if followup == "stock_regression_retry":
+            assert "tests/test_existing.py::test_stock_guard" in note
+            assert "assert stock_guard() == 0" in note
+            assert (
+                "(1 stock failures, 1 review failures, 0 static checks)" in caplog.text
+            )
+        elif followup == "review_regression_retry":
+            # The configured operator command executes before the stock command.
+            assert "test_passing_review_guard" in note
+            assert "assert stock_guard() == 0" in note
+            assert "::test_stock_guard" not in note
+        else:
+            assert "ruff check" in note and "F821" in note and "Undefined name" in note
+            assert "> " not in note
+            assert (
+                "(0 stock failures, 1 review failures, 1 static checks)" in caplog.text
+            )
+        assert "    unbound_name\n" not in gateway.prompts[2]
     assert len(gateway.prompts) == len(followups) + 1
 
 
@@ -3331,7 +3433,7 @@ def test_scoped_rollout_paces_exact_edit_then_restores_verification(
         assert not counts
 
 
-@pytest.mark.parametrize("scenario", ("same", "changed_selection", "resume"))
+@pytest.mark.parametrize("scenario", ("same", "changed_selection", "resume", "rotate"))
 def test_pinned_stock_counterfactual_only_feeds_verified_private_repair(
     solver_case, monkeypatch, scenario
 ):
@@ -3341,6 +3443,8 @@ def test_pinned_stock_counterfactual_only_feeds_verified_private_repair(
     task, _, runner, checkpoints = solver_case
     different_selection = scenario == "changed_selection"
     resume = scenario == "resume"
+    rotate = scenario == "rotate"
+    dependency_seed = resume or rotate
     states = []
     lease_ended = Event()
 
@@ -3361,20 +3465,22 @@ def test_pinned_stock_counterfactual_only_feeds_verified_private_repair(
             "\nfrom fixture_calc import stock_value\n"
             "\ndef test_review_value():\n    assert stock_value(review=True) == 8\n"
         )
-        if resume:
+        if dependency_seed:
             stream.write(
                 "\ndef test_review_z_extra():\n    assert stock_value(review='extra') == 80\n"
             )
-    stock_return = "    return floor(3.5)\n" if resume else "    return 3\n"
+    stock_return = "    return floor(3.5)\n" if dependency_seed else "    return 3\n"
     method = (
         "\ndef stock_value(*, review=False):\n"
-        + ("    if review == 'extra':\n        return 70\n" if resume else "")
+        + ("    if review == 'extra':\n        return 70\n" if dependency_seed else "")
         + "    if review:\n"
         "        return 7\n"
         + "    # preserve the existing definition and its lengthy comments\n" * 110
         + stock_return
     )
-    original = ("from math import floor\n\n" if resume else "") + BASE_SOURCE + method
+    original = (
+        ("from math import floor\n\n" if dependency_seed else "") + BASE_SOURCE + method
+    )
     test = (
         "from fixture_calc import stock_value\n"
         "import pytest\n\n"
@@ -3425,8 +3531,23 @@ def test_pinned_stock_counterfactual_only_feeds_verified_private_repair(
 
     monkeypatch.setattr(review_solver, "stock_collection", collect)
     prompts = []
-    extra = edit(SOURCE, "        return 70\n", "        return 80\n") if resume else ""
-    remove_import = edit(SOURCE, "from math import floor\n\n", "") if resume else ""
+    extra = (
+        edit(SOURCE, "        return 70\n", "        return 80\n")
+        if dependency_seed
+        else ""
+    )
+    remove_import = (
+        edit(SOURCE, "from math import floor\n\n", "") if dependency_seed else ""
+    )
+    fix_first = edit(SOURCE, "        return 7\n", "        return 8\n")
+    private_edits = iter(
+        (
+            fix_first + edit(SOURCE, stock_return, "    return 0\n"),
+            edit(SOURCE, "        return 7\n", "        return 9\n"),
+            extra,
+            fix_first,
+        )
+    )
     early_edits = iter(
         (
             FIRST
@@ -3462,7 +3583,7 @@ def test_pinned_stock_counterfactual_only_feeds_verified_private_repair(
             elif "Private regression repair." in prompt:
                 assert checkpoints and b"+    return -3\n" in checkpoints[-1].patch
                 assert stock_return.strip() in prompt
-                content = edit(SOURCE, "        return 7\n", "        return 8\n")
+                content = next(private_edits) if rotate else fix_first
             elif "Advisory strategy" in prompt:
                 content = "unusable format"
             elif len(prompts) <= 3:
@@ -3484,7 +3605,9 @@ def test_pinned_stock_counterfactual_only_feeds_verified_private_repair(
             )
 
     executor = PlainExecutor(
-        runner, Gateway(), Limits(model_requests=10, concurrent_probes=1)
+        runner,
+        Gateway(),
+        Limits(model_requests=13 if rotate else 10, concurrent_probes=1),
     )
     budget = _Budget(executor.limits, lease_ended.is_set, task)
     if resume:
@@ -3546,6 +3669,20 @@ def test_pinned_stock_counterfactual_only_feeds_verified_private_repair(
     result = solve(executor, task, archive.getvalue(), budget, "fixture")
     assert all(check.returncode == 0 for check in result.checks)
     private = [prompt for prompt in prompts if "Private regression repair." in prompt]
+    if rotate:
+        assert [prompt.splitlines()[0].rsplit("::", 1)[-1] for prompt in private] == [
+            "test_review_value",
+            "test_review_value",
+            "test_review_z_extra",
+            "test_review_value",
+        ]
+        assert "New failure from the rejected edit" in private[1]
+        assert "tests/test_stock.py::test_stock" in private[1]
+        assert "Last proposal feedback for this goal" not in private[2]
+        assert "assert stock_value(review='extra') == 80" in private[2]
+        assert b"+        return 80\n" in result.patch
+        assert b"+    return 0\n" not in result.patch
+        return
     assert len(private) == (0 if different_selection else 1)
     assert len(probes) == (2 if different_selection else 3)
     if different_selection:
