@@ -98,7 +98,7 @@ from .review_solver_context import (
     focused_check_excerpt,
     focused_source_excerpt,
     imported_model_declarations,
-    repository_pytest_example,
+    repository_pytest_context,
     stock_assertion_progress,
     stock_assertion_failure_line,
     stock_failure_site,
@@ -110,7 +110,10 @@ from .review_stock_collection import stock_collection
 from .task_context import (
     MESSAGE_BYTES,
     REPOSITORY_PYTEST_EXAMPLE,
+    REPOSITORY_PYTEST_USAGE,
     TEST_MODULE_REPLY_ENDING,
+    TEST_REPAIR_GUIDANCE,
+    TEST_VERIFICATION_FEEDBACK,
     compact_focused_review,
     excerpt,
     wire_size,
@@ -170,7 +173,7 @@ _BLOCK = re.compile(
 )
 _MARKER = re.compile(r"^(?:<{5,}|={5,}|>{5,})(?:[ \t]|$)", re.M)
 _PYTHON_FENCE = re.compile(
-    r"(?P<fence>`{3,}|~{3,})(?:python|py)[ \t]*\n(?P<code>.*?)\n(?P=fence)",
+    r"(?P<fence>`{3,}|~{3,})(?:python|py)?[ \t]*\n(?P<code>.*?)\n(?P=fence)",
     re.S | re.I,
 )
 _FENCE_LINE = re.compile(r"^[ \t]*(?:`{3,}|~{3,})", re.M)
@@ -182,6 +185,10 @@ _TEST_RESULT = re.compile(r"^(FAILED|ERROR) ([^\s]+::[^\s]+)", re.M)
 _TEST_SECTION = re.compile(r"^_{5,} (.+?) _{5,}$", re.M)
 _PYTEST_SECTION = re.compile(r"^={5,} ([^\n]+?) ={5,}$", re.M)
 _PYTEST_CRASH_LINE = re.compile(r"^\S[^\n]*?\.py:[1-9][0-9]*: .+$")
+_TEST_ERROR_KINDS = re.compile(
+    r"\b(?:AssertionError|AttributeError|FileNotFoundError|ImportError|IndexError|"
+    r"KeyError|ModuleNotFoundError|NameError|RuntimeError|TypeError|ValueError)\b"
+)
 _PYTEST_TOTALS = re.compile(r"(?:\d+ [a-z]+, )*\d+ [a-z]+ in \d+(?:\.\d+)?s(?: \([\d:]+\))?")
 _STOCK_REPAIR_CASE_LIMIT = 4
 _DEPENDENCY_SEED_CASE_LIMIT = 6
@@ -277,7 +284,19 @@ def _complete_test_module(response, path, limit):
         if len(response.encode()) > maximum:
             return None
         response = response.replace("\r\n", "\n")
-        fenced = _PYTHON_FENCE.fullmatch(response.strip())
+        stripped = response.strip()
+        fenced = _PYTHON_FENCE.fullmatch(stripped)
+        if not fenced and len(markers := list(_FENCE_LINE.finditer(stripped))) == 2:
+            start, close = (marker.start() for marker in markers)
+            end = stripped.find("\n", close)
+            end = len(stripped) if end < 0 else end
+            outside = stripped[:start] + stripped[end:]
+            if (
+                len(outside) <= 600 and len(outside.splitlines()) <= 6
+                and not _MARKER.search(outside) and ".py" not in outside
+                and not re.search(r"(?m)^\s*(?:diff |@@|REPLACE |--- |\+\+\+ )", outside)
+            ):
+                fenced = _PYTHON_FENCE.fullmatch(stripped[start:end].strip())
         source = (fenced["code"] if fenced else response).rstrip("\n") + "\n"
         data = source.encode()
         if (
@@ -302,12 +321,16 @@ def _complete_test_module(response, path, limit):
         return None
 
 
-def _apply_test_reply(response, sources, path, *, allow_module, limit):
+def _apply_test_reply(response, sources, path, *, allow_module, failed_draft, limit):
     try:
         return apply_blocks(response, sources, path)
     except ValueError:
         if allow_module and (module := _complete_test_module(response, path, limit)):
             return {path: module}
+        if allow_module and failed_draft and re.search(r"(?m)^REPLACE ", response or ""):
+            return apply_definitions(
+                response, {path: sources[path]}, single_function=True
+            )
         raise
 
 
@@ -647,7 +670,8 @@ def _regression_api(path, content, query, limit):
 
 def _test_authoring_messages(
     current, review, fixtures, interfaces, new_path, note, *,
-    allow_test_module=False, repository_example=""
+    allow_test_module=False, repository_example="", repository_usage="",
+    repair_failed_tests=False,
 ):
     behaviors = list(
         dict.fromkeys(" ".join(body.split()) for _, _, body in review.feedback)
@@ -660,6 +684,12 @@ def _test_authoring_messages(
         for path, content in sources.items()
     )
     draft = current[new_path]
+    definition_guidance = (
+        f"\nFor a focused repair, prefer one named replacement. Start with REPLACE {new_path}::name "
+        "on its own line, substituting the existing function name or Class.method. "
+        "Follow with the complete repaired definition, including decorators.\n"
+        if allow_test_module and repair_failed_tests and draft else ""
+    )
     if len(draft) > 4400:
         position = re.search(rf"{re.escape(new_path)}:([1-9][0-9]*)", note)
         draft = focused_source_excerpt(
@@ -670,9 +700,15 @@ def _test_authoring_messages(
         )
     request = (
         "Selected failure: new regression tests\n"
-        f"Edit only {new_path}. Write fresh offline pytest tests for the distinct "
-        "requested behaviors. Keep the complete module concise so it fits in one reply. "
-        "Share setup and parameterize examples for the same behavior. Use public APIs and independent fixtures. "
+        f"Edit only {new_path}. "
+        + (
+            TEST_REPAIR_GUIDANCE + " Keep existing fixtures and coverage where they already work. "
+            if repair_failed_tests else
+            "Write fresh offline pytest tests for the distinct requested behaviors. "
+            "Keep the complete module concise so it fits in one reply. "
+            "Share setup and parameterize examples for the same behavior. "
+        )
+        + "Use public APIs and independent fixtures. "
         "Use the operator examples as behavior and setup references, without copying them.\n"
         "Requested behaviors (quoted review notes):\n"
         + "\n".join(f"- {excerpt(body, 320)}" for body in behaviors if body)
@@ -680,9 +716,10 @@ def _test_authoring_messages(
             REPOSITORY_PYTEST_EXAMPLE + repository_example + "\n"
             if repository_example else ""
         )
+        + (REPOSITORY_PYTEST_USAGE + repository_usage + "\n" if repository_usage else "")
         + f"\nOperator test names: {names}\n"
         + (
-            f"Latest verification or edit feedback:\n{excerpt(note, 1600)}\n"
+            TEST_VERIFICATION_FEEDBACK + excerpt(note, 1600) + "\n"
             if note
             else ""
         )
@@ -697,6 +734,7 @@ def _test_authoring_messages(
         + f"\nNew test file: {new_path}\n"
         + "\nCurrent checkout:\n"
         + f"Edit the test file at the exact path {new_path}.\n"
+        + definition_guidance
         + (
             TEST_MODULE_REPLY_ENDING if allow_test_module
             else "Respond with exact SEARCH/REPLACE blocks only."
@@ -705,7 +743,7 @@ def _test_authoring_messages(
     return [
         {
             "role": "system",
-            "content": _TEST_MODULE_SYSTEM if allow_test_module else _SYSTEM,
+            "content": (_TEST_MODULE_SYSTEM if allow_test_module else _SYSTEM) + definition_guidance,
         },
         {"role": "user", "content": request},
     ]
@@ -752,6 +790,8 @@ def _proposal_messages(
     parameter_focus="",
     allow_test_module=False,
     repository_example="",
+    repository_usage="",
+    repair_failed_tests=False,
 ):
     if target == _TEST_GOAL:
         return _test_authoring_messages(
@@ -763,6 +803,8 @@ def _proposal_messages(
             note,
             allow_test_module=allow_test_module,
             repository_example=repository_example,
+            repository_usage=repository_usage,
+            repair_failed_tests=repair_failed_tests,
         )
     diagnostic = failures.get(
         target,
@@ -2810,6 +2852,7 @@ def solve(executor, task, archive, budget, version):
     test_format_failures = 0
     test_tool_attempted = False
     repository_example = None
+    repository_usage = ""
     repository_models = ""
 
     def start_new_draft(target):
@@ -3297,7 +3340,9 @@ def solve(executor, task, archive, budget, version):
                             test_tool_attempted = False
                         if repository_example is None:
                             reviewed_sources = {path: current[path] for path in paths}
-                            repository_example = repository_pytest_example(archive, reviewed_sources)
+                            repository_example, repository_usage = repository_pytest_context(
+                                archive, reviewed_sources, " ".join(body for _, _, body in review.feedback)
+                            )
                             repository_models = imported_model_declarations(archive, reviewed_sources)
                         allow_test_module = bool(
                             original[new_path] == current[new_path] == ""
@@ -3523,6 +3568,8 @@ def solve(executor, task, archive, budget, version):
                         parameter_focus=parameter_focus,
                         allow_test_module=allow_test_module,
                         repository_example=repository_example or "",
+                        repository_usage=repository_usage,
+                        repair_failed_tests=target == _TEST_GOAL and bool(test_draft and test_diagnostic),
                         rejection=(
                             _private_repair_context(current, repair)
                             if repair is not None
@@ -3734,6 +3781,7 @@ def solve(executor, task, archive, budget, version):
                                 and original[new_path] == current[new_path] == ""
                                 and not _protected(new_path, task, new_test=True)
                             ),
+                            failed_draft=bool(test_draft and test_diagnostic),
                             limit=executor.limits.patch_bytes,
                         )
                     if candidate is None and active_line_snapshot is not None:
@@ -3856,9 +3904,10 @@ def solve(executor, task, archive, budget, version):
                 test_rejection = None
                 notes.pop(target, None)
                 if after:
+                    kinds = {kind for detail in after.values() for kind in _TEST_ERROR_KINDS.findall(detail)}
                     _LOG.info(
-                        "Verifying a new pytest module via %s left %d check diagnostic(s)",
-                        completion.route, len(after),
+                        "Verifying a new pytest module via %s left %d check diagnostic(s); categories=%s",
+                        completion.route, len(after), ",".join(sorted(kinds)) or "check failure",
                     )
                     test_diagnostic = "\n".join(
                         f"{name}: {excerpt(detail, 1000)}"
@@ -3878,6 +3927,7 @@ def solve(executor, task, archive, budget, version):
                         if not isinstance(rejection, _VerificationRejected):
                             raise
                         test_rejection = error
+                        _LOG.info("Final verification rejected the new pytest module via %s", completion.route)
                         test_diagnostic = (
                             str(rejection)
                             + "\n"

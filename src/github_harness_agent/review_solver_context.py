@@ -3,6 +3,8 @@
 import ast
 import re
 import tarfile
+from collections import Counter
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import PurePosixPath
 
@@ -170,7 +172,7 @@ def _dotted_name(node):
 
 def _reviewed_imports(body, modules):
     bindings = {}
-    reviewed_calls = set()
+    reviewed_calls = {}
     for node in body:
         if not isinstance(node, _IMPORT) or getattr(node, "level", 0):
             continue
@@ -184,8 +186,10 @@ def _reviewed_imports(body, modules):
                 qualified = f"{node.module}.{alias.name}"
                 bindings[local] = node
                 if alias.name in modules.get(node.module, ()):
-                    reviewed_calls.add(local)
-            reviewed_calls.update(f"{local}.{name}" for name in modules.get(qualified, ()))
+                    reviewed_calls[local] = modules[node.module][alias.name]
+            reviewed_calls.update(
+                {f"{local}.{name}": returned for name, returned in modules.get(qualified, {}).items()}
+            )
     return bindings, reviewed_calls
 
 
@@ -196,8 +200,191 @@ def _source_root(path):
     return PurePosixPath(*parts[: len(parts) - parts[::-1].index("src")])
 
 
-def repository_pytest_example(archive, sources, *, max_bytes=850):
-    """Find one complete example that calls a public API of a reviewed module."""
+@dataclass(frozen=True)
+class _ReturnedValue:
+    methods: dict[str, bool | tuple[bool, ...]]
+    mapping: bool | tuple[bool, ...] = False
+
+
+@dataclass(frozen=True)
+class _UsageOrigin:
+    rows: tuple[str, ...]
+    methods: dict[str, bool | tuple[bool, ...]]
+    mapping: bool = False
+
+
+def _mapping_result(annotation):
+    def is_mapping(item):
+        item = item.value if isinstance(item, ast.Subscript) else item
+        return _dotted_name(item) in {"dict", "Dict", "typing.Dict", "Mapping", "typing.Mapping", "collections.abc.Mapping"}
+
+    if (
+        isinstance(annotation, ast.Subscript)
+        and _dotted_name(annotation.value) in {"tuple", "Tuple", "typing.Tuple"}
+        and isinstance(annotation.slice, ast.Tuple)
+        and not any(isinstance(item, ast.Constant) and item.value is Ellipsis for item in annotation.slice.elts)
+    ):
+        return tuple(is_mapping(item) for item in annotation.slice.elts)
+    return is_mapping(annotation)
+
+
+def _reviewed_calls(declarations):
+    classes = {
+        node.name: {
+            method.name: _mapping_result(method.returns) for method in node.body
+            if isinstance(method, _FUNCTION) and not method.name.startswith("_")
+        }
+        for node in declarations
+        if isinstance(node, ast.ClassDef) and not node.name.startswith("_")
+    }
+    functions = {}
+    for node in declarations:
+        if not isinstance(node, _FUNCTION) or node.name.startswith("_"):
+            continue
+        result = getattr(node.returns, "id", "")
+        if result not in classes:
+            returns = [item.value for item in node.body if isinstance(item, ast.Return)]
+            if len(returns) == 1 and isinstance(returns[0], ast.Call):
+                result = _dotted_name(returns[0].func)
+        functions[node.name] = _ReturnedValue(classes.get(result, {}), _mapping_result(node.returns))
+    return {**{name: _ReturnedValue(methods) for name, methods in classes.items()}, **functions}
+
+
+def _shape_operand(node):
+    if isinstance(node, ast.Starred):
+        return "*" + _shape_operand(node.value)
+    name = _dotted_name(node)
+    return name if len(name) <= 72 and name else "..."
+
+
+def _shape_targets(node):
+    if isinstance(node, ast.Name):
+        return (node.id,)
+    if isinstance(node, (ast.Tuple, ast.List)) and all(
+        isinstance(item, ast.Name) for item in node.elts
+    ):
+        return tuple(item.id for item in node.elts)
+    return ()
+
+
+def _rebound_names(node):
+    for item in ast.walk(node):
+        if isinstance(item, ast.Name) and isinstance(item.ctx, (ast.Store, ast.Del)):
+            yield item.id
+        elif isinstance(item, ast.alias):
+            yield item.asname or item.name.split(".", 1)[0]
+        elif isinstance(item, (*_FUNCTION, ast.ClassDef, ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+            if item.name:
+                yield item.name
+        elif isinstance(item, ast.MatchMapping) and item.rest:
+            yield item.rest
+
+
+def _usage_shapes(node, reviewed_calls):
+    """Read calls and public attributes from straight-line code and context bodies."""
+    bound = _fixture_arguments(node)
+    bound.update(arg.arg for arg in (node.args.vararg, node.args.kwarg) if arg is not None)
+    bound.update(
+        name for item in ast.walk(node) if isinstance(item, (ast.Global, ast.Nonlocal))
+        for name in item.names
+    )
+    local_names = set(_rebound_names(node)) | bound
+    yield from _usage_block(node.body, reviewed_calls, local_names, {}, bound)
+
+
+def _usage_block(statements, reviewed_calls, local_names, origins, bound):
+    for statement in statements:
+        rebound = Counter(_rebound_names(statement))
+        if isinstance(statement, (ast.With, ast.AsyncWith)):
+            context_names = set().union(*(_rebound_names(item) for item in statement.items))
+            nested_origins = {name: origin for name, origin in origins.items() if name not in context_names}
+            yield from _usage_block(
+                statement.body, reviewed_calls, local_names, nested_origins, bound | context_names,
+            )
+            # A suppressing exit can leave a previous value in place. A fresh name with a
+            # single proven mapping assignment either has that value or cannot be read.
+            for name, writes in rebound.items():
+                origins.pop(name, None)
+                origin = nested_origins.get(name)
+                if writes == 1 and name not in bound and name not in context_names and origin and origin.mapping:
+                    origins[name] = origin
+            bound.update(rebound)
+            continue
+        target = None
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            target = statement.targets[0]
+        elif isinstance(statement, ast.AnnAssign):
+            target = statement.target
+        names = _shape_targets(target)
+        expression = getattr(statement, "value", None)
+        awaited = isinstance(expression, ast.Await)
+        if awaited:
+            expression = expression.value
+        rows = ()
+        returned = _ReturnedValue({})
+        if isinstance(expression, ast.Call):
+            called = _dotted_name(expression.func)
+            receiver, _, method = called.rpartition(".")
+            if called in reviewed_calls and called.split(".", 1)[0] not in local_names:
+                returned = reviewed_calls[called]
+            elif receiver in origins and method in origins[receiver].methods:
+                returned = _ReturnedValue({}, origins[receiver].methods[method])
+            else:
+                called = ""
+            if called:
+                args = [_shape_operand(arg) for arg in expression.args]
+                args.extend(
+                    f"{arg.arg}={_shape_operand(arg.value)}" if arg.arg else "**..."
+                    for arg in expression.keywords
+                )
+                invocation = f"{called}({', '.join(args)})"
+                if awaited:
+                    invocation = "await " + invocation
+                if names:
+                    invocation = f"{', '.join(names)} = {invocation}"
+                if len(invocation.encode()) <= 210:
+                    setup = origins[receiver].rows if receiver in origins else ()
+                    rows = (*setup[-1:], invocation)
+                    yield called, rows
+        value = statement.test if isinstance(statement, ast.Assert) else expression
+        if value is not None:
+            for item in ast.walk(value):
+                if (
+                    isinstance(item, ast.Subscript) and isinstance(item.ctx, ast.Load)
+                    and isinstance(item.value, ast.Name) and not item.value.id.startswith("_")
+                    and len(item.value.id) <= 72 and (origin := origins.get(item.value.id))
+                    and origin.mapping and isinstance(item.slice, ast.Constant)
+                    and isinstance(key := item.slice.value, str)
+                    and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", key)
+                ):
+                    lookup = f"{item.value.id}[{key!r}]"
+                    yield lookup, (*origin.rows, lookup)
+                if not isinstance(item, ast.Attribute):
+                    continue
+                attribute = _dotted_name(item)
+                owner, _, member = attribute.partition(".")
+                if (
+                    owner in origins and not any(part.startswith("_") for part in member.split("."))
+                    and member not in origins[owner].methods and len(attribute.encode()) <= 160
+                ):
+                    yield attribute, (*origins[owner].rows, attribute)
+        for name in rebound:
+            origins.pop(name, None)
+        bound.update(rebound)
+        if rows:
+            single = isinstance(target, ast.Name)
+            if single and isinstance(returned.mapping, bool):
+                mapping = (returned.mapping,)
+            elif not single and isinstance(returned.mapping, tuple) and len(returned.mapping) == len(names):
+                mapping = returned.mapping
+            else:
+                mapping = (False,) * len(names)
+            for name, is_mapping in zip(names, mapping):
+                origins[name] = _UsageOrigin(rows, returned.methods if single else {}, is_mapping)
+
+
+def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usage_bytes=820):
+    """Return a complete small example and separate bounded public API usage shapes."""
     modules = {}
     for path, source in sources.items():
         source_path = PurePosixPath(path)
@@ -210,14 +397,13 @@ def repository_pytest_example(archive, sources, *, max_bytes=850):
             declarations = ast.parse(source).body
         except (SyntaxError, ValueError, RecursionError):
             continue
-        modules[".".join(parts)] = {
-            node.name
-            for node in declarations
-            if isinstance(node, (*_FUNCTION, ast.ClassDef)) and not node.name.startswith("_")
-        }
+        modules[".".join(parts)] = _reviewed_calls(declarations)
     if not any(modules.values()):
-        return ""
+        return "", ""
     module_stems = {module.rsplit(".", 1)[-1] for module in modules}
+    query_words = _words(query.replace("_", " "))
+    example = ""
+    shapes = []
 
     try:
         with tarfile.open(fileobj=BytesIO(archive), mode="r:") as snapshot:
@@ -246,10 +432,23 @@ def repository_pytest_example(archive, sources, *, max_bytes=850):
                 if not reviewed_calls:
                     continue
                 fixtures = {node for _, node, _ in _pytest_fixtures(body)}
-                for node in body:
+                members = tuple(
+                    node
+                    for declaration in body
+                    if isinstance(declaration, ast.ClassDef) and declaration.name.startswith("Test")
+                    for node in declaration.body
+                    if isinstance(node, _FUNCTION) and node.name.startswith("test_")
+                )
+                for node in (*body, *members):
                     if not isinstance(node, _FUNCTION) or not (
                         node.name.startswith("test_") or node in fixtures
                     ):
+                        continue
+                    if usage_bytes:
+                        for symbol, rows in _usage_shapes(node, reviewed_calls):
+                            relevance = _words(symbol.replace("_", " ")) & query_words
+                            shapes.append((len(relevance), "." in symbol or "[" in symbol, path, rows))
+                    if example or node in members:
                         continue
                     if not any(
                         _dotted_name(call.func) in reviewed_calls
@@ -262,10 +461,30 @@ def repository_pytest_example(archive, sources, *, max_bytes=850):
                         for item in sorted(selected, key=lambda item: item.lineno) + [node]
                     )
                     if len(excerpt.encode()) <= max_bytes:
-                        return excerpt.rstrip()
+                        example = excerpt.rstrip()
+                        if not usage_bytes:
+                            return example, ""
     except (tarfile.TarError, OSError, EOFError):
         pass
-    return ""
+    usage = []
+    shown = set()
+    for _, _, path, rows in sorted(shapes, key=lambda item: item[:2], reverse=True):
+        additions = [row for row in rows if row not in shown]
+        if not additions:
+            continue
+        chunk = "\n".join((f"# {path}", *additions))
+        if len(chunk.encode()) + 1 <= usage_bytes:
+            usage.append(chunk)
+            shown.update(additions)
+            usage_bytes -= len(chunk.encode()) + 1
+        if len(usage) >= 4:
+            break
+    return example, "\n".join(usage)
+
+
+def repository_pytest_example(archive, sources, *, max_bytes=850):
+    example, _ = repository_pytest_context(archive, sources, max_bytes=max_bytes, usage_bytes=0)
+    return example
 
 
 def imported_model_declarations(archive, sources, *, max_bytes=850):

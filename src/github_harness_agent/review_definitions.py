@@ -164,7 +164,7 @@ def _documents(sources):
     return documents
 
 
-def apply_definitions(response, sources, *, only=None):
+def apply_definitions(response, sources, *, only=None, single_function=False):
     """Return a fresh source mapping or reject the proposal without partial edits."""
     if (
         not isinstance(response, str)
@@ -173,13 +173,19 @@ def apply_definitions(response, sources, *, only=None):
     ):
         raise ValueError("Definition response is empty or exceeds the edit limit")
     text = _unfence(response.replace("\r\n", "\n"))
+    if single_function and not text.startswith("REPLACE "):
+        raise ValueError("Start with a qualified REPLACE header")
     documents = _documents(sources)
     replacements = _edits(text, documents)
-    if only is not None:
+    if only is not None or single_function:
         replacements = tuple(replacements)
-        if len(replacements) != 1 or replacements[0][:2] != only:
+        if only is not None and (len(replacements) != 1 or replacements[0][:2] != only):
             raise ValueError("Expected one replacement of the localized definition")
-    return _apply_definition_edits(sources, documents, replacements)
+        if single_function and (len(replacements) != 1 or not replacements[0][1]):
+            raise ValueError("Expected one complete replacement function or method")
+    return _apply_definition_edits(
+        sources, documents, replacements, functions_only=single_function
+    )
 
 
 def _unique_object(pairs):
@@ -230,7 +236,7 @@ def apply_native_definition(calls, sources):
     return _apply_definition_edits(sources, documents, ((path, symbol, body),))
 
 
-def _apply_definition_edits(sources, documents, replacements):
+def _apply_definition_edits(sources, documents, replacements, *, functions_only=False):
     edits = defaultdict(list)
     added_imports = defaultdict(dict)
     for path, name, body in replacements:
@@ -264,6 +270,8 @@ def _apply_definition_edits(sources, documents, replacements):
             raise ValueError(
                 "Replacement must be one complete definition with the same name and kind"
             )
+        if functions_only and not isinstance(old, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            raise ValueError("Expected a function or method, including for class-based pytest tests")
         lines = sources[path].splitlines(keepends=True)
         start = min([old.lineno, *(item.lineno for item in old.decorator_list)]) - 1
         margin = lines[start][: len(lines[start]) - len(lines[start].lstrip())]

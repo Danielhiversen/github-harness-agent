@@ -1,3 +1,4 @@
+import ast
 import tarfile
 from io import BytesIO
 
@@ -141,6 +142,134 @@ def test_repository_example_supports_module_imports_and_complete_pytest_fixtures
         {"src/example/formatting.py": "def format_amount(amount):\n    return str(amount)\n"},
     )
     assert example == "# tests/conftest.py\n" + source.rstrip()
+
+
+def test_fresh_test_context_keeps_grounded_usage_from_oversized_tracked_test():
+    archive = BytesIO()
+    source = (
+        "from example.formatting import Formatter, build_formatter\n"
+        "from other import calculate\n"
+        "def test_small():\n    assert Formatter().ready()\n"
+        "class TestCalculation:\n"
+        "    def test_calculation(self):\n"
+        + "        # long setup\n" * 150
+        + "        client = build_formatter()\n"
+        "        with mock_context(Formatter(marker='context only')):\n"
+        "            total, report = client.calculate(values, precision=3)\n"
+        "            assert report.summary == 'hidden expected value'\n"
+        "        unrelated = calculate(values, bogus=True)\n"
+        "        ignored = helper('private setup')\n"
+    )
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        data = source.encode()
+        entry = tarfile.TarInfo("tests/test_formatting.py")
+        entry.size = len(data)
+        snapshot.addfile(entry, BytesIO(data))
+    path = "src/example/formatting.py"
+    production = {path: (
+        "class Formatter:\n    def ready(self): ...\n"
+        "    def calculate(self, values, *, precision): ...\n"
+        "def build_formatter() -> Formatter:\n    return Formatter()\n"
+    )}
+    review = ReviewRecovery(feedback=((path, 3, "calculate report summary"),), previous_failure="")
+    example, usage = review_solver_context.repository_pytest_context(
+        archive.getvalue(), production, "calculate report summary", usage_bytes=330,
+    )
+    assert "test_small" in example
+    assert "test_calculation" not in example
+    assert "client = build_formatter()" in usage
+    assert "total, report = client.calculate(values, precision=...)" in usage
+    assert "report.summary" in usage
+    assert all(item not in usage for item in ("assert", "hidden expected", "bogus", "private setup"))
+    assert "mock_context" not in usage and "marker=" not in usage
+    assert len(usage.encode()) <= 330
+
+    new_path = "tests/test_review_regressions.py"
+    messages = _proposal_messages(
+        (-1, "new regression tests"), {**production, new_path: example}, {}, True,
+        "NameError: report", review, {}, [], new_path, allow_test_module=True,
+        repository_example=example, repository_usage=usage, repair_failed_tests=True,
+    )
+    compacted = compact_focused_review(messages, max_bytes=2100)
+    for prompt in (messages[-1]["content"], compacted[-1]["content"]):
+        assert "test_small" in prompt and "precision=..." in prompt
+        assert "preserve passing cases" in prompt
+        assert "NameError: report" in prompt
+        assert prompt.endswith(TEST_MODULE_REPLY_ENDING)
+
+
+@pytest.mark.parametrize("scope,await_call", [("with", ""), ("async with", "await ")])
+def test_usage_shapes_tracks_with_bodies_without_leaking_rebound_origins(scope, await_call):
+    node, = ast.parse(
+        f"""async def test_calculation():
+    client = build_formatter()
+    {scope} mock_context():
+        result = {await_call}client.calculate(inside=True)
+        {scope} mock_context() as client:
+            client.calculate(shadowed=True)
+        client.calculate(overwritten=True)
+    assert result.not_proven_after_with
+    client.calculate(not_restored=True)
+    other = build_formatter()
+    if flag:
+        other = unreviewed()
+    other.calculate(possibly_rebound=True)
+"""
+    ).body
+    declarations = ast.parse("""
+class Formatter:
+    def calculate(self, **options): ...
+def build_formatter() -> Formatter: ...
+""").body
+    reviewed_calls = review_solver_context._reviewed_calls(declarations)
+    usage = "\n".join(
+        row
+        for _, rows in review_solver_context._usage_shapes(node, reviewed_calls)
+        for row in rows
+    )
+    assert f"result = {await_call}client.calculate(inside=...)" in usage
+    assert all(
+        marker not in usage
+        for marker in (
+            "mock_context", "shadowed", "overwritten", "not_proven_after_with",
+            "not_restored", "possibly_rebound",
+        )
+    )
+
+
+def test_usage_shapes_extracts_only_public_keys_from_proven_mapping_results():
+    declarations = ast.parse("""
+class Formatter:
+    def calculate(self) -> tuple[int, dict[str, int]]: ...
+    def totals(self) -> dict[str, int]: ...
+def build_formatter() -> Formatter: ...
+""").body
+    node, = ast.parse("""
+def test_calculation(uncertain):
+    client = build_formatter()
+    with fixture_context():
+        total, summary = client.calculate()
+    assert summary['observed_count'] == 42, 'do not show this assertion'
+    assert summary['_private'] == 5
+    assert summary['12.3,45.6'] == 5
+    assert summary[key_name] == 5
+    assert summary['invalid-key'] == 5
+    assert uncertain['fixture_key'] == 5
+    assert total['wrong_tuple_slot'] == 5
+    own = client.totals()
+    size = own['public_total']
+    _private_mapping = client.totals()
+    assert _private_mapping['private_receiver'] == 5
+    conflicting = uncertain
+    with fixture_context():
+        _, conflicting = client.calculate()
+    assert conflicting['ambiguous_key'] == 0
+""").body
+    shapes = dict(review_solver_context._usage_shapes(node, review_solver_context._reviewed_calls(declarations)))
+    lookups = {name for name in shapes if "[" in name}
+    assert lookups == {"summary['observed_count']", "own['public_total']"}
+    assert shapes["summary['observed_count']"][-1] == "summary['observed_count']"
+    assert "do not show" not in str(shapes) and "42" not in str(shapes)
 
 
 def test_review_imported_models_use_pinned_package_source_including_relative_imports():
