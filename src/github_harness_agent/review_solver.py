@@ -45,7 +45,11 @@ from .review_definitions import (
 from .review_guard_probe import stock_guard_diagnostic
 from .review_guards import guarded_sources
 from .review_mock_replay import mock_call_diagnostic
-from .review_planner import apply_coding_advice, request_coding_advice
+from .review_planner import (
+    apply_coding_advice,
+    localized_retry_symbol,
+    request_coding_advice,
+)
 from .review_recovery import operator_acceptance_context
 from .review_solver_context import (
     focused_check_excerpt,
@@ -674,7 +678,9 @@ def _coding_completion(
         _LOG.info("Applying a free planning strategy to the current review goal")
     elif advice is not None:
         _LOG.info("Reusing a free planning strategy for the current review goal")
-    messages = apply_coding_advice(messages, advice or fresh_advice)
+    messages = apply_coding_advice(
+        messages, advice or fresh_advice, reuse=advice is not None
+    )
     if native_source is not None:
         focused = compact_focused_review(messages, max_bytes=12 * 1024) or messages
         request = focused[-1]["content"].removesuffix(DEFINITION_ENDING)
@@ -1287,8 +1293,14 @@ def solve(executor, task, archive, budget, version):
                     )
                     if repair is not None and repair.stock_origin:
                         named_definitions = repair.retry_named
+                    localized_retry = (
+                        localized_retry_symbol(advice)
+                        if stock_fixture and repair is None
+                        else None
+                    )
                     native = (
                         named_definitions
+                        and localized_retry is None
                         and target in native_ready
                         and target not in native_attempted
                         and launch_budget >= 2
@@ -1324,8 +1336,10 @@ def solve(executor, task, archive, budget, version):
                     if continuation is not None and mock_detail:
                         mock_detail = "Observations from the saved draft before the unpublished edit:\n" + mock_detail
                         _LOG.info("Continuing an unpublished edit for tracked pytest case %s", target[1])
+                    # Begin with SEARCH. A localized retry can replace the one
+                    # complete method only when both exact definitions fit.
                     if stock_fixture and (plan or advice is not None):
-                        named_definitions = False
+                        named_definitions = localized_retry is not None
                     messages = _proposal_messages(
                         target,
                         source,
@@ -1398,6 +1412,7 @@ def solve(executor, task, archive, budget, version):
                         named_definitions,
                         planner_input is not None or advice is not None,
                         (rotation_key, bool(exclude)),
+                        localized_retry,
                         repair,
                     )
                     cost = 2 if native or planner_input is not None else 1
@@ -1423,6 +1438,7 @@ def solve(executor, task, archive, budget, version):
                 named_definitions,
                 advised,
                 (rotation_key, rotated),
+                localized_retry,
                 repair,
             ) = pending.pop(future)
             if (
@@ -1461,7 +1477,9 @@ def solve(executor, task, archive, budget, version):
                     candidate = native_candidate
                     if candidate is None:
                         candidate = (
-                            apply_definitions(completion.content, source)
+                            apply_definitions(
+                                completion.content, source, only=localized_retry
+                            )
                             if named_definitions
                             else apply_blocks(completion.content, source, new_path)
                         )
@@ -1701,7 +1719,11 @@ def solve(executor, task, archive, budget, version):
                     )
                 ):
                     count_recovery(no_progress, target)
-                if fresh_advice is not None and not introduced and target in after:
+                if (
+                    fresh_advice is not None
+                    and target in after
+                    and (not introduced or localized_retry_symbol(fresh_advice) is not None)
+                ):
                     retry_advice[target] = fresh_advice
                 if (
                     continuation is None

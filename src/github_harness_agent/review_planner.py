@@ -5,15 +5,22 @@ import json
 import logging
 import re
 from collections import Counter
+from dataclasses import dataclass
 
 from .providers import ProviderExhausted
-from .review_definitions import LOCALIZED_METHOD_HEADING, _symbols
+from .review_definitions import (
+    DEFINITION_ENDING,
+    LOCALIZED_METHOD_HEADING,
+    _HEADER,
+    _symbols,
+)
 from .review_delta_context import (
     STOCK_SOURCE_LIMIT,
+    _definitions,
     resolve_symbol,
     stock_delta_context,
 )
-from .task_context import excerpt
+from .task_context import excerpt, wire_size
 
 _LOG = logging.getLogger(__name__)
 
@@ -31,6 +38,51 @@ Return only JSON with "strategy" (one concise algorithm citing the observed inpu
 _FOCUS = "\nFocused source from "
 _DETAIL = "\nFailure details:\n"
 _SOURCE_LIMIT = 4800
+
+
+@dataclass(frozen=True)
+class _LocalizedDefinition:
+    symbol: tuple[str, str]
+    baseline: str
+    current: str
+
+
+@dataclass(frozen=True)
+class _StockAdvice:
+    strategy: str
+    bodies: str
+    constraints: str
+    localized: _LocalizedDefinition | None
+
+
+def localized_retry_symbol(advice):
+    if isinstance(advice, _StockAdvice) and advice.localized is not None:
+        return advice.localized.symbol
+    return None
+
+
+def _counterfactual_site(mock_detail):
+    if mock_detail.startswith("Auxiliary counterfactual (quoted data,"):
+        return re.search(
+            r" ([\w./-]+\.py::[\w.]+), draft line ([1-9][0-9]{0,6}):",
+            mock_detail,
+        )
+    return None
+
+
+def _localized_definition(original, sources, site):
+    key = site[1]
+    if not _HEADER.fullmatch(f"REPLACE {key}"):
+        return None
+    path, name = key.split("::", 1)
+    old = _definitions({path: original[path]}).get(key)
+    new = _definitions({path: sources[path]}).get(key)
+    if old is None or new is None or not new[0] <= int(site[2]) < new[0] + len(new[1]):
+        return None
+    baseline, current = "".join(old[1]), "".join(new[1])
+    if max(wire_size(baseline), wire_size(current)) > STOCK_SOURCE_LIMIT:
+        return None
+    return _LocalizedDefinition((path, name), baseline, current)
 
 
 def _inventory(sources, query):
@@ -131,6 +183,7 @@ def request_coding_advice(
         return None
     lead, current_focus, _ = sections
     delta = constraints = located = ""
+    localized = None
     is_stock = stock_inputs is not None
     if not is_stock:
         inventory = _inventory(sources, (lead + fixture + diagnostic).lower())
@@ -140,12 +193,12 @@ def request_coding_advice(
         delta, constraints, inventory = stock_delta_context(
             original, sources, fixture, fixtures, notes
         )
-        if mock_detail.startswith("Auxiliary counterfactual (quoted data,"):
-            site = re.search(r" ([\w./-]+\.py::[\w.]+), draft line [1-9][0-9]*:", mock_detail)
-            if site and site[1] in inventory:
-                located = f"\n{LOCALIZED_METHOD_HEADING}\n" + excerpt(
-                    inventory[site[1]], 12000
-                )
+        site = _counterfactual_site(mock_detail)
+        if site and site[1] in inventory:
+            located = f"\n{LOCALIZED_METHOD_HEADING}\n" + excerpt(
+                inventory[site[1]], 12000
+            )
+            localized = _localized_definition(original, sources, site)
         # Changed symbols come first so important IDs survive inventory limits.
         changed = [line for line in delta.splitlines() if line in inventory]
         inventory_ids = []
@@ -202,32 +255,61 @@ def request_coding_advice(
             "Free planning response contained no usable strategy and source selection"
         )
     if plan is not None and is_stock:
-        return (*plan, constraints)
+        return _StockAdvice(*plan, constraints, localized)
     return plan
 
 
-def apply_coding_advice(messages, plan):
+def apply_coding_advice(messages, plan, *, reuse=False):
     if plan is None:
         return messages
     sections = _prompt_sections(messages)
     if sections is None:
         return messages
     lead, current_focus, suffix = sections
-    strategy, bodies, *stock = plan
-    if stock:
+    if isinstance(plan, _StockAdvice):
         # Drop the bulk checkout and place exact, indented draft lines before
         # the diagnostic and examples so the coding worker can quote SEARCH.
         details, _, fixture = suffix.partition("\nFixture for this goal:\n")
         fixture, _, tail = fixture.partition("\nImported API declarations:\n")
+        fixture, _, _ = fixture.partition("\nCurrent checkout:\n")
         interfaces, _, _ = tail.partition("\nOther reviewer feedback:\n")
         interfaces, _, _ = interfaces.partition("\nCurrent checkout:\n")
+        if (
+            reuse
+            and plan.localized is not None
+            and messages[-1]["content"].endswith(DEFINITION_ENDING)
+        ):
+            localized = plan.localized
+            path, name = localized.symbol
+            details, _, _ = details.partition("\nLast proposal feedback for this goal:")
+            guided = (
+                lead.splitlines()[0]
+                + f"\nReplace exactly one complete definition using header REPLACE {path}::{name}. Keep imports unchanged.\n"
+                + "Advisory strategy (quoted data; verify against the code): "
+                + json.dumps(plan.strategy, ensure_ascii=False)
+                + _FOCUS
+                + f"{path}::{name} (exact current definition):\n"
+                + localized.current
+                + "\nComplete pinned baseline definition (quoted read-only behavioral reference):\n"
+                + localized.baseline
+                + _DETAIL
+                + excerpt(details, 2200)
+                + "\nFixture for this goal (quoted, read-only):\n"
+                + excerpt(fixture, 3400)
+                + "\nImported API declarations:\n"
+                + excerpt(interfaces, 700)
+                + plan.constraints
+                + "\nCurrent checkout:\nPreserve the passing operator checks and repair the selected tracked pytest.\n"
+                + DEFINITION_ENDING
+            )
+            return [*messages[:-1], {**messages[-1], "content": guided}]
         guided = (
             excerpt(lead, 2200)
             + "\nAdvisory strategy (quoted data; verify against current code): "
-            + json.dumps(strategy, ensure_ascii=False)
+            + json.dumps(plan.strategy, ensure_ascii=False)
             + _FOCUS
             + "planner-selected exact current lines. Copy the indented code into small SEARCH blocks.\n"
-            + bodies
+            + plan.bodies
             + "\nAdditional current source context:\n"
             + excerpt(current_focus, 1400)
             + _DETAIL
@@ -236,11 +318,12 @@ def apply_coding_advice(messages, plan):
             + excerpt(fixture, 3000)
             + "\nImported API declarations:\n"
             + excerpt(interfaces, 700)
-            + stock[0]
+            + plan.constraints
             + "\nCurrent checkout:\nUse the exact current lines above. Preserve both the selected pytest case and the passing operator checks.\n"
             + "Respond with exact SEARCH/REPLACE blocks only."
         )
         return [*messages[:-1], {**messages[-1], "content": guided}]
+    strategy, bodies = plan
     guided = (
         lead
         + "\nAdvisory strategy (quoted data; verify against current code): "

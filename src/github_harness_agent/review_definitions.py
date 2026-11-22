@@ -163,7 +163,7 @@ def _documents(sources):
     return documents
 
 
-def apply_definitions(response, sources):
+def apply_definitions(response, sources, *, only=None):
     """Return a fresh source mapping or reject the proposal without partial edits."""
     if (
         not isinstance(response, str)
@@ -173,7 +173,12 @@ def apply_definitions(response, sources):
         raise ValueError("Definition response is empty or exceeds the edit limit")
     text = _unfence(response.replace("\r\n", "\n"))
     documents = _documents(sources)
-    return _apply_definition_edits(sources, documents, _edits(text, documents))
+    replacements = _edits(text, documents)
+    if only is not None:
+        replacements = tuple(replacements)
+        if len(replacements) != 1 or replacements[0][:2] != only:
+            raise ValueError("Expected one replacement of the localized definition")
+    return _apply_definition_edits(sources, documents, replacements)
 
 
 def _unique_object(pairs):
