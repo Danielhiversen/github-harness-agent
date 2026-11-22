@@ -13,7 +13,6 @@ _LOOP = (ast.For, ast.AsyncFor, ast.While)
 _CONTROL = (*_LOOP, ast.If, ast.With, ast.AsyncWith, ast.Try, ast.TryStar, ast.Match)
 
 
-
 def _diagnostic_window(lines, imports, row, limit):
     start, stop = max(1, row - 4), min(len(lines), row + 4)
     for index, (first, last) in enumerate(imports):
@@ -261,6 +260,89 @@ def _caller_excerpt(lines, consumer, active, limit):
     return result if len(result) <= limit else ""
 
 
+def _self_attribute(value):
+    return (
+        isinstance(value, ast.Attribute)
+        and isinstance(value.value, ast.Name)
+        and value.value.id == "self"
+    )
+
+
+def _attribute_statements(method):
+    for node in ast.walk(method):
+        if isinstance(node, ast.Assign) and any(map(_self_attribute, node.targets)):
+            yield node
+        elif isinstance(node, ast.AnnAssign) and _self_attribute(node.target):
+            yield node
+        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            call = node.value.func
+            if (
+                isinstance(call, ast.Attribute)
+                and call.attr in {"append", "extend"}
+                and _self_attribute(call.value)
+            ):
+                yield node
+
+
+def _dependency_inventory(lines, module, active, caller, shown, limit):
+    """Summarize missing APIs for local class types referenced by this edit."""
+    direct = _references((active, caller))
+    related = _references(
+        node
+        for node in module.body
+        if isinstance(node, _FUNCTION) and node.name in direct
+    )
+    classes = [
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name in direct | related
+    ]
+    classes.sort(key=lambda node: (node.name not in direct, node.lineno))
+    heading = "# Referenced class APIs (selected source lines)\n"
+    sections = []
+    shown_lines = {line.strip() for line in shown.splitlines()}
+    remaining = limit - len(heading) - 1
+    for cls in classes[:3]:
+        label = f"# {cls.name}\n"
+        allowance = min(remaining, max(320, limit // len(classes))) - len(label)
+        methods = [node for node in cls.body if isinstance(node, _FUNCTION)]
+        methods.sort(key=lambda method: (method.name != "__init__", method.lineno))
+        ranges = [
+            (node.lineno, node.end_lineno)
+            for node in cls.body
+            if isinstance(node, _ASSIGNMENT)
+        ]
+        ranges.extend(
+            (node.lineno, node.end_lineno)
+            for method in methods
+            for node in _attribute_statements(method)
+        )
+        ranges.extend(
+            (method.lineno, max(method.lineno, _start(method.body[0]) - 1))
+            for method in sorted(
+                methods, key=lambda node: (node.name not in direct, node.lineno)
+            )
+            if method.name == "__init__"
+            or method.name in direct
+            or not method.name.startswith("_")
+        )
+        kept = []
+        for start, end in ranges:
+            text = "".join(lines[start - 1 : end])
+            if len(text) > min(allowance, 220) or all(
+                row.strip() in shown_lines for row in text.splitlines() if row.strip()
+            ):
+                continue
+            kept.append(text)
+            allowance -= len(text)
+            shown_lines.update(row.strip() for row in text.splitlines())
+        if kept:
+            section = label + "".join(kept)
+            sections.append(section)
+            remaining -= len(section)
+    return heading + "".join(sections) + "\n" if sections else ""
+
+
 def focused_source_excerpt(
     source, target, *, review_note="", anchor=None, max_chars=3000
 ):
@@ -350,6 +432,19 @@ def focused_source_excerpt(
         append(active, clip_to=max_chars * (45 if consumers else 66) // 100)
     if owner is not None:
         declaration(owner)
+    if consumers and max_chars >= 2400:
+        primary = _caller_excerpt(lines, consumers[0], active, remaining)
+        inventory = _dependency_inventory(
+            lines,
+            module,
+            active,
+            consumers[0],
+            "".join(excerpts) + primary,
+            min(1100, remaining // 5),
+        )
+        if inventory:
+            excerpts.append(inventory)
+            remaining -= len(inventory)
     for index, node in enumerate(consumers[:2]):
         limit = remaining if index == 0 else min(max_chars // 4, remaining)
         chunk = _caller_excerpt(lines, node, active, limit)

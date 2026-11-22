@@ -201,12 +201,18 @@ def test_check_location_precedes_historical_review_in_compact_prompt(
 
 def test_check_focus_rejects_unrecognized_tools_and_external_paths():
     sources = {"core.py": "import array\n"}
-    assert focused_check_excerpt(
-        ("custom-check",), "core.py:1:1: F401 Unused import", sources
-    ) is None
-    assert focused_check_excerpt(
-        ("pytest",), "/operator/core.py:1: AssertionError", sources
-    ) is None
+    assert (
+        focused_check_excerpt(
+            ("custom-check",), "core.py:1:1: F401 Unused import", sources
+        )
+        is None
+    )
+    assert (
+        focused_check_excerpt(
+            ("pytest",), "/operator/core.py:1: AssertionError", sources
+        )
+        is None
+    )
 
 
 def test_compact_review_keeps_middle_of_caller_and_selected_fixture():
@@ -219,10 +225,19 @@ def test_compact_review_keeps_middle_of_caller_and_selected_fixture():
         "            pending.append(dispatch(candidate))\n"
     )
     source = (
-        "def load_index(items):\n    return sorted(items)\n\n"
+        "def load_index(items):\n    return Index().select(items)\n\n"
         "def publish(items):\n"
         f"{filler}{scheduling}{filler}"
         "    return pending\n"
+        "\nclass Index:\n"
+        "    def __init__(self):\n"
+        + "".join("    " + row for row in filler.splitlines(keepends=True))
+        + "        self.segments: list[tuple[int, int]] = []\n"
+        + "".join("    " + row for row in filler.splitlines(keepends=True))
+        + "\n    def register(self, segment):\n"
+        "        self.segments.append(segment)\n"
+        "\n    def select(self, items):\n"
+        "        return sorted(items)\n"
     )
     target = (0, "test_publish.py::test_selected")
     fixtures = {
@@ -242,7 +257,7 @@ def test_compact_review_keeps_middle_of_caller_and_selected_fixture():
         "Earlier proposal omitted the dispatch body",
         review,
         fixtures,
-        (),
+        ("unrelated imported interface\n" * 400,),
         "",
     )
     compact = compact_focused_review(messages, max_bytes=12 * 1024)
@@ -251,6 +266,9 @@ def test_compact_review_keeps_middle_of_caller_and_selected_fixture():
     content = compact[1]["content"]
     assert scheduling in content
     assert "def publish(items):" in content
+    assert "self.segments: list[tuple[int, int]] = []" in content
+    assert "self.segments.append(segment)" in content
+    assert "def select(self, items):" in content
     assert "assert publish(inputs) == submitted" in content
     assert "Keep scheduling order" in content
     assert "Earlier proposal omitted the dispatch body" in content
