@@ -1000,12 +1000,13 @@ def solve(executor, task, archive, budget, version):
                                 archive, check_command, target[1], diagnostics[target]
                             )
                         stock_fixture = stock_fixtures[cache_key]
+                    can_plan = target in operator or bool(stock_fixture)
                     named_definitions = (
                         target in failures
                         and (
                             malformed.get(target, 0) >= RECOVERY_MODE_THRESHOLD
                             or (
-                                target in operator
+                                can_plan
                                 and continuation is None
                                 and repair is None
                                 and no_progress.get(target, 0) >= RECOVERY_MODE_THRESHOLD
@@ -1052,7 +1053,7 @@ def solve(executor, task, archive, budget, version):
                     planner_input = None
                     plan_count, last_planned = planning_attempts.get(target, (0, -3))
                     if (
-                        target in operator
+                        can_plan
                         and not native
                         and advice is None
                         and repair is None
@@ -1063,7 +1064,9 @@ def solve(executor, task, archive, budget, version):
                         and launch_budget >= 2
                         and budget.remaining() > 30
                     ):
-                        fixture = _fixture_excerpt(fixtures, target[1], selected_first=True)
+                        fixture = stock_fixture or _fixture_excerpt(
+                            fixtures, target[1], selected_first=True
+                        )
                         planner_input = source, fixture, diagnostics[target]
                         planning_attempts[target] = plan_count + 1, attempts[target]
                     future = pool.submit(
@@ -1276,6 +1279,7 @@ def solve(executor, task, archive, budget, version):
                 not introduced
                 and not (progressed or partial)
                 and snapshot is current
+                and target in old_operator
                 and no_progress.get(target)
             ):
                 prefix_progress = observe_prefix_progress(
@@ -1299,7 +1303,13 @@ def solve(executor, task, archive, budget, version):
                 or stale_regression
                 or not (progressed or partial or prefix_progress)
             ):
-                if snapshot is current and target in old_operator and "::" in target[1]:
+                if snapshot is current and (
+                    (target in old_operator and "::" in target[1])
+                    or (
+                        target in after
+                        and stock_fixtures.get((target, failures.get(target)))
+                    )
+                ):
                     count_recovery(no_progress, target)
                 if fresh_advice is not None and not introduced and target in after:
                     retry_advice[target] = fresh_advice

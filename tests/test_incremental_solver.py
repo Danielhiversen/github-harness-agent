@@ -563,6 +563,70 @@ def test_stock_pytest_goal_includes_the_tracked_test_without_edit_access(solver_
     assert all(check.returncode == 0 for check in result.checks)
 
 
+def test_stalled_stock_pytest_uses_advice_and_named_fallback(solver_case):
+    task, _, runner, _ = solver_case
+    task = replace(task, require_new_tests=False)
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, content in {
+            SOURCE: BASE_SOURCE + "\ndef stock_result():\n    return -3\n",
+            "tests/test_existing.py": (
+                "from fixture_calc import stock_result\n\n"
+                "def test_stock_result():\n    assert stock_result() == 3\n"
+            ),
+        }.items():
+            data = content.encode()
+            entry = tarfile.TarInfo(path)
+            entry.size = len(data)
+            snapshot.addfile(entry, BytesIO(data))
+    calls = []
+    edits = iter((
+        FIRST + SECOND,
+        edit(SOURCE, "    return -3\n", "    return -4\n"),
+        edit(SOURCE, "    return -3\n", "    return -5\n"),
+        "An incomplete edit",
+        edit(SOURCE, "    return -3\n", "    return -6\n"),
+        edit(SOURCE, "    return -3\n", "    return -7\n"),
+    ))
+
+    class Gateway:
+        def complete(self, *, role, messages, max_output_tokens, **request):
+            prompt = messages[-1]["content"]
+            calls.append((role, prompt, max_output_tokens))
+            if role == "planning":
+                content = '{"strategy": "Correct the stock return value.", "symbols": ["fixture_calc.py::stock_result"]}'
+            elif prompt.endswith("Respond with complete named Python definitions only."):
+                content = f"REPLACE {SOURCE}::stock_result\ndef stock_result():\n    return 3\n"
+            else:
+                content = next(edits, edit(SOURCE, "    return -3\n", "    return 3\n"))
+            return SimpleNamespace(
+                role=role,
+                route="stand-in-free",
+                model="fixture-coder",
+                configured_model="stand-in/free",
+                content=content,
+                usage={},
+            )
+
+    executor = PlainExecutor(runner, Gateway(), Limits(model_requests=8, concurrent_probes=1))
+    budget = _Budget(executor.limits, lambda: False, task)
+    result = solve(executor, task, archive.getvalue(), budget, "fixture-version")
+
+    assert [role for role, _, _ in calls] == ["coding"] * 3 + ["planning"] + ["coding"] * 4
+    planner_prompt = calls[3][1]
+    assert "def test_stock_result():" in planner_prompt
+    assert "assert stock_result() == 3" in planner_prompt
+    assert f"Editable checkout paths (use these exact names): {SOURCE}\n" in planner_prompt
+    assert "def test_first():" not in planner_prompt
+    assert "Correct the stock return value." in calls[4][1]
+    assert "Correct the stock return value." in calls[5][1]
+    assert "Correct the stock return value." not in calls[6][1]
+    assert calls[7][1].endswith("Respond with complete named Python definitions only.")
+    assert calls[7][2] == 6144
+    assert all(check.returncode == 0 for check in result.checks)
+    assert b"tests/test_existing.py" not in result.patch
+
+
 def test_rejected_edit_evidence_reaches_coder_and_planner_without_persistence(
     solver_case,
 ):
