@@ -1,10 +1,12 @@
 """Compare a stalled stock pytest case with its passing pinned baseline."""
 
 import ast
+import hashlib
 import inspect
 import json
 import re
 import time
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 from types import SimpleNamespace
 
@@ -24,11 +26,38 @@ _OBSERVATION_BOUNDARY = re.compile(
 )
 
 
+@dataclass(frozen=True)
+class CounterCallerLocation:
+    path: str
+    name: str
+    line: int
+    source_digest: str
+
+
+@dataclass(frozen=True)
+class CounterCallerSite:
+    locations: tuple[CounterCallerLocation, ...]
+    excerpts: str
+
+
+class _ReplayDiagnostic(str):
+    def __new__(cls, text, site):
+        result = super().__new__(cls, text)
+        result.counter_site = site
+        return result
+
+
+def counter_caller_site(report):
+    return report.counter_site if isinstance(report, _ReplayDiagnostic) else None
+
+
 def compact_observations(detail, limit):
     """Budget for each replay report, including both sides of a counter comparison."""
     if len(detail.encode()) <= limit:
         return detail
-    reports = [part.strip() for part in _OBSERVATION_BOUNDARY.split(detail) if part.strip()]
+    reports = [
+        part.strip() for part in _OBSERVATION_BOUNDARY.split(detail) if part.strip()
+    ]
     if not reports:
         return ""
     allowance = max(0, (limit - len(reports) + 1) // len(reports))
@@ -36,13 +65,16 @@ def compact_observations(detail, limit):
     for report in reports:
         if report.startswith(_COUNTER_HEADING) and len(report.encode()) > allowance:
             rows = [
-                line for line in report.splitlines()
+                line
+                for line in report.splitlines()
                 if line.startswith(("Pinned: ", "Draft: "))
             ]
             if rows and allowance > len(_COUNTER_HEADING) + len(rows):
                 row_limit = (allowance - len(_COUNTER_HEADING) - len(rows)) // len(rows)
                 result.append(
-                    _COUNTER_HEADING + "\n" + "\n".join(excerpt(row, row_limit) for row in rows)
+                    _COUNTER_HEADING
+                    + "\n"
+                    + "\n".join(excerpt(row, row_limit) for row in rows)
                 )
                 continue
         result.append(excerpt(report, allowance))
@@ -272,17 +304,29 @@ def _divergent_caller_source(old, new, sources):
             continue
         pair = next(
             (
-                (before, after)
-                for before, after in zip(base_stack[1:], draft_stack[1:])
+                (offset, before, after)
+                for offset, (before, after) in enumerate(
+                    zip(base_stack[1:], draft_stack[1:]), 1
+                )
                 if before[:2] != after[:2]
             ),
             None,
         )
         if pair is not None:
-            base = _caller_source("Pinned", pair[0], sources[0])
-            attempted = _caller_source("Draft", pair[1], sources[1])
-            return base + attempted if base and attempted else ""
-    return ""
+            offset, before, after = pair
+            base = _caller_source("Pinned", before, sources[0])
+            attempted = _caller_source("Draft", after, sources[1])
+            if not base or not attempted:
+                return None
+            locations = tuple(
+                CounterCallerLocation(
+                    path, name, line, hashlib.sha256(source.encode()).hexdigest()
+                )
+                for path, name, line in draft_stack[offset:]
+                if (source := sources[1].get(path))
+            )
+            return CounterCallerSite(locations, base + attempted)
+    return None
 
 
 def _counter_difference(baseline, candidate, node, reviewed_sources=None):
@@ -342,17 +386,18 @@ def _counter_difference(baseline, candidate, node, reviewed_sources=None):
     rows = [
         render(label, events) for label, events in (("Pinned", old), ("Draft", new))
     ]
-    return (
+    text = (
         _COUNTER_HEADING + " "
         f"The pinned case passed and the draft failed at {node} line {line} (evaluation {failed + 1}). "
         "Locations show where the probe observed each change, with reviewed callers.\n"
         + "\n".join(rows)
-        + (
-            _divergent_caller_source(old[first:], new[first:], reviewed_sources)
-            if reviewed_sources
-            else ""
-        )
     )
+    site = (
+        _divergent_caller_source(old[first:], new[first:], reviewed_sources)
+        if reviewed_sources
+        else None
+    )
+    return _ReplayDiagnostic(text + site.excerpts, site) if site else text
 
 
 def mock_call_diagnostic(
@@ -418,14 +463,9 @@ def mock_call_diagnostic(
     )
     if candidate is None:
         return ""
-    return "\n".join(
-        filter(
-            None,
-            (
-                _counter_difference(
-                    baseline[1], candidate[1], base_node, reviewed_sources
-                ),
-                _differences(baseline[0], candidate[0]),
-            ),
-        )
+    counter = _counter_difference(
+        baseline[1], candidate[1], base_node, reviewed_sources
     )
+    text = "\n".join(filter(None, (counter, _differences(baseline[0], candidate[0]))))
+    site = counter_caller_site(counter)
+    return _ReplayDiagnostic(text, site) if site else text

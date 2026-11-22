@@ -49,7 +49,11 @@ from .review_definitions import (
 )
 from .review_guard_probe import stock_guard_diagnostic
 from .review_guards import guarded_sources
-from .review_mock_replay import compact_observations, mock_call_diagnostic
+from .review_mock_replay import (
+    compact_observations,
+    counter_caller_site,
+    mock_call_diagnostic,
+)
 from .review_line_ranges import (
     LineRangeSnapshot,
     apply_line_range_edit,
@@ -1493,6 +1497,7 @@ def solve(executor, task, archive, budget, version):
     line_routes = {}
     stock_fixtures = {}
     mock_diagnostics = {}
+    counter_sites = {}
     max_proposals = min(36, budget.model_requests_remaining())
     editor = actor
     submitted = 0
@@ -1534,6 +1539,7 @@ def solve(executor, task, archive, budget, version):
         line_retries.clear()
         line_routes.clear()
         mock_diagnostics.clear()
+        counter_sites.clear()
         last_routes.pop(target, None)
         notes.pop(target, None)
         malformed.pop(target, None)
@@ -1841,6 +1847,7 @@ def solve(executor, task, archive, budget, version):
                             original, source, stock_fixture, patch_for,
                         )
                         mock_diagnostics[target] = "\n".join(filter(None, (counterfactual, traces)))
+                        counter_sites[target] = counter_caller_site(traces)
                         if counterfactual:
                             _LOG.info("Isolated guard replay localized the tracked pytest regression")
                     mock_detail = mock_diagnostics.get(target, "")
@@ -1911,6 +1918,7 @@ def solve(executor, task, archive, budget, version):
                         planner_input = (
                             source, fixture, diagnostics[target], mock_detail,
                             (original, fixtures, review.feedback) if stock_fixture else None,
+                            counter_sites.get(target),
                         )
                         planning_attempts[target] = plan_count + 1, attempts[target]
                     rotation_key = None

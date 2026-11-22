@@ -474,6 +474,7 @@ _LOCALIZED_BASELINE_EXCERPT = (
 )
 _LOCALIZED_FIXTURE = "\nFixture for this goal (quoted, read-only):\n"
 _LOCALIZED_FOCUS = "\nFocused source from "
+COUNTER_CALLER_EVIDENCE = "\nVerified counter caller source windows (quoted):\n"
 _LOCALIZED_FAILURE = "\nFailure details:\n"
 _LOCALIZED_CHECKOUT = "\nCurrent checkout:\n"
 _LOCALIZED_STRATEGY = "\nAdvisory strategy (quoted data; verify against the code): "
@@ -514,6 +515,7 @@ def _compact_localized_review(messages, max_bytes):
     current, found_base, reference = source.partition(baseline_marker)
     baseline, found_failure, detail = reference.partition(_LOCALIZED_FAILURE)
     failure, found_fixture, fixture = detail.partition(_LOCALIZED_FIXTURE)
+    failure, caller_marker, caller_excerpts = failure.partition(COUNTER_CALLER_EVIDENCE)
     if not all((found_base, found_failure, found_fixture, current.strip())):
         return None
     checkout, found_checkout, footer = fixture.partition(_LOCALIZED_CHECKOUT)
@@ -529,6 +531,7 @@ def _compact_localized_review(messages, max_bytes):
         (strategy_marker, strategy, 8),
         (_LOCALIZED_BASELINE_EXCERPT, baseline, 10),
         (_LOCALIZED_FAILURE, failure, 20),
+        (caller_marker, caller_excerpts, None),
         (_LOCALIZED_FIXTURE, fixture, 25),
         (_LOCALIZED_IMPORTS, imports, 2),
         (_LOCALIZED_NOTES, notes if notes_marker else "", 10),
@@ -557,8 +560,17 @@ def _compact_localized_review(messages, max_bytes):
     spare = max_bytes - wire_size(payload(markers))
     if spare < 0:
         return None
+    caller_size = wire_size(caller_excerpts) - 2
+    retain_callers = bool(caller_excerpts) and spare >= caller_size + 384
+    if retain_callers:
+        spare -= caller_size
     excerpts = [
-        heading + _bounded_content(body, spare * share // 100)
+        heading
+        + (
+            (body if retain_callers else "")
+            if share is None
+            else _bounded_content(body, spare * share // 100)
+        )
         for heading, body, share in layout
     ]
     compact = payload(excerpts)

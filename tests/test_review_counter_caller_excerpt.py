@@ -1,4 +1,9 @@
-from github_harness_agent.review_mock_replay import _counter_difference
+from github_harness_agent.review_mock_replay import (
+    _counter_difference,
+    counter_caller_site,
+)
+from github_harness_agent.review_delta_context import stock_delta_context
+from github_harness_agent.review_planner import _localized_counter_definition
 
 
 BASELINE = """def increment(mapping):
@@ -66,3 +71,21 @@ def test_counter_caller_source_requires_both_reviewed_files_and_a_common_origin(
         "tests/test_demo.py::test_count",
         ({"module.py": BASELINE}, {"module.py": DRAFT}),
     )
+
+
+def test_caller_location_uses_existing_enclosing_definition_when_helper_is_new():
+    pinned = _report(None, [["module.py", "original_route", 7]])
+    draft = _report(
+        0, [["module.py", "added_route", 7], ["module.py", "original_route", 13]]
+    )
+    original, sources = {"module.py": BASELINE}, {"module.py": DRAFT}
+    report = _counter_difference(
+        pinned, draft, "tests/test_demo.py::test_count", (original, sources)
+    )
+    _, _, inventory = stock_delta_context(original, sources, "", {}, [])
+    localized = _localized_counter_definition(
+        original, sources, inventory, counter_caller_site(report)
+    )
+    assert localized.symbol == ("module.py", "original_route")
+    assert "if allowed:" in localized.baseline
+    assert "added_route(mapping, allowed)" in localized.current

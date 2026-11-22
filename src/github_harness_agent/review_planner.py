@@ -1,6 +1,7 @@
 """Optional advisory planning for a stalled review implementation goal."""
 
 import ast
+import hashlib
 import json
 import logging
 import re
@@ -21,7 +22,8 @@ from .review_delta_context import (
     stock_delta_context,
 )
 from .review_line_ranges import LINE_RANGE_ENDING, line_range_prompt
-from .task_context import excerpt, wire_size
+from .review_mock_replay import CounterCallerSite, compact_observations
+from .task_context import COUNTER_CALLER_EVIDENCE, excerpt, wire_size
 
 _LOG = logging.getLogger(__name__)
 
@@ -54,6 +56,7 @@ class _StockAdvice:
     bodies: str
     constraints: str
     localized: _LocalizedDefinition | None
+    caller_excerpts: str
 
 
 def localized_retry_symbol(advice):
@@ -71,19 +74,34 @@ def _counterfactual_site(mock_detail):
     return None
 
 
-def _localized_definition(original, sources, site):
-    key = site[1]
+def _localized_definition(original, sources, key, line):
     if not _HEADER.fullmatch(f"REPLACE {key}"):
         return None
     path, name = key.split("::", 1)
     old = _definitions({path: original[path]}).get(key)
     new = _definitions({path: sources[path]}).get(key)
-    if old is None or new is None or not new[0] <= int(site[2]) < new[0] + len(new[1]):
+    if old is None or new is None or not new[0] <= line < new[0] + len(new[1]):
         return None
     baseline, current = "".join(old[1]), "".join(new[1])
     if max(wire_size(baseline), wire_size(current)) > STOCK_SOURCE_LIMIT:
         return None
     return _LocalizedDefinition((path, name), baseline, current)
+
+
+def _localized_counter_definition(original, sources, inventory, site):
+    if not isinstance(site, CounterCallerSite):
+        return None
+    for location in site.locations:
+        key = f"{location.path}::{location.name}"
+        if key not in inventory:
+            continue
+        source = sources[location.path]
+        if hashlib.sha256(source.encode()).hexdigest() != location.source_digest:
+            continue
+        localized = _localized_definition(original, sources, key, location.line)
+        if localized is not None:
+            return localized
+    return None
 
 
 def _inventory(sources, query):
@@ -178,12 +196,13 @@ def request_coding_advice(
     diagnostic,
     mock_detail="",
     stock_inputs=None,
+    counter_site=None,
 ):
     sections = _prompt_sections(messages)
     if sections is None:
         return None
     lead, current_focus, _ = sections
-    delta = constraints = located = ""
+    delta = constraints = located = caller_excerpts = ""
     localized = None
     is_stock = stock_inputs is not None
     if not is_stock:
@@ -194,12 +213,21 @@ def request_coding_advice(
         delta, constraints, inventory = stock_delta_context(
             original, sources, fixture, fixtures, notes
         )
-        site = _counterfactual_site(mock_detail)
-        if site and site[1] in inventory:
-            located = f"\n{LOCALIZED_METHOD_HEADING}\n" + excerpt(
-                inventory[site[1]], 12000
-            )
-            localized = _localized_definition(original, sources, site)
+        localized = _localized_counter_definition(
+            original, sources, inventory, counter_site
+        )
+        if localized is not None:
+            located = f"\n{LOCALIZED_METHOD_HEADING}\n" + localized.current
+            caller_excerpts = counter_site.excerpts
+        else:
+            site = _counterfactual_site(mock_detail)
+            if site and site[1] in inventory:
+                located = f"\n{LOCALIZED_METHOD_HEADING}\n" + excerpt(
+                    inventory[site[1]], 12000
+                )
+                localized = _localized_definition(
+                    original, sources, site[1], int(site[2])
+                )
         # Changed symbols come first so important IDs survive inventory limits.
         changed = [line for line in delta.splitlines() if line in inventory]
         inventory_ids = []
@@ -213,7 +241,14 @@ def request_coding_advice(
         return None
     if is_stock:
         lead = excerpt(lead, 2200)
-        mock_detail = excerpt(mock_detail, 3000)
+        if caller_excerpts:
+            mock_detail = (
+                compact_observations(mock_detail.replace(caller_excerpts, "", 1), 1900)
+                + COUNTER_CALLER_EVIDENCE
+                + caller_excerpts
+            )
+        else:
+            mock_detail = excerpt(mock_detail, 3000)
     request = (
         lead
         + "\nVerification diagnostic (quoted):\n"
@@ -256,7 +291,7 @@ def request_coding_advice(
             "Free planning response contained no usable strategy and source selection"
         )
     if plan is not None and is_stock:
-        return _StockAdvice(*plan, constraints, localized)
+        return _StockAdvice(*plan, constraints, localized, caller_excerpts)
     return plan
 
 
@@ -271,6 +306,10 @@ def apply_coding_advice(messages, plan, *, reuse=False, line_snapshot=None):
         # Drop the bulk checkout and place exact, indented draft lines before
         # the diagnostic and examples so the coding worker can quote SEARCH.
         details, _, fixture = suffix.partition("\nFixture for this goal:\n")
+        caller_context = ""
+        if plan.caller_excerpts:
+            details = details.replace(plan.caller_excerpts, "", 1)
+            caller_context = COUNTER_CALLER_EVIDENCE + plan.caller_excerpts
         fixture, _, tail = fixture.partition("\nImported API declarations:\n")
         fixture, _, _ = fixture.partition("\nCurrent checkout:\n")
         interfaces, _, _ = tail.partition("\nOther reviewer feedback:\n")
@@ -312,6 +351,7 @@ def apply_coding_advice(messages, plan, *, reuse=False, line_snapshot=None):
                 + localized.baseline
                 + _DETAIL
                 + excerpt(details, 2200)
+                + caller_context
                 + "\nFixture for this goal (quoted, read-only):\n"
                 + excerpt(fixture, 3400)
                 + "\nImported API declarations:\n"
@@ -331,6 +371,7 @@ def apply_coding_advice(messages, plan, *, reuse=False, line_snapshot=None):
             + "\nAdditional current source context:\n"
             + excerpt(current_focus, 1400)
             + _DETAIL
+            + caller_context
             + excerpt(details, 1400)
             + "\nFixture for this goal:\n"
             + excerpt(fixture, 3000)

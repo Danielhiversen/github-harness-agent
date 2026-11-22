@@ -128,3 +128,105 @@ def test_named_retry_rejects_edits_outside_localized_definition():
             sources,
             only=(PATH, "Queue.receive"),
         )
+
+
+def test_verified_counter_caller_localizes_and_survives_constrained_sparse_prompt():
+    from github_harness_agent.review_line_ranges import prepare_line_range_edit
+    from github_harness_agent.review_mock_replay import (
+        _counter_difference,
+        counter_caller_site,
+    )
+    from github_harness_agent.review_planner import request_coding_advice
+    import httpx
+    from test_providers import GROQ, deployment, openai_response, routed
+
+    from github_harness_agent.task_context import wire_size
+
+    old = (
+        "    def receive(self, value):\n"
+        "        if value > 4:\n"
+        "            self.increment(value)\n"
+        + "        # Keep the exact localized definition.\n" * 140
+        + "        return value + 3\n"
+    )
+    current = old.replace("value > 4", "value >= 4")
+    prefix = (
+        "class Queue:\n"
+        "    def fallback(self, value):\n"
+        "        if value < 2:\n"
+        "            self.increment(value)\n\n"
+    )
+    original = {PATH: prefix + old}
+    sources = {PATH: prefix + current}
+    shared = [PATH, "Queue.increment", 1]
+    pinned_stack = [shared, [PATH, "Queue.fallback", 4]]
+    draft_stack = [shared, [PATH, "Queue.receive", 8]]
+    report = _counter_difference(
+        [1, None, [["a" * 64, [[pinned_stack, 0, 1]]]]],
+        [1, 0, [["a" * 64, [[draft_stack, 0, 1]]]]],
+        "test_queue.py::test_tracked",
+        (original, sources),
+    )
+    calls = []
+
+    def complete(gateway, role, messages, *rest, **options):
+        calls.append((role, messages, options))
+        return SimpleNamespace(
+            content='{"strategy":"Trace the correct dispatch.","symbols":["pkg.queue.Queue.receive"]}'
+        )
+
+    executor = SimpleNamespace(gateway=object())
+    budget = SimpleNamespace(complete=complete)
+    planner_args = (
+        executor,
+        budget,
+        _messages(False),
+        sources,
+        STOCK,
+        "stock failure",
+        str(report),
+        (original, {"tests/test_operator.py": OPERATOR}, []),
+    )
+    advice = request_coding_advice(
+        *planner_args, counter_site=counter_caller_site(report)
+    )
+    assert calls[0][2]["timeout_cap"] == 120
+    assert current in calls[0][1][-1]["content"]
+    assert localized_retry_symbol(advice) == (PATH, "Queue.receive")
+    retry = _messages(True)
+    retry[-1]["content"] = retry[-1]["content"].replace(
+        "stock failure", "stock failure\n" + str(report)
+    )
+    _coding_completion(executor, budget, retry, None, None, advice=advice)
+    assert old in calls[1][1][-1]["content"] and current in calls[1][1][-1]["content"]
+    line_snapshot = prepare_line_range_edit(sources, (PATH, "Queue.receive"))
+    _coding_completion(
+        executor, budget, retry, None, None, advice=advice, line_snapshot=line_snapshot
+    )
+    requests = []
+
+    def handle(request):
+        import json
+
+        messages = json.loads(request.content)["messages"]
+        requests.append(messages)
+        return httpx.Response(200, json=openai_response())
+
+    assert wire_size(calls[2][1]) > 12 * 1024
+    router = routed(deployment(GROQ), handle)
+    router.complete(role="coding", messages=calls[2][1], max_output_tokens=3072)
+    assert len(requests) == 1 and wire_size(requests[0]) <= 12 * 1024
+    prompt = requests[0][-1]["content"]
+    assert line_snapshot.digest in prompt and "return value + 3" in prompt
+    assert "Pinned caller source" in prompt and "Draft caller source" in prompt
+    assert "if value < 2:" in prompt and "if value >= 4:" in prompt
+    assert "assert queue.receive(5) == 8" in prompt
+    untrusted = request_coding_advice(*planner_args)
+    assert localized_retry_symbol(untrusted) is None
+    assert calls[-1][2]["timeout_cap"] == 60
+
+    stale = list(planner_args)
+    stale[3] = {PATH: sources[PATH].replace("value >= 4", "value >= 5")}
+    rejected = request_coding_advice(*stale, counter_site=counter_caller_site(report))
+    assert localized_retry_symbol(rejected) is None
+    assert calls[-1][2]["timeout_cap"] == 60
