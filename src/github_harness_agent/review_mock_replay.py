@@ -11,7 +11,8 @@ from .review_solver_context import _STOCK_NODE
 from .worker import Cancelled, ExecutionError, LimitExceeded
 
 _PLANNING_RESERVE = 30
-_REPLAY_SECONDS = 10
+# Includes startup and staging in a fresh isolated verification workspace.
+_REPLAY_SECONDS = 20
 _DETAIL_BYTES = 900
 
 
