@@ -11,7 +11,7 @@ from github_harness_agent.review_solver_context import (
 from github_harness_agent.task_context import compact_focused_review
 from github_harness_agent.review_solver import _proposal_messages
 from github_harness_agent.review_recovery import ReviewRecovery
-from github_harness_agent.task_context import wire_size
+from github_harness_agent.task_context import MESSAGE_BYTES, wire_size
 
 
 @pytest.fixture
@@ -217,6 +217,19 @@ def normalize(values):
     assert "Editable checkout paths" in prompt
     assert "Reviewer feedback: Normalize the numeric category" in prompt
     assert "Focused source from module.py:\n# Line 4\ndef normalize" in prompt
+
+
+def test_stock_pytest_context_keeps_full_source_when_it_fits_the_cloud_request():
+    source = "def main():\n    return items()\n" + "# padding\n" * 2800
+    source += "def neighboring_helper():\n    return 12345\n"
+    target = (1, "tests/test_items.py::test_selection")
+    review = ReviewRecovery((("module.py", 1, "Preserve selection order"),), "")
+    messages = _proposal_messages(
+        target, {"module.py": source}, {target: "AssertionError"}, False, "",
+        review, {}, (), "", stock_fixture="def test_selection():\n    assert main()",
+    )
+    assert source in messages[-1]["content"]
+    assert wire_size(messages) <= MESSAGE_BYTES
 
 
 @pytest.mark.parametrize(

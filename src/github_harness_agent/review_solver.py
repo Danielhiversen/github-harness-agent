@@ -45,7 +45,7 @@ from .review_solver_context import (
     focused_source_excerpt,
     stock_pytest_excerpt,
 )
-from .task_context import compact_focused_review, excerpt
+from .task_context import MESSAGE_BYTES, compact_focused_review, excerpt, wire_size
 from .test_updates import has_runnable_test
 
 _LOG = logging.getLogger(__name__)
@@ -505,16 +505,6 @@ def _proposal_messages(
             f"Focused source from {path}:\n{focus}\n"
             f"Failure details:\n{diagnostic}\n"
         )
-    source = "\n".join(
-        f"FILE {name}\n"
-        + (
-            content
-            if name == path and len(content) <= 24000
-            else source_excerpt(content, query, 14500 // len(current))
-        )
-        for name, content in current.items()
-        if content
-    )
     editable = [
         name for name, text in current.items() if text or (needs_tests and not failures)
     ]
@@ -544,21 +534,42 @@ def _proposal_messages(
         )
         + (f"\nNew test file: {new_path}\n" if needs_tests and not failures else "")
         + "\nCurrent checkout:\n"
-        + source
-        + f"\nSelected failure: {target[1]}. Fix this failure without breaking passing behavior.\n"
+    )
+    ending = (
+        f"\nSelected failure: {target[1]}. Fix this failure without breaking passing behavior.\n"
         + (
             DEFINITION_ENDING
             if named_definitions
             else "Respond with exact SEARCH/REPLACE blocks only."
         )
     )
-    return [
-        {
-            "role": "system",
-            "content": _DEFINITION_SYSTEM if named_definitions else _SYSTEM,
-        },
-        {"role": "user", "content": request},
-    ]
+
+    def with_sources(items):
+        source = "\n".join(f"FILE {name}\n{content}" for name, content in items if content)
+        return [
+            {
+                "role": "system",
+                "content": _DEFINITION_SYSTEM if named_definitions else _SYSTEM,
+            },
+            {"role": "user", "content": request + source + ending},
+        ]
+
+    # A stock regression can originate outside the historical review anchor.
+    # Keep those definitions when the complete request fits its existing budget.
+    if stock_fixture and sum(map(len, current.values())) <= MESSAGE_BYTES:
+        complete = with_sources(current.items())
+        if wire_size(complete) <= MESSAGE_BYTES:
+            return complete
+    return with_sources(
+        (
+            name,
+            content
+            if name == path and len(content) <= 24000
+            else source_excerpt(content, query, 14500 // len(current)),
+        )
+        for name, content in current.items()
+        if content
+    )
 
 
 def _finish_review(executor, task, archive, budget, patch, actor, version):
