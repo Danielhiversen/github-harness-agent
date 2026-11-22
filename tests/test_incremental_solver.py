@@ -2903,6 +2903,53 @@ def test_solver_accepts_only_authorized_complete_test_modules(solver_case, scena
     assert not checkpoints
 
 
+@pytest.mark.parametrize("proposal_kind", ("regression", "removed", "collection"))
+def test_solver_preserves_verified_passing_cases_in_unpublished_draft(solver_case, proposal_kind):
+    task, archive, runner, checkpoints = solver_case
+    fixed = BASE_SOURCE.replace("return -1", "return 1").replace("return -2", "return 2")
+    checkpoint = DraftCheckpoint(
+        "harness2/base",
+        task.base_sha,
+        patch_for({SOURCE: BASE_SOURCE}, {SOURCE: fixed}),
+        guidance=_GUIDANCE,
+        last_editor=("fixture", "fixture/coder"),
+    )
+    task = replace(task, checkpoints={checkpoint.key: checkpoint})
+    keep = "\n\ndef test_keep():\n    assert second() == 2\n"
+    good = TEST + keep
+    previous = good.replace("(1, 2)", "(0, 0)")
+    if proposal_kind == "regression":
+        new_draft = good.replace("second() == 2", "second() == 3")
+    elif proposal_kind == "removed":
+        new_draft = TEST
+    else:
+        new_draft = "from fixture_calc import unavailable\n" + previous
+    expected_draft = new_draft if proposal_kind == "collection" else previous
+    gateway = FreeGateway(
+        edit(NEW_TEST, "", previous),
+        edit(NEW_TEST, previous, new_draft),
+        edit(NEW_TEST, expected_draft, good),
+    )
+    independent = runner.path / "independent"
+    independent.mkdir()
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=3),
+        verification_runner=FixtureRunner(independent),
+    )
+
+    result = solve(executor, task, archive, _Budget(executor.limits, lambda: False, task), "fixture-version")
+
+    assert expected_draft in gateway.prompts[2]
+    if proposal_kind == "collection":
+        assert "during collection" in gateway.prompts[2]
+    else:
+        assert f"Selected failing case: {NEW_TEST}::test_results" in gateway.prompts[2]
+        assert f"{NEW_TEST}::test_keep" in gateway.prompts[2]
+    assert b"def test_keep():\n+    assert second() == 2" in result.patch
+    assert any(NEW_TEST in check.command and check.returncode == 0 for check in result.checks)
+    assert not checkpoints
+
+
 @pytest.mark.parametrize(
     "tool_reply", ("valid", "extra", "duplicate", "unavailable", "empty", "failing_test"),
 )

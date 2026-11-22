@@ -1980,7 +1980,9 @@ class PlainExecutor:
                     if any(check.returncode for check in checks):
                         break
                     report = f".git/gha-test-update-{uuid4().hex}.xml"
-                    focused = focused_pytest(task.checks, selectors, report)
+                    focused = focused_pytest(
+                        task.checks, selectors, report, verbose=selectors == new_python_tests
+                    )
                     if not focused:
                         continue
                     check = self._run_checks(workspace, budget, (focused,))[0]

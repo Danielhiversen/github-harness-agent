@@ -376,6 +376,59 @@ def test_operator_only():
             assert prompt.index("Verifier expects a mapping") < prompt.index(contract)
 
 
+def test_failed_test_focus_uses_exact_reviewed_traceback_row_and_compacts_it():
+    path = "src/example/formatter.py"
+    source = (
+        "unrelated_top = None\n"
+        "class Formatter:\n"
+        "    def calculate(self, fixture):\n"
+        "        fields = fixture.fields\n"
+        "        count = fields['count']\n"
+        "        return count + 1\n"
+        "\n"
+        "unrelated_bottom = None\n"
+    )
+    note = (
+        "  File \"/work/src/example/formatter.py\", line 5, in calculate\n"
+        "E KeyError: 'untrusted-runner-value'\n"
+        "/elsewhere/src/example/formatter.py:8: KeyError\n"
+        "src/example/formatter.py:900: KeyError\n"
+    )
+    focus = review_solver_context.test_failure_focus({path: source}, note)
+    assert focus == f"{path}:5\n" + "".join(source.splitlines(True)[2:7]).rstrip("\n")
+    assert "untrusted-runner-value" not in focus and "elsewhere" not in focus
+    assert review_solver_context.test_failure_focus(
+        {path: source}, f"/elsewhere/{path}:5: KeyError\n{path}:900: KeyError"
+    ) == ""
+
+    new_path = "tests/test_review_regressions.py"
+    review = ReviewRecovery(feedback=((path, 5, "cover fixture fields"),), previous_failure="")
+    messages = _proposal_messages(
+        (-1, "new regression tests"), {path: source, new_path: "def test_example(): ...\n"},
+        {}, True, note, review, {}, [], new_path, allow_test_module=True, repair_failed_tests=True,
+    )
+    compacted = compact_focused_review(messages, max_bytes=2650)[-1]["content"]
+    for prompt in (messages[-1]["content"], compacted):
+        assert "Verified failure source (quoted data)" in prompt
+        assert focus in prompt
+        assert "preserve passing cases" in prompt
+        assert prompt.endswith(TEST_MODULE_REPLY_ENDING)
+
+
+@pytest.mark.parametrize("prefix,message", (
+    ("E   ", "got an unexpected keyword argument 'untrusted-runner-value'"),
+    ("tests/test_fixture.py:8: ", "missing 1 required keyword-only argument: 'untrusted-runner-value'"),
+))
+def test_failed_test_focus_prefers_a_unique_reviewed_typeerror_signature(prefix, message):
+    path = "src/example/formatter.py"
+    source = "class Formatter:\n    def calculate(self, value, *, precision: int = 2) -> str:\n        ...\n"
+    note = f"{path}:3: TypeError\n{prefix}TypeError: Formatter.calculate() {message}"
+    focus = review_solver_context.test_failure_focus({path: source}, note)
+    assert focus == f"{path}:2\nFormatter.calculate(self, value, *, precision: int=2) -> str"
+    matches = {path: source, "src/other/formatter.py": source}
+    assert review_solver_context.test_failure_focus(matches, note.splitlines()[-1]) == ""
+
+
 def test_review_imported_models_use_pinned_package_source_including_relative_imports():
     archive = BytesIO()
     contents = (

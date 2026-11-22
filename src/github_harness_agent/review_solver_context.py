@@ -108,6 +108,61 @@ def focused_check_excerpt(command, diagnostic, sources, *, max_chars=2800):
     return (focus_path, "".join(chunks)) if chunks else None
 
 
+_NATIVE_TEST_FRAME = re.compile(r'^File "([^"\n]{1,512}\.py)", line ([1-9][0-9]{0,6})(?:, in .*)?$')
+_ARGUMENT_TYPEERROR = re.compile(
+    r"^(?:E\s+|[^\n]{1,512}\.py:[1-9][0-9]{0,6}:\s*)?"
+    r"TypeError:\s+([A-Za-z_]\w{0,100})(?:\.([A-Za-z_]\w{0,100}))?\(\) "
+    r"(?:got an unexpected keyword argument|missing [1-9][0-9]* required "
+    r"(?:positional|keyword-only) arguments?)(?=[:\s]|$)"
+)
+
+
+def _reviewed_argument_signature(sources, owner, method):
+    matches = []
+    for path, source in sources.items():
+        try:
+            declarations = ast.parse(source).body
+            for declaration in declarations:
+                if not isinstance(declaration, ast.ClassDef) or declaration.name != owner:
+                    continue
+                for node in declaration.body:
+                    if isinstance(node, _FUNCTION) and node.name == method:
+                        signature = f"{owner}.{method}({ast.unparse(node.args)})"
+                        if node.returns is not None:
+                            signature += f" -> {ast.unparse(node.returns)}"
+                        matches.append(f"{path}:{node.lineno}\n{signature}")
+        except (SyntaxError, ValueError, RecursionError):
+            continue
+    return matches[0] if len(matches) == 1 else ""
+
+
+def test_failure_focus(sources, diagnostic, *, max_bytes=660):
+    """Return at most one small excerpt from reviewed source named by the test failure."""
+    diagnostic_lines = diagnostic.splitlines()
+    for line in reversed(diagnostic_lines):
+        match = _ARGUMENT_TYPEERROR.match(line.lstrip())
+        if match:
+            signature = _reviewed_argument_signature(sources, match[1], match[2] or "__init__")
+            if signature and len(signature.encode()) <= max_bytes:
+                return signature
+    for line in reversed(diagnostic_lines):
+        native = _NATIVE_TEST_FRAME.fullmatch(line.lstrip())
+        frames = ((native[1], int(native[2])),) if native else check_locations(("pytest",), line)
+        for raw_path, row in frames:
+            path = raw_path.removeprefix("/work/").removeprefix("./")
+            if path not in sources:
+                continue
+            lines = sources[path].splitlines(keepends=True)
+            if row > len(lines):
+                continue
+            for radius in (2, 1, 0):
+                context = "".join(lines[max(0, row - 1 - radius) : row + radius]).rstrip("\n")
+                focus = f"{path}:{row}\n{context}"
+                if context.strip() and len(focus.encode()) <= max_bytes:
+                    return focus
+    return ""
+
+
 def _tracked_python(snapshot, path):
     try:
         member = snapshot.getmember(path)

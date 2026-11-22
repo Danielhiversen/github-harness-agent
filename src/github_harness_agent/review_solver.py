@@ -106,6 +106,7 @@ from .review_solver_context import (
     stock_integer_assertion_failure_line,
     stock_missing_count_after_reorder,
     stock_pytest_excerpt,
+    test_failure_focus,
 )
 from .review_stock_collection import stock_collection
 from .task_context import (
@@ -116,6 +117,7 @@ from .task_context import (
     TEST_MODULE_REPLY_ENDING,
     TEST_REPAIR_GUIDANCE,
     TEST_VERIFICATION_FEEDBACK,
+    TEST_VERIFICATION_SOURCE,
     compact_focused_review,
     excerpt,
     wire_size,
@@ -184,6 +186,12 @@ _FILE_HEADER = re.compile(
     re.M | re.I,
 )
 _TEST_RESULT = re.compile(r"^(FAILED|ERROR) ([^\s]+::[^\s]+)", re.M)
+_NAMED_PYTEST_PASS = re.compile(
+    r"^(\S+\.py::\S+) PASSED(?:[ \t]+\[[ 0-9]+%\])?[ \t]*$", re.M
+)
+_NAMED_PYTEST_FAIL = re.compile(
+    r"^FAILED (\S+\.py::\S+)(?:[ \t]+- [^\n]*)?[ \t]*$", re.M
+)
 _TEST_SECTION = re.compile(r"^_{5,} (.+?) _{5,}$", re.M)
 _PYTEST_SECTION = re.compile(r"^={5,} ([^\n]+?) ={5,}$", re.M)
 _PYTEST_CRASH_LINE = re.compile(r"^\S[^\n]*?\.py:[1-9][0-9]*: .+$")
@@ -469,12 +477,19 @@ class _PytestRun:
     passed: int
     failed: frozenset[str]
     deselected: int
+    named_cases: frozenset[str] | None = None
 
 
 def _complete_pytest_run(outcome):
-    if outcome.returncode not in (0, 1) or not outcome.stdout:
+    if not outcome.stdout:
         return None
-    text = re.sub(r"\x1b\[[0-9;]*m", "", outcome.stdout.decode("utf-8", "replace"))
+    return _parse_complete_pytest(outcome.returncode, outcome.stdout.decode("utf-8", "replace"))
+
+
+def _parse_complete_pytest(returncode, output):
+    if returncode not in (0, 1) or not output:
+        return None
+    text = re.sub(r"\x1b\[[0-9;]*m", "", output)
     lines = text.rstrip().splitlines()
     if not lines or not _PYTEST_TOTALS.fullmatch(lines[-1].strip(" =")):
         return None
@@ -485,18 +500,58 @@ def _complete_pytest_run(outcome):
     if counts.keys() - {"passed", "failed", "deselected", "warning", "warnings"}:
         return None
     passed, failed = counts.get("passed", 0), counts.get("failed", 0)
-    if not passed + failed or bool(failed) != bool(outcome.returncode):
+    if not passed + failed or bool(failed) != bool(returncode):
         return None
     sections = _PYTEST_SECTION.split(text)
     summaries = [
         body for title, body in zip(sections[1::2], sections[2::2], strict=True)
         if title == "short test summary info"
     ]
-    cases = _TEST_RESULT.findall(summaries[-1]) if summaries else []
+    summary = summaries[-1] if summaries else ""
+    cases = _TEST_RESULT.findall(summary)
     nodes = frozenset(node for status, node in cases if status == "FAILED")
     if len(cases) != failed or len(nodes) != failed:
         return None
-    return _PytestRun(passed, nodes, counts.get("deselected", 0))
+    progress = sections[2] if sections[1:2] == ["test session starts"] else sections[0]
+    passed_names = _NAMED_PYTEST_PASS.findall(progress)
+    exact_failed = set(_NAMED_PYTEST_FAIL.findall(summary))
+    passed_nodes = frozenset(passed_names)
+    named_cases = (
+        passed_nodes | nodes
+        if len(passed_names) == len(passed_nodes) == passed
+        and exact_failed == nodes
+        and not passed_nodes & nodes
+        and not re.search(r"(?m)^!+ stopping after \d+ failures? !+", text)
+        else None
+    )
+    return _PytestRun(passed, nodes, counts.get("deselected", 0), named_cases)
+
+
+def _lost_passing_test(before, after, path):
+    for check, previous in before.items():
+        candidate = after.get(check)
+        if (
+            not previous or previous.named_cases is None
+            or not candidate or candidate.named_cases is None
+        ):
+            continue
+        old_passes = previous.named_cases - previous.failed
+        lost = old_passes & candidate.failed
+        if not candidate.deselected:
+            lost |= old_passes - candidate.named_cases
+        if case := min((node for node in lost if node.startswith(path + "::")), default=None):
+            return case
+    return None
+
+
+def _focused_generated_run(checks, command):
+    if command is None:
+        return None
+    for check in checks:
+        observed = tuple(word for word in check.command if not word.startswith("--junitxml="))
+        if observed == command:
+            return _parse_complete_pytest(check.returncode, check.output)
+    return None
 
 
 class _PrivateCheckOutputExceeded(CommandOutputExceeded):
@@ -718,6 +773,7 @@ def _test_authoring_messages(
     names, setup = _regression_context(fixtures)
     test_query = words(" ".join([*behaviors, names, setup, note]))
     sources = {path: content for path, content in current.items() if path != new_path}
+    failure_source = test_failure_focus(sources, note) if repair_failed_tests else ""
     operator_contract = operator_api_contract(fixtures, sources)
     api = "\n".join(
         _regression_api(path, content, test_query, 2100 // len(sources))
@@ -766,6 +822,7 @@ def _test_authoring_messages(
             if note
             else ""
         )
+        + (TEST_VERIFICATION_SOURCE + failure_source + "\n" if failure_source else "")
         + "Focused source from verified public APIs:\n"
         + api
         + "\nFixture for this goal:\n"
@@ -2891,6 +2948,8 @@ def solve(executor, task, archive, budget, version):
     test_draft = current.get(new_path, "")
     test_diagnostic = ""
     test_rejection = None
+    test_case_runs = {}
+    focused_generated = focused_pytest(task.checks, (new_path,), verbose=True) if new_path else None
     test_format_snapshot = None
     test_format_failures = 0
     test_tool_attempted = False
@@ -3381,6 +3440,7 @@ def solve(executor, task, archive, budget, version):
                             test_format_snapshot = current
                             test_format_failures = 0
                             test_tool_attempted = False
+                            test_case_runs = {}
                         if repository_example is None:
                             reviewed_sources = {path: current[path] for path in paths}
                             repository_example, repository_usage = repository_pytest_context(
@@ -3943,30 +4003,34 @@ def solve(executor, task, archive, budget, version):
                 )
                 continue
             if target == _TEST_GOAL:
-                test_draft = candidate[new_path]
-                test_rejection = None
-                notes.pop(target, None)
+                next_draft = candidate[new_path]
+                next_rejection = None
+                next_case_runs = after_runs
+                result = None
                 if after:
                     kinds = {kind for detail in after.values() for kind in _TEST_ERROR_KINDS.findall(detail)}
                     _LOG.info(
                         "Verifying a new pytest module via %s left %d check diagnostic(s); categories=%s",
                         completion.route, len(after), ",".join(sorted(kinds)) or "check failure",
                     )
-                    test_diagnostic = _failed_test_feedback(after, new_path)
-                elif not has_runnable_test(new_path, test_draft.encode()):
-                    test_diagnostic = (
+                    next_diagnostic = _failed_test_feedback(after, new_path)
+                elif not has_runnable_test(new_path, next_draft.encode()):
+                    next_diagnostic = (
                         "Add at least one runnable pytest test to this draft."
                     )
                 else:
                     try:
-                        return _finish_review(
+                        result = _finish_review(
                             executor, task, archive, budget, proposed, editor, version
                         )
                     except AttemptRejected as error:
                         rejection = error.__cause__
                         if not isinstance(rejection, _VerificationRejected):
                             raise
-                        test_rejection = error
+                        next_rejection = error
+                        next_case_runs["focused"] = _focused_generated_run(
+                            rejection.checks, focused_generated
+                        )
                         _LOG.info("Final verification rejected the new pytest module via %s", completion.route)
                         failures_by_check = {}
                         for index, check in enumerate(rejection.checks):
@@ -3977,8 +4041,31 @@ def solve(executor, task, archive, budget, version):
                                 failures_by_check[index, node] = _test_detail(check.output, node)
                             if not nodes:
                                 failures_by_check[index, f"check {index + 1}"] = check.output
-                        test_diagnostic = _failed_test_feedback(failures_by_check, new_path)
-                        test_diagnostic += "\n" + str(rejection)
+                        next_diagnostic = (
+                            _failed_test_feedback(failures_by_check, new_path) + "\n" + str(rejection)
+                        )
+                    else:
+                        next_case_runs["focused"] = _focused_generated_run(
+                            result.checks, focused_generated
+                        )
+                lost_test = (
+                    _lost_passing_test(test_case_runs, next_case_runs, new_path)
+                    if allow_test_module and test_format_snapshot is current else None
+                )
+                if lost_test:
+                    notes[target] = (
+                        f"The last edit regressed or removed the already-passing case {lost_test}. "
+                        "This prompt shows the retained draft and its original failure. Preserve the passing case."
+                    )
+                    _LOG.info("Retained the prior unpublished draft after losing a verified passing pytest case")
+                    continue
+                if result is not None:
+                    return result
+                test_draft = next_draft
+                test_rejection = next_rejection
+                test_diagnostic = next_diagnostic
+                test_case_runs = next_case_runs if allow_test_module else {}
+                notes.pop(target, None)
                 continue
             # Never trade a passing operator test for another one. Stock diagnostics
             # can change while a behavior is corrected; finish those before publishing.

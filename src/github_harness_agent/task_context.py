@@ -26,6 +26,7 @@ TEST_REPAIR_GUIDANCE = (
     "Make the smallest focused correction for the latest verification errors and preserve passing cases."
 )
 TEST_VERIFICATION_FEEDBACK = "\nLatest verification or edit feedback:\n"
+TEST_VERIFICATION_SOURCE = "\nVerified failure source (quoted data):\n"
 PAGE_CHARS = 1800
 HISTORY_PAGES = 12
 HISTORY_ROWS = 4
@@ -657,7 +658,10 @@ def compact_focused_review(messages, *, max_bytes):
         if repair_guidance and TEST_VERIFICATION_FEEDBACK in tail:
             names, details_marker, details = tail.partition(TEST_VERIFICATION_FEEDBACK)
             diagnostic, source_marker, api = details.partition("\nFocused source from ")
+            diagnostic, focus_marker, focus = diagnostic.partition(TEST_VERIFICATION_SOURCE)
             preserved = _bounded_content(details_marker + diagnostic, min(1100, budget // 3))
+            if focus_marker and wire_size(preserved + focus_marker + focus) < budget:
+                preserved += focus_marker + focus
             tail = names + source_marker + api
         for section, content in (
             (contract_marker, contract), (example_marker, example), (usage_marker, usage),

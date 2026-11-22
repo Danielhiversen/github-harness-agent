@@ -1,6 +1,12 @@
 import pytest
 
-from github_harness_agent.review_solver import _apply_test_reply, _complete_test_module, apply_blocks
+from github_harness_agent.review_solver import (
+    _apply_test_reply,
+    _complete_test_module,
+    _lost_passing_test,
+    _parse_complete_pytest,
+    apply_blocks,
+)
 
 PATH = "tests/test_review_regressions.py"
 MODULE = "from math import sqrt\n\ndef test_positive():\n    assert sqrt(4) == 2\n"
@@ -71,3 +77,30 @@ def test_named_test_retry_rejects_out_of_scope_edits(reply, allow_module, failed
         _apply_test_reply(
             reply, sources, PATH, allow_module=allow_module, failed_draft=failed_draft, limit=4096,
         )
+
+
+@pytest.mark.parametrize(
+    ("returncode", "ambiguous"),
+    (
+        (0, ". [100%]\n==================== 1 passed in 0.01s ===================="),
+        (
+            1,
+            f"{PATH}::test_other PASSED [ 33%]\n"
+            "==================== short test summary info ====================\n"
+            f"FAILED {PATH}::test_break - AssertionError\n"
+            "!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!\n"
+            "==================== 1 failed, 1 passed in 0.01s ====================",
+        ),
+    ),
+)
+def test_missing_named_case_is_ambiguous_with_sparse_or_interrupted_output(returncode, ambiguous):
+    previous = _parse_complete_pytest(
+        0,
+        f"{PATH}::test_positive PASSED [100%]\n"
+        "==================== 1 passed in 0.01s ====================",
+    )
+    later = _parse_complete_pytest(returncode, ambiguous)
+
+    assert previous.named_cases == {f"{PATH}::test_positive"}
+    assert later is not None and later.named_cases is None
+    assert _lost_passing_test({0: previous}, {0: later}, PATH) is None
