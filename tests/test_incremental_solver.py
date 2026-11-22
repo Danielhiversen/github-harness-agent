@@ -1248,6 +1248,7 @@ def test_private_repair_reconciles_a_stock_gain_without_storing_regressions(solv
             assert case in prompt.splitlines()[0]
             assert "Private regression repair" in prompt
             assert "test_stock_goal" in prompt
+            assert "assert stock() == 3" in prompt
     assert len(gateway.prompts) == len(followups) + 1
 
 

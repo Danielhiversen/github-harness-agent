@@ -512,6 +512,7 @@ def _proposal_messages(
     check_command=(),
     rejection="",
     stock_fixture=None,
+    preserved_stock_fixture="",
     mock_detail="",
 ):
     if target == _TEST_GOAL:
@@ -574,6 +575,12 @@ def _proposal_messages(
         if stock_fixture is None
         else stock_fixture
     )
+    if preserved_stock_fixture:
+        fixture += (
+            "\nThis unpublished implementation already passes the following tracked repository case. "
+            "Compare its public inputs and expected behavior with the failing review case and preserve both.\n"
+            + excerpt(preserved_stock_fixture, 4800)
+        )
     request = (
         goal
         + (f"Last proposal feedback for this goal: {note}\n" if note else "")
@@ -611,7 +618,7 @@ def _proposal_messages(
 
     # A stock regression can originate outside the historical review anchor.
     # Keep those definitions when the complete request fits its existing budget.
-    if stock_fixture and sum(map(len, current.values())) <= MESSAGE_BYTES:
+    if (stock_fixture or preserved_stock_fixture) and sum(map(len, current.values())) <= MESSAGE_BYTES:
         complete = with_sources(current.items())
         if wire_size(complete) <= MESSAGE_BYTES:
             return complete
@@ -1318,6 +1325,10 @@ def solve(executor, task, archive, budget, version):
                         named_definitions=named_definitions,
                         check_command=check_command,
                         stock_fixture=stock_fixture,
+                        preserved_stock_fixture=(
+                            stock_fixtures.get((repair.origin, failures.get(repair.origin)), "")
+                            if repair is not None and repair.stock_origin else ""
+                        ),
                         mock_detail=mock_detail,
                         rejection=(
                             _private_repair_context(current, repair)
