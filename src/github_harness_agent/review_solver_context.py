@@ -160,6 +160,169 @@ def _fixture_arguments(node):
     return dependencies
 
 
+def _dotted_name(node):
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    return ".".join((node.id, *reversed(parts))) if isinstance(node, ast.Name) else ""
+
+
+def _reviewed_imports(body, modules):
+    bindings = {}
+    reviewed_calls = set()
+    for node in body:
+        if not isinstance(node, _IMPORT) or getattr(node, "level", 0):
+            continue
+        for alias in node.names:
+            if isinstance(node, ast.Import):
+                local = alias.asname or alias.name
+                qualified = alias.name
+                bindings[local.split(".", 1)[0]] = node
+            else:
+                local = alias.asname or alias.name
+                qualified = f"{node.module}.{alias.name}"
+                bindings[local] = node
+                if alias.name in modules.get(node.module, ()):
+                    reviewed_calls.add(local)
+            reviewed_calls.update(f"{local}.{name}" for name in modules.get(qualified, ()))
+    return bindings, reviewed_calls
+
+
+def _source_root(path):
+    parts = path.parts
+    if "src" not in parts[:-1]:
+        return PurePosixPath()
+    return PurePosixPath(*parts[: len(parts) - parts[::-1].index("src")])
+
+
+def repository_pytest_example(archive, sources, *, max_bytes=850):
+    """Find one complete example that calls a public API of a reviewed module."""
+    modules = {}
+    for path, source in sources.items():
+        source_path = PurePosixPath(path)
+        parts = source_path.relative_to(_source_root(source_path)).with_suffix("").parts
+        if parts[-1:] == ("__init__",):
+            parts = parts[:-1]
+        if not parts or not all(part.isidentifier() for part in parts):
+            continue
+        try:
+            declarations = ast.parse(source).body
+        except (SyntaxError, ValueError, RecursionError):
+            continue
+        modules[".".join(parts)] = {
+            node.name
+            for node in declarations
+            if isinstance(node, (*_FUNCTION, ast.ClassDef)) and not node.name.startswith("_")
+        }
+    if not any(modules.values()):
+        return ""
+    module_stems = {module.rsplit(".", 1)[-1] for module in modules}
+
+    try:
+        with tarfile.open(fileobj=BytesIO(archive), mode="r:") as snapshot:
+            candidates = []
+            for member in snapshot:
+                path = PurePosixPath(member.name)
+                if (
+                    member.type in (tarfile.REGTYPE, tarfile.AREGTYPE)
+                    and member.size <= 128 * 1024
+                    and _STOCK_NODE.fullmatch(member.name + "::test_example")
+                    and (
+                        path.name == "conftest.py"
+                        or path.name.startswith("test_")
+                        or path.name.endswith("_test.py")
+                    )
+                ):
+                    stem = path.stem.removeprefix("test_").removesuffix("_test")
+                    priority = stem in module_stems
+                    candidates.append((not priority, member.name))
+            for _, path in sorted(candidates)[:64]:
+                tracked = _tracked_python(snapshot, path)
+                if tracked is None:
+                    continue
+                lines, body = tracked
+                imports, reviewed_calls = _reviewed_imports(body, modules)
+                if not reviewed_calls:
+                    continue
+                fixtures = {node for _, node, _ in _pytest_fixtures(body)}
+                for node in body:
+                    if not isinstance(node, _FUNCTION) or not (
+                        node.name.startswith("test_") or node in fixtures
+                    ):
+                        continue
+                    if not any(
+                        _dotted_name(call.func) in reviewed_calls
+                        for call in ast.walk(node) if isinstance(call, ast.Call)
+                    ):
+                        continue
+                    selected = {imports[name] for name in _references([node]) & imports.keys()}
+                    excerpt = f"# {path}\n" + "".join(
+                        "".join(lines[_start(item) - 1 : item.end_lineno])
+                        for item in sorted(selected, key=lambda item: item.lineno) + [node]
+                    )
+                    if len(excerpt.encode()) <= max_bytes:
+                        return excerpt.rstrip()
+    except (tarfile.TarError, OSError, EOFError):
+        pass
+    return ""
+
+
+def imported_model_declarations(archive, sources, *, max_bytes=850):
+    """Describe imported classes from the pinned checkout without importing code."""
+    imports = {}
+    for path, source in sources.items():
+        path = PurePosixPath(path)
+        try:
+            body = ast.parse(source).body
+        except (SyntaxError, ValueError, RecursionError):
+            continue
+        for node in body:
+            if not isinstance(node, ast.ImportFrom) or not node.module:
+                continue
+            if node.level > len(path.parents):
+                continue
+            roots = (path.parents[node.level - 1],) if node.level else (
+                _source_root(path), PurePosixPath()
+            )
+            module_parts = node.module.split(".")
+            for root in roots:
+                module = root.joinpath(*module_parts)
+                imports.setdefault(str(module.with_suffix(".py")), set()).update(
+                    alias.name for alias in node.names if alias.name[:1].isupper()
+                )
+    chunks = []
+    try:
+        with tarfile.open(fileobj=BytesIO(archive), mode="r:") as snapshot:
+            relevant = (path for path, names in imports.items() if names)
+            for path in tuple(relevant)[:24]:
+                tracked = _tracked_python(snapshot, path)
+                if not tracked:
+                    continue
+                _, body = tracked
+                for node in body:
+                    if not isinstance(node, ast.ClassDef) or node.name not in imports[path]:
+                        continue
+                    fields = [
+                        f"    {ast.unparse(item)}"
+                        for item in node.body
+                        if isinstance(item, ast.AnnAssign)
+                    ]
+                    fields += [
+                        f"    def __init__({ast.unparse(item.args)})"
+                        for item in node.body
+                        if isinstance(item, ast.FunctionDef) and item.name == "__init__"
+                    ]
+                    if fields:
+                        chunk = "\n".join((f"# {path}", f"class {node.name}:", *fields, ""))
+                        if len(chunk.encode()) <= max_bytes:
+                            chunks.append(chunk)
+                            max_bytes -= len(chunk.encode())
+    except (tarfile.TarError, OSError, EOFError, RecursionError):
+        pass
+    return "".join(chunks).rstrip()
+
+
 def stock_pytest_excerpt(archive, command, node, diagnostic, *, failure_window_only=False):
     """Read a pytest node and local fixture declarations from the pinned Git archive."""
     target = node.split("[", 1)[0].removeprefix("/work/").removeprefix("./")

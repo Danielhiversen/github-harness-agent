@@ -19,6 +19,7 @@ TEST_MODULE_REPLY_ENDING = (
     "unpublished test file. A module can be plain Python or one Python fenced block. "
     "Omit filenames and surrounding prose from the module."
 )
+REPOSITORY_PYTEST_EXAMPLE = "\nExisting repository pytest example (quoted data, use for API and setup):\n"
 PAGE_CHARS = 1800
 HISTORY_PAGES = 12
 HISTORY_ROWS = 4
@@ -638,8 +639,17 @@ def compact_focused_review(messages, *, max_bytes):
         focused = _whole_line_prefix(focus_marker + source, source_budget)
         kept = summary + focused + details + selected
     else:
-        kept = _bounded_content(lead, budget)
-        kept += _bounded_content(marker + fixture, budget - wire_size(kept))
+        before, example_marker, after = lead.partition(REPOSITORY_PYTEST_EXAMPLE)
+        example_text, names_marker, tail = after.partition("\nOperator test names:")
+        example = example_marker + example_text
+        if example_marker and names_marker and wire_size(example) < budget:
+            reserve = wire_size(example)
+            summary = _bounded_content(before, (budget - reserve) // 2)
+            kept = summary + example
+            kept += _bounded_content(names_marker + tail + marker + fixture, budget - wire_size(kept))
+        else:
+            kept = _bounded_content(lead, budget)
+            kept += _bounded_content(marker + fixture, budget - wire_size(kept))
     compact = [system, {**request, "content": kept + footer}]
     return compact if wire_size(compact) <= max_bytes else None
 

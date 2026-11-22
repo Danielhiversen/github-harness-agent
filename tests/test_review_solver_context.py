@@ -8,10 +8,12 @@ from github_harness_agent.review_solver_context import (
     focused_source_excerpt,
     stock_pytest_excerpt,
 )
+from github_harness_agent import review_solver_context
 from github_harness_agent.task_context import compact_focused_review
 from github_harness_agent.review_solver import _proposal_messages
 from github_harness_agent.review_recovery import ReviewRecovery
 from github_harness_agent.task_context import MESSAGE_BYTES, wire_size
+from github_harness_agent.task_context import TEST_MODULE_REPLY_ENDING
 
 
 @pytest.fixture
@@ -69,6 +71,100 @@ def test_stock_pytest_excerpt_rejects_paths_outside_exact_regular_tracked_files(
         f"{path}::TestWeather::test_forecast",
         "tests/test_weather.py:153: AssertionError",
     ) == ""
+
+
+def test_fresh_test_prompt_uses_complete_tracked_example_from_reviewed_module():
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, source in {
+            "tests/test_other.py": "from other.formatting import format_amount\n"
+            "\ndef test_other():\n    assert format_amount(0) == 'unrelated'\n",
+            "tests/test_formatting.py": "from example.formatting import format_amount as format_value\n"
+            "\ndef test_format_amount():\n"
+            + "    # lengthy setup\n" * 180
+            + "    assert format_value(0) == 'large'\n"
+            "\ndef test_decimal_amount():\n    assert format_value(12) == '12.00'\n",
+        }.items():
+            data = source.encode()
+            entry = tarfile.TarInfo(path)
+            entry.size = len(data)
+            snapshot.addfile(entry, BytesIO(data))
+
+    production = {"src/example/formatting.py": "def format_amount(value: int) -> str:\n    return str(value)\n"}
+    example = review_solver_context.repository_pytest_example(archive.getvalue(), production)
+    assert "from example.formatting import format_amount as format_value" in example
+    assert "def test_decimal_amount():\n    assert format_value(12) == '12.00'" in example
+    assert "test_format_amount" not in example
+    assert "unrelated" not in example
+
+    path = "tests/test_review_regressions.py"
+    review = ReviewRecovery(
+        feedback=(("src/example/formatting.py", 1, "cover decimal amounts"),),
+        previous_failure="",
+    )
+    messages = _proposal_messages(
+        (-1, "new regression tests"),
+        {**production, path: ""},
+        {},
+        True,
+        "",
+        review,
+        {},
+        [],
+        path,
+        allow_test_module=True,
+        repository_example=example,
+    )
+    compacted = compact_focused_review(messages, max_bytes=1600)
+    for prompt in (messages[-1]["content"], compacted[-1]["content"]):
+        assert "format_value(12) == '12.00'" in prompt
+        assert prompt.endswith(TEST_MODULE_REPLY_ENDING)
+    assert "def format_amount(value: int) -> str" in messages[-1]["content"]
+
+
+def test_repository_example_supports_module_imports_and_complete_pytest_fixtures():
+    archive = BytesIO()
+    source = (
+        "import pytest\n"
+        "from example import formatting as formatter\n"
+        "@pytest.fixture\n"
+        "def amount_text():\n"
+        "    return formatter.format_amount(88)\n"
+    )
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        data = source.encode()
+        entry = tarfile.TarInfo("tests/conftest.py")
+        entry.size = len(data)
+        snapshot.addfile(entry, BytesIO(data))
+    example = review_solver_context.repository_pytest_example(
+        archive.getvalue(),
+        {"src/example/formatting.py": "def format_amount(amount):\n    return str(amount)\n"},
+    )
+    assert example == "# tests/conftest.py\n" + source.rstrip()
+
+
+def test_review_imported_models_use_pinned_package_source_including_relative_imports():
+    archive = BytesIO()
+    contents = (
+        "from dataclasses import dataclass\n"
+        "@dataclass\nclass Request:\n    value: int\n    precision: int = 2\n"
+        "class Result:\n    def __init__(self, text: str):\n        self.text = text\n"
+        "class Unrelated:\n    other: str\n"
+    )
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        data = contents.encode()
+        entry = tarfile.TarInfo("src/example/models.py")
+        entry.size = len(data)
+        snapshot.addfile(entry, BytesIO(data))
+    declarations = review_solver_context.imported_model_declarations(
+        archive.getvalue(),
+        {"src/example/formatting.py": "from .models import Request\n"
+         "from example.models import Result\n"
+         "def format_amount(value: Request) -> Result:\n    return Result(str(value.value))\n"},
+    )
+    assert "class Request:\n    value: int\n    precision: int = 2" in declarations
+    assert "class Result:\n    def __init__(self, text: str)" in declarations
+    assert "Unrelated" not in declarations
 
 
 def test_matching_method_includes_owner_imports_and_referenced_definitions():

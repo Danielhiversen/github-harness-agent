@@ -97,6 +97,8 @@ from .review_recovery import operator_acceptance_context
 from .review_solver_context import (
     focused_check_excerpt,
     focused_source_excerpt,
+    imported_model_declarations,
+    repository_pytest_example,
     stock_assertion_progress,
     stock_assertion_failure_line,
     stock_failure_site,
@@ -107,6 +109,7 @@ from .review_solver_context import (
 from .review_stock_collection import stock_collection
 from .task_context import (
     MESSAGE_BYTES,
+    REPOSITORY_PYTEST_EXAMPLE,
     TEST_MODULE_REPLY_ENDING,
     compact_focused_review,
     excerpt,
@@ -599,13 +602,16 @@ def _regression_api(path, content, query, limit):
             prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
             name = owner + node.name
             signature = f"{prefix} {name}({ast.unparse(node.args)})"
+            if node.returns is not None:
+                signature += f" -> {ast.unparse(node.returns)}"
             signatures.append((len(words(signature) & query), signature))
     signatures.sort(key=lambda item: item[0], reverse=True)
     return path + "\n" + excerpt("\n".join(text for _, text in signatures), limit)
 
 
 def _test_authoring_messages(
-    current, review, fixtures, interfaces, new_path, note, *, allow_test_module=False
+    current, review, fixtures, interfaces, new_path, note, *,
+    allow_test_module=False, repository_example=""
 ):
     behaviors = list(
         dict.fromkeys(" ".join(body.split()) for _, _, body in review.feedback)
@@ -629,10 +635,15 @@ def _test_authoring_messages(
     request = (
         "Selected failure: new regression tests\n"
         f"Edit only {new_path}. Write fresh offline pytest tests for the distinct "
-        "requested behaviors. Use public APIs and independent fixtures. "
+        "requested behaviors. Keep the complete module concise so it fits in one reply. "
+        "Share setup and parameterize examples for the same behavior. Use public APIs and independent fixtures. "
         "Use the operator examples as behavior and setup references, without copying them.\n"
         "Requested behaviors (quoted review notes):\n"
         + "\n".join(f"- {excerpt(body, 320)}" for body in behaviors if body)
+        + (
+            REPOSITORY_PYTEST_EXAMPLE + repository_example + "\n"
+            if repository_example else ""
+        )
         + f"\nOperator test names: {names}\n"
         + (
             f"Latest verification or edit feedback:\n{excerpt(note, 1600)}\n"
@@ -704,6 +715,7 @@ def _proposal_messages(
     mock_detail="",
     parameter_focus="",
     allow_test_module=False,
+    repository_example="",
 ):
     if target == _TEST_GOAL:
         return _test_authoring_messages(
@@ -714,6 +726,7 @@ def _proposal_messages(
             new_path,
             note,
             allow_test_module=allow_test_module,
+            repository_example=repository_example,
         )
     diagnostic = failures.get(
         target,
@@ -2736,6 +2749,8 @@ def solve(executor, task, archive, budget, version):
     test_draft = current.get(new_path, "")
     test_diagnostic = ""
     test_rejection = None
+    repository_example = None
+    repository_models = ""
 
     def start_new_draft(target):
         nonlocal interactive_target, interactive_symbol, hedge_used
@@ -3215,6 +3230,10 @@ def solve(executor, task, archive, budget, version):
                         )
                     allow_test_module = False
                     if target == _TEST_GOAL:
+                        if repository_example is None:
+                            reviewed_sources = {path: current[path] for path in paths}
+                            repository_example = repository_pytest_example(archive, reviewed_sources)
+                            repository_models = imported_model_declarations(archive, reviewed_sources)
                         allow_test_module = bool(
                             not current[new_path] and (not test_draft or test_diagnostic)
                         )
@@ -3398,7 +3417,11 @@ def solve(executor, task, archive, budget, version):
                         note,
                         _draft_review(review, original, source),
                         fixtures,
-                        interfaces,
+                        (
+                            [repository_models, *interfaces]
+                            if repository_models and target == _TEST_GOAL
+                            else interfaces
+                        ),
                         new_path,
                         continuing=continuation is not None or repair is not None,
                         named_definitions=named_definitions,
@@ -3423,6 +3446,7 @@ def solve(executor, task, archive, budget, version):
                         mock_detail=mock_detail,
                         parameter_focus=parameter_focus,
                         allow_test_module=allow_test_module,
+                        repository_example=repository_example or "",
                         rejection=(
                             _private_repair_context(current, repair)
                             if repair is not None
@@ -3651,6 +3675,11 @@ def solve(executor, task, archive, budget, version):
                 except ValueError:
                     if repair is None and not scoped_line:
                         queue_iteration_retry(target, snapshot)
+                    if target == _TEST_GOAL:
+                        _LOG.info(
+                            "New pytest module reply via %s did not parse (characters=%d)",
+                            completion.route, len(completion.content or ""),
+                        )
                     if stock_fixtures.get((target, failures.get(target))):
                         raw = completion.content or ""
                         _LOG.info(
@@ -3748,6 +3777,10 @@ def solve(executor, task, archive, budget, version):
                 test_rejection = None
                 notes.pop(target, None)
                 if after:
+                    _LOG.info(
+                        "Verifying a new pytest module via %s left %d check diagnostic(s)",
+                        completion.route, len(after),
+                    )
                     test_diagnostic = "\n".join(
                         f"{name}: {excerpt(detail, 1000)}"
                         for (_, name), detail in list(after.items())[:4]
