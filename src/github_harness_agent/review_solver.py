@@ -35,6 +35,7 @@ from .review_composition import compose_line_edits, small_line_edits
 from .review_assertions import assertion_progress, operator_assertions
 from .review_prefix_replay import observe_prefix_progress
 from .review_definitions import (
+    CAUSAL_EDIT_GUIDANCE,
     DEFINITION_ENDING,
     DEFINITION_FORMAT,
     NATIVE_DEFINITION_TOOL,
@@ -683,6 +684,12 @@ def _coding_completion(
     messages = apply_coding_advice(
         messages, advice or fresh_advice, reuse=advice is not None
     )
+    causal_edit = localized_retry_symbol(advice or fresh_advice) is not None
+    if causal_edit:
+        messages = [
+            {**messages[0], "content": messages[0]["content"] + "\n" + CAUSAL_EDIT_GUIDANCE},
+            *messages[1:],
+        ]
     if native_source is not None:
         focused = compact_focused_review(messages, max_bytes=12 * 1024) or messages
         request = focused[-1]["content"].removesuffix(DEFINITION_ENDING)
@@ -722,7 +729,7 @@ def _coding_completion(
         exclude=exclude,
         after_provider=route,
         max_output_tokens=(
-            6144 if messages[-1]["content"].endswith(DEFINITION_ENDING) else 3072
+            6144 if causal_edit or messages[-1]["content"].endswith(DEFINITION_ENDING) else 3072
         ),
     )
     return completion, None, fresh_advice

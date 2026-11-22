@@ -7,6 +7,7 @@ import textwrap
 from collections import defaultdict
 from pathlib import PurePosixPath
 
+CAUSAL_EDIT_GUIDANCE = "Reason through the observed passing and failing executions before producing the scoped edit."
 DEFINITION_ENDING = "Respond with complete named Python definitions only."
 LOCALIZED_METHOD_HEADING = "Exact current method localized by the offline replay:"
 DEFINITION_FORMAT = """Use only definition edit blocks. Begin each with an exact header:

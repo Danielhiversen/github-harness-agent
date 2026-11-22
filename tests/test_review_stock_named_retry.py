@@ -94,7 +94,7 @@ def test_stock_named_retry_keeps_exact_pair_and_existing_strategy(
         "Respond with exact SEARCH/REPLACE blocks only."
     )
     assert old not in fresh[-1]["content"]
-    assert calls[1][2]["max_output_tokens"] == 3072
+    assert calls[1][2]["max_output_tokens"] == (6144 if localized else 3072)
     if not localized:
         assert retry[-1]["content"].endswith(
             "Respond with exact SEARCH/REPLACE blocks only."

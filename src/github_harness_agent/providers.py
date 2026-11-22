@@ -29,7 +29,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from .review_definitions import DEFINITION_ENDING, LOCALIZED_METHOD_HEADING
+from .review_definitions import CAUSAL_EDIT_GUIDANCE, DEFINITION_ENDING, LOCALIZED_METHOD_HEADING
 from .task_context import (
     MESSAGE_BYTES,
     compact_focused_review,
@@ -297,6 +297,13 @@ def _gemini_payload(
     return body
 
 
+def _causal_edit(messages):
+    return (
+        len(messages) == 2 and messages[0].get("role") == "system"
+        and str(messages[0].get("content") or "").endswith(CAUSAL_EDIT_GUIDANCE)
+    )
+
+
 def _chat_payload(
     route: _Route,
     messages: Sequence[Mapping],
@@ -336,7 +343,7 @@ def _chat_payload(
     ):
         # NIM defaults to high reasoning. Focused text edits need the limited
         # output for source, while native calls require the thinking parser.
-        thinking = bool(tools) or cleaned[1]["content"].endswith(DEFINITION_ENDING)
+        thinking = bool(tools) or _causal_edit(cleaned) or cleaned[1]["content"].endswith(DEFINITION_ENDING)
         settings = {"enable_thinking": thinking, "force_nonempty_content": True}
         if thinking:
             settings["medium_effort"] = True
@@ -882,7 +889,7 @@ class ProviderRouter:
                 attempt_limit = route.attempt_timeout
                 last_prompt = str(messages[-1].get("content") or "") if messages else ""
                 extended = not tools and (
-                    (role == "coding" and last_prompt.endswith(DEFINITION_ENDING))
+                    (role == "coding" and (_causal_edit(messages) or last_prompt.endswith(DEFINITION_ENDING)))
                     or (role == "planning" and LOCALIZED_METHOD_HEADING in last_prompt)
                 )
                 if route.model == _NEMOTRON and not extended:

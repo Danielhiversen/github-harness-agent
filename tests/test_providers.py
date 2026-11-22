@@ -209,17 +209,19 @@ def test_nemotron_extended_deadline_for_focused_reasoning(role, named, localized
         content += providers.DEFINITION_ENDING
     if localized:
         content += providers.LOCALIZED_METHOD_HEADING
+    causal = role == "coding" and localized
+    system = "Edit." + ("\n" + providers.CAUSAL_EDIT_GUIDANCE if causal else "")
     router.complete(
         role=role,
-        messages=[{"role": "system", "content": "Edit."}, {"role": "user", "content": content}],
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": content}],
         max_output_tokens=6144,
         timeout=115,
     )
     payload = json.loads(requests[0].content)
-    assert payload["chat_template_kwargs"]["enable_thinking"] == (named or role == "planning")
+    assert payload["chat_template_kwargs"]["enable_thinking"] == (named or role == "planning" or causal)
     assert payload["max_tokens"] == 6144
     timeout = requests[0].extensions["timeout"]["read"]
-    limit = 110 if named or (role == "planning" and localized) else 60
+    limit = 110 if named or localized else 60
     assert limit - 3 < timeout <= limit
 
 
