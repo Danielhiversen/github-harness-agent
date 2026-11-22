@@ -76,13 +76,16 @@ class _PinnedStockRestore:
 
 def pinned_stock_restore_seed(advice, original, sources, allowed, *, minimum_bytes):
     """Build a speculative exact restore and describe its static dependencies."""
-    symbol = localized_retry_symbol(advice)
-    if symbol is None:
+    located = (
+        advice
+        if isinstance(advice, _LocalizedDefinition)
+        else (advice.localized if isinstance(advice, _StockAdvice) else None)
+    )
+    if located is None:
         return None
-    path, qualified = symbol
+    path, qualified = located.symbol
     if path not in allowed or path not in original or path not in sources:
         return None
-    located = advice.localized
     if (
         located.baseline == located.current
         or len(located.current.encode()) < minimum_bytes
@@ -175,7 +178,11 @@ def _localized_counter_definition(original, sources, inventory, site):
         return None
     for location in site.locations:
         key = f"{location.path}::{location.name}"
-        if key not in inventory:
+        if (
+            (inventory is not None and key not in inventory)
+            or location.path not in original
+            or location.path not in sources
+        ):
             continue
         source = sources[location.path]
         if hashlib.sha256(source.encode()).hexdigest() != location.source_digest:
@@ -184,6 +191,11 @@ def _localized_counter_definition(original, sources, inventory, site):
         if localized is not None:
             return localized
     return None
+
+
+def pinned_counter_location(original, sources, site):
+    """Use verified host localization without constructing model advice."""
+    return _localized_counter_definition(original, sources, None, site)
 
 
 def _inventory(sources, query):

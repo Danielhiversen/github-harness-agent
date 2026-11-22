@@ -73,6 +73,7 @@ from .review_line_ranges import (
 from .review_planner import (
     apply_coding_advice,
     localized_retry_symbol,
+    pinned_counter_location,
     request_coding_advice,
     pinned_stock_restore_seed,
 )
@@ -1933,6 +1934,28 @@ def solve(executor, task, archive, budget, version):
     repair_attempted = set()
     pinned_restore_attempted = regression_repair is not None
     pinned_restore_advice = {}
+    eager_source = current
+    eager_target = next(iter(failures)) if len(failures) == 1 else None
+    if not (
+        eager_target is not None
+        and draft is not None
+        and actor is not None
+        and actor.role == "coding"
+        and actor.configured_model
+        and retained_recovery is not None
+        and retained_recovery.identity == retained_identity
+        and max(malformed.get(eager_target, 0), no_progress.get(eager_target, 0))
+        >= RECOVERY_MODE_THRESHOLD
+        and eager_target[0] >= len(task.pull_checks)
+        and _named_operator_cases({eager_target}, commands)
+        and (eager_run := pytest_runs.get(eager_target[0])) is not None
+        and eager_run.failed == {eager_target[1]}
+        and _verified_operator_runs(
+            pytest_runs, pytest_runs, set(), task.pull_checks, operator_cases
+        )
+    ):
+        eager_target = None
+    eager_trace, eager_advisory = None, ""
     unavailable = {}
     test_draft = current.get(new_path, "")
     test_diagnostic = ""
@@ -2027,6 +2050,60 @@ def solve(executor, task, archive, budget, version):
             launch_budget = min(
                 max_proposals - submitted, budget.model_requests_remaining()
             )
+            if (
+                eager_target is not None
+                and current is eager_source
+                and failures.keys() == {eager_target}
+                and eager_trace is None
+                and not pinned_restore_attempted
+                and patch
+                and not pending
+                and retired is None
+                and private is None
+                and alternate is None
+                and launch_budget >= 1 + int(needs_tests)
+                and budget.commands_remaining() >= 3 * len(commands) + 6
+                and budget.remaining() >= 115
+            ):
+                eager_trace = ""
+                command = commands[eager_target[0]]
+                diagnostic = failures[eager_target]
+                fixture = stock_pytest_excerpt(
+                    archive, command, eager_target[1], diagnostic
+                )
+                stock_fixtures[eager_target, diagnostic] = fixture
+                if fixture:
+                    eager_trace = mock_call_diagnostic(
+                        executor,
+                        task,
+                        archive,
+                        budget,
+                        command,
+                        eager_target[1],
+                        patch,
+                        failure_line=stock_assertion_failure_line(eager_target[1], diagnostic),
+                        reviewed_sources=(original, current),
+                    )
+                    located = pinned_counter_location(
+                        original, current, counter_caller_site(eager_trace)
+                    )
+                    if (
+                        located is not None
+                        and located.current != located.baseline
+                        and len(located.current.encode()) >= _LONG_LOCALIZED_DEFINITION_BYTES
+                        and budget.remaining() >= 75
+                    ):
+                        pinned_restore_attempted = True
+                        regression_repair, eager_advisory = probe_pinned_restore(
+                            eager_target, located
+                        )
+                        if regression_repair is not None:
+                            repair_attempted.add(eager_target)
+                            continuations.pop(eager_target, None)
+                            _LOG.info("Verified pinned definition restore entered private stock repair")
+                            continue
+                        if eager_advisory:
+                            mock_diagnostics[eager_target] = eager_advisory
             if interactive_target is None and len(failures) == 1:
                 sole_target = next(iter(failures))
                 # Let the ranked planner try a verified plateau first. If it
@@ -2048,6 +2125,7 @@ def solve(executor, task, archive, budget, version):
                 and not pending
                 and retired is None
                 and private is None
+                and alternate is None
                 and failures.keys() == {interactive_target}
                 and patch
                 and actor is not None
@@ -2294,8 +2372,13 @@ def solve(executor, task, archive, budget, version):
                         and launch_budget >= 2
                         and budget.remaining() > 30
                     )
-                    if plan and stock_fixture and patch and target not in mock_diagnostics:
-                        traces = mock_call_diagnostic(
+                    if plan and stock_fixture and patch and target not in counter_sites:
+                        cached_trace = (
+                            eager_trace
+                            if target == eager_target and source is eager_source
+                            else None
+                        )
+                        traces = cached_trace if cached_trace is not None else mock_call_diagnostic(
                             executor, task, archive, budget, check_command, target[1], patch,
                             failure_line=stock_assertion_failure_line(
                                 target[1], diagnostics[target]
@@ -2306,7 +2389,11 @@ def solve(executor, task, archive, budget, version):
                             executor, task, archive, budget, check_command, target[1],
                             original, source, stock_fixture, patch_for,
                         )
-                        mock_diagnostics[target] = "\n".join(filter(None, (counterfactual, traces)))
+                        mock_diagnostics[target] = "\n".join(
+                            filter(None, (
+                                counterfactual, traces, eager_advisory if cached_trace is not None else "",
+                            ))
+                        )
                         counter_sites[target] = counter_caller_site(traces)
                         if counterfactual:
                             _LOG.info("Isolated guard replay localized the tracked pytest regression")

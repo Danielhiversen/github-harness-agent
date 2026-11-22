@@ -3506,3 +3506,160 @@ def test_pinned_stock_counterfactual_only_feeds_verified_private_repair(
         assert all(probe == probes[0] for probe in probes) and probes[0]
     assert b"tests/test_stock.py" not in result.patch
     assert b"+        return 8\n" in result.patch
+
+
+@pytest.mark.parametrize(
+    "scenario", ["one_request", "planner_outage", "untyped", "rejected_seed"]
+)
+def test_resumed_stock_plateau_can_try_pinned_restore_before_planning(
+    solver_case, monkeypatch, scenario
+):
+    from hashlib import sha256
+
+    from github_harness_agent import review_solver
+    from github_harness_agent.providers import ProviderExhausted
+    from github_harness_agent.review_mock_replay import (
+        CounterCallerLocation,
+        CounterCallerSite,
+        _ReplayDiagnostic,
+    )
+
+    task, _, runner, checkpoints = solver_case
+    task = replace(task, require_new_tests=False)
+    acceptance = Path(task.pull_checks[0][-1])
+    with acceptance.open("a") as stream:
+        stream.write(
+            "\nfrom fixture_calc import stock_value\n"
+            "\ndef test_review_value():\n    assert stock_value(review=True) == 8\n"
+        )
+    original = BASE_SOURCE + (
+        "\ndef stock_value(*, review=False):\n"
+        "    if review:\n"
+        "        return 7\n"
+        + "    # preserve ordinary reviewed method behavior\n" * 140
+        + "    return 3\n"
+    )
+    current = (
+        original.replace("return -1", "return 1")
+        .replace("return -2", "return 2")
+        .replace("return 7", "return 8")
+        .replace("return 3", "return -3")
+    )
+    patch = patch_for({SOURCE: original}, {SOURCE: current})
+    draft = DraftCheckpoint(
+        review_solver._CHECKPOINT,
+        task.base_sha,
+        patch,
+        guidance=_GUIDANCE,
+        last_editor=("fixture-free", "fixture/free"),
+    )
+    target = (1, "tests/test_existing.py::test_stock")
+    task = replace(
+        task,
+        checkpoints={draft.key: draft},
+        solver_recovery=SolverRecovery(
+            review_solver._recovery_digest(
+                task, {acceptance.name: acceptance.read_text()}, patch
+            ),
+            ((review_solver._goal_digest(target), 0, 2),),
+        ),
+    )
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, text in {
+            SOURCE: original,
+            "tests/test_existing.py": (
+                "from fixture_calc import stock_value\n"
+                "\ndef test_stock():\n    assert stock_value() == 3\n"
+            ),
+        }.items():
+            data = text.encode()
+            member = tarfile.TarInfo(path)
+            member.size = len(data)
+            snapshot.addfile(member, BytesIO(data))
+
+    calls = {"replay": 0, "guard": 0, "seed": 0}
+    real_seed = review_solver.pinned_stock_restore_seed
+
+    def replay(*args, **kwargs):
+        calls["replay"] += 1
+        row = current.splitlines().index("    return -3") + 1
+        site = CounterCallerSite(
+            (
+                CounterCallerLocation(
+                    SOURCE, "stock_value", row, sha256(current.encode()).hexdigest()
+                ),
+            ),
+            "Pinned and draft caller evidence.",
+        )
+        text = "Auxiliary mapping counter changes (quoted advisory data)."
+        return text if scenario == "untyped" else _ReplayDiagnostic(text, site)
+
+    def guard(*args, **kwargs):
+        calls["guard"] += 1
+        return ""
+
+    def seed(*args, **kwargs):
+        calls["seed"] += 1
+        prepared = real_seed(*args, **kwargs)
+        if scenario == "rejected_seed":
+            return replace(
+                prepared,
+                advisory="Auxiliary pinned dependencies (quoted advisory data). Synthetic binding.",
+            )
+        return prepared
+
+    monkeypatch.setattr(review_solver, "mock_call_diagnostic", replay)
+    monkeypatch.setattr(review_solver, "stock_guard_diagnostic", guard)
+    monkeypatch.setattr(review_solver, "pinned_stock_restore_seed", seed)
+    if scenario == "rejected_seed":
+        monkeypatch.setattr(
+            review_solver, "stock_collection", lambda *args, **kwargs: None
+        )
+    phases = []
+    prompts = []
+
+    class Gateway:
+        def complete(self, *, role, messages, **kwargs):
+            phases.append(role)
+            prompt = messages[-1]["content"]
+            prompts.append(prompt)
+            if role == "planning":
+                raise ProviderExhausted(None, {"planner": "upstream timeout"})
+            content = (
+                edit(SOURCE, "        return 7\n", "        return 8\n")
+                if "Private regression repair." in prompt
+                else edit(SOURCE, "    return -3\n", "    return 3\n")
+            )
+            return SimpleNamespace(
+                role=role,
+                route="fixture-free",
+                model="fixture-coder",
+                configured_model="fixture/free",
+                content=content,
+                usage={},
+                tool_calls=(),
+            )
+
+    request_cap = 1 if scenario == "one_request" else 3
+    executor = PlainExecutor(
+        runner, Gateway(), Limits(model_requests=request_cap, concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+    result = solve(executor, task, archive.getvalue(), budget, "fixture")
+    assert all(check.returncode == 0 for check in result.checks)
+    assert not checkpoints
+    assert calls["replay"] == 1
+    if scenario in {"one_request", "planner_outage"}:
+        assert phases == ["coding"]
+        assert calls["seed"] == 1 and calls["guard"] == 0
+        assert "Private regression repair." in prompts[0]
+        assert "test_review_value" in prompts[0]
+    else:
+        assert phases == ["planning", "coding"]
+        assert calls["guard"] == 1
+        assert calls["seed"] == int(scenario == "rejected_seed")
+        assert all("Private regression repair." not in prompt for prompt in prompts)
+        assert prompts[0].count("Synthetic binding.") == int(
+            scenario == "rejected_seed"
+        )
