@@ -41,6 +41,8 @@ from github_harness_agent.review_solver import (
     patch_for,
     solve,
 )
+
+
 from github_harness_agent.worker import CommandOutputExceeded
 
 SOURCE = "fixture_calc.py"
@@ -172,6 +174,117 @@ def solver_case(tmp_path, monkeypatch):
     return task, archive.getvalue(), FixtureRunner(tmp_path), checkpoints
 
 
+def test_normal_operator_prompt_keeps_the_exercised_traversal_beyond_the_review_anchor(
+    solver_case,
+):
+    task, _, runner, _ = solver_case
+    task = replace(task, require_new_tests=False)
+    acceptance = Path(task.pull_checks[0][-1])
+    with acceptance.open("a") as stream:
+        stream.write(
+            "\nfrom fixture_calc import Explorer\n\n"
+            "def test_limit_applies_to_traversal():\n"
+            "    assert Explorer().walk(limit=1) == [0, 1]\n"
+        )
+    filler = "# Unrelated details elsewhere in the reviewed production module.\n" * 420
+    prior = (
+        BASE_SOURCE + filler + "\nclass Explorer:\n"
+        "    def walk(self, *, limit):\n"
+        "        result = [0]\n"
+        "        for level in range(limit):\n"
+        "            result.append(level + 1)\n"
+        "        return result\n"
+    )
+    current = (
+        BASE_SOURCE.replace("return -1", "return 1").replace("return -2", "return 2")
+        + filler
+        + "\nclass State:\n"
+        "    def __init__(self, depth):\n"
+        "        self.depth = depth\n\n"
+        "class Explorer:\n"
+        "    def walk(self, *, limit):\n"
+        "        if limit < 0:\n"
+        "            raise ValueError('nonnegative limit required')\n"
+        "        pending = [State(0)]\n"
+        "        result = []\n"
+        "        while pending:\n"
+        "            state = pending.pop()\n"
+        "            result.append(state.depth)\n"
+        "            if state.depth < 2:\n"
+        "                child = self._descend(state)\n"
+        "                pending.append(child)\n"
+        "        return result\n\n"
+        "    def _descend(self, parent):\n"
+        "        return State(parent.depth + 1)\n"
+    )
+    checkpoint = DraftCheckpoint(
+        "harness2/base",
+        task.base_sha,
+        patch_for({SOURCE: prior}, {SOURCE: current}),
+        guidance=_GUIDANCE,
+        last_editor=("fixture", "fixture/coder"),
+    )
+    task = replace(task, checkpoints={checkpoint.key: checkpoint})
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, content in {
+            SOURCE: prior,
+            "tests/test_existing.py": "def test_stock():\n    assert True\n",
+        }.items():
+            data = content.encode()
+            entry = tarfile.TarInfo(path)
+            entry.size = len(data)
+            snapshot.addfile(entry, BytesIO(data))
+
+    class Gateway(FreeGateway):
+        def complete(self, **kwargs):
+            messages = kwargs["messages"]
+            compact = compact_focused_review(messages, max_bytes=8192) or messages
+            prompt = compact[-1]["content"]
+            assert (
+                prompt.startswith("Selected failure:")
+                and "test_limit_applies_to_traversal" in prompt.splitlines()[0]
+            )
+            assert wire_size(compact) <= 8192
+            focus = prompt.split("\nFocused source from ", 1)[1].split(
+                "\nFailure details:", 1
+            )[0]
+            for row in (
+                "        pending = [State(0)]",
+                "            state = pending.pop()",
+                "                child = self._descend(state)",
+                "                pending.append(child)",
+                "    def _descend(self, parent):",
+                "        return State(parent.depth + 1)",
+            ):
+                assert f"{current.splitlines().index(row) + 1} | {row}" in focus
+            prior_row = "        for level in range(limit):"
+            assert f"{prior.splitlines().index(prior_row) + 1} | {prior_row}" in focus
+            assert (
+                "keyword limit" in focus
+                and "Pinned iteration bound (read-only)" in focus
+            )
+            assert prompt.endswith("Respond with exact SEARCH/REPLACE blocks only.")
+            return super().complete(**kwargs)
+
+    gateway = Gateway(
+        edit(
+            SOURCE,
+            "            if state.depth < 2:\n",
+            "            if state.depth < min(2, limit):\n",
+        )
+    )
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=1, concurrent_probes=1)
+    )
+    result = solve(
+        executor,
+        task,
+        archive.getvalue(),
+        _Budget(executor.limits, lambda: False, task),
+        "fixture",
+    )
+    assert all(check.returncode == 0 for check in result.checks)
 def test_evidence_pairs_line_traceback_locations_with_each_pytest_node(solver_case):
     task, archive, runner, _ = solver_case
     executor = PlainExecutor(runner, FreeGateway())

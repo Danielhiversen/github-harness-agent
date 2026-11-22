@@ -623,6 +623,7 @@ def _proposal_messages(
     preserved_stock_fixture="",
     private_source="",
     mock_detail="",
+    parameter_focus="",
 ):
     if target == _TEST_GOAL:
         return _test_authoring_messages(
@@ -654,13 +655,15 @@ def _proposal_messages(
             private_source,
         )
         if private_source
+        else ("the exercised traversal and its prior bound (quoted)", parameter_focus)
+        if parameter_focus
         else focused_check_excerpt(check_command, diagnostic, current)
     )
     if mock_detail:
         diagnostic += "\n" + mock_detail
     if check_focus:
         selected_source, focus = check_focus
-        if not private_source:
+        if not (private_source or parameter_focus):
             path = selected_source
         lead = (
             f"Focused source from {selected_source}:\n{focus}\n"
@@ -3042,11 +3045,23 @@ def solve(executor, task, archive, budget, version):
                     # complete method only when both exact definitions fit.
                     if stock_fixture and (plan or advice is not None):
                         named_definitions = localized_retry is not None
+                    parameter_focus = ""
                     if target in operator:
                         parameter_note = lost_iteration_argument(
-                            _fixture_excerpt(fixtures, target[1], selected_only=True), original, source
+                            _fixture_excerpt(fixtures, target[1], selected_only=True),
+                            original,
+                            source,
+                            source_windows=(
+                                repair is None
+                                and source is current
+                                and _trusted_operator_node(
+                                    target[1], check_command, operator_cases
+                                )
+                            ),
                         )
-                        if parameter_note:
+                        if "\nCurrent traversal " in parameter_note:
+                            parameter_focus = parameter_note
+                        elif parameter_note:
                             mock_detail = "\n".join(filter(None, (mock_detail, parameter_note)))
                     messages = _proposal_messages(
                         target,
@@ -3079,6 +3094,7 @@ def solve(executor, task, archive, budget, version):
                             else ""
                         ),
                         mock_detail=mock_detail,
+                        parameter_focus=parameter_focus,
                         rejection=(
                             _private_repair_context(current, repair)
                             if repair is not None
