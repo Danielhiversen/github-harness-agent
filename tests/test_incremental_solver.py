@@ -967,6 +967,100 @@ def test_private_operator_regressions_are_repaired_without_trading_passing_cases
     assert all(check.returncode == 0 for check in result.checks)
 
 
+@pytest.mark.parametrize(
+    "scenario", ("compatible", "identical", "canary", "unrelated", "low_budget")
+)
+def test_guarded_stock_reconciliation_checks_every_suite(solver_case, monkeypatch, scenario):
+    task, _, runner, checkpoints = solver_case
+    task = replace(task, require_new_tests=False)
+    operator_call = "stock()" if scenario == "identical" else "stock(legacy=True)"
+    Path(task.pull_checks[0][-1]).write_text(
+        "from fixture_calc import first, stock\n\n"
+        f"def test_previous_behavior():\n    assert {operator_call} == -2\n\n"
+        "def test_unrelated_behavior():\n    assert first() == -1\n"
+    )
+    canary = (
+        "\ndef test_matching_modes():\n    assert stock() == stock(legacy=True)\n"
+        if scenario == "canary"
+        else ""
+    )
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, content in {
+            SOURCE: BASE_SOURCE + "\ndef stock(*, legacy: bool = False):\n    shared = 1\n    return shared - 3\n",
+            "tests/test_existing.py": (
+                "from fixture_calc import stock\n\n"
+                "def test_stock_goal():\n    assert stock() == 4\n" + canary
+            ),
+        }.items():
+            data = content.encode()
+            entry = tarfile.TarInfo(path)
+            entry.size = len(data)
+            snapshot.addfile(entry, BytesIO(data))
+    proposal = edit(SOURCE, "    return shared - 3\n", "    return shared + 3\n")
+    if scenario == "unrelated":
+        proposal += SECOND
+    gateway = FreeGateway(proposal, "An incomplete edit")
+    executor = PlainExecutor(runner, gateway, Limits(model_requests=2, concurrent_probes=1))
+    budget = _Budget(executor.limits, lambda: False, task)
+    if scenario == "low_budget":
+        monkeypatch.setattr(
+            "github_harness_agent.review_solver._GUARD_MIN_REMAINING",
+            executor.limits.wall_time + 1,
+        )
+    guard_failures = []
+
+    def record(*args, **kwargs):
+        failures = evidence(*args, **kwargs)
+        if b" if legacy else " in args[4] or b"+    if legacy:" in args[4]:
+            guard_failures.append({node for _, node in failures})
+        return failures
+
+    monkeypatch.setattr("github_harness_agent.review_solver.evidence", record)
+    if scenario == "compatible":
+        result = solve(executor, task, archive.getvalue(), budget, "fixture-version")
+        assert all(check.returncode == 0 for check in result.checks)
+        assert b"shared - 3 if legacy else shared + 3" in result.patch
+        assert b"+    shared =" not in result.patch
+        assert result.route_trace[-1].configured_model == "stand-in/free"
+        assert len(gateway.prompts) == 1
+        assert guard_failures[-1] == set()
+    else:
+        with pytest.raises(AttemptRejected):
+            solve(executor, task, archive.getvalue(), budget, "fixture-version")
+        assert "Private regression repair" in gateway.prompts[1]
+        assert len(guard_failures) == (2 if scenario in {"identical", "canary"} else 0)
+        if scenario == "canary":
+            assert any(
+                any(node.endswith("::test_matching_modes") for node in failures)
+                for failures in guard_failures
+            )
+    assert not checkpoints
+
+
+@pytest.mark.parametrize(
+    ("signature", "context", "arguments"),
+    (
+        ("mode: str | None = None", "", (None, "legacy")),
+        ("mode", "    if mode == 'legacy':\n        pass\n", ("legacy", "plain")),
+    ),
+)
+def test_guard_uses_a_public_parameter_signature_or_existing_condition(
+    signature, context, arguments
+):
+    from github_harness_agent.review_guards import guarded_sources
+
+    before = f"def select({signature}):\n{context}    return -1\n"
+    after = before.replace("return -1", "return 1")
+    outcomes = set()
+    for candidate in guarded_sources(before, after):
+        assert candidate.startswith(f"def select({signature}):\n{context}")
+        namespace = {}
+        exec(candidate, namespace)
+        outcomes.add(tuple(namespace["select"](arg) for arg in arguments))
+    assert outcomes == {(1, -1), (-1, 1)}
+
+
 @pytest.mark.parametrize("followup", ("repair", "lose_stock", "operator_remains", "partial_stock"))
 def test_private_repair_reconciles_a_stock_gain_without_storing_regressions(solver_case, followup):
     task, _, runner, checkpoints = solver_case

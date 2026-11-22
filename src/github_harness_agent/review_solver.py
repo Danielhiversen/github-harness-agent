@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
@@ -40,6 +41,7 @@ from .review_definitions import (
     apply_definitions,
     apply_native_definition,
 )
+from .review_guards import guarded_sources
 from .review_mock_replay import mock_call_diagnostic
 from .review_planner import apply_coding_advice, request_coding_advice
 from .review_recovery import operator_acceptance_context
@@ -51,6 +53,7 @@ from .review_solver_context import (
 )
 from .task_context import MESSAGE_BYTES, compact_focused_review, excerpt, wire_size
 from .test_updates import has_runnable_test
+from .worker import Cancelled, ExecutionError, LimitExceeded
 
 _LOG = logging.getLogger(__name__)
 _CHECKPOINT = "harness2/base"
@@ -83,6 +86,8 @@ _PYTEST_SECTION = re.compile(r"^={5,} ([^\n]+?) ={5,}$", re.M)
 _PYTEST_CRASH_LINE = re.compile(r"^\S[^\n]*?\.py:[1-9][0-9]*: .+$")
 _PYTEST_TOTALS = re.compile(r"(?:\d+ [a-z]+, )*\d+ [a-z]+ in \d+(?:\.\d+)?s(?: \([\d:]+\))?")
 _STOCK_REPAIR_CASE_LIMIT = 4
+_GUARD_SECONDS = 20
+_GUARD_MIN_REMAINING = 45
 _MODEL_FAILURE_THRESHOLD = 2
 _WORD = re.compile(r"[a-z]{3,}")
 _STOP = set(
@@ -857,6 +862,26 @@ def _verified_operator_runs(before, after, failures, operator_commands, names):
     return reported == failures
 
 
+class _GuardBudget:
+    """Charge the normal command budget while capping optional verification time."""
+
+    def __init__(self, budget):
+        self.budget = budget
+        self.cancelled = budget.cancelled
+        self.limits = budget.limits
+        self.deadline = time.monotonic() + _GUARD_SECONDS
+
+    def remaining(self):
+        remaining = min(self.budget.remaining(), self.deadline - time.monotonic())
+        if remaining <= 0:
+            raise LimitExceeded("Guarded review verification timed out")
+        return remaining
+
+    def claim(self, kind, limit):
+        self.remaining()
+        return self.budget.claim(kind, limit)
+
+
 def _private_repair_context(current, repair):
     if repair.stock_origin:
         gained = "the entire repository pytest check containing " + excerpt(repair.origin[1], 160)
@@ -1025,6 +1050,46 @@ def solve(executor, task, archive, budget, version):
         counts = model_failures.get(rotation_key)
         if counts is not None and snapshot is current and editor.configured_model:
             counts[editor.route, editor.configured_model] += 1
+
+    def reconcile_stock_gain(target, proposed_sources):
+        if (
+            budget.remaining() < _GUARD_MIN_REMAINING
+            or budget.commands_remaining() < 3 * len(commands) + 1
+            or proposed_sources.keys() != current.keys()
+        ):
+            return None
+        changed = [path for path in current if current[path] != proposed_sources[path]]
+        if len(changed) != 1:
+            return None
+        path = changed[0]
+        if path not in paths or _protected(path, task, new_test=False):
+            return None
+        probe_budget = _GuardBudget(budget)
+        for source in guarded_sources(current[path], proposed_sources[path]):
+            sources = {**current, path: source}
+            guarded_patch = patch_for(original, sources)
+            if not guarded_patch or len(guarded_patch) > executor.limits.patch_bytes:
+                continue
+            runs = {}
+            try:
+                checked = evidence(
+                    executor, task, archive, probe_budget, guarded_patch, commands,
+                    pytest_runs=runs,
+                )
+            except Cancelled:
+                raise
+            except (ExecutionError, ValueError):
+                budget.remaining()
+                return None
+            if (
+                checked.keys() < failures.keys()
+                and _preserved_stock_gain(target, pytest_runs, runs, checked)
+                and _verified_operator_runs(
+                    pytest_runs, runs, set(), task.pull_checks, operator_cases
+                )
+            ):
+                return sources, guarded_patch, checked, runs
+        return None
 
     planning_attempts = {}
     retry_advice = {}
@@ -1473,13 +1538,17 @@ def solve(executor, task, archive, budget, version):
                 )
                 and _named_operator_cases(old_operator | new_operator, commands)
             ):
-                repair_attempted.add(target)
-                retry_advice.clear()
-                continuations.pop(target, None)
-                regression_repair = _RegressionRepair(
-                    target, candidate, after, gained, introduced, stock_origin=bool(stock_gain)
-                )
-                continue
+                guarded = reconcile_stock_gain(target, candidate) if stock_gain else None
+                if guarded is None:
+                    repair_attempted.add(target)
+                    retry_advice.clear()
+                    continuations.pop(target, None)
+                    regression_repair = _RegressionRepair(
+                        target, candidate, after, gained, introduced, stock_origin=bool(stock_gain)
+                    )
+                    continue
+                candidate, proposed, after, after_runs = guarded
+                new_operator, introduced = set(), set()
             progressed = new_operator < old_operator or (
                 new_operator == old_operator and after.keys() < failures.keys()
             )
