@@ -2482,11 +2482,12 @@ def test_localized_named_failure_tries_numbered_ranges_as_an_independent_remedy(
     ],
 )
 def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
-    solver_case, monkeypatch, interactive_tests, scenario
+    solver_case, monkeypatch, caplog, interactive_tests, scenario
 ):
     from github_harness_agent import review_solver
     from github_harness_agent.providers import ProviderExhausted
 
+    caplog.set_level("INFO", logger=review_solver.__name__)
     task, _, runner, checkpoints = solver_case
     recovery = []
     long_evidence = scenario == "long_evidence"
@@ -2760,6 +2761,8 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
     if not interactive_tests and not unrequested_tests:
         expected.append("author")
     assert phases == expected
+    if scenario == "localized" and not interactive_tests:
+        assert "(exact edits succeeded=1 rejected=1, shell actions=2)" in caplog.text
     if scenario == "reserved":
         assert budget.model_requests_remaining() == 0
     if scenario != "wrong_snapshot":
@@ -2904,3 +2907,105 @@ def test_scoped_outage_requires_live_budget_and_attributable_source(
                 scoped_sources=scope,
             )
         assert scope == {SOURCE: BASE_SOURCE}
+
+
+@pytest.mark.parametrize(
+    "scenario", ("direct", "stale", "stale_twice", "route_outage", "unscoped")
+)
+def test_scoped_rollout_paces_exact_edit_then_restores_verification(
+    solver_case, scenario
+):
+    from collections import Counter
+
+    from github_harness_agent.providers import ProviderExhausted
+
+    task, archive, runner, _ = solver_case
+    task = replace(
+        task, save_checkpoint=None, review_recovery=None, require_new_tests=False
+    )
+    ordinary = {"run", "edit_file"}
+    inspect_source = ("run", {"argv": ["cat", SOURCE]})
+    exact = (
+        "edit_file",
+        {"path": SOURCE, "old_text": "    return -1\n", "new_text": "    return 1\n"},
+    )
+    verification = ("run", {"argv": list(task.checks[0])})
+    attempts = [(ordinary, inspect_source), (ordinary, inspect_source)]
+    if scenario in {"stale", "stale_twice"}:
+        stale = ("edit_file", {**exact[1], "old_text": "    return stale\n"})
+        attempts += [({"edit_file"}, stale), ({"run"}, inspect_source)]
+        if scenario == "stale_twice":
+            attempts += [({"edit_file"}, stale), (ordinary, exact)]
+        else:
+            attempts.append(({"edit_file"}, exact))
+    elif scenario == "route_outage":
+        attempts += [({"edit_file"}, None), (ordinary, exact)]
+    else:
+        attempts.append((ordinary if scenario == "unscoped" else {"edit_file"}, exact))
+    attempts += [(ordinary, verification), (ordinary, ("finish", {}))]
+    used = []
+
+    class Gateway:
+        def complete(self, *, role, messages, tools, **request):
+            names, action = attempts[len(used)]
+            assert {tool["function"]["name"] for tool in tools} == names
+            used.append(names)
+            if action is None:
+                raise ProviderExhausted(None)
+            name, arguments = action
+            if names == {"edit_file"}:
+                assert "exact" in messages[0]["content"].lower()
+                assert SOURCE in messages[0]["content"]
+                assert any(
+                    "return -1" in str(item.get("content")) for item in messages[1:]
+                )
+            if names == {"run"}:
+                assert "old_text must occur exactly once" in messages[-1]["content"]
+            calls = (
+                ()
+                if name == "finish"
+                else (
+                    {
+                        "id": str(len(used)),
+                        "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(arguments)},
+                    },
+                )
+            )
+            return SimpleNamespace(
+                role=role,
+                route="fixture",
+                model="fixture",
+                configured_model="fixture",
+                content="done" if not calls else None,
+                tool_calls=calls,
+                usage={},
+            )
+
+    executor = PlainExecutor(runner, Gateway(), Limits(model_requests=len(attempts)))
+    budget = _Budget(executor.limits, lambda: False, task)
+    scope = None if scenario == "unscoped" else {SOURCE: BASE_SOURCE}
+    counts = Counter()
+    patch, _, actor = executor._rollout(
+        task,
+        archive,
+        budget,
+        "Test scoped pacing.",
+        "coding",
+        clarification=False,
+        scoped_sources=scope,
+        scoped_action_counts=counts,
+    )
+
+    assert b"+    return 1\n" in patch
+    assert len(used) == len(attempts)
+    assert actor.configured_model == "fixture"
+    if scope is not None:
+        assert "    return 1\n" in scope[SOURCE]
+        assert counts["successful_edits"] == 1
+        assert counts["rejected_edits"] == {"stale": 1, "stale_twice": 2}.get(
+            scenario, 0
+        )
+        assert counts["shell_actions"] == (4 if scenario.startswith("stale") else 3)
+    else:
+        assert not counts

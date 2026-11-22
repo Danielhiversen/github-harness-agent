@@ -918,6 +918,7 @@ class PlainExecutor:
         checkpoint_guidance=None,
         seed_draft=None,
         scoped_sources=None,
+        scoped_action_counts=None,
     ):
         with self.runner.workspace(
             archive, budget.remaining, budget.cancelled
@@ -1080,6 +1081,14 @@ class PlainExecutor:
             text_batch_applied = False
             scoped_edits = {}
             scoped_outage = None
+            scoped_production = tuple(
+                path
+                for path in scoped_sources or ()
+                if not _protected(path, task, new_test=False)
+            )
+            scoped_pacing = "inspect" if scoped_production else "ordinary"
+            inspection_turns = 0
+            scoped_retried = False
 
             def valid_recovery_test(path, content):
                 return (
@@ -1109,6 +1118,7 @@ class PlainExecutor:
                 focus_next_turn = False
                 request_messages = messages
                 request_tools = tools
+                paced_edit = scoped_readback = False
                 if recovery_turn:
                     request_tools = (RECOVERY_EDIT_TOOL,)
                     request_messages = [
@@ -1128,6 +1138,29 @@ class PlainExecutor:
                         },
                         *messages[1:],
                     ]
+                elif (
+                    scoped_pacing in {"edit", "readback"}
+                    and budget.model_requests_remaining() > 1
+                ):
+                    paced_edit = scoped_pacing == "edit"
+                    scoped_readback = not paced_edit
+                    scoped_pacing = "ordinary"
+                    request_tools = (EDIT_TOOL,) if paced_edit else (RUN_TOOL,)
+                    guidance = (
+                        "Use edit_file now to make one exact replacement in the reviewed production "
+                        f"files {json.dumps(scoped_production)}. Copy old_text from source already inspected. "
+                        "Choose the smallest fix for the tracked failure and preserve passing behavior."
+                        if paced_edit
+                        else "The exact match was stale. Use run to read the affected source lines again. "
+                        "Keep this turn to inspection so the next edit can use exact current text."
+                    )
+                    request_messages = [
+                        {
+                            **messages[0],
+                            "content": messages[0]["content"] + "\n\n" + guidance,
+                        },
+                        *messages[1:],
+                    ]
                 native_error = None
                 try:
                     last_editor = (
@@ -1144,6 +1177,9 @@ class PlainExecutor:
                 except _RequestBudgetExceeded as error:
                     budget.reject(error, last, latest=True)
                 except ProviderExhausted as error:
+                    if (paced_edit or scoped_readback) and has_model_turn():
+                        budget.remaining()
+                        continue
                     if not recovery_turn:
                         if text_batch_applied:
                             break
@@ -1220,6 +1256,8 @@ class PlainExecutor:
                 if not calls:
                     if clarification and completion.content:
                         self._check_clarification(completion.content)
+                    if (paced_edit or scoped_readback) and has_model_turn():
+                        continue
                     can_continue = (
                         automatic_review
                         and turns < limit
@@ -1268,9 +1306,11 @@ class PlainExecutor:
                     assistant["provider_context"] = provider_context
                 messages.append(assistant)
                 ran_command = ran_check = False
+                inspected = refreshed = stale_edit = False
                 successful_text_edits = 0
                 for tool in recovery_calls if recovery_turn else calls:
-                    if focused_test_turn and tool["function"]["name"] != "edit_file":
+                    name = tool["function"]["name"]
+                    if focused_test_turn and name != "edit_file":
                         messages.append(
                             {
                                 "role": "tool",
@@ -1281,7 +1321,8 @@ class PlainExecutor:
                         continue
                     if (
                         task.context is not None
-                        and tool["function"]["name"] == "read_task_context"
+                        and not (paced_edit or scoped_readback)
+                        and name == "read_task_context"
                     ):
                         try:
                             budget.claim("context read", 40)
@@ -1295,13 +1336,21 @@ class PlainExecutor:
                             }
                         )
                         continue
-                    is_edit = tool["function"]["name"] == "edit_file"
+                    is_edit = name == "edit_file"
                     touched = False
                     checked_command = None
                     before_check = None
                     before_tree = None
                     try:
                         budget.claim("command", self.limits.commands)
+                        if paced_edit and (len(calls) != 1 or not is_edit):
+                            raise InvalidEdit(
+                                "Make exactly one edit_file call on this turn."
+                            )
+                        if scoped_readback and name != "run":
+                            raise InvalidEdit(
+                                "Use run to inspect the source on this turn."
+                            )
                         if is_edit:
                             action = "edit_file"
                             data = edit_payload(tool, self.limits.patch_bytes)
@@ -1311,7 +1360,16 @@ class PlainExecutor:
                                 scoped_sources is not None
                                 and edit["path"] not in scoped_sources
                             ):
-                                raise InvalidEdit("That file is outside the scoped review.")
+                                raise InvalidEdit(
+                                    "That file is outside the scoped review."
+                                )
+                            if paced_edit and (
+                                edit["path"] not in scoped_production
+                                or edit.get("old_text") is None
+                            ):
+                                raise InvalidEdit(
+                                    "Replace exact text in an existing reviewed production file."
+                                )
                             if focused_test_turn:
                                 path = edit["path"]
                                 if (
@@ -1394,14 +1452,21 @@ class PlainExecutor:
                         )
                     if text_recovery and touched and returncode == 0:
                         successful_text_edits += 1
-                    if (
-                        scoped_sources is not None
-                        and is_edit
-                        and touched
-                        and returncode == 0
-                    ):
-                        path = edit["path"]
-                        if not _protected(path, task, new_test=False):
+                    if scoped_sources is not None:
+                        edit_succeeded = is_edit and touched and returncode == 0
+                        if scoped_action_counts is not None:
+                            if is_edit:
+                                outcome = (
+                                    "successful_edits"
+                                    if edit_succeeded
+                                    else "rejected_edits"
+                                )
+                                scoped_action_counts[outcome] += 1
+                            elif name == "run" and touched:
+                                scoped_action_counts["shell_actions"] += 1
+                        if edit_succeeded and edit["path"] in scoped_production:
+                            scoped_pacing = "ordinary"
+                            path = edit["path"]
                             earlier = scoped_edits.pop(path, None)
                             expected = earlier[0] if earlier else scoped_sources[path]
                             old = edit.get("old_text")
@@ -1415,6 +1480,17 @@ class PlainExecutor:
                                         turns,
                                         last,
                                     )
+                        elif (
+                            is_edit
+                            and paced_edit
+                            and output.startswith(
+                                "exit 1\nold_text must occur exactly once."
+                            )
+                        ):
+                            stale_edit = True
+                        elif name == "run" and touched:
+                            inspected = True
+                            refreshed |= returncode == 0 and checked_command is None
                     if touched:
                         actor = last
                         ran_command = True
@@ -1481,6 +1557,19 @@ class PlainExecutor:
                     )
                 if text_recovery:
                     text_batch_applied = successful_text_edits == len(calls)
+                if scoped_pacing == "inspect" and inspected:
+                    inspection_turns += 1
+                    if inspection_turns >= 2:
+                        scoped_pacing = "edit"
+                if (
+                    stale_edit
+                    and not scoped_retried
+                    and budget.model_requests_remaining() >= 3
+                ):
+                    scoped_retried = True
+                    scoped_pacing = "readback"
+                elif scoped_readback and refreshed:
+                    scoped_pacing = "edit"
                 if ran_command and checkpoint_index is not None:
                     self._stage_rollout(
                         workspace, budget, artifacts, index=checkpoint_index

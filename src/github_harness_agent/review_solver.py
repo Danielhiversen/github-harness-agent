@@ -1356,6 +1356,7 @@ def solve(executor, task, archive, budget, version):
                 bounded = excerpt(section, room)
             instructions += heading + bounded
         initial_tools = probe.tools_left
+        scoped_actions = Counter()
         interactive_task = replace(
             task,
             instructions=instructions,
@@ -1378,6 +1379,7 @@ def solve(executor, task, archive, budget, version):
                 checkpoint_key=_CHECKPOINT,
                 checkpoint_guidance=_GUIDANCE,
                 scoped_sources=reviewed,
+                scoped_action_counts=scoped_actions,
             )
             sources = {**current, **reviewed}
             # Prove the production fix with the accepted test selection first.
@@ -1411,8 +1413,13 @@ def solve(executor, task, archive, budget, version):
             budget.remaining()
         finally:
             _LOG.info(
-                "Interactive review used %d model turns and %d tool actions",
-                probe.limits.rollout_requests - probe.turns_left, initial_tools - probe.tools_left,
+                "Interactive review used %d model turns and %d tool actions "
+                "(exact edits succeeded=%d rejected=%d, shell actions=%d)",
+                probe.limits.rollout_requests - probe.turns_left,
+                initial_tools - probe.tools_left,
+                scoped_actions["successful_edits"],
+                scoped_actions["rejected_edits"],
+                scoped_actions["shell_actions"],
             )
         return None
 
