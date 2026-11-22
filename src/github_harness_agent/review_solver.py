@@ -50,6 +50,8 @@ _BLOCK = re.compile(
 _MARKER = re.compile(r"^(?:<{5,}|={5,}|>{5,})(?:[ \t]|$)", re.M)
 _TEST_RESULT = re.compile(r"^(FAILED|ERROR) ([^\s]+::[^\s]+)", re.M)
 _TEST_SECTION = re.compile(r"^_{5,} (.+?) _{5,}$", re.M)
+_PYTEST_SECTION = re.compile(r"^={5,} ([^\n]+?) ={5,}$", re.M)
+_PYTEST_CRASH_LINE = re.compile(r"^\S[^\n]*?\.py:[1-9][0-9]*: .+$")
 _WORD = re.compile(r"[a-z]{3,}")
 _STOP = set(
     "self test check review request fixture calls builder return catalog assert tests with this from that they when have with which should".split()
@@ -143,6 +145,38 @@ def _test_detail(output, node):
     return next((line for line in output.splitlines() if node in line), node)
 
 
+def _line_failure_details(output):
+    parts = _PYTEST_SECTION.split(output)
+    sections = dict(zip(parts[1::2], parts[2::2], strict=True))
+    summary = sections.get("short test summary info", "")
+    nodes = [
+        node for status, node in _TEST_RESULT.findall(summary) if status == "FAILED"
+    ]
+    if not nodes or len(set(nodes)) != len(nodes):
+        return {}
+    reports = []
+    detail = []
+    captured = False
+    for line in sections.get("FAILURES", "").splitlines():
+        if _PYTEST_CRASH_LINE.fullmatch(line):
+            location = line[:800]
+            message = "\n".join(detail)[: 1599 - len(location)]
+            reports.append(f"{location}\n{message}".rstrip())
+            detail = []
+            captured = False
+        elif line.startswith("-----"):
+            captured = True
+        elif not captured and (
+            line.startswith(("E ", "> ")) or (detail and line.startswith(" "))
+        ):
+            detail.append(line)
+    # Pytest emits both sections in report order. If the terminal output is
+    # incomplete or ambiguous, keep the individually named short summaries.
+    if len(nodes) != len(reports):
+        return {}
+    return dict(zip(nodes, reports, strict=True))
+
+
 def evidence(executor, task, archive, budget, patch, commands):
     with executor.verification_runner.workspace(
         archive, budget.remaining, budget.cancelled
@@ -158,12 +192,18 @@ def evidence(executor, task, archive, budget, patch, commands):
             if outcome.returncode:
                 output = _combined(outcome)
                 nodes = [node for _, node in _TEST_RESULT.findall(output)]
+                line_traceback = "--tb=line" in command or any(
+                    option == ("--tb", "line") for option in zip(command, command[1:])
+                )
+                line_details = _line_failure_details(output) if line_traceback else {}
                 for node in nodes or [
                     f"check {number + 1} (exit {outcome.returncode})"
                 ]:
                     key = (number, node)
                     failures[key] = (
-                        output[-3000:] if not nodes else _test_detail(output, node)
+                        output[-3000:]
+                        if not nodes
+                        else (line_details.get(node) or _test_detail(output, node))
                     )
                 if outcome.returncode >= 125 or outcome.returncode < 0:
                     from .worker import ExecutionError

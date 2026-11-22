@@ -133,6 +133,7 @@ def run_worker(store, config, once=False, *, pull: tuple[str, int] | None = None
         limits[repo] = Limits(
             wall_time=_configured_limit(repo, cfg, "wall_time", defaults.wall_time, 3600),
             model_requests=model_requests,
+            concurrent_probes=_configured_limit(repo, cfg, "concurrent_probes", defaults.concurrent_probes, 6),
             commands=_configured_limit(repo, cfg, "commands", defaults.commands, 512),
             rollout_requests=rollout_requests,
         )

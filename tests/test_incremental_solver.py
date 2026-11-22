@@ -19,7 +19,14 @@ from github_harness_agent.executor import (
     _Budget,
 )
 from github_harness_agent.review_recovery import ReviewRecovery
-from github_harness_agent.review_solver import _GUIDANCE, apply_blocks, patch_for, solve
+from github_harness_agent.review_solver import (
+    _GUIDANCE,
+    _line_failure_details,
+    apply_blocks,
+    evidence,
+    patch_for,
+    solve,
+)
 
 SOURCE = "fixture_calc.py"
 NEW_TEST = "tests/test_review_regressions.py"
@@ -108,6 +115,34 @@ def solver_case(tmp_path, monkeypatch):
         save_checkpoint=checkpoints.append,
     )
     return task, archive.getvalue(), FixtureRunner(tmp_path), checkpoints
+
+
+def test_evidence_pairs_line_traceback_locations_with_each_pytest_node(solver_case):
+    task, archive, runner, _ = solver_case
+    executor = PlainExecutor(runner, FreeGateway())
+    budget = _Budget(executor.limits, lambda: False, task)
+    command = (*task.pull_checks[0][:-1], "--tb=line", task.pull_checks[0][-1])
+
+    failures = evidence(executor, task, archive, budget, b"", (command,))
+
+    by_test = {key[1].split("::")[-1]: detail for key, detail in failures.items()}
+    assert by_test.keys() == {"test_first", "test_second"}
+    assert "test_acceptance.py:4: assert -1 == 1" in by_test["test_first"]
+    assert "test_acceptance.py:7: assert -2 == 2" in by_test["test_second"]
+    assert "assert -2 == 2" not in by_test["test_first"]
+    assert "assert -1 == 1" not in by_test["test_second"]
+
+
+def test_line_traceback_does_not_guess_when_a_location_is_missing():
+    output = (
+        "===== FAILURES =====\n"
+        "E    assert result == 1\n"
+        "test_sample.py:4: assert result == 1\n"
+        "===== short test summary info =====\n"
+        "FAILED test_sample.py::test_first\n"
+        "FAILED test_sample.py::test_second\n"
+    )
+    assert _line_failure_details(output) == {}
 
 
 def test_apply_blocks_is_atomic_when_a_later_search_is_ambiguous():
