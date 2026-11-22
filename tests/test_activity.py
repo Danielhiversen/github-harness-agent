@@ -4,6 +4,25 @@ from github_harness_agent.activity import control, status
 from github_harness_agent.store import LeaseLost, Store
 
 
+def test_previous_provider_failure_only_blocks_a_waiting_retry(tmp_path):
+    now = 100.0
+    store = Store(tmp_path / "jobs.db", lambda: now)
+    repo = "org/weather"
+    message = "provider routes exhausted"
+    store.enqueue(repo, 4, {"pull": 19, "last_error": message})
+    job = store.claim()
+    store.save(job, "queued", delay=60)
+    assert next(status(store, repo, 19))["blocker"] == message
+    control(store, repo, 19, "retry")
+    assert next(status(store, repo, 19))["blocker"] is None
+    job = store.claim()
+    store.observe_model(job, "a", "success", "coding", "next-free-provider", "model")
+    row = next(status(store, repo, 19))
+    assert row["blocker"] is None
+    assert row["last_error"] == message
+    assert row["last_successful_call"]["provider"] == "next-free-provider"
+
+
 def test_lease_fenced_model_activity_and_scoped_retry(tmp_path):
     now = [100.0]
     store = Store(tmp_path / "jobs.db", lambda: now[0])

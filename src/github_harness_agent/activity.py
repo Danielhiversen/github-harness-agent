@@ -80,6 +80,10 @@ def status(store, repo=None, pull=None):
                     success = detail
                 else:
                     active.append(detail)
+            waiting = row["state"] == "paused" or (
+                row["state"] == "queued" and row["due"] > store.clock()
+            )
+            last_error = data.get("last_error")
             yield {
                 **{
                     k: row[k]
@@ -101,8 +105,9 @@ def status(store, repo=None, pull=None):
                 "active_calls": active,
                 "last_successful_call": success,
                 "next_retry_at": _iso(row["due"]) if row["state"] == "queued" else None,
+                "last_error": last_error,
                 "blocker": data.get("pause_reason")
-                or data.get("last_error")
+                or (last_error if waiting else None)
                 or data.get("ci_diagnostic"),
                 "ci_failures": [
                     {k: failure.get(k) for k in ("source", "name", "result")}
