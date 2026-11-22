@@ -1,7 +1,9 @@
 """Combine a small production edit with its previous behavior under a public input guard."""
 
 import ast
+import tokenize
 from copy import copy
+from io import StringIO
 from textwrap import indent
 
 from .review_definitions import _symbols
@@ -65,7 +67,7 @@ def _optional(annotation):
     return False
 
 
-def _guard(function):
+def _guards(function, *, before_predicate=None):
     parameters = {
         arg.arg: arg.annotation
         for arg in (
@@ -78,9 +80,30 @@ def _guard(function):
     for node in ast.walk(function):
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
             parameters.pop(node.id, None)
+        elif before_predicate is not None:
+            # Several bindings use strings instead of Name(Store) nodes.
+            if isinstance(node, ast.alias):
+                parameters.pop(node.asname or node.name.split(".", 1)[0], None)
+                if node.name == "*":
+                    return
+            elif isinstance(
+                node,
+                (
+                    *_FUNCTIONS,
+                    ast.ClassDef,
+                    ast.ExceptHandler,
+                    ast.MatchAs,
+                    ast.MatchStar,
+                ),
+            ):
+                parameters.pop(node.name, None)
+            elif isinstance(node, ast.MatchMapping):
+                parameters.pop(node.rest, None)
     for statement in function.body:
-        if not isinstance(statement, ast.If) or not isinstance(
-            statement.test, ast.Compare
+        if (
+            not isinstance(statement, ast.If)
+            or not isinstance(statement.test, ast.Compare)
+            or (before_predicate is not None and statement.lineno >= before_predicate)
         ):
             continue
         match statement.test:
@@ -90,15 +113,18 @@ def _guard(function):
                 comparators=[ast.Constant(value=str())],
             ):
                 if name in parameters:
-                    return ast.unparse(statement.test)
+                    yield ast.unparse(statement.test)
     for name, annotation in parameters.items():
         if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
             annotation = ast.parse(annotation.value, mode="eval").body
         if isinstance(annotation, ast.Name) and annotation.id == "bool":
-            return name
+            yield name
         if _optional(annotation):
-            return f"{name} is None"
-    return None
+            yield f"{name} is None"
+
+
+def _guard(function):
+    return next(_guards(function), None)
 
 
 def _bounded_site(source, alternative):
@@ -141,6 +167,80 @@ def _expression(old, new, predicate):
     return ast.unparse(old_form) + "\n"
 
 
+def _predicate(function, start, end):
+    pending = list(_children(function))
+    matches = []
+    while pending:
+        node = pending.pop()
+        if (
+            isinstance(node, ast.If)
+            and node.test.lineno <= start <= end <= node.test.end_lineno
+        ):
+            matches.append(node)
+        pending.extend(
+            child
+            for child in _children(node)
+            if hasattr(child, "lineno")
+            and child.lineno <= start <= end <= child.end_lineno
+        )
+    return matches[0] if len(matches) == 1 else None
+
+
+def _predicate_parts(source, expression):
+    raw = source.encode()
+    lines = raw.splitlines(keepends=True)
+    start = sum(map(len, lines[: expression.lineno - 1])) + expression.col_offset
+    end = sum(map(len, lines[: expression.end_lineno - 1])) + expression.end_col_offset
+    return raw[:start], raw[start:end], raw[end:]
+
+
+def _predicate_site(source, alternative, function, other, start, old_end, new_end):
+    old = _predicate(function, start, old_end)
+    new = _predicate(other, start, new_end)
+    if old is None or new is None:
+        return None
+    prefix, previous, suffix = _predicate_parts(source, old.test)
+    new_prefix, edited, new_suffix = _predicate_parts(alternative, new.test)
+    return old, new, prefix, previous, edited, suffix, new_prefix, new_suffix
+
+
+def _guarded_predicates(function, site):
+    old, new, prefix, previous, edited, suffix, new_prefix, new_suffix = site
+    if (
+        prefix != new_prefix
+        or suffix != new_suffix
+        or ast.dump(old.test) == ast.dump(new.test)
+    ):
+        return
+    if any(
+        isinstance(
+            item, (ast.NamedExpr, ast.Yield, ast.YieldFrom, ast.Await, ast.Lambda)
+        )
+        for expression in (old.test, new.test)
+        for item in ast.walk(expression)
+    ):
+        return
+    for expression in (previous, edited):
+        tokens = tokenize.generate_tokens(
+            StringIO("(" + expression.decode() + ")").readline
+        )
+        if any(token.type == tokenize.COMMENT for token in tokens):
+            return
+    guards = list(dict.fromkeys(_guards(function, before_predicate=old.lineno)))
+    if len(guards) != 1:
+        return
+    guard = guards[0].encode()
+    alternatives = []
+    for selected, fallback in ((edited, previous), (previous, edited)):
+        expression = (
+            b"((" + selected + b") if (" + guard + b") else (" + fallback + b"))"
+        )
+        result = (prefix + expression + suffix).decode()
+        compile(result, "<guarded review predicate>", "exec")
+        alternatives.append(result)
+    yield from alternatives
+
+
 def guarded_sources(source, alternative):
     """Yield up to two candidates for one small change inside an existing function."""
     if max(len(source.encode()), len(alternative.encode())) > _MAX_SOURCE_BYTES:
@@ -150,8 +250,10 @@ def guarded_sources(source, alternative):
         return
     before, start, old_end, new_end, blocks = site
     try:
-        new_defs = dict(_symbols(ast.parse(alternative).body))
-        for name, function in _symbols(ast.parse(source).body):
+        new_symbols = list(_symbols(ast.parse(alternative).body))
+        new_defs = dict(new_symbols)
+        old_symbols = list(_symbols(ast.parse(source).body))
+        for name, function in old_symbols:
             if (
                 not isinstance(function, _FUNCTIONS)
                 or not function.lineno <= start < old_end <= function.end_lineno
@@ -161,6 +263,17 @@ def guarded_sources(source, alternative):
             if not isinstance(other, _FUNCTIONS) or ast.dump(function.args) != ast.dump(
                 other.args
             ):
+                return
+            predicate = _predicate_site(
+                source, alternative, function, other, start + 1, old_end, new_end
+            )
+            if predicate is not None:
+                if any(
+                    sum(symbol == name for symbol, _ in entries) != 1
+                    for entries in (old_symbols, new_symbols)
+                ):
+                    return
+                yield from _guarded_predicates(function, predicate)
                 return
             old, new = (
                 _statements(function, start + 1, old_end),
@@ -207,5 +320,5 @@ def guarded_sources(source, alternative):
                 compile(result, "<guarded review edit>", "exec")
                 yield result
             return
-    except (SyntaxError, ValueError, RecursionError):
+    except (SyntaxError, tokenize.TokenError, ValueError, RecursionError):
         return
