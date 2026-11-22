@@ -13,7 +13,7 @@ from dataclasses import dataclass, field, replace
 
 from . import review_recovery
 from .check_artifacts import check_label
-from .check_diagnostics import ordinary_static_locations
+from .check_diagnostics import check_locations, ordinary_static_locations
 from .checkpoint import (
     RECOVERY_GOAL_LIMIT,
     RECOVERY_MODE_THRESHOLD,
@@ -33,7 +33,7 @@ from .executor import (
     _protected,
 )
 from .providers import ProviderExhausted
-from .review_composition import compose_line_edits, small_line_edits
+from .review_composition import compose_line_edits, selective_reverts, small_line_edits
 from .review_assertions import assertion_progress, operator_assertions
 from .review_prefix_replay import observe_prefix_progress
 from .review_definitions import (
@@ -1296,7 +1296,7 @@ def solve(executor, task, archive, budget, version):
             )
         return None
 
-    def reconcile_stock_gain(target, proposed_sources):
+    def reconcile_stock_gain(target, proposed_sources, regressions=None):
         if (
             budget.remaining() < _GUARD_MIN_REMAINING
             or budget.commands_remaining() < 3 * len(commands) + 1
@@ -1304,16 +1304,35 @@ def solve(executor, task, archive, budget, version):
         ):
             return None
         changed = [path for path in current if current[path] != proposed_sources[path]]
-        if len(changed) != 1:
+        allowed = {path for path in paths if not _protected(path, task, new_test=False)}
+        if not changed or any(path not in allowed for path in changed):
             return None
-        path = changed[0]
-        if path not in paths or _protected(path, task, new_test=False):
-            return None
-        probe_budget = _GuardBudget(budget)
         try:
-            for source in guarded_sources(current[path], proposed_sources[path]):
-                verified = verify_stock_gain(target, {**current, path: source}, probe_budget)
+            candidates = ()
+            if len(changed) == 1:
+                path = changed[0]
+                candidates = tuple(
+                    {**current, path: source}
+                    for source in guarded_sources(current[path], proposed_sources[path])
+                )
+            selective = not candidates and regressions is not None
+            if selective:
+                locations = {
+                    (path.removeprefix("/work/").removeprefix("./"), row)
+                    for (number, _), diagnostic in regressions.items()
+                    for path, row in check_locations(commands[number], diagnostic)
+                }
+                candidates = selective_reverts(
+                    current, proposed_sources, allowed, locations
+                )
+            probe_budget = _GuardBudget(budget, wall_seconds=45 if selective else None)
+            for sources in candidates:
+                verified = verify_stock_gain(target, sources, probe_budget)
                 if verified is not None:
+                    if selective:
+                        _LOG.info(
+                            "Selective reversion preserved the verified stock gain and review cases"
+                        )
                     return verified
         except Cancelled:
             raise
@@ -2082,12 +2101,18 @@ def solve(executor, task, archive, budget, version):
                 )
                 and _named_operator_cases(old_operator | new_operator, commands)
             ):
-                guarded = (
-                    reconcile_stock_gain(target, candidate)
+                reconciled = (
+                    reconcile_stock_gain(
+                        target,
+                        candidate,
+                        {key: after[key] for key in introduced}
+                        if source is current and editor.configured_model
+                        else None,
+                    )
                     if stock_gain and not static_failures
                     else None
                 )
-                if guarded is None:
+                if reconciled is None:
                     repair_attempted.add(target)
                     retry_advice.clear()
                     line_retries.clear()
@@ -2111,7 +2136,7 @@ def solve(executor, task, archive, budget, version):
                             len(admitted_static),
                         )
                     continue
-                candidate, proposed, after, after_runs = guarded
+                candidate, proposed, after, after_runs = reconciled
                 new_operator, introduced = set(), set()
             progressed = new_operator < old_operator or (
                 new_operator == old_operator and after.keys() < failures.keys()

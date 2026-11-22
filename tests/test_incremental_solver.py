@@ -1232,6 +1232,103 @@ def test_guard_uses_a_public_parameter_signature_or_existing_condition(
     assert outcomes == {(1, -1), (-1, 1)}
 
 
+@pytest.mark.parametrize(
+    "scenario", ("revert", "six_hunks", "required_hunk", "low_budget")
+)
+def test_selective_stock_revert_checks_both_suites(solver_case, monkeypatch, scenario):
+    task, _, runner, checkpoints = solver_case
+    task = replace(task, require_new_tests=False)
+    Path(task.pull_checks[0][-1]).write_text(
+        "from fixture_calc import first, guard\n\n"
+        "def test_guard():\n    assert guard() == 0\n\n"
+        "def test_first():\n    assert first() == -1\n"
+    )
+    stock_guard = (
+        "\ndef test_required_guard():\n    with pytest.raises(ValueError):\n        guard()\n"
+        if scenario == "required_hunk"
+        else ""
+    )
+    extra = (30, 40, 50) if scenario == "six_hunks" else ()
+    extra_source = "".join(
+        f"\ndef extra_{value}():\n    return -{value}\n" for value in extra
+    )
+    extra_tests = "".join(
+        f"\ndef test_extra_{value}():\n    from fixture_calc import extra_{value}\n    assert extra_{value}() == {value}\n"
+        for value in extra
+    )
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, content in {
+            SOURCE: BASE_SOURCE
+            + "\ndef left():\n    return -10\n\ndef right():\n    return -20\n"
+            + extra_source
+            + "\ndef guard():\n    return 0\n",
+            "tests/test_existing.py": (
+                "import pytest\nfrom fixture_calc import left, right, guard\n\n"
+                "def test_stock():\n    assert (left(), right()) == (10, 20)\n"
+                + stock_guard
+                + extra_tests
+            ),
+        }.items():
+            data = content.encode()
+            entry = tarfile.TarInfo(path)
+            entry.size = len(data)
+            snapshot.addfile(entry, BytesIO(data))
+    left_edit = (
+        "    # Preserve the stock slice main value.\n    return 10\n"
+        if extra
+        else "    return 10\n"
+    )
+    proposal = (
+        edit(SOURCE, "    return -10\n", left_edit)
+        + edit(SOURCE, "    return -20\n", "    return 20\n")
+        + edit(SOURCE, "    return 0\n", "    raise ValueError('guard regression')\n")
+        + "".join(
+            edit(SOURCE, f"    return -{value}\n", f"    return {value}\n")
+            for value in extra
+        )
+    )
+    gateway = FreeGateway(proposal, "An incomplete edit")
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=2, concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+    if scenario == "low_budget":
+        monkeypatch.setattr(
+            "github_harness_agent.review_solver._GUARD_MIN_REMAINING",
+            executor.limits.wall_time + 1,
+        )
+
+    probes = []
+    needed = tuple(f"+    return {value}\n".encode() for value in (10, 20, *extra))
+    rejected = b"+    raise ValueError"
+    additions = (*needed, rejected)
+
+    def record(*args, **kwargs):
+        failures = evidence(*args, **kwargs)
+        patch = args[4]
+        if sum(line in patch for line in additions) == len(needed):
+            probes.append((patch, failures))
+        return failures
+
+    monkeypatch.setattr("github_harness_agent.review_solver.evidence", record)
+    if scenario in {"revert", "six_hunks"}:
+        result = solve(executor, task, archive.getvalue(), budget, "fixture-version")
+        assert all(check.returncode == 0 for check in result.checks)
+        assert all(line in result.patch for line in needed)
+        assert rejected not in result.patch
+        assert len(gateway.prompts) == 1
+        assert result.route_trace[-1].configured_model == "stand-in/free"
+        assert probes == [(result.patch, {})]
+    else:
+        with pytest.raises(AttemptRejected):
+            solve(executor, task, archive.getvalue(), budget, "fixture-version")
+        assert "Private regression repair" in gateway.prompts[1]
+        assert len(probes) == (2 if scenario == "required_hunk" else 0)
+        assert all(failures for _, failures in probes)
+    assert not checkpoints
+
+
 def test_compose_line_edits_requires_exact_base_and_reviewed_paths():
     from github_harness_agent.review_composition import compose_line_edits, small_line_edits
 

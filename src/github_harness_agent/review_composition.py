@@ -1,4 +1,4 @@
-"""Compose small exact line edits independently made against one reviewed draft."""
+"""Apply and combine small exact line edits against one reviewed draft."""
 
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -16,7 +16,7 @@ class LineEdit:
         return self.start + len(self.original)
 
 
-def small_line_edits(base, proposal, allowed):
+def small_line_edits(base, proposal, allowed, *, max_edits=4):
     if base.keys() != proposal.keys():
         return ()
     changed = [path for path in base if base[path] != proposal[path]]
@@ -43,7 +43,7 @@ def small_line_edits(base, proposal, allowed):
                 )
     lines = [line for edit in edits for line in (*edit.original, *edit.replacement)]
     if (
-        len(edits) > 4
+        len(edits) > max_edits
         or len(lines) > 24
         or sum(len(line.encode()) for line in lines) > 4096
     ):
@@ -54,8 +54,12 @@ def small_line_edits(base, proposal, allowed):
 def compose_line_edits(base, first, second):
     if not first or not second:
         return None
+    return _apply_line_edits(base, (*first, *second))
+
+
+def _apply_line_edits(base, edits):
     by_path = {}
-    for edit in (*first, *second):
+    for edit in edits:
         by_path.setdefault(edit.path, []).append(edit)
     merged = base.copy()
     for path, edits in by_path.items():
@@ -83,3 +87,30 @@ def compose_line_edits(base, first, second):
             return None
         merged[path] = source
     return merged
+
+
+def selective_reverts(base, proposal, allowed, locations):
+    """Yield at most two exact subsets of a single small multi-hunk edit."""
+    edits = small_line_edits(base, proposal, allowed, max_edits=6)
+    if len(edits) < 3:
+        return
+
+    shifts = {}
+    ranked = []
+    for index, edit in enumerate(edits):
+        # Tracebacks refer to the provider draft, where earlier hunks can shift rows.
+        shift = shifts.get(edit.path, 0)
+        start = edit.start + shift + 1
+        stop = start + max(1, len(edit.replacement))
+        hits = sum(start <= row < stop for path, row in locations if path == edit.path)
+        ranked.append((-hits, -(len(edit.original) + len(edit.replacement)), index))
+        shifts[edit.path] = shift + len(edit.replacement) - len(edit.original)
+
+    yielded = 0
+    for _, _, omitted in sorted(ranked):
+        candidate = _apply_line_edits(base, (*edits[:omitted], *edits[omitted + 1 :]))
+        if candidate is not None:
+            yield candidate
+            yielded += 1
+            if yielded == 2:
+                return
