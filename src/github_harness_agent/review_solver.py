@@ -849,7 +849,7 @@ def solve(executor, task, archive, budget, version):
             # attempts and verified checkpoint writes coalesce other updates.
             retain_recovery(durable=True)
 
-    planned = set()
+    planning_attempts = {}
     max_proposals = min(36, budget.model_requests_remaining())
     editor = actor
     submitted = 0
@@ -988,18 +988,20 @@ def solve(executor, task, archive, budget, version):
                         ),
                     )
                     planner_input = None
+                    plan_count, last_planned = planning_attempts.get(target, (0, -3))
                     if (
                         target in operator
                         and not native
-                        and target not in planned
+                        and plan_count < 2
+                        and attempts[target] - last_planned >= 3
                         and no_progress.get(target, 0) >= RECOVERY_MODE_THRESHOLD
                         and continuation is None
                         and launch_budget >= 2
                         and budget.remaining() > 30
                     ):
-                        fixture = _fixture_excerpt(fixtures, target[1])
+                        fixture = _fixture_excerpt(fixtures, target[1], selected_first=True)
                         planner_input = source, fixture, diagnostics[target]
-                        planned.add(target)
+                        planning_attempts[target] = plan_count + 1, attempts[target]
                     future = pool.submit(
                         _coding_completion,
                         executor,
@@ -1255,6 +1257,7 @@ def solve(executor, task, archive, budget, version):
             regression_repair = None
             repair_attempted.clear()
             rejected.clear()
+            planning_attempts.clear()
             last_routes.pop(target, None)
             notes.pop(target, None)
             if prefix_progress:

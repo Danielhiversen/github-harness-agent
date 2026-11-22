@@ -881,6 +881,8 @@ class ProviderRouter:
                     )
                     max_tokens = min(max_tokens, 2600)
                 payload = builder(route, route_messages, tools, max_tokens)
+                if role == "planning" and "chat_template_kwargs" in payload:
+                    payload["chat_template_kwargs"].update(enable_thinking=True, medium_effort=True)
                 if groq_edit and route.model in {
                     "openai/gpt-oss-120b",
                     "openai/gpt-oss-20b",

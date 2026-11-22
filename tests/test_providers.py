@@ -171,6 +171,25 @@ def test_nemotron_reserves_output_for_focused_reviews(use_tool):
     assert "chat_template_kwargs" not in providers._chat_payload(route, messages, tools, 3072)
 
 
+def test_nemotron_planner_has_its_own_reasoning_budget():
+    payloads = []
+    def handle(request):
+        payloads.append(json.loads(request.content))
+        return httpx.Response(200, json=openai_response())
+
+    router = routed(deployment("nvidia-free/nvidia/nemotron-3-ultra-550b-a55b"), handle)
+    router.complete(
+        role="planning",
+        messages=[{"role": "system", "content": "Plan."},
+                  {"role": "user", "content": "Selected failure: test_order"}],
+        max_output_tokens=4096,
+    )
+    assert payloads[0]["chat_template_kwargs"] == {
+        "enable_thinking": True, "medium_effort": True, "force_nonempty_content": True,
+    }
+    assert payloads[0]["max_tokens"] == 4096
+
+
 def quality_order():
     config = deployment(OPENROUTER, OPENROUTER_SIBLING, KILO, OLLAMA)
     config[1]["url"] = config[0]["url"]

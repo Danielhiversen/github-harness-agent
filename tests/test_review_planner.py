@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 from github_harness_agent.providers import ProviderExhausted
@@ -62,5 +63,16 @@ def test_brief_planner_timeout_preserves_normal_coding_prompt():
     assert returned is messages
     assert len(calls) == 1
     assert calls[0][1] == "planning"
-    assert calls[0][3]["timeout_cap"] == 25
+    assert 25 < calls[0][3]["timeout_cap"] <= 60
+    assert calls[0][3]["max_output_tokens"] == 4096
+    assert "code" in calls[0][2][-1]["content"].split("Relevant current implementation", 1)[1]
     assert calls[0][3]["retry_oversize"] is False
+
+
+def test_detailed_plan_keeps_only_existing_symbols_and_preserves_source_evidence():
+    inventory = {"demo.py::update": "def update():\n    pass\n"}
+    plan = "Trace the sample from the failing fixture using the current implementation. " * 16
+    response = json.dumps({"strategy": plan, "symbols": ["demo.py::new_helper", "demo.py::update"]})
+    strategy, bodies = _advice(response, inventory)
+    assert strategy == plan.strip()
+    assert bodies == "demo.py::update\ndef update():\n    pass\n"

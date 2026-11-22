@@ -384,8 +384,8 @@ def test_stalled_implementation_uses_bounded_advice_then_normal_verification(
             prompt = messages[-1]["content"]
             prompts.append((role, prompt))
             if role == "planning":
-                assert timeout <= 25
-                assert request["max_output_tokens"] <= 512
+                assert timeout <= 60
+                assert request["max_output_tokens"] == 4096
                 assert "fixture_calc.py::second" in prompt
                 assert "def test_results():" in prompt
                 assert (
@@ -896,7 +896,7 @@ def test_solver_keeps_verified_progress_across_free_gateway_proposals(solver_cas
         "incomplete edit",
         FIRST,
         SECOND + regress_first,
-        SECOND,
+        FIRST,
         edit(NEW_TEST, "", TEST),
     )
     executor = PlainExecutor(
@@ -921,7 +921,8 @@ def test_solver_keeps_verified_progress_across_free_gateway_proposals(solver_cas
         (True, True, False),
     ]
     assert "No complete edit blocks" not in gateway.prompts[1]
-    assert "Proposal was discarded" in gateway.prompts[3]
+    assert gateway.prompts[3].splitlines()[0].endswith("::test_first")
+    assert "Private regression repair" in gateway.prompts[3]
     assert all(check.returncode == 0 for check in result.checks)
     assert any(NEW_TEST in check.command for check in result.checks)
 
