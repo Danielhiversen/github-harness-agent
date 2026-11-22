@@ -174,6 +174,7 @@ def _test_excerpt(lines, node, names):
 
 def _operator_examples(fixtures, names):
     candidates = []
+    contracts = []
     for path, source in fixtures.items():
         if not (module := _parse(source)):
             continue
@@ -194,6 +195,22 @@ def _operator_examples(fixtures, names):
                 if _call_names(helper := symbols[name]) & names
             ]
             if direct or helpers:
+                calls = [
+                    ast.unparse(call)
+                    for call in ast.walk(node)
+                    if isinstance(call, ast.Call)
+                    and isinstance(call.func, (ast.Name, ast.Attribute))
+                    and (call.func.attr if isinstance(call.func, ast.Attribute) else call.func.id)
+                    in names
+                ]
+                assertions = [
+                    ast.unparse(stmt.test) for stmt in ast.walk(node)
+                    if isinstance(stmt, ast.Assert)
+                ]
+                if calls and assertions:
+                    contracts.append(
+                        f"{qualified}: {excerpt(calls[0], 160)} -> {excerpt(assertions[-1], 180)}"
+                    )
                 body = _test_excerpt(lines, node, names | symbols.keys())
                 body += "".join(
                     _test_excerpt(lines, helper, names) for helper in helpers[:1]
@@ -206,7 +223,8 @@ def _operator_examples(fixtures, names):
         if len(example) <= remaining:
             selected.append(example)
             remaining -= len(example)
-    return "".join(selected)
+    overview = excerpt("\n".join(contracts), 2300) if contracts else ""
+    return (overview + "\n\n" if overview else "") + "".join(selected)
 
 
 def stock_delta_context(original, current, stock_fixture, fixtures, notes):
@@ -237,7 +255,9 @@ def stock_delta_context(original, current, stock_fixture, fixtures, notes):
                 remaining -= len(section)
         if key in draft:
             inventory[key] = _search_source(key, *after, regions)
-    examples = _operator_examples(fixtures, names | changed_names)
+    # A draft for multiple review threads can change unrelated public APIs.
+    # Prefer positive examples of the entry points the failing stock case uses.
+    examples = _operator_examples(fixtures, names or changed_names)
     note_limit = 3300 // max(1, len(notes))
     constraints = "\nReview notes (quoted):\n" + "\n".join(
         f"{path}:{line}: {excerpt(body, note_limit)}" for path, line, body in notes

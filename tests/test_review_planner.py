@@ -200,3 +200,18 @@ def test_stock_coding_prompt_keeps_complete_large_selected_method():
     coding = apply_coding_advice(messages, plan)[-1]["content"]
     assert method in coding
     assert coding.endswith("Respond with exact SEARCH/REPLACE blocks only.")
+
+
+def test_stock_overview_preserves_call_modes_across_large_operator_cases():
+    from github_harness_agent.review_delta_context import _operator_examples
+
+    fixture = "".join(
+        f"def test_mode_{index}(service):\n"
+        + ("    # offline setup for this call\n" * 30)
+        + f"    result = service.fetch(mode={index})\n"
+        + f"    assert result == {index}\n\n"
+        for index in range(6)
+    )
+    evidence = _operator_examples({"test_modes.py": fixture}, {"fetch"})
+    for index in range(6):
+        assert f"test_mode_{index}: service.fetch(mode={index}) -> result == {index}" in evidence
