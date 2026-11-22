@@ -682,6 +682,29 @@ def test_review_keeps_an_evaluable_comparison_for_the_next_free_edit(solver_case
     assert all(check.returncode == 0 for check in result.checks)
 
 
+def test_stock_repair_can_finish_two_dependent_edits_privately(solver_case, monkeypatch):
+    task, archive, runner, checkpoints = solver_case
+    task = replace(task, require_new_tests=False)
+    mark = edit(SOURCE, "def first():\n", "broken_stock = True\n\ndef first():\n")
+    tentative = "enabled = False\nbroken_stock = not enabled\n"
+    monkeypatch.setattr("github_harness_agent.review_solver.mock_call_diagnostic", lambda *args: "Observed differing calls.")
+    monkeypatch.setattr("github_harness_agent.review_solver.stock_guard_diagnostic", lambda *args: "")
+    monkeypatch.setattr("github_harness_agent.review_solver.request_coding_advice", lambda *args: None)
+    gateway = FreeGateway(
+        FIRST + SECOND + mark,
+        edit(SOURCE, "broken_stock = True\n", "broken_stock = 1\n"),
+        edit(SOURCE, "broken_stock = True\n", "broken_stock = bool(1)\n"),
+        edit(SOURCE, "broken_stock = True\n", tentative),
+        edit(SOURCE, "enabled = False\n", "enabled = True\n"),
+    )
+    executor = PlainExecutor(runner, gateway, Limits(model_requests=8, concurrent_probes=1))
+    result = solve(executor, task, archive, _Budget(executor.limits, lambda: False, task), "fixture")
+    assert "one unpublished proposal" in gateway.prompts[-1]
+    assert b"+enabled = True\n" in result.patch
+    assert not any(b"+enabled = False" in checkpoint.patch for checkpoint in checkpoints)
+    assert all(check.returncode == 0 for check in result.checks)
+
+
 def test_stalled_stock_pytest_uses_advice_and_named_fallback(solver_case):
     task, _, runner, _ = solver_case
     task = replace(task, require_new_tests=False)

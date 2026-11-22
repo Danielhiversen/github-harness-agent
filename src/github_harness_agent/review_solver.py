@@ -41,6 +41,7 @@ from .review_definitions import (
     apply_definitions,
     apply_native_definition,
 )
+from .review_guard_probe import stock_guard_diagnostic
 from .review_guards import guarded_sources
 from .review_mock_replay import mock_call_diagnostic
 from .review_planner import apply_coding_advice, request_coding_advice
@@ -1254,10 +1255,19 @@ def solve(executor, task, archive, budget, version):
                         and budget.remaining() > 30
                     )
                     if plan and stock_fixture and patch and target not in mock_diagnostics:
-                        mock_diagnostics[target] = mock_call_diagnostic(
+                        traces = mock_call_diagnostic(
                             executor, task, archive, budget, check_command, target[1], patch
                         )
+                        counterfactual = stock_guard_diagnostic(
+                            executor, task, archive, budget, check_command, target[1],
+                            original, source, stock_fixture, patch_for,
+                        )
+                        mock_diagnostics[target] = "\n".join(filter(None, (counterfactual, traces)))
+                        if counterfactual:
+                            _LOG.info("Isolated guard replay localized the tracked pytest regression")
                     mock_detail = mock_diagnostics.get(target, "")
+                    if continuation is not None and mock_detail:
+                        mock_detail = "Observations from the saved draft before the unpublished edit:\n" + mock_detail
                     if stock_fixture and (plan or advice is not None):
                         named_definitions = False
                     messages = _proposal_messages(
@@ -1556,14 +1566,15 @@ def solve(executor, task, archive, budget, version):
             partial = not progressed and assertion_progress(
                 assertions, task.pull_checks, target, failures, after
             )
-            if (
+            isolated_stock_failure = (
                 snapshot is current
                 and failures.keys() == after.keys() == {target}
                 and stock_fixtures.get((target, failures[target]))
                 and _same_pytest_selection(pytest_runs.get(target[0]), after_runs.get(target[0]))
                 and pytest_runs[target[0]].failed == after_runs[target[0]].failed == {target[1]}
                 and _verified_operator_runs(pytest_runs, after_runs, set(), task.pull_checks, operator_cases)
-            ):
+            )
+            if isolated_stock_failure:
                 partial = stock_assertion_evaluated(archive, target[1], failures[target], after[target])
                 if partial:
                     _LOG.info("The tracked pytest comparison now evaluates at the previous lookup failure")
@@ -1610,7 +1621,7 @@ def solve(executor, task, archive, budget, version):
                 if (
                     continuation is None
                     and snapshot is current
-                    and target in old_operator
+                    and (target in old_operator or (isolated_stock_failure and mock_diagnostics.get(target)))
                     and "::" in target[1]
                     and after.keys() == failures.keys()
                 ):

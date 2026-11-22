@@ -152,7 +152,7 @@ def request_coding_advice(
         return None
     if is_stock:
         lead = excerpt(lead, 2200)
-        mock_detail = excerpt(mock_detail, 1100)
+        mock_detail = excerpt(mock_detail, 3000)
     request = (
         lead
         + "\nVerification diagnostic (quoted):\n"
