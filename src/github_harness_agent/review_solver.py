@@ -20,6 +20,7 @@ from .checkpoint import (
     SolverRecovery,
 )
 from .executor import (
+    SYSTEM_PROMPT,
     AttemptRejected,
     CandidateEvidence,
     RefinementEvidence,
@@ -106,6 +107,9 @@ _PYTEST_TOTALS = re.compile(r"(?:\d+ [a-z]+, )*\d+ [a-z]+ in \d+(?:\.\d+)?s(?: \
 _STOCK_REPAIR_CASE_LIMIT = 4
 _STOCK_REPAIR_RETRIES = 2
 _STOCK_HEDGE_DELAY = 60
+_INTERACTIVE_MAX_TURNS = 6
+_INTERACTIVE_MAX_TOOLS = 12
+_INTERACTIVE_RESERVE_SECONDS = 60
 _GUARD_SECONDS = 90
 _GUARD_MIN_REMAINING = 45
 _COMPOSITION_MIN_REMAINING = 60
@@ -933,12 +937,13 @@ def _verified_operator_runs(before, after, failures, operator_commands, names):
 class _GuardBudget:
     """Charge the normal command budget while capping optional verification time."""
 
-    def __init__(self, budget):
+    def __init__(self, budget, *, wall_seconds=None, reserve=25):
         self.budget = budget
         self.cancelled = budget.cancelled
         self.limits = budget.limits
         # Leave room for the normal private repair if neither guarded edit verifies.
-        self.deadline = time.monotonic() + min(_GUARD_SECONDS, max(0, budget.remaining() - 25))
+        limit = _GUARD_SECONDS if wall_seconds is None else wall_seconds
+        self.deadline = time.monotonic() + min(limit, max(0, budget.remaining() - reserve))
 
     def remaining(self):
         remaining = min(self.budget.remaining(), self.deadline - time.monotonic())
@@ -949,6 +954,35 @@ class _GuardBudget:
     def claim(self, kind, limit):
         self.remaining()
         return self.budget.claim(kind, limit)
+
+
+class _InteractiveBudget(_GuardBudget):
+    def __init__(self, budget, turns, tools):
+        super().__init__(budget, wall_seconds=180, reserve=_INTERACTIVE_RESERVE_SECONDS)
+        self.limits = replace(budget.limits, rollout_requests=turns)
+        self.turns_left = turns
+        self.tools_left = tools
+
+    def model_requests_remaining(self):
+        return min(self.turns_left, self.budget.model_requests_remaining())
+
+    def complete(self, *args, **kwargs):
+        if not self.model_requests_remaining():
+            raise _RequestBudgetExceeded("Interactive review model request limit reached")
+        self.turns_left -= 1
+        kwargs.update(
+            timeout_cap=min(40, self.remaining()), retry_oversize=False, max_output_tokens=3072
+        )
+        return self.budget.complete(*args, **kwargs)
+
+    def claim(self, kind, limit):
+        if not self.tools_left:
+            raise _RequestBudgetExceeded("Interactive review tool limit reached")
+        self.tools_left -= 1
+        return super().claim(kind, limit)
+
+    def reject(self, *args, **kwargs):
+        return self.budget.reject(*args, **kwargs)
 
 
 def _private_repair_context(current, repair):
@@ -1138,6 +1172,65 @@ def solve(executor, task, archive, budget, version):
             return sources, proposal, checked, runs
         return None
 
+    def interactive_stock_gain(target, probe):
+        reviewed = {
+            path: current[path] for path in paths if not _protected(path, task, new_test=False)
+        }
+        if not reviewed:
+            return None
+        if task.require_new_tests and not _protected(new_path, task, new_test=True):
+            reviewed[new_path] = current[new_path]
+        draft = DraftCheckpoint(
+            _CHECKPOINT, task.base_sha, patch, guidance=_GUIDANCE,
+            last_editor=(actor.route, actor.configured_model) if actor and actor.configured_model else None,
+        )
+        interactive_task = replace(
+            task,
+            instructions=(
+                task.instructions
+                + "\n\nThe saved draft passes the operator review checks. Use the workspace tools to inspect the draft, "
+                "test a focused fix, and preserve all passing behavior. Edit only these paths: "
+                + json.dumps(sorted(reviewed))
+                + "\nTracked pytest node: " + target[1]
+                + "\nConfigured pytest command: " + json.dumps(commands[target[0]])
+                + "\nLast failure (quoted data):\n" + excerpt(failures[target], 1800)
+            ),
+            checkpoints={_CHECKPOINT: draft},
+            save_checkpoint=None,
+            save_solver_recovery=None,
+            review_recovery=None,
+            context=None,
+            test_update=None,
+        )
+        try:
+            _, _, editor = executor._rollout(
+                interactive_task,
+                archive,
+                probe,
+                SYSTEM_PROMPT,
+                "coding",
+                clarification=False,
+                checkpoint_key=_CHECKPOINT,
+                checkpoint_guidance=_GUIDANCE,
+                scoped_sources=reviewed,
+            )
+            sources = {**current, **reviewed}
+            # Prove the production fix with the accepted test selection first.
+            production = {**sources, new_path: current[new_path]} if new_path in sources else sources
+            if production == current or editor is None or not editor.configured_model:
+                return None
+            verified = verify_stock_gain(target, production, budget)
+            if verified is not None:
+                _, verified_patch, checked, runs = verified
+                proposed = verified_patch if production == sources else patch_for(original, sources)
+                if len(proposed) <= executor.limits.patch_bytes:
+                    return (sources, proposed, checked, runs), editor
+        except Cancelled:
+            raise
+        except (ExecutionError, ProviderExhausted, ValueError, OSError):
+            budget.remaining()
+        return None
+
     def reconcile_stock_gain(target, proposed_sources):
         if (
             budget.remaining() < _GUARD_MIN_REMAINING
@@ -1198,6 +1291,8 @@ def solve(executor, task, archive, budget, version):
     editor = actor
     submitted = 0
     pending = {}
+    interactive_target = None
+    interactive_attempted = False
     stock_hedge = None
     hedge_used = False
     hedge_pair = set()
@@ -1271,6 +1366,51 @@ def solve(executor, task, archive, budget, version):
             launch_budget = min(
                 max_proposals - submitted, budget.model_requests_remaining()
             )
+            if (
+                interactive_target is not None
+                and not interactive_attempted
+                and not pending
+                and retired is None
+                and private is None
+                and patch
+                and failures.keys() == {interactive_target}
+                and stock_fixtures.get((interactive_target, failures[interactive_target]))
+                and (stock_run := pytest_runs.get(interactive_target[0])) is not None
+                and stock_run.failed == {interactive_target[1]}
+                and _verified_operator_runs(
+                    pytest_runs, pytest_runs, set(), task.pull_checks, operator_cases
+                )
+                and interactive_target not in line_retries
+                and interactive_target not in retry_advice
+                and interactive_target not in continuations
+                and retained_recovery is not None
+                and retained_recovery.identity == retained_identity
+                and any(
+                    goal == _goal_digest(interactive_target)
+                    and max(bad, stalled) >= RECOVERY_MODE_THRESHOLD
+                    for goal, bad, stalled in retained_recovery.goals
+                )
+                and executor.verification_runner is not executor.runner
+            ):
+                turns = min(
+                    budget.limits.rollout_requests or _INTERACTIVE_MAX_TURNS,
+                    _INTERACTIVE_MAX_TURNS,
+                    launch_budget - int(needs_tests),
+                )
+                tools = min(_INTERACTIVE_MAX_TOOLS, budget.commands_remaining() - 2 * len(commands) - 1)
+                if turns >= 5 and tools >= 6 and budget.remaining() >= _INTERACTIVE_RESERVE_SECONDS + 90:
+                    interactive_attempted = True
+                    before = budget.model_requests_remaining()
+                    _LOG.info("Trying isolated interactive repair for %s", interactive_target[1])
+                    proposed = interactive_stock_gain(interactive_target, _InteractiveBudget(budget, turns, tools))
+                    submitted += before - budget.model_requests_remaining()
+                    if proposed is not None:
+                        (current, patch, failures, pytest_runs), actor = proposed
+                        editor = actor
+                        test_draft = current.get(new_path, "")
+                        # Keep this candidate in memory until ordinary regression authoring and final verification.
+                        continue
+                    launch_budget = min(max_proposals - submitted, budget.model_requests_remaining())
             if (
                 stock_hedge is not None
                 and len(pending) == 1
@@ -1572,6 +1712,8 @@ def solve(executor, task, archive, budget, version):
                 paired or continuation is not None or advised or repair is not None
             ) and snapshot is not current:
                 continue
+            if snapshot is current and (line_retry is not None or (localized_retry is not None and line_followup is None)):
+                interactive_target = target
             try:
                 completion, native_candidate, fresh_advice = future.result()
             except ProviderExhausted as error:
@@ -1918,6 +2060,7 @@ def solve(executor, task, archive, budget, version):
                 if not sibling.cancel() and not sibling.done():
                     retired = sibling
             current, failures, patch, actor = candidate, after, proposed, editor
+            interactive_target = None
             hedge_used = False
             pytest_runs = after_runs
             continuations.clear()

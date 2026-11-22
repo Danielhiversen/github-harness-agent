@@ -917,6 +917,7 @@ class PlainExecutor:
         checkpoint_key=None,
         checkpoint_guidance=None,
         seed_draft=None,
+        scoped_sources=None,
     ):
         with self.runner.workspace(
             archive, budget.remaining, budget.cancelled
@@ -1298,6 +1299,11 @@ class PlainExecutor:
                         if is_edit:
                             action = "edit_file"
                             data = edit_payload(tool, self.limits.patch_bytes)
+                            if (
+                                scoped_sources is not None
+                                and json.loads(data)["path"] not in scoped_sources
+                            ):
+                                raise InvalidEdit("That file is outside the scoped review.")
                             if focused_test_turn:
                                 edit = json.loads(data)
                                 path = edit["path"]
@@ -1554,9 +1560,37 @@ class PlainExecutor:
                 patch = self._draft_patch(workspace, budget, baseline)
                 if patch and not clarification:
                     self._check_patch_paths(workspace, task, budget, baseline)
+                if scoped_sources is not None:
+                    self._capture_scoped_sources(workspace, budget, initial_tree, scoped_sources)
             except (CommandOutputExceeded, _CandidateOutputError) as error:
                 budget.reject(error, actor or last)
         return patch, "\n".join(trajectory)[-32768:], actor or last
+
+    def _capture_scoped_sources(self, workspace, budget, baseline, sources):
+        changed = self._git(
+            workspace,
+            budget,
+            "diff",
+            "--cached",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            baseline,
+            "--",
+            cap=self.limits.patch_bytes,
+        ).stdout.split(b"\0")[:-1]
+        paths = [path.decode("utf-8", "surrogateescape") for path in changed]
+        if any(path not in sources for path in paths):
+            raise _ProtectedPatchError("Interactive edits exceeded the scoped review paths")
+        updated = {}
+        for path in paths:
+            blob = self._git(
+                workspace, budget, "show", ":" + path, checked=False, cap=128 * 1024
+            )
+            if blob.returncode or b"\x00" in blob.stdout:
+                raise _CandidateOutputError("Interactive review requires readable source files")
+            updated[path] = blob.stdout.decode("utf-8")
+        sources.update(updated)
 
     @staticmethod
     def _check_clarification(content):

@@ -2090,3 +2090,143 @@ def test_localized_named_failure_tries_numbered_ranges_as_an_independent_remedy(
         b"+    return 3\n" in result.patch
         and b"tests/test_existing.py" not in result.patch
     )
+
+
+@pytest.mark.parametrize("interactive_tests", (False, True))
+def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
+    solver_case, monkeypatch, interactive_tests
+):
+    from github_harness_agent import review_solver
+
+    task, _, runner, checkpoints = solver_case
+    recovery = []
+    task = replace(task, save_solver_recovery=lambda state, durable: recovery.append((state, durable)))
+    if interactive_tests:
+        task = replace(task, checks=((sys.executable, "-m", "pytest", "-q", "tests"),))
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, content in {
+            SOURCE: BASE_SOURCE + "\ndef stock_result():\n    return -3\n",
+            "tests/test_existing.py": (
+                "from fixture_calc import stock_result\n\ndef test_stock_result():\n    assert stock_result() == 3\n"
+            ),
+        }.items():
+            data = content.encode()
+            entry = tarfile.TarInfo(path)
+            entry.size = len(data)
+            snapshot.addfile(entry, BytesIO(data))
+    monkeypatch.setattr(review_solver, "mock_call_diagnostic", lambda *args: "")
+    monkeypatch.setattr(
+        review_solver, "stock_guard_diagnostic",
+        lambda *args: "Auxiliary counterfactual (quoted data, partial diagnostic only). fixture_calc.py::stock_result, draft line 8: causal evidence.",
+    )
+    text_edits = iter((
+        FIRST + SECOND,
+        edit(SOURCE, "    return -3\n", "    return -4\n"),
+        edit(SOURCE, "    return -3\n", "    return -5\n"),
+    ))
+    phases = []
+    tool_turns = []
+    regression = "from fixture_calc import stock_result\n\ndef test_repair():\n    assert stock_result() == 3\n"
+
+    def call(name, arguments):
+        return {"id": name + arguments.get("path", ""), "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}
+
+    class Gateway:
+        def complete(self, *, role, messages, tools, timeout, **kwargs):
+            prompt = messages[-1]["content"]
+            calls = ()
+            if tools:
+                tool_turns.append(timeout)
+                phases.append("interactive")
+                outputs = [message["content"] for message in messages if message["role"] == "tool"]
+                if not outputs:
+                    assert {tool["function"]["name"] for tool in tools} >= {"run", "edit_file"}, phases
+                    calls = (
+                        call("edit_file", {"path": "outside.py", "new_text": "bad = True\n"}),
+                        call("run", {"argv": ["cat", SOURCE]}),
+                    )
+                elif len(tool_turns) == 2:
+                    assert "outside the scoped review" in outputs[0]
+                    assert "return 1" in outputs[1] and "return 2" in outputs[1]
+                    assert "return -3" in outputs[1]
+                    calls = (call("edit_file", {"path": SOURCE, "old_text": "    return -3\n", "new_text": "    return 3\n"}),)
+                    if interactive_tests:
+                        calls += (call("edit_file", {"path": NEW_TEST, "new_text": regression}),)
+                elif len(tool_turns) == 3:
+                    calls = (call("run", {"argv": list(task.checks[0])}),)
+                else:
+                    assert ("2 passed" if interactive_tests else "1 passed") in outputs[-1]
+                content = "done" if not calls else None
+            elif role == "planning":
+                phases.append("planning")
+                content = json.dumps({"strategy": "Trace the public inputs.", "symbols": [f"{SOURCE}::stock_result"]})
+            elif prompt.startswith("Selected failure: new regression tests"):
+                phases.append("author")
+                assert len(checkpoints) == 1 and b"+    return 3\n" not in checkpoints[0].patch
+                content = edit(NEW_TEST, "", regression)
+            elif "single line-range JSON object" in prompt:
+                phases.append("numbered")
+                content = "invalid line range"
+            elif prompt.endswith("Respond with complete named Python definitions only."):
+                phases.append("named")
+                content = "invalid named edit"
+            elif "Trace the public inputs." in prompt:
+                phases.append("guided search")
+                content = "invalid search edit"
+            else:
+                phases.append("text")
+                content = next(text_edits)
+            return SimpleNamespace(
+                role=role, route="fixture", model="fixture", configured_model="fixture", content=content,
+                tool_calls=calls, usage={},
+            )
+
+    verifier_root = runner.path / "verification"
+    verifier_root.mkdir()
+    executor = PlainExecutor(
+        runner, Gateway(), Limits(model_requests=14, concurrent_probes=1),
+        verification_runner=FixtureRunner(verifier_root),
+    )
+    result = solve(executor, task, archive.getvalue(), _Budget(executor.limits, lambda: False, task), "fixture")
+
+    expected = ["text"] * 3 + ["planning", "guided search", "named", "numbered"] + ["interactive"] * 4
+    if not interactive_tests:
+        expected.append("author")
+    assert phases == expected
+    assert len(checkpoints) == 1 and b"+    return 3\n" not in checkpoints[0].patch
+    assert any(durable for _, durable in recovery)
+    assert all(0 < timeout <= 40 for timeout in tool_turns)
+    assert b"+    return 3\n" in result.patch and NEW_TEST.encode() in result.patch
+    assert b"outside.py" not in result.patch
+    assert all(check.returncode == 0 for check in result.checks)
+
+
+def test_scoped_rollout_rejects_unreviewed_files_written_through_run(solver_case):
+    task, archive, runner, _ = solver_case
+    task = replace(task, save_checkpoint=None, review_recovery=None, require_new_tests=False)
+
+    class Gateway:
+        def complete(self, *, role, messages, **request):
+            finished = any(message["role"] == "tool" for message in messages)
+            commands = () if finished else ({
+                "id": "run",
+                "type": "function",
+                "function": {
+                    "name": "run",
+                    "arguments": json.dumps({
+                        "argv": [sys.executable, "-c", "from pathlib import Path; Path('outside.py').write_text('pass\\n')"]
+                    }),
+                },
+            },)
+            return SimpleNamespace(
+                role=role, route="fixture", model="fixture", configured_model="fixture",
+                content="done" if finished else None, tool_calls=commands, usage={},
+            )
+
+    executor = PlainExecutor(runner, Gateway(), Limits(model_requests=2))
+    budget = _Budget(executor.limits, lambda: False, task)
+    scope = {SOURCE: BASE_SOURCE}
+    with pytest.raises(AttemptRejected, match="Interactive edits exceeded the scoped review paths"):
+        executor._rollout(task, archive, budget, "Test scoped tool calls.", "coding", clarification=False, scoped_sources=scope)
+    assert scope == {SOURCE: BASE_SOURCE}
