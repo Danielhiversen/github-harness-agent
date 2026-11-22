@@ -354,3 +354,37 @@ def test_stock_failure_site_logs_only_the_tracked_location_and_exception():
     assert stock_failure_site(node, "tests/test_counts.py:8: KeyError: 'private value'") == "line 8 (KeyError)"
     assert stock_failure_site(node, "/work/tests/test_counts.py:9: assert 2 == 1") == "line 9 (AssertionError)"
     assert stock_failure_site(node, "other.py:8: AssertionError") == ""
+
+
+
+def test_short_pytest_frame_localizes_only_the_selected_test_and_evaluated_assert():
+    from github_harness_agent.review_solver_context import stock_assertion_evaluated, stock_failure_site
+    from github_harness_agent.review_solver import _test_detail
+
+    path = "tests/test_counts.py"
+    node = f"{path}::TestCounts::test_count[one]"
+    frame = f"{path}:3: in test_count"
+    source = b"class TestCounts:\n    def test_count(self, report):\n        assert report['count'] == 1\n"
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        entry = tarfile.TarInfo(path)
+        entry.size = len(source)
+        snapshot.addfile(entry, BytesIO(source))
+    def detail(error):
+        output = (
+            "=================================== FAILURES ===================================\n"
+            "_________________________ TestCounts.test_count[one] _________________________\n"
+            f"{frame}\n    assert report['count'] == 1\nE   {error}\n"
+            "=========================== short test summary info ============================\n"
+            f"FAILED {node} - {error}\n"
+        )
+        return _test_detail(output, node)
+
+    lookup = detail("KeyError: 'count'")
+    evaluated = detail("assert 2 == 1")
+    assert stock_failure_site(node, lookup) == "line 3 (KeyError)"
+    assert stock_failure_site(node, evaluated) == "line 3 (AssertionError)"
+    assert stock_assertion_evaluated(archive.getvalue(), node, lookup, evaluated)
+    assert not stock_failure_site(node, lookup.replace("in test_count", "in helper"))
+    assert not stock_failure_site(node, lookup.replace("E   ", "src/helper.py:4: in helper\nE   "))
+    assert not stock_assertion_evaluated(archive.getvalue(), node, lookup, evaluated.replace(":3:", ":4:"))

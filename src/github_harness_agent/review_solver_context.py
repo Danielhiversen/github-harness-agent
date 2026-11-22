@@ -246,20 +246,26 @@ def _words(text):
     return set(re.findall(r"[A-Za-z][A-Za-z0-9]*", separated.lower()))
 
 
+def _stock_frame(match, detail):
+    prefix = rf"^(?:/work/|\./)?{re.escape(match['path'])}:([1-9][0-9]{{0,6}}): "
+    kind = r"(assert|[A-Za-z]{1,48}(?:Error|Exception))\b"
+    frame = re.match(prefix + kind, detail)
+    if not frame:
+        # pytest --tb=short separates the frame from the exception. Require
+        # the selected function and an adjacent error, never a helper's frame.
+        function = re.escape(match["name"].rsplit("::", 1)[-1])
+        frame = re.match(prefix + rf"in {function}\nE[ \t]+" + kind, detail)
+    if frame:
+        return int(frame[1]), "AssertionError" if frame[2] == "assert" else frame[2]
+    return None
+
+
 def stock_failure_site(node, detail):
     """Describe a traceback in the selected test without logging assertion data."""
     selected = node.split("[", 1)[0].removeprefix("/work/").removeprefix("./")
     match = _STOCK_NODE.fullmatch(selected) if len(selected) <= 512 else None
-    if not match:
-        return ""
-    location = re.match(
-        rf"^(?:/work/|\./)?{re.escape(match['path'])}:([1-9][0-9]{{0,6}}): "
-        r"(assert|[A-Za-z]{1,48}(?:Error|Exception))\b", detail,
-    )
-    if not location:
-        return ""
-    kind = "AssertionError" if location[2] == "assert" else location[2]
-    return f"line {location[1]} ({kind})"
+    frame = _stock_frame(match, detail) if match else None
+    return f"line {frame[0]} ({frame[1]})" if frame else ""
 
 
 def stock_assertion_evaluated(archive, node, before, after):
@@ -269,11 +275,12 @@ def stock_assertion_evaluated(archive, node, before, after):
     if match is None:
         return False
     path = match["path"]
-    location = rf"^(?:/work/|\./)?{re.escape(path)}:([1-9][0-9]{{0,6}}): "
-    old = re.match(location + r"(?:KeyError|IndexError|AttributeError)\b", before)
-    new = re.match(location + r"(?:assert\b|AssertionError\b)", after)
+    old, new = _stock_frame(match, before), _stock_frame(match, after)
     evaluated = re.search(r"(?:^E\s+|: )assert\s+[^\n]+", after, re.M)
-    if not old or not new or old[1] != new[1] or evaluated is None:
+    if (
+        old is None or old[1] not in {"KeyError", "IndexError", "AttributeError"}
+        or new != (old[0], "AssertionError") or evaluated is None
+    ):
         return False
     try:
         with tarfile.open(fileobj=BytesIO(archive), mode="r:") as snapshot:
@@ -294,7 +301,7 @@ def stock_assertion_evaluated(archive, node, before, after):
         return False
     return any(
         isinstance(item, ast.Assert)
-        and item.lineno == int(old[1])
+        and item.lineno == old[0]
         and isinstance(item.test, ast.Compare)
         and any(isinstance(expr, (ast.Subscript, ast.Attribute)) for expr in ast.walk(item.test))
         for item in ast.walk(tests[0])
