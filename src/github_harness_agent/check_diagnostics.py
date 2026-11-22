@@ -1,6 +1,7 @@
 """Summarize recognized check diagnostics without returning raw command output."""
 
 import re
+from collections import Counter
 from pathlib import PurePosixPath
 
 from .check_artifacts import check_label
@@ -136,16 +137,25 @@ def ordinary_unused_import_failure(command, output):
     )
 
 
-def static_error_message(command, output):
-    """Use the verifier's error line without including its source context."""
+def static_error_message(command, output, *, before=""):
+    """Return the first new error message, ignoring line shifts and source context."""
     tool = check_label(command, ())
-    for line in _ANSI_COLOR.sub("", output).splitlines():
-        if tool == "mypy" and _MYPY.fullmatch(line) and ": error: " in line:
-            return line.split(": error: ", 1)[1]
-        if tool == "ruff" and (
-            match := _RUFF_SHORT.match(line) or _RUFF_HEADER.match(line)
-        ):
-            return line[match.end() :].strip()
+
+    def messages(text):
+        for line in _ANSI_COLOR.sub("", text).splitlines():
+            if tool == "mypy" and _MYPY.fullmatch(line) and ": error: " in line:
+                yield line.split(": error: ", 1)[1]
+            elif tool == "ruff":
+                if match := _RUFF_SHORT.match(line):
+                    yield line[match.start(4) :].strip()
+                elif _RUFF_HEADER.match(line):
+                    yield line.strip()
+
+    existing = Counter(messages(before))
+    for message in messages(output):
+        if not existing[message]:
+            return message
+        existing[message] -= 1
     return ""
 
 

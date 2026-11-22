@@ -1388,7 +1388,26 @@ def solve(executor, task, archive, budget, version):
         )
 
     def private_retry_feedback(repair, target, after, runs, static_runs):
-        novel = next((key for key in after if key not in repair.failures), None)
+        novel = None
+        new_static = ""
+        for key, diagnostic in after.items():
+            if key not in repair.failures:
+                novel = key
+                break
+            if key not in repair.static_failures or key[0] not in static_runs:
+                continue
+            command = commands[key[0]]
+            before = repair.failures[key]
+            if len(
+                ordinary_static_locations(command, before)
+            ) != repair.static_failures[key] or len(
+                ordinary_static_locations(command, diagnostic)
+            ) != len(static_runs[key[0]]):
+                continue
+            new_static = static_error_message(command, diagnostic, before=before)
+            if new_static:
+                novel = key
+                break
         key = novel or target
         if key not in after:
             return ""
@@ -1432,7 +1451,9 @@ def solve(executor, task, archive, budget, version):
                 fixture = stock_pytest_excerpt(archive, command, node, diagnostic)
         elif tool in {"mypy", "ruff"}:
             title = f"{tool} check {number + 1}"
-            if number in static_runs:
+            if new_static:
+                detail = new_static
+            elif number in static_runs:
                 detail = (
                     check_details(command, diagnostic)
                     + " "

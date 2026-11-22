@@ -4,6 +4,7 @@ from github_harness_agent.check_diagnostics import (
     check_details,
     check_failure_summary,
     ordinary_static_locations,
+    static_error_message,
 )
 
 
@@ -98,6 +99,32 @@ def test_private_static_ruff_locations_require_complete_lint_diagnostics():
     )
     assert ordinary_static_locations(command, "ruff failed\n" + output) == ()
 
+
+def test_private_static_feedback_only_names_new_error_messages():
+    ruff = ("ruff", "check", ".")
+    prior = "src/core.py:2:5: F401 unused import\n"
+    shifted = "F401 unused import\n --> src/core.py:6:5\n6 | unverified source\n"
+    assert static_error_message(ruff, shifted, before=prior) == ""
+    assert (
+        static_error_message(
+            ruff, shifted + "src/core.py:7:5: F821 undefined name\n", before=prior
+        )
+        == "F821 undefined name"
+    )
+    assert static_error_message(ruff, shifted * 2, before=prior) == "F401 unused import"
+
+    mypy = ("mypy", "src")
+    prior = "src/core.py:2: error: Missing import  [import-not-found]\n"
+    shifted = prior.replace(":2:", ":3:")
+    assert static_error_message(mypy, shifted, before=prior) == ""
+    assert (
+        static_error_message(
+            mypy,
+            shifted + "src/core.py:4: error: Incompatible value  [assignment]\n",
+            before=prior,
+        )
+        == "Incompatible value  [assignment]"
+    )
 
 
 def test_one_static_check_can_report_multiple_local_errors_in_private_recovery():
