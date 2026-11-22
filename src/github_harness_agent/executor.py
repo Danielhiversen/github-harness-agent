@@ -1080,7 +1080,7 @@ class PlainExecutor:
             focus_next_turn = False
             text_batch_applied = False
             scoped_edits = {}
-            scoped_outage = None
+            scoped_stop = None
             scoped_production = tuple(
                 path
                 for path in scoped_sources or ()
@@ -1111,7 +1111,7 @@ class PlainExecutor:
                 ) and budget.model_requests_remaining() > 0
 
             while limit is None or turns < limit:
-                if text_batch_applied and not has_model_turn():
+                if (text_batch_applied or scoped_sources is not None) and not has_model_turn():
                     break
                 recovery_turn = recovery if turns == 0 else None
                 focused_test_turn = focus_next_turn
@@ -1175,7 +1175,10 @@ class PlainExecutor:
                         review_windows=bool(recovery_turn),
                     )
                 except _RequestBudgetExceeded as error:
-                    budget.reject(error, last, latest=True)
+                    if scoped_sources is None:
+                        budget.reject(error, last, latest=True)
+                    scoped_stop = error
+                    break
                 except ProviderExhausted as error:
                     if (paced_edit or scoped_readback) and has_model_turn():
                         budget.remaining()
@@ -1186,7 +1189,7 @@ class PlainExecutor:
                         if not scoped_edits:
                             raise
                         budget.remaining()
-                        scoped_outage = error
+                        scoped_stop = error
                         break
                     native_error = error
                     completion = None
@@ -1464,9 +1467,11 @@ class PlainExecutor:
                                 scoped_action_counts[outcome] += 1
                             elif name == "run" and touched:
                                 scoped_action_counts["shell_actions"] += 1
-                        if edit_succeeded and edit["path"] in scoped_production:
-                            scoped_pacing = "ordinary"
+                        if edit_succeeded:
                             path = edit["path"]
+                            production_edit = path in scoped_production
+                            if production_edit:
+                                scoped_pacing = "ordinary"
                             earlier = scoped_edits.pop(path, None)
                             expected = earlier[0] if earlier else scoped_sources[path]
                             old = edit.get("old_text")
@@ -1480,6 +1485,13 @@ class PlainExecutor:
                                         turns,
                                         last,
                                     )
+                            elif (
+                                last.configured_model
+                                and old is None
+                                and not expected
+                                and not production_edit
+                            ):
+                                scoped_edits[path] = (edit["new_text"], turns, last)
                         elif (
                             is_edit
                             and paced_edit
@@ -1672,6 +1684,10 @@ class PlainExecutor:
                 trajectory.append(
                     "[OBSERVATION] Reached the rollout model-turn limit. Staging the current patch."
                 )
+            if scoped_sources is not None and scoped_stop is None and not has_model_turn():
+                scoped_stop = _RequestBudgetExceeded(
+                    "Interactive review model request limit reached"
+                )
             self._stage_rollout(workspace, budget, artifacts)
             try:
                 patch = self._draft_patch(workspace, budget, baseline)
@@ -1679,49 +1695,64 @@ class PlainExecutor:
                     self._check_patch_paths(workspace, task, budget, baseline)
                 if scoped_sources is not None:
                     updated = self._capture_scoped_sources(
-                        workspace, budget, initial_tree, scoped_sources
+                        workspace, budget, initial_tree, scoped_sources,
+                        text_only=scoped_stop is not None,
                     )
-                    if scoped_outage is not None:
+                    if scoped_stop is not None:
                         production = {
-                            path: content
-                            for path, content in updated.items()
+                            path for path in updated
                             if not _protected(path, task, new_test=False)
                         }
                         if not production or any(
                             path not in scoped_edits or scoped_edits[path][0] != content
-                            for path, content in production.items()
+                            for path, content in updated.items()
                         ):
-                            raise scoped_outage
+                            if isinstance(scoped_stop, _RequestBudgetExceeded):
+                                budget.reject(scoped_stop, last, latest=True)
+                            raise scoped_stop
                         _, _, actor = max(
                             (scoped_edits[path] for path in production),
                             key=lambda entry: entry[1],
                         )
                         budget.remaining()
                         logging.getLogger(__name__).info(
-                            "Harvesting %d attributed scoped source edit(s) after provider exhaustion",
+                            "Harvesting attributed edits in %d scoped production file(s) after %s",
                             len(production),
+                            "provider exhaustion"
+                            if isinstance(scoped_stop, ProviderExhausted)
+                            else "the model request limit",
                         )
                     scoped_sources.update(updated)
             except (CommandOutputExceeded, _CandidateOutputError) as error:
                 budget.reject(error, actor or last)
         return patch, "\n".join(trajectory)[-32768:], actor or last
 
-    def _capture_scoped_sources(self, workspace, budget, baseline, sources):
+    def _capture_scoped_sources(self, workspace, budget, baseline, sources, *, text_only):
         changed = self._git(
             workspace,
             budget,
             "diff",
             "--cached",
-            "--name-only",
+            "--raw",
             "--no-renames",
             "-z",
             baseline,
             "--",
             cap=self.limits.patch_bytes,
         ).stdout.split(b"\0")[:-1]
-        paths = [path.decode("utf-8", "surrogateescape") for path in changed]
+        if len(changed) % 2:
+            raise _CandidateOutputError("Unexpected scoped patch metadata")
+        paths = [path.decode("utf-8", "surrogateescape") for path in changed[1::2]]
         if any(path not in sources for path in paths):
             raise _ProtectedPatchError("Interactive edits exceeded the scoped review paths")
+        if text_only:
+            for header in changed[::2]:
+                fields = header.split()
+                if len(fields) != 5 or (
+                    fields[0] != b":" + fields[1]
+                    and (fields[0], fields[1], fields[-1]) != (b":000000", b"100644", b"A")
+                ):
+                    raise _CandidateOutputError("Interactive edits changed file metadata")
         updated = {}
         for path in paths:
             blob = self._git(

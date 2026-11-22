@@ -2646,6 +2646,8 @@ def test_localized_stock_repairs_choose_numbered_and_named_formats(
         (False, "localized"),
         (True, "localized"),
         (False, "outage"),
+        (False, "turn_cap"),
+        (True, "turn_cap"),
         (False, "outage_regression"),
         (True, "outage_partial_retry"),
         (False, "outage_missing_tests_retry"),
@@ -2668,12 +2670,13 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
     recovery = []
     long_evidence = scenario == "long_evidence"
     outage = scenario.startswith("outage")
+    turn_cap = scenario == "turn_cap"
     partial_retry = scenario == "outage_partial_retry"
     retry_after_outage = partial_retry or scenario == "outage_missing_tests_retry"
     unrequested_tests = scenario == "outage_unrequested_tests"
     if unrequested_tests:
         task = replace(task, require_new_tests=False)
-    localized = scenario == "localized" or long_evidence or outage
+    localized = scenario == "localized" or long_evidence or outage or turn_cap
     acceptance = Path(task.pull_checks[0][-1])
     with acceptance.open("a") as file:
         file.write("\nfrom fixture_calc import stock_result\n"
@@ -2766,7 +2769,7 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
         nonlocal focused_command
         if request.url.path == "/api/tags":
             return httpx.Response(200, json=local_inventory())
-        assert scenario in {"localized", "unlocalized", "long_evidence"} or outage
+        assert scenario in {"localized", "unlocalized", "long_evidence"} or outage or turn_cap
         payload = json.loads(request.content)
         calls = ()
         tools, messages = payload["tools"], payload["messages"]
@@ -2807,6 +2810,8 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
             assert "return -3" in outputs[1]
             if scenario == "outage_regression":
                 old, new = "        return 7\n    return -3\n", "        return 8\n    return 3\n"
+            elif turn_cap:
+                old, new = "    return -3\n", "    return 0\n"
             else:
                 old, new = "    return -3\n", "    return -1\n" if partial_retry else "    return 3\n"
             calls = (call("edit_file", {"path": SOURCE, "old_text": old, "new_text": new}),)
@@ -2816,6 +2821,12 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
             if unrequested_tests:
                 assert "outside the scoped review" in outputs[-1]
             calls = (call("run", {"argv": focused_command}),)
+        elif turn_cap:
+            calls = (
+                (call("edit_file", {"path": SOURCE, "old_text": "    return 0\n", "new_text": "    return 3\n"}),)
+                if len(tool_turns) == 12
+                else (call("run", {"argv": ["cat", SOURCE]}),)
+            )
         else:
             assert "1 passed" in outputs[-1]
         message = {"tool_calls": calls} if calls else {"content": "done"}
@@ -2874,8 +2885,9 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
 
     verifier_root = runner.path / "verification"
     verifier_root.mkdir()
+    request_limit = 7 if scenario == "reserved" else 24 if turn_cap else 14
     executor = PlainExecutor(
-        runner, Gateway(), Limits(model_requests=7 if scenario == "reserved" else 14, concurrent_probes=1),
+        runner, Gateway(), Limits(model_requests=request_limit, concurrent_probes=1),
         verification_runner=FixtureRunner(verifier_root),
     )
     budget = _Budget(executor.limits, lambda: False, task)
@@ -2929,6 +2941,8 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
             expected += ["named", "numbered"]
         if outage:
             expected += ["interactive"] * 3 + ["provider outage"]
+        elif turn_cap:
+            expected += ["interactive"] * 12
         else:
             expected += ["text"] if scenario == "reserved" else ["interactive"] * 4
         assert any(durable for _, durable in recovery)
@@ -2939,6 +2953,11 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
     assert phases == expected
     if scenario == "localized" and not interactive_tests:
         assert "(exact edits succeeded=1 rejected=1, shell actions=2)" in caplog.text
+    if turn_cap:
+        assert (
+            f"(exact edits succeeded={2 + int(interactive_tests)} rejected=1, shell actions=10)"
+            in caplog.text
+        )
     if scenario == "reserved":
         assert budget.model_requests_remaining() == 0
     if scenario != "wrong_snapshot":
@@ -2995,10 +3014,13 @@ def test_scoped_rollout_rejects_unreviewed_files_written_through_run(solver_case
 @pytest.mark.parametrize(
     "scenario", ("attributed", "no_edit", "cancelled", "expired", "unattributed")
 )
+@pytest.mark.parametrize("stop", ("outage", "request_cap", "turn_cap"))
 def test_scoped_outage_requires_live_budget_and_attributable_source(
-    solver_case, scenario
+    solver_case, scenario, stop
 ):
+    from github_harness_agent.executor import AttemptBudgetRejected
     from github_harness_agent.providers import ProviderExhausted
+    from github_harness_agent.review_solver import _InteractiveBudget
     from github_harness_agent.worker import Cancelled, LimitExceeded
 
     task, archive, runner, _ = solver_case
@@ -3011,12 +3033,13 @@ def test_scoped_outage_requires_live_budget_and_attributable_source(
     class Gateway:
         def complete(self, *, role, **request):
             turns.append(role)
-            if len(turns) == 3:
+            if len(turns) == (3 if stop == "outage" else 2):
                 if scenario == "cancelled":
                     cancellation.set()
                 if scenario == "expired":
-                    budget.deadline = 0
-                raise ProviderExhausted(None)
+                    parent.deadline = 0
+                if stop == "outage":
+                    raise ProviderExhausted(None)
             if len(turns) == 1 and scenario != "no_edit":
                 name, params = (
                     "edit_file",
@@ -3052,8 +3075,19 @@ def test_scoped_outage_requires_live_budget_and_attributable_source(
                 usage={},
             )
 
+    class RacingBudget(_Budget):
+        def complete(self, *args, **kwargs):
+            if stop == "request_cap" and len(turns) == 2:
+                # A concurrent request acquires the final slot after the rollout's
+                # remaining-request check and before the delegated request claims it.
+                self.claim("model request", self.limits.model_requests)
+            return super().complete(*args, **kwargs)
+
     executor = PlainExecutor(runner, Gateway(), Limits(model_requests=3))
-    budget = _Budget(executor.limits, cancellation.is_set, task)
+    parent = RacingBudget(executor.limits, cancellation.is_set, task)
+    budget = parent if stop == "outage" else _InteractiveBudget(
+        parent, 2 if stop == "turn_cap" else 3, 8
+    )
     scope = {SOURCE: BASE_SOURCE}
     if scenario == "attributed":
         patch, _, actor = executor._rollout(
@@ -3070,9 +3104,9 @@ def test_scoped_outage_requires_live_budget_and_attributable_source(
         assert actor.configured_model == "editor"
     else:
         expected = {"cancelled": Cancelled, "expired": LimitExceeded}.get(
-            scenario, ProviderExhausted
+            scenario, ProviderExhausted if stop == "outage" else AttemptBudgetRejected
         )
-        with pytest.raises(expected):
+        with pytest.raises(expected) as caught:
             executor._rollout(
                 task,
                 archive,
@@ -3082,7 +3116,69 @@ def test_scoped_outage_requires_live_budget_and_attributable_source(
                 clarification=False,
                 scoped_sources=scope,
             )
+        assert type(caught.value) is expected
         assert scope == {SOURCE: BASE_SOURCE}
+    if stop != "outage":
+        assert len(turns) == 2
+
+
+@pytest.mark.parametrize(
+    "scenario", ("outside", "protected", "shell_test", "tests_only", "tool_limit", "unmatched", "mode")
+)
+def test_scoped_turn_cap_refuses_side_effects_and_tests_without_production(
+    solver_case, scenario
+):
+    from github_harness_agent.review_solver import _InteractiveBudget
+
+    task, archive, runner, _ = solver_case
+    task = replace(task, save_checkpoint=None, review_recovery=None)
+    path = {
+        "outside": "outside.py",
+        "protected": "tests/test_existing.py",
+        "shell_test": NEW_TEST,
+        "tests_only": NEW_TEST,
+    }.get(scenario, SOURCE)
+    production = (
+        "edit_file",
+        {
+            "path": SOURCE,
+            "old_text": "    return -9\n" if scenario == "unmatched" else "    return -1\n",
+            "new_text": "    return 1\n",
+        },
+    )
+    if scenario == "tests_only":
+        actions = [("edit_file", {"path": path, "new_text": "def test_result():\n    assert True\n"})]
+    elif scenario in {"tool_limit", "unmatched"}:
+        actions = [production, ("run", {"argv": ["cat", SOURCE]})]
+    elif scenario == "mode":
+        actions = [production, ("run", {"argv": ["chmod", "+x", SOURCE]})]
+    else:
+        script = f"from pathlib import Path; Path({path!r}).write_text('pass\\n')"
+        actions = [production, ("run", {"argv": [sys.executable, "-c", script]})]
+
+    class Gateway:
+        def complete(self, *, role, **request):
+            name, params = actions.pop(0)
+            call = {
+                "id": name,
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(params)},
+            }
+            return SimpleNamespace(
+                role=role, route="editor", model="editor", configured_model="editor",
+                content=None, tool_calls=(call,), usage={},
+            )
+
+    executor = PlainExecutor(runner, Gateway(), Limits(model_requests=3))
+    parent = _Budget(executor.limits, lambda: False, task)
+    probe = _InteractiveBudget(parent, len(actions), 1 if scenario == "tool_limit" else 8)
+    scope = {SOURCE: BASE_SOURCE, NEW_TEST: ""}
+    with pytest.raises(AttemptRejected):
+        executor._rollout(
+            task, archive, probe, "Scoped tool calls.", "coding",
+            clarification=False, scoped_sources=scope,
+        )
+    assert scope == {SOURCE: BASE_SOURCE, NEW_TEST: ""}
 
 
 @pytest.mark.parametrize(

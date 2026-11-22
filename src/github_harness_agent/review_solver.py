@@ -124,6 +124,7 @@ _STOCK_HEDGE_DELAY = 60
 _INTERACTIVE_MAX_TURNS = 12
 _INTERACTIVE_MAX_TOOLS = 24
 _INTERACTIVE_RESERVE_SECONDS = 60
+_INTERACTIVE_CAPTURE_RESERVE_SECONDS = 5
 _INTERACTIVE_INSTRUCTIONS_BYTES = 4100
 _GUARD_SECONDS = 90
 _GUARD_MIN_REMAINING = 45
@@ -1064,9 +1065,12 @@ class _InteractiveBudget(_GuardBudget):
     def complete(self, *args, **kwargs):
         if not self.model_requests_remaining():
             raise _RequestBudgetExceeded("Interactive review model request limit reached")
+        available = self.remaining() - _INTERACTIVE_CAPTURE_RESERVE_SECONDS
+        if available <= 0:
+            raise LimitExceeded("Interactive review ran out of time for another model request")
         self.turns_left -= 1
         kwargs.update(
-            timeout_cap=min(120, self.remaining()), retry_oversize=False, max_output_tokens=3072
+            timeout_cap=min(120, available), retry_oversize=False, max_output_tokens=3072
         )
         return self.budget.complete(*args, **kwargs)
 
