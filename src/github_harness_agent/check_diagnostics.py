@@ -103,6 +103,28 @@ def check_locations(command, output):
                 yield match[1], int(match[2])
 
 
+def ordinary_static_locations(command, output):
+    """Return complete located diagnostics for an ordinary lint or type failure."""
+    tool = check_label(command, ())
+    output = _ANSI_COLOR.sub("", output)
+    if re.search(r"^(?:error:|mypy:|ruff failed\b)", output, re.M):
+        return ()
+    if tool == "mypy":
+        errors = [line for line in output.splitlines() if ": error:" in line]
+        matches = [_MYPY.fullmatch(line) for line in errors]
+        if not matches or any(match is None for match in matches):
+            return ()
+        locations = tuple((match[1], int(match[2])) for match in matches)
+        summary = re.search(r"^Found (\d+) errors? in \d+ files?\b", output, re.M)
+        return locations if summary is None or int(summary[1]) == len(locations) else ()
+    if tool == "ruff":
+        locations = tuple((path, int(row)) for _, path, row, _ in _ruff_matches(output))
+        summary = re.search(r"^Found (\d+) errors?\.", output, re.M)
+        if summary is not None and int(summary[1]) == len(locations):
+            return locations
+    return ()
+
+
 def check_failure_summary(task, checks, *, baseline_failed=False):
     failures = []
     for index, failed in enumerate(checks):

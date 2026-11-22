@@ -9,10 +9,11 @@ import re
 import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from . import review_recovery
 from .check_artifacts import check_label
+from .check_diagnostics import ordinary_static_locations
 from .checkpoint import (
     RECOVERY_GOAL_LIMIT,
     RECOVERY_MODE_THRESHOLD,
@@ -105,6 +106,7 @@ _PYTEST_SECTION = re.compile(r"^={5,} ([^\n]+?) ={5,}$", re.M)
 _PYTEST_CRASH_LINE = re.compile(r"^\S[^\n]*?\.py:[1-9][0-9]*: .+$")
 _PYTEST_TOTALS = re.compile(r"(?:\d+ [a-z]+, )*\d+ [a-z]+ in \d+(?:\.\d+)?s(?: \([\d:]+\))?")
 _STOCK_REPAIR_CASE_LIMIT = 4
+_STOCK_REPAIR_STATIC_LIMIT = 2
 _STOCK_REPAIR_RETRIES = 2
 _STOCK_HEDGE_DELAY = 60
 _INTERACTIVE_MAX_TURNS = 12
@@ -281,7 +283,17 @@ def _complete_pytest_run(outcome):
     return _PytestRun(passed, nodes, counts.get("deselected", 0))
 
 
-def evidence(executor, task, archive, budget, patch, commands, *, pytest_runs=None):
+def evidence(
+    executor,
+    task,
+    archive,
+    budget,
+    patch,
+    commands,
+    *,
+    pytest_runs=None,
+    static_runs=None,
+):
     with executor.verification_runner.workspace(
         archive, budget.remaining, budget.cancelled
     ) as ws:
@@ -297,6 +309,10 @@ def evidence(executor, task, archive, budget, patch, commands, *, pytest_runs=No
                 pytest_runs[number] = _complete_pytest_run(outcome)
             if outcome.returncode:
                 output = _combined(outcome)
+                if static_runs is not None and outcome.returncode == 1:
+                    locations = ordinary_static_locations(command, output)
+                    if locations:
+                        static_runs[number] = locations
                 nodes = [node for _, node in _TEST_RESULT.findall(output)]
                 line_traceback = "--tb=line" in command or any(
                     option == ("--tb", "line") for option in zip(command, command[1:])
@@ -829,14 +845,44 @@ class _RegressionRepair:
     retries: int = 0
     retry_note: str = ""
     retry_named: bool = False
+    static_failures: dict[tuple[int, str], int] = field(default_factory=dict)
+
+    def next_target(self, commands):
+        if self.static_failures:
+            return min(
+                self.static_failures,
+                key=lambda key: (check_label(commands[key[0]], ()) != "mypy", key),
+            )
+        return min(self.introduced)
 
 
 def _retry_stock_repair(repair, note, named_definitions):
     if repair.retries >= _STOCK_REPAIR_RETRIES:
         return None
     return replace(
-        repair, retries=repair.retries + 1, retry_note=note, retry_named=named_definitions
+        repair,
+        retries=repair.retries + 1,
+        retry_note=note,
+        retry_named=named_definitions,
     )
+
+
+def _localized_static_failures(keys, static_runs, sources, allowed):
+    total = 0
+    checked = {}
+    for number, node in keys:
+        locations = static_runs.get(number)
+        if not locations or node != f"check {number + 1} (exit 1)":
+            return None
+        total += len(locations)
+        if total > _STOCK_REPAIR_STATIC_LIMIT:
+            return None
+        for path, row in locations:
+            path = path.removeprefix("/work/").removeprefix("./")
+            if path not in allowed or not 1 <= row <= len(sources[path].splitlines()):
+                return None
+        checked[number, node] = len(locations)
+    return checked
 
 
 def _named_operator_cases(keys, commands):
@@ -1360,7 +1406,7 @@ def solve(executor, task, archive, budget, version):
                 None,
             )
             repair_target = (
-                min(regression_repair.introduced) if regression_repair else None
+                regression_repair.next_target(commands) if regression_repair else None
             )
             available = sorted(
                 (
@@ -1468,7 +1514,11 @@ def solve(executor, task, archive, budget, version):
                     attempts[target] = attempts.get(target, 0) + 1
                     repair = regression_repair if target == repair_target else None
                     line_retry = line_retries.pop(target, None)
-                    advice = line_retry.advice if line_retry else retry_advice.pop(target, None)
+                    advice = (
+                        line_retry.advice
+                        if line_retry
+                        else retry_advice.pop(target, None)
+                    )
                     # Give the strategy one more attempt on its original draft.
                     # Keep any unpublished continuation available as a fallback.
                     continuation = (
@@ -1488,7 +1538,11 @@ def solve(executor, task, archive, budget, version):
                         regression_repair = None
                         source, diagnostics = repair.sources, repair.failures
                         note = repair.retry_note
-                        _LOG.info("Verifying a private repair of %d newly failing review case(s)", len(repair.introduced))
+                        _LOG.info(
+                            "Verifying private repair of %d review case(s) and %d static check(s)",
+                            len(repair.introduced),
+                            len(repair.static_failures),
+                        )
                     if target == _TEST_GOAL:
                         source = {**current, new_path: test_draft}
                         note = "\n".join(
@@ -1518,7 +1572,8 @@ def solve(executor, task, archive, budget, version):
                                 can_plan
                                 and continuation is None
                                 and repair is None
-                                and no_progress.get(target, 0) >= RECOVERY_MODE_THRESHOLD
+                                and no_progress.get(target, 0)
+                                >= RECOVERY_MODE_THRESHOLD
                                 and attempts[target] >= 6
                                 and attempts[target] % 3 == 0
                             )
@@ -1530,7 +1585,10 @@ def solve(executor, task, archive, budget, version):
                         )
                     )
                     if repair is not None and repair.stock_origin:
-                        named_definitions = repair.retry_named
+                        named_definitions = (
+                            repair.retry_named
+                            and check_label(check_command, ()) != "ruff"
+                        )
                     localized_retry = (
                         localized_retry_symbol(advice)
                         if stock_fixture and repair is None
@@ -1820,8 +1878,16 @@ def solve(executor, task, archive, budget, version):
                 if len(proposed) > executor.limits.patch_bytes:
                     raise ValueError("Patch exceeds the configured byte limit")
                 after_runs = {}
+                static_runs = {}
                 after = evidence(
-                    executor, task, archive, budget, proposed, commands, pytest_runs=after_runs
+                    executor,
+                    task,
+                    archive,
+                    budget,
+                    proposed,
+                    commands,
+                    pytest_runs=after_runs,
+                    static_runs=static_runs,
                 )
             except ValueError as error:
                 if line_followup is not None and snapshot is current:
@@ -1830,7 +1896,8 @@ def solve(executor, task, archive, budget, version):
                 if repair is not None and repair.stock_origin:
                     regression_repair = _retry_stock_repair(
                         repair,
-                        notes[target] + ". Use the unchanged stock-passing draft and follow the requested edit format.",
+                        notes[target]
+                        + ". Use the unchanged stock-passing draft and follow the requested edit format.",
                         not named_definitions,
                     )
                 _LOG.info(
@@ -1890,16 +1957,26 @@ def solve(executor, task, archive, budget, version):
                     completion.route, run.passed if run else "unknown",
                     len(run.failed) if run else "unknown", len(new_operator), ", ".join(check_types) or "none",
                 )
+            static_failures = _localized_static_failures(
+                after.keys() - new_operator, static_runs, candidate, paths
+            )
             stock_gain = (
                 not old_operator
-                and 0 < len(introduced) <= _STOCK_REPAIR_CASE_LIMIT
+                and len(introduced) <= _STOCK_REPAIR_CASE_LIMIT
                 and snapshot is current
                 and stock_fixtures.get((target, failures.get(target)))
                 and _named_operator_cases({target}, commands)
                 and _preserved_stock_gain(target, pytest_runs, after_runs, after)
-                and (after.keys() - new_operator) < failures.keys()
+                and (
+                    static_failures
+                    or (introduced and (after.keys() - new_operator) < failures.keys())
+                )
                 and _verified_operator_runs(
-                    pytest_runs, after_runs, new_operator, task.pull_checks, operator_cases
+                    pytest_runs,
+                    after_runs,
+                    new_operator,
+                    task.pull_checks,
+                    operator_cases,
                 )
             )
             if repair is not None:
@@ -1922,24 +1999,61 @@ def solve(executor, task, archive, budget, version):
                     )
                 )
                 if repair.stock_origin:
-                    verified = (
-                        _preserved_stock_gain(repair.origin, pytest_runs, after_runs, after)
-                        and _verified_operator_runs(
-                            pytest_runs, after_runs, new_operator, task.pull_checks, operator_cases
-                        )
-                        and (after.keys() - new_operator) <= (repair.failures.keys() - repair.introduced)
+                    pending_static = _localized_static_failures(
+                        repair.static_failures.keys() & after.keys(),
+                        static_runs,
+                        candidate,
+                        paths,
                     )
-                    improved = verified and introduced < repair.introduced
-                    if verified and introduced == repair.introduced:
+                    verified = (
+                        _preserved_stock_gain(
+                            repair.origin, pytest_runs, after_runs, after
+                        )
+                        and _verified_operator_runs(
+                            pytest_runs,
+                            after_runs,
+                            new_operator,
+                            task.pull_checks,
+                            operator_cases,
+                        )
+                        and (after.keys() - new_operator)
+                        <= (repair.failures.keys() - repair.introduced)
+                        and introduced <= repair.introduced
+                        and pending_static is not None
+                        and all(
+                            amount <= repair.static_failures[key]
+                            for key, amount in pending_static.items()
+                        )
+                    )
+                    improved = verified and (
+                        introduced < repair.introduced
+                        or sum(pending_static.values())
+                        < sum(repair.static_failures.values())
+                    )
+                    if not improved:
+                        reason = (
+                            "The selected case still fails on the proposed edit."
+                            if verified
+                            else "The edit regressed a passing check or could not be verified."
+                        )
                         regression_repair = _retry_stock_repair(
                             repair,
-                            "The selected case still fails on the proposed edit. Try a different fix against the unchanged stock-passing draft. "
-                            + excerpt(after[target], 240),
+                            reason
+                            + " Try a different fix against the unchanged stock-passing draft. "
+                            + excerpt(after.get(target, ""), 240),
                             named_definitions,
                         )
                         if regression_repair is not None:
                             continue
-                if not improved or introduced:
+                    else:
+                        _LOG.info(
+                            "Private stock repair progressed: %d review case(s) and %d static check(s) remain",
+                            len(introduced),
+                            len(pending_static),
+                        )
+                else:
+                    pending_static = {}
+                if not improved or introduced or pending_static:
                     if improved and (repair.stock_origin or repair.attempts == 0):
                         regression_repair = replace(
                             repair,
@@ -1951,6 +2065,7 @@ def solve(executor, task, archive, budget, version):
                             retries=0,
                             retry_note="",
                             retry_named=False,
+                            static_failures=pending_static,
                         )
                     else:
                         rejected[repair.origin] = _rejected_attempt(
@@ -1958,8 +2073,7 @@ def solve(executor, task, archive, budget, version):
                         )
                     continue
             elif (
-                introduced
-                and (gained or stock_gain)
+                (stock_gain or (introduced and gained))
                 and snapshot is current
                 and target not in repair_attempted
                 and regression_repair is None
@@ -1969,15 +2083,34 @@ def solve(executor, task, archive, budget, version):
                 )
                 and _named_operator_cases(old_operator | new_operator, commands)
             ):
-                guarded = reconcile_stock_gain(target, candidate) if stock_gain else None
+                guarded = (
+                    reconcile_stock_gain(target, candidate)
+                    if stock_gain and not static_failures
+                    else None
+                )
                 if guarded is None:
                     repair_attempted.add(target)
                     retry_advice.clear()
                     line_retries.clear()
                     continuations.pop(target, None)
-                    regression_repair = _RegressionRepair(
-                        target, candidate, after, gained, introduced, stock_origin=bool(stock_gain)
+                    admitted_static = (
+                        static_failures if stock_gain and static_failures else {}
                     )
+                    regression_repair = _RegressionRepair(
+                        target,
+                        candidate,
+                        after,
+                        gained,
+                        introduced,
+                        stock_origin=bool(stock_gain),
+                        static_failures=admitted_static,
+                    )
+                    if stock_gain:
+                        _LOG.info(
+                            "Entering private stock repair with %d review case(s) and %d static check(s)",
+                            len(introduced),
+                            len(admitted_static),
+                        )
                     continue
                 candidate, proposed, after, after_runs = guarded
                 new_operator, introduced = set(), set()

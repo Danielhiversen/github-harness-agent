@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from test_executor import FixtureRunner
+from test_executor import FixtureRunner, FixtureWorkspace
 from test_providers import KILO, OLLAMA, OPENROUTER, OPENROUTER_SIBLING, deployment, routed
 
 from github_harness_agent import review_recovery
@@ -1459,6 +1459,122 @@ def test_private_repair_reconciles_a_stock_gain_without_storing_regressions(solv
         assert after_provider[2] == "provider-2"
         assert "The selected case still fails" in gateway.prompts[2]
     assert len(gateway.prompts) == len(followups) + 1
+
+
+@pytest.mark.parametrize(
+    "scenario", ("mixed", "static_only", "external", "infra", "unrecognized")
+)
+def test_private_static_repair_preserves_stock_and_rechecks_every_gate(
+    solver_case, monkeypatch, scenario
+):
+    task, _, runner, checkpoints = solver_case
+    mypy = ("mypy", ".")
+    task = replace(task, checks=(*task.checks, mypy))
+    Path(task.pull_checks[0][-1]).write_text(
+        "from fixture_calc import first, second, stock\n\n"
+        + (
+            "def test_first():\n    assert first() == -1\n\n"
+            "def test_second():\n    assert second() == -2\n\n"
+            "def test_third():\n    assert first() + second() == -3\n"
+            if scenario == "static_only"
+            else "def test_first():\n    assert isinstance(stock(), int)\n\n"
+            "def test_second():\n    assert stock() < 10\n\n"
+            "def test_third():\n    assert stock() % 2 == 1 and first() == -1\n"
+        )
+    )
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, content in {
+            SOURCE: BASE_SOURCE + "\ndef stock() -> int:\n    return -3\n",
+            "tests/test_existing.py": (
+                "from fixture_calc import stock\n\n"
+                "def test_stock_goal():\n    assert str(stock()) == '3'\n"
+            ),
+        }.items():
+            data = content.encode()
+            entry = tarfile.TarInfo(path)
+            entry.size = len(data)
+            snapshot.addfile(entry, BytesIO(data))
+
+    original_command = FixtureWorkspace.command
+    mypy_runs = []
+
+    def command(workspace, argv, *args, **kwargs):
+        if tuple(argv) != mypy:
+            return original_command(workspace, argv, *args, **kwargs)
+        source = (workspace.root / SOURCE).read_text()
+        mypy_runs.append(source)
+        if 'return "3"' not in source:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=b"Success: no issues found in 1 source file\n",
+                stderr=b"",
+            )
+        diagnostic_path = "../outside.py" if scenario == "external" else SOURCE
+        diagnostic = (
+            "mypy: failed to load project configuration\n"
+            if scenario == "unrecognized"
+            else f'{diagnostic_path}:8: error: Incompatible return value type (got "str", expected "int")  [return-value]\n'
+            "Found 1 error in 1 file (checked 1 source file)\n"
+        )
+        return SimpleNamespace(
+            returncode=2 if scenario == "infra" else 1,
+            stdout=diagnostic.encode(),
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(FixtureWorkspace, "command", command)
+    initial = edit(SOURCE, "    return -3\n", '    return "3"\n')
+    if scenario == "mixed":
+        initial += FIRST
+    good = scenario in {"mixed", "static_only"}
+    attempts = (
+        (
+            "An incomplete edit",
+            f"REPLACE {SOURCE}::stock\ndef stock() -> int:\n    return -3\n",
+            f"REPLACE {SOURCE}::stock\ndef stock() -> int:\n    return 3\n",
+            *(
+                (edit(SOURCE, "    return 1\n", "    return -1\n"),)
+                if scenario == "mixed"
+                else ()
+            ),
+            edit(
+                NEW_TEST,
+                "",
+                "from fixture_calc import stock\n\ndef test_stock_value():\n    assert stock() == 3\n",
+            ),
+        )
+        if good
+        else ("An incomplete edit",)
+    )
+    gateway = FreeGateway(initial, *attempts)
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=len(attempts) + 1, concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    if good:
+        result = solve(executor, task, archive.getvalue(), budget, "fixture-version")
+        assert all(check.returncode == 0 for check in result.checks)
+        assert b"+    return 3\n" in result.patch and NEW_TEST.encode() in result.patch
+        assert len(checkpoints) == 1
+        assert b"+    return 3\n" in checkpoints[0].patch
+        assert b"+    return 1\n" not in checkpoints[0].patch
+        for prompt in gateway.prompts[1:4]:
+            assert "Private regression repair" in prompt
+            assert "check 3 (exit 1)" in prompt.splitlines()[0]
+            assert "Incompatible return value type" in prompt
+            assert '    return "3"' in prompt
+        assert "unchanged stock-passing draft" in gateway.prompts[3]
+        if scenario == "mixed":
+            assert "test_third" in gateway.prompts[4].splitlines()[0]
+            assert "return 3" in gateway.prompts[4]
+        assert len(mypy_runs) >= 5
+    else:
+        with pytest.raises(AttemptRejected):
+            solve(executor, task, archive.getvalue(), budget, "fixture-version")
+        assert not checkpoints
+        assert "Private regression repair" not in gateway.prompts[1]
 
 
 def test_private_regression_repair_is_discarded_if_a_concurrent_draft_advances(

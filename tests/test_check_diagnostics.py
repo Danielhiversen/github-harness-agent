@@ -1,6 +1,10 @@
 from types import SimpleNamespace
 
-from github_harness_agent.check_diagnostics import check_details, check_failure_summary
+from github_harness_agent.check_diagnostics import (
+    check_details,
+    check_failure_summary,
+    ordinary_static_locations,
+)
 
 
 def test_ruff_multiline_and_concise_locations_survive_without_messages():
@@ -75,3 +79,21 @@ def test_unknown_checks_return_only_ordinal_and_exit_status():
         check_details(("uv", "run", "--with", "pytest", "custom"), failed.output) == ""
     )
     assert check_details(("uv", "run", "--script", "pytest"), failed.output) == ""
+
+
+def test_private_static_ruff_locations_require_complete_lint_diagnostics():
+    command = ("uv", "run", "ruff", "check", ".")
+    output = (
+        "F401 [*] `os` imported but unused\n"
+        " --> src/core.py:2:8\n"
+        "src/other.py:5:1: F821 Undefined name `x`\n"
+        "Found 2 errors.\n"
+    )
+    assert ordinary_static_locations(command, output) == (
+        ("src/core.py", 2),
+        ("src/other.py", 5),
+    )
+    assert (
+        ordinary_static_locations(command, output.replace("Found 2", "Found 3")) == ()
+    )
+    assert ordinary_static_locations(command, "ruff failed\n" + output) == ()
