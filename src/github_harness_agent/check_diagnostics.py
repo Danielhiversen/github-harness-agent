@@ -87,17 +87,44 @@ def check_details(command, output):
 
 
 def check_failure_summary(task, checks, *, baseline_failed=False):
-    failed = checks[-1]
-    if failed.command in task.pull_checks:
-        label = (
-            f"Operator acceptance check {task.pull_checks.index(failed.command) + 1}"
-        )
-    else:
-        label = f"Required check {(len(checks) - 1) % len(task.checks) + 1}"
-    summary = f"{label} exited with status {failed.returncode}."
-    details = check_details(failed.command, failed.output)
-    if details:
-        summary += f" {details}"
+    failures = []
+    for index, failed in enumerate(checks):
+        if not failed.returncode:
+            continue
+        if failed.command in task.pull_checks:
+            label = f"Operator acceptance check {task.pull_checks.index(failed.command) + 1}"
+        else:
+            label = f"Required check {index % len(task.checks) + 1}"
+        summary = f"{label} exited with status {failed.returncode}."
+        details = check_details(failed.command, failed.output)
+        if details:
+            summary += f" {details}"
+        failures.append(summary)
+    summary = " ".join(failures)
     if baseline_failed:
         summary += " The check also failed on the baseline."
     return summary
+
+
+def required_review_checks(task):
+    """Use the configured check order and append any separate operator checks."""
+    return (
+        *task.checks,
+        *(check for check in task.pull_checks if check not in task.checks),
+    )
+
+
+def check_progress(task, failure):
+    """Rank complete trusted checks first, then the presence of required coverage."""
+    commands = required_review_checks(task)
+    evidence = getattr(failure, "checks", ())
+    trusted_checks = evidence[: len(commands)]
+    if not commands or tuple(check.command for check in trusted_checks) != commands:
+        return None
+    if any(not 0 <= check.returncode < 125 for check in evidence):
+        return None
+    passes = sum(check.returncode == 0 for check in trusted_checks)
+    has_coverage = task.require_new_tests and not getattr(
+        failure, "missing_regression_tests", False
+    )
+    return passes, has_coverage

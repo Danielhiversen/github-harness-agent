@@ -939,6 +939,65 @@ def test_coding_workspace_git_status_is_clean_and_head_is_diffable(fixture):
     assert b"+4" in result.patch
 
 
+@pytest.mark.parametrize("coverage", ("optional", "missing", "present"))
+def test_review_verification_reports_all_required_check_outcomes(fixture, coverage):
+    from github_harness_agent.check_diagnostics import check_progress
+    from github_harness_agent.executor import AttemptRejected
+
+    task, source, runner = fixture
+    checks = tuple(
+        (sys.executable, "-c", command)
+        for command in (
+            "raise SystemExit(1)",
+            "raise SystemExit(2)",
+            "pass",
+        )
+    )
+    task = replace(
+        task,
+        checks=checks[:1],
+        pull_checks=checks[1:],
+        verify_base_first=True,
+        require_new_tests=coverage != "optional",
+    )
+    code = "open('number.txt','w').write('5\\n')"
+    if coverage == "present":
+        code += "; open('test_new.py','w').write('def test_behavior():\\n    assert 1 == 1\\n')"
+    gateway = ScriptedGateway(code)
+    with pytest.raises(ExecutionError) as error:
+        PlainExecutor(runner, gateway).execute(task, source)
+
+    failure = (
+        error.value.__cause__
+        if isinstance(error.value, AttemptRejected)
+        else error.value
+    )
+    assert tuple(check.returncode for check in failure.checks) == (1, 2, 0)
+    assert check_progress(task, failure) == (1, coverage == "present")
+    assert "Required check 1 exited with status 1." in str(failure)
+    assert "Operator acceptance check 1 exited with status 2." in str(failure)
+
+
+def test_review_verification_stops_at_infrastructure_failure(fixture):
+    from github_harness_agent.check_diagnostics import check_progress
+    from github_harness_agent.executor import AttemptRejected
+
+    task, source, runner = fixture
+    checks = tuple(
+        (sys.executable, "-c", code)
+        for code in ("raise SystemExit(1)", "raise SystemExit(125)", "pass")
+    )
+    task = replace(task, checks=checks, verify_base_first=True)
+    with pytest.raises(ExecutionError) as error:
+        PlainExecutor(
+            runner, ScriptedGateway("open('number.txt','w').write('5\\n')")
+        ).execute(task, source)
+
+    assert not isinstance(error.value, AttemptRejected)
+    assert tuple(check.returncode for check in error.value.checks) == (1, 125)
+    assert check_progress(task, error.value) is None
+
+
 def test_patch_induced_check_failure_can_choose_another_model(fixture):
     from github_harness_agent.executor import AttemptRejected
 
@@ -1363,13 +1422,21 @@ def test_harness2_review_retries_failed_base_with_safe_check_summary(fixture):
     from github_harness_agent.rebase import git
 
     task, source, runner = fixture
+    (source / "number.py").write_text(
+        "def current_number():\n"
+        "    # Baseline source\n"
+        "    from pathlib import Path\n"
+        "    value = Path('number.txt').read_text()\n"
+        "    assert value == '4\\n'\n"
+        "    return value\n"
+    )
     (source / "test_number.py").write_text(
-        "from pathlib import Path\nimport pytest\n\n"
+        "from number import current_number\nimport pytest\n\n"
         "@pytest.mark.parametrize('expected', [pytest.param('4\\n', id='private-param')])\n"
         "def test_number(expected):\n"
-        "    assert Path('number.txt').read_text() == expected\n"
+        "    assert current_number() == expected\n"
     )
-    git(source, "add", "test_number.py")
+    git(source, "add", "test_number.py", "number.py")
     git(
         source,
         "-c",
@@ -1385,15 +1452,27 @@ def test_harness2_review_retries_failed_base_with_safe_check_summary(fixture):
         task,
         base_sha=base,
         verify_base_first=True,
+        inline_review_threads=2,
         checks=((sys.executable, "-m", "pytest", "-q", "test_number.py"),),
     )
 
     class RepairGateway(ScriptedGateway):
         def complete(self, **kwargs):
             message = kwargs["messages"][-1]
+            if not self.roles:
+                assert (
+                    "one review concern at a time" in kwargs["messages"][0]["content"]
+                )
             if message["role"] == "user" and len(self.roles) == 2:
                 assert "test_number.py::test_number" in message["content"]
                 assert "Required check 1 exited with status 1" in message["content"]
+                assert (
+                    "Current draft source near failing pytest frames"
+                    in message["content"]
+                )
+                assert "number.py" in message["content"]
+                assert "def current_number():" in message["content"]
+                assert "# Candidate source" in message["content"]
                 assert "private-" not in message["content"]
                 self.code = (
                     "from pathlib import Path; p = Path('number.txt'); "
@@ -1401,7 +1480,10 @@ def test_harness2_review_retries_failed_base_with_safe_check_summary(fixture):
                 )
             return super().complete(**kwargs)
 
-    gateway = RepairGateway("open('number.txt','w').write('5\\n')")
+    gateway = RepairGateway(
+        "from pathlib import Path; Path('number.txt').write_text('5\\n'); "
+        "p = Path('number.py'); p.write_text(p.read_text().replace('Baseline', 'Candidate'))"
+    )
     verifier = FixtureRunner(source)
     result = Harness2Executor(
         runner, gateway, Limits(model_requests=4), verification_runner=verifier
@@ -1463,6 +1545,47 @@ def test_verified_uv_ruff_failure_survives_into_the_repair_turn(fixture):
     )
     assert result.refinement.candidates[0].error == summary
     assert result.refinement.selected_candidate == "repair"
+
+
+@pytest.mark.parametrize("improves", [False, True])
+def test_harness2_review_checkpoint_retains_best_independently_checked_draft(
+    fixture, improves
+):
+    from github_harness_agent.executor import _VerificationRejected
+
+    task, source, runner = fixture
+    saved = {}
+
+    def check(expected):
+        return (
+            sys.executable,
+            "-c",
+            "from pathlib import Path; "
+            f"assert Path('number.txt').read_text().strip() == {expected!r}",
+        )
+
+    task = replace(
+        task,
+        verify_base_first=True,
+        checks=(check("5"), check("6")),
+        save_checkpoint=lambda draft: saved.update({draft.key: draft}),
+    )
+    base, repair = ("7", "5") if improves else ("5", "7")
+
+    class RepairGateway(ScriptedGateway):
+        def complete(self, **kwargs):
+            if len(self.roles) == 2:
+                self.code = f"open('number.txt','w').write('{repair}\\n')"
+            return super().complete(**kwargs)
+
+    gateway = RepairGateway(f"open('number.txt','w').write('{base}\\n')")
+    with pytest.raises(_VerificationRejected):
+        Harness2Executor(runner, gateway, Limits(model_requests=4)).execute(
+            task, source
+        )
+
+    assert b"+5\n" in saved["harness2/base"].patch
+    assert not saved["harness2/repair"].patch
 
 
 def test_harness2_review_retries_missing_regression_coverage_from_safe_draft(fixture):

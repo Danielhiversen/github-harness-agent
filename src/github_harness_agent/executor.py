@@ -17,9 +17,10 @@ from uuid import uuid4
 
 from .activity import observed_call
 from .check_artifacts import STAT_FILES_COMMAND, check_label
-from .check_diagnostics import check_failure_summary
+from .check_diagnostics import check_failure_summary, required_review_checks
 from .checkpoint import DraftCheckpoint
 from .file_edit import EDIT_COMMAND, EDIT_TOOL, InvalidEdit, edit_payload
+from .repair_context import repair_source_context
 from .review_recovery import (
     RECOVERY_EDIT_TOOL,
     TEXT_RECOVERY_SYSTEM,
@@ -156,6 +157,8 @@ class _VerificationRejected(ExecutionError):
 class _MissingRegressionTests(_VerificationRejected):
     """A review requires new runnable test coverage."""
 
+    missing_regression_tests = True
+
 
 @dataclass(frozen=True)
 class TaskSnapshot:
@@ -179,6 +182,7 @@ class TaskSnapshot:
     require_new_tests: bool = False
     pull_checks: tuple[tuple[str, ...], ...] = ()
     review_recovery: ReviewRecovery | None = None
+    repair_failure: tuple["CheckEvidence", ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True)
@@ -919,6 +923,15 @@ class PlainExecutor:
                     + "; ".join(progress)
                 )
             initial_tree = staged_tree
+            if task.repair_failure:
+                source = repair_source_context(
+                    task.repair_failure,
+                    lambda path: self._read_recovery_source(
+                        workspace, budget, task, initial_tree, path
+                    ),
+                )
+                if source:
+                    instructions += "\n\n" + source
             acceptance_source = ""
             if task.pull_checks:
                 try:
@@ -1608,12 +1621,12 @@ class PlainExecutor:
                 raise ExecutionError("Worker could not validate the generated patch")
             raise _CandidateOutputError(message)
 
-    def _run_checks(self, workspace, budget, commands):
+    def _run_checks(self, workspace, budget, commands, *, collect=False):
         checks = []
         for command in commands:
             result = self._command(workspace, budget, command, checked=False)
             checks.append(CheckEvidence(command, result.returncode, _combined(result)))
-            if result.returncode:
+            if result.returncode and (not collect or not 0 < result.returncode < 125):
                 break
         return checks
 
@@ -1626,6 +1639,9 @@ class PlainExecutor:
             budget.reject(
                 CommandOutputExceeded("Patch exceeded the configured size"), actor
             )
+        commands = (
+            required_review_checks(task) if task.verify_base_first else task.checks
+        )
         with self.verification_runner.workspace(
             archive, budget.remaining, budget.cancelled
         ) as workspace:
@@ -1666,13 +1682,28 @@ class PlainExecutor:
                 )
             if missing_tests:
                 reason = "Add new runnable regression tests for the behavior requested in the review."
-                if task.pull_checks:
-                    evidence = self._run_checks(workspace, budget, task.pull_checks)
-                    if evidence[-1].returncode:
-                        reason += " " + check_failure_summary(task, evidence)
-                budget.reject(_MissingRegressionTests(reason), actor)
-            checks = self._run_checks(workspace, budget, task.checks)
-        trusted_passed = checks[-1].returncode == 0
+                evidence = self._run_checks(
+                    workspace,
+                    budget,
+                    commands if task.verify_base_first else task.pull_checks,
+                    collect=task.verify_base_first,
+                )
+                diagnostics = check_failure_summary(task, evidence)
+                if task.verify_base_first and any(
+                    not 0 <= check.returncode < 125 for check in evidence
+                ):
+                    error = ExecutionError(diagnostics)
+                    error.checks = tuple(evidence)
+                    raise error
+                if diagnostics:
+                    reason += " " + diagnostics
+                error = _MissingRegressionTests(reason)
+                error.checks = tuple(evidence)
+                budget.reject(error, actor)
+            checks = self._run_checks(
+                workspace, budget, commands, collect=task.verify_base_first
+            )
+        trusted_passed = not any(check.returncode for check in checks)
         selections = []
         if amended_test:
             selections.append((task.test_update,))
@@ -1686,9 +1717,16 @@ class PlainExecutor:
                 self._stage_baseline(workspace, budget)
                 self._git(workspace, budget, "apply", "--index", "--binary", data=patch)
                 if new_tests:
-                    checks.extend(self._run_checks(workspace, budget, task.checks))
+                    checks.extend(
+                        self._run_checks(
+                            workspace,
+                            budget,
+                            commands,
+                            collect=task.verify_base_first,
+                        )
+                    )
                 for selectors in selections:
-                    if checks[-1].returncode:
+                    if any(check.returncode for check in checks):
                         break
                     report = f".git/gha-test-update-{uuid4().hex}.xml"
                     focused = focused_pytest(task.checks, selectors, report)
@@ -1706,27 +1744,32 @@ class PlainExecutor:
                                 "The selected test coverage did not pass as executed pytest tests.",
                             )
                     checks.append(check)
-        if checks[-1].returncode:
-            failed = checks[-1]
-            rejection = 0 < failed.returncode < 125
+        failures = [check for check in checks if check.returncode]
+        if failures:
+            rejection = all(0 < check.returncode < 125 for check in failures)
             error_type = _VerificationRejected if rejection else ExecutionError
             error = error_type(check_failure_summary(task, checks))
             error.checks = tuple(checks)
             if actor is not None and actor.configured_model and rejection:
-                if trusted_passed or failed.command in task.pull_checks:
+                if trusted_passed or any(
+                    failed.command in task.pull_checks for failed in failures
+                ):
                     budget.reject(error, actor)
                 with self.verification_runner.workspace(
                     archive, budget.remaining, budget.cancelled
                 ) as baseline:
                     self._stage_baseline(baseline, budget)
-                    result = self._command(
-                        baseline, budget, failed.command, checked=False
+                    baseline_checks = self._run_checks(
+                        baseline,
+                        budget,
+                        tuple(failed.command for failed in failures),
+                        collect=task.verify_base_first,
                     )
-                if result.returncode == 0:
+                if any(check.returncode == 0 for check in baseline_checks):
                     budget.reject(error, actor)
                 error_type = (
                     _VerificationRejected
-                    if 0 < result.returncode < 125
+                    if all(0 < check.returncode < 125 for check in baseline_checks)
                     else ExecutionError
                 )
                 error = error_type(

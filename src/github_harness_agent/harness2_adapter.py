@@ -6,7 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from .check_diagnostics import check_failure_summary
+from .check_diagnostics import check_failure_summary, check_progress
 from .checkpoint import DraftCheckpoint
 from .executor import (
     AttemptRejected,
@@ -45,17 +45,55 @@ def _base_guidance(task):
     return "\n\n".join(filter(None, (BASE_GUIDANCE, task.repository_guidance)))
 
 
+def _retain_best_review_draft(task, budget, base_score, repair_score, repair):
+    if (
+        task.save_checkpoint is None
+        or base_score is None
+        or repair_score is None
+        or base_score == repair_score
+        or repair is None
+    ):
+        return
+    budget.remaining()
+    if repair_score > base_score:
+        # Save the improved base first. A restart between writes will treat the
+        # old repair checkpoint as stale because its base digest will differ.
+        task.save_checkpoint(
+            replace(repair, key="harness2/base", seed_patch_digest=None)
+        )
+    task.save_checkpoint(replace(repair, patch=b""))
+
+
 def verify_review_repair(executor, task, archive, budget):
+    from .review_solver import solve
+
+    solved = solve(executor, task, archive, budget, HARNESS2_REVISION)
+    if solved is not None:
+        return solved
     guidance = _base_guidance(task)
     prompt = f"{SYSTEM_PROMPT}\n\n{guidance}"
+    if task.inline_review_threads > 1:
+        prompt += (
+            "\n\nHandle one review concern at a time. Read the review index and, for the "
+            "current concern, inspect the cited source and its existing tests. Verify the "
+            "focused change before moving to the next concern. Account for every review "
+            "request before finishing."
+        )
     candidates = []
     seed = None
     last_safe = None
+    last_repair = None
+    base_score = None
 
     def save_base(draft):
         nonlocal last_safe
         task.save_checkpoint(draft)
         last_safe = draft
+
+    def save_repair(draft):
+        nonlocal last_repair
+        task.save_checkpoint(draft)
+        last_repair = draft
 
     rollout_task = (
         replace(task, save_checkpoint=save_base)
@@ -66,6 +104,7 @@ def verify_review_repair(executor, task, archive, budget):
     for label in ("base", "repair"):
         key = f"harness2/{label}"
         candidate = CandidateEvidence(label, None, "")
+        patch = b""
         try:
             patch, trajectory, actor = executor._rollout(
                 rollout_task,
@@ -84,9 +123,19 @@ def verify_review_repair(executor, task, archive, budget):
             )
             verified = executor._verify(task, archive, budget, patch, actor=actor)
         except (AttemptRejected, _ProtectedPatchError, _VerificationRejected) as error:
-            if label == "repair":
-                raise
             failure = error.__cause__ if isinstance(error, AttemptRejected) else error
+            if label == "repair":
+                if patch:
+                    repair = last_repair or task.checkpoints.get(key)
+                    if repair is None or repair.patch != patch:
+                        repair = DraftCheckpoint(
+                            key, task.base_sha, patch, guidance=guidance
+                        )
+                    _retain_best_review_draft(
+                        task, budget, base_score, check_progress(task, failure), repair
+                    )
+                raise
+            base_score = check_progress(task, failure)
             if isinstance(failure, _ProtectedPatchError):
                 feedback = failure.repair_feedback
                 # A resumed checkpoint is only eligible if the rollout restored it.
@@ -105,9 +154,13 @@ def verify_review_repair(executor, task, archive, budget):
             candidates.append(replace(candidate, error=feedback))
             rollout_task = replace(
                 task,
+                save_checkpoint=save_repair if task.save_checkpoint is not None else None,
+                repair_failure=getattr(failure, "checks", ()),
                 instructions=(
                     f"{task.instructions}\n\nIndependent validation of the "
-                    f"draft failed. {feedback} Inspect and repair the draft."
+                    f"draft failed. {feedback} Inspect the failing check evidence and address "
+                    "one failure at a time. Preserve passing behavior and rerun the relevant "
+                    "check after each focused repair."
                 ),
             )
         else:
