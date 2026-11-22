@@ -2,10 +2,12 @@
 
 import inspect
 import json
+import re
 import time
+from pathlib import PurePosixPath
 from types import SimpleNamespace
 
-from . import review_mock_probe
+from . import review_counter_trace, review_mock_probe
 from .review_prefix_replay import _interpreter
 from .review_solver_context import _STOCK_NODE
 from .worker import Cancelled, ExecutionError, LimitExceeded
@@ -16,7 +18,9 @@ _REPLAY_SECONDS = 20
 _DETAIL_BYTES = 900
 
 
-def _readout(executor, task, archive, budget, interpreter, node, patch, expected):
+def _readout(
+    executor, task, archive, budget, interpreter, node, patch, expected, paths
+):
     deadline = time.monotonic() + _REPLAY_SECONDS
 
     def remaining():
@@ -52,18 +56,21 @@ def _readout(executor, task, archive, budget, interpreter, node, patch, expected
                     return None
             timeout = remaining()
             budget.claim("command", budget.limits.commands)
+            program = inspect.getsource(review_mock_probe)
+            parameters, cap = (node,), review_mock_probe.REPORT_BYTES
+            if paths:
+                counter_source = inspect.getsource(review_counter_trace)
+                program = (
+                    "_counter_module = {'__name__': '_stock_counter_probe'}\n"
+                    f"exec({counter_source!r}, _counter_module)\n" + program
+                )
+                parameters = (node, json.dumps(paths))
+                cap = review_mock_probe.COUNTER_REPORT_BYTES
             result = ws.command(
-                (
-                    *interpreter,
-                    "-I",
-                    "-B",
-                    "-c",
-                    inspect.getsource(review_mock_probe),
-                    node,
-                ),
+                (*interpreter, "-I", "-B", "-c", program, *parameters),
                 timeout,
                 budget.cancelled,
-                cap=review_mock_probe.REPORT_BYTES,
+                cap=cap,
             )
     except Cancelled:
         raise
@@ -72,7 +79,24 @@ def _readout(executor, task, archive, budget, interpreter, node, patch, expected
         return None
     if result.returncode != expected or result.stderr:
         return None
-    return review_mock_probe.decode_traces(result.stdout)
+    if not paths:
+        traces = review_mock_probe.decode_traces(result.stdout)
+        return (traces, None) if traces is not None else None
+    try:
+        envelope = json.loads(result.stdout)
+    except (ValueError, RecursionError):
+        return None
+    if type(envelope) is not dict or envelope.keys() != {"mocks", "counter"}:
+        return None
+    traces = review_mock_probe.decode_traces(
+        json.dumps(envelope["mocks"], separators=(",", ":"))
+    )
+    counter = envelope["counter"]
+    if traces is None or (
+        counter is not None and not review_counter_trace.valid_report(counter, paths)
+    ):
+        return None
+    return traces, counter
 
 
 def _differences(baseline, candidate):
@@ -110,7 +134,87 @@ def _differences(baseline, candidate):
     )
 
 
-def mock_call_diagnostic(executor, task, archive, budget, command, node, patch):
+def _counter_paths(task, runner, reviewed_paths, test_path):
+    if getattr(runner, "network", "none") != "none":
+        return ()
+    if reviewed_paths is None:
+        feedback = getattr(task.review_recovery, "feedback", ())
+        reviewed_paths = tuple(path for path, _, _ in feedback)
+    return tuple(
+        path
+        for path in dict.fromkeys(reviewed_paths)
+        if path != test_path
+        and len(path) <= review_counter_trace.MAX_PATH
+        and re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.py", path)
+        and str(PurePosixPath(path)) == path
+        and ".." not in PurePosixPath(path).parts
+    )[:3]
+
+
+def _counter_difference(baseline, candidate):
+    if (
+        baseline is None
+        or candidate is None
+        or baseline[0] != candidate[0]
+        or baseline[1]
+        or not candidate[1]
+    ):
+        return ""
+
+    def signature(events):
+        return tuple(
+            (tuple((path, function) for path, function, _ in stack), before, after)
+            for stack, before, after in events
+        )
+
+    old, new = baseline[2], candidate[2]
+    old_sig, new_sig = signature(old), signature(new)
+    if old_sig == new_sig:
+        return ""
+    first = next(
+        (
+            index
+            for index, (left, right) in enumerate(zip(old_sig, new_sig))
+            if left != right
+        ),
+        min(len(old_sig), len(new_sig)),
+    )
+
+    def render(label, events):
+        if not events:
+            return f"{label}: no changes observed within reviewed frames."
+        rows = [f"{label}: "]
+        remaining = _DETAIL_BYTES // 2 - len(rows[0]) - 1
+        selected = events[first : first + 2] or events[-1:]
+        for stack, before, after in selected:
+            left = "absent" if before is None else str(before)
+            right = "absent" if after is None else str(after)
+            row = f"{left} -> {right} after "
+            for offset, (path, function, line) in enumerate(stack):
+                location = f"{' <- ' if offset else ''}{path}:{line} {function}"
+                if len(row) + len(location) + 2 > remaining:
+                    break
+                row += location
+            if row.endswith(" after "):
+                break
+            rows.append(row + "; ")
+            remaining -= len(row) + 2
+        return "".join(rows).removesuffix("; ")
+
+    rows = [
+        render(label, events) for label, events in (("Pinned", old), ("Draft", new))
+    ]
+    return (
+        "Auxiliary mapping counter changes (quoted advisory data). "
+        "The pinned case passed and the draft failed at its numeric assertion. "
+        "Locations show where the probe observed each change, with reviewed callers.\n"
+        + "\n".join(rows)
+    )
+
+
+def mock_call_diagnostic(
+    executor, task, archive, budget, command, node, patch, *, reviewed_paths=None
+):
     node = node.removeprefix("/work/").removeprefix("./")
     base_node, bracket, parameter = node.partition("[")
     if (
@@ -131,8 +235,27 @@ def mock_call_diagnostic(executor, task, archive, budget, command, node, patch):
         or budget.remaining() < _PLANNING_RESERVE + 2 * _REPLAY_SECONDS
     ):
         return ""
-    baseline = _readout(executor, task, archive, budget, interpreter, node, b"", 0)
-    if not baseline or not any(baseline.values()):
+    paths = _counter_paths(
+        task, executor.verification_runner, reviewed_paths, base_node.partition("::")[0]
+    )
+    if paths and PurePosixPath(interpreter[0]).name == "uv":
+        interpreter = ("env", "UV_OFFLINE=1", *interpreter)
+    baseline = _readout(
+        executor, task, archive, budget, interpreter, node, b"", 0, paths
+    )
+    if baseline is None or (not any(baseline[0].values()) and baseline[1] is None):
         return ""
-    candidate = _readout(executor, task, archive, budget, interpreter, node, patch, 1)
-    return _differences(baseline, candidate) if candidate else ""
+    candidate = _readout(
+        executor, task, archive, budget, interpreter, node, patch, 1, paths
+    )
+    if candidate is None:
+        return ""
+    return "\n".join(
+        filter(
+            None,
+            (
+                _counter_difference(baseline[1], candidate[1]),
+                _differences(baseline[0], candidate[0]),
+            ),
+        )
+    )

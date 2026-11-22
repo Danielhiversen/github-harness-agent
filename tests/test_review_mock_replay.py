@@ -40,12 +40,12 @@ _COMMAND = (sys.executable, "-m", "pytest", "-q", "tests/test_service.py")
 _NODE = "tests/test_service.py::test_invoke"
 
 
-def _archive(source):
+def _archive(source, test=_TEST):
     buffer = BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as snapshot:
         for path, text in {
             "service.py": source,
-            "tests/test_service.py": _TEST,
+            "tests/test_service.py": test,
         }.items():
             data = text.encode()
             entry = tarfile.TarInfo(path)
@@ -124,3 +124,106 @@ def test_mock_call_probe_skips_authorized_edit_to_selected_test(tmp_path):
 )
 def test_untrusted_mock_report_must_match_safe_schema(output):
     assert decode_traces(output) is None
+
+
+_COUNTER_SOURCE = """
+class Collector:
+    def __init__(self):
+        self.summary = {"processed_count": 0, "private_text": "never print me"}
+
+    def process(self):
+        self._tick()
+        return self.summary
+
+    def _tick(self):
+        self.summary["processed_count"] += 1
+
+def invoke():
+    return Collector().process()
+"""
+_COUNTER_TEST = """
+from service import invoke
+
+def test_invoke():
+    assert invoke()["processed_count"] == 1
+"""
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("nested", True),
+        ("empty baseline", True),
+        ("unreviewed", False),
+        ("ambiguous", False),
+        ("ambiguous mappings", False),
+        ("unrelated mutation", False),
+        ("unchanged transitions", False),
+        ("sensitive field", False),
+    ],
+)
+def test_replay_reports_bounded_counter_locations_only(tmp_path, case, expected):
+    before, test = _COUNTER_SOURCE, _COUNTER_TEST
+    after = before.replace("+= 1", "+= 2")
+    paths = ("service.py",)
+    if case == "empty baseline":
+        before = before.replace('self.summary["processed_count"] += 1', "pass")
+        before = before.replace('"processed_count": 0', '"processed_count": 1')
+        after = before.replace(
+            "        pass", '        self.summary["processed_count"] += 1'
+        )
+    elif case == "unreviewed":
+        paths = ("unreviewed.py",)
+    elif case == "ambiguous":
+        test += '    assert invoke()["processed_count"] == 1\n'
+    elif case == "ambiguous mappings":
+        before = before.replace(
+            "        self._tick()",
+            '        self.shadow = {"processed_count": 0}\n        self._tick()',
+        ).replace(
+            '        self.summary["processed_count"] += 1',
+            '        self.summary["processed_count"] += 1\n        self.shadow["processed_count"] += 1',
+        )
+        after = before.replace("+= 1", "+= 2")
+    elif case == "unrelated mutation":
+        after = before.replace("+= 1", "+= 8").replace(
+            "        return self.summary", '        return {"processed_count": 2}'
+        )
+    elif case == "unchanged transitions":
+        after = before.replace("return self.summary", 'return {"processed_count": 2}')
+    elif case == "sensitive field":
+        before, after, test = (
+            source.replace("processed_count", "access_token")
+            for source in (before, after, test)
+        )
+    runner = FixtureRunner(tmp_path)
+    executor = PlainExecutor(runner, None, Limits(), verification_runner=runner)
+    task = TaskSnapshot(
+        "org/fixture", "1" * 40, "Exercise public processing.", (_COMMAND,)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+    patch = patch_for({"service.py": before}, {"service.py": after})
+    detail = mock_call_diagnostic(
+        executor,
+        task,
+        _archive(before, test),
+        budget,
+        _COMMAND,
+        _NODE,
+        patch,
+        reviewed_paths=paths,
+    )
+    if not expected:
+        assert detail == ""
+        return
+    assert "mapping counter" in detail
+    assert "Collector._tick" in detail and "Collector.process" in detail
+    assert "processed_count" not in detail and "never print me" not in detail
+    assert "0 -> 2" in detail if case == "nested" else "1 -> 2" in detail
+    if case == "empty baseline":
+        assert "no changes observed" in detail
+    assert len(runner.workspaces) == 2
+    assert all(
+        (workspace / "tests/test_service.py").read_text() == test
+        for workspace in runner.workspaces
+    )

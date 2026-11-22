@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import Base, Mock, _Call, _CallList
 
 REPORT_BYTES = 8192
+COUNTER_REPORT_BYTES = 2 * REPORT_BYTES
 _MAX_MOCKS = 4
 _MAX_CALLS = 12
 _MAX_ITEMS = 6
@@ -135,10 +136,15 @@ def decode_traces(output):
     return traces
 
 
-def _run_pytest(node):
+def _run_pytest(node, counter_paths=()):
     import pytest
 
     path = Path(node.split("::", 1)[0]).resolve()
+    counter = (
+        globals()["_counter_module"]["CounterTrace"](path, node, counter_paths)
+        if counter_paths
+        else None
+    )
 
     class Probe:
         reports = ()
@@ -177,11 +183,27 @@ def _run_pytest(node):
                     self.traces = _locals_trace(frame)
                     sys.setprofile(None)
 
+            tracer = (
+                counter.tracer(code)
+                if counter is not None and sys.gettrace() is None
+                else None
+            )
             sys.setprofile(profile)
+            if tracer is not None:
+                sys.settrace(tracer)
             try:
                 return (yield)
             finally:
                 sys.setprofile(None)
+                if tracer is not None:
+                    sys.settrace(None)
+
+        @pytest.hookimpl(wrapper=True)
+        def pytest_runtest_makereport(self, item, call):
+            report = yield
+            if counter is not None and item.nodeid == node and report.when == "call":
+                counter.failure(report, call)
+            return report
 
         def pytest_runtest_logreport(self, report):
             if report.nodeid == node and not hasattr(report, "wasxfail"):
@@ -200,22 +222,32 @@ def _run_pytest(node):
         ("call", expected),
         ("teardown", "passed"),
     ):
-        return int(status), probe.traces
-    return 4, None
+        return (
+            int(status),
+            probe.traces,
+            counter.report() if counter is not None else None,
+        )
+    return 4, None, None
 
 
-def _main(node):
+def _main(node, counter_paths=()):
     # Keep all test output, even native stdout/stderr, out of the report stream.
     with os.fdopen(os.dup(1), "w") as report, open(os.devnull, "wb") as sink:
         os.dup2(sink.fileno(), 1)
         os.dup2(sink.fileno(), 2)
-        status, traces = _run_pytest(node)
-        if traces is not None:
-            payload = json.dumps(traces, separators=(",", ":"), allow_nan=False)
-            if len(payload) <= REPORT_BYTES:
+        status, traces, counter = _run_pytest(node, counter_paths)
+        if traces is not None or counter is not None:
+            data, cap = traces, REPORT_BYTES
+            if counter_paths:
+                data, cap = (
+                    {"mocks": traces or {}, "counter": counter},
+                    COUNTER_REPORT_BYTES,
+                )
+            payload = json.dumps(data, separators=(",", ":"), allow_nan=False)
+            if len(payload) <= cap:
                 report.write(payload)
         return status
 
 
 if __name__ == "__main__":
-    sys.exit(_main(sys.argv[1]))
+    sys.exit(_main(sys.argv[1], json.loads(sys.argv[2]) if len(sys.argv) > 2 else ()))
