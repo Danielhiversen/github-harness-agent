@@ -1,6 +1,7 @@
 """Integration between durable jobs, verified Git objects and the PR writer."""
 
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -12,23 +13,39 @@ from github_harness_agent.executor import (
     REVIEW_ROUND_EXHAUSTED,
     AttemptRejected,
     CheckEvidence,
+    PlainExecutor,
     ReviewRoundExhausted,
     RouteEvidence,
 )
 from github_harness_agent.intake import adopt_open_pulls, reconcile
 from github_harness_agent.reviews import Feedback, ReviewBatch
 from github_harness_agent.store import Store
+from github_harness_agent.worker import ExecutionError
 
+from test_executor import FixtureRunner
 from test_intake import pull
 from test_publish import FakeGitHub
 
 
 @pytest.mark.parametrize(
     "scenario",
-    ["stable", "moving", "conflict", "fallback", "aggregate", "aggregate-legacy"],
+    [
+        "stable", "moving", "conflict", "fallback", "aggregate", "aggregate-legacy",
+        "moving-operator-failure",
+    ],
 )
 def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario):
-    move_target = scenario in {"moving", "conflict"}
+    operator_failure = scenario == "moving-operator-failure"
+    move_target = scenario in {"moving", "conflict"} or operator_failure
+    if operator_failure:
+        stock_check = (sys.executable, "-c", "pass")
+        operator_check = (
+            sys.executable, "-c", "from pathlib import Path\nraise SystemExit(Path('during').exists())",
+        )
+        runner_path = tmp_path / "revalidate"
+        runner_path.mkdir()
+        verifier = PlainExecutor(FixtureRunner(runner_path), None)
+        rechecks = []
     repo = tmp_path / "project"
     repo.mkdir()
     git(repo, "init", "-q")
@@ -195,6 +212,12 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario):
             if "Review requests" in task.instructions:
                 assert git(path, "show", task.base_sha + ":during") == b"during edit\n"
                 assert b"+two" in patch
+                if operator_failure:
+                    try:
+                        return verifier.verify_patch(task, path, patch, cancelled)
+                    except ExecutionError as error:
+                        rechecks.extend(error.checks)
+                        raise
             else:
                 assert (
                     git(path, "show", task.base_sha + ":main-during")
@@ -209,6 +232,8 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario):
     db = Store(tmp_path / "db", lambda: clock[0])
     api = API(None)
     cfg = {"checks": [["test"]], "base": "main", "mode": "canary"}
+    if operator_failure:
+        cfg.update(checks=[list(stock_check)], pull_checks={"21": [list(operator_check)]})
     reconcile(api, db, "a/b", cfg)
     if move_target:
         target["main"] = commit_file(base, "main-before", "main moved before editing\n")
@@ -269,7 +294,7 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario):
     monkeypatch.setattr(
         controller,
         "collect_reviews",
-        lambda *a, **kw: ReviewBatch(first, (item, ambiguous)),
+        lambda *a, **kw: ReviewBatch(first, (item,) if operator_failure else (item, ambiguous)),
     )
     replies = []
     lag = True
@@ -323,7 +348,18 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario):
             "collect_reviews",
             lambda *a, **kw: ReviewBatch(first, (item,)),
         )
+    push_count = api.pushes
     run(db.claim())
+    if operator_failure:
+        assert [(check.command, check.returncode) for check in rechecks] == [
+            (stock_check, 0), (operator_check, 1),
+        ]
+        assert not replies and api.branch == first and api.pushes == push_count
+        with db.tx() as conn:
+            stored = conn.execute("SELECT data,state FROM tasks").fetchone()
+        assert stored["state"] == "paused"
+        assert json.loads(stored["data"])["pause_reason"] == "required verification failed after rebasing"
+        return
     if scenario == "conflict":
         assert not replies
         assert api.branch == first
