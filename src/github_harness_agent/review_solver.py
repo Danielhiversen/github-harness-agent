@@ -1765,42 +1765,69 @@ def solve(executor, task, archive, budget, version):
         verified = verify_stock_candidate(target, sources, probe_budget)
         return verified[0] if verified else None
 
-    def verify_guard_order(target, sources):
+    def focused_guard_trial(target, proposal, probe):
         focused = focused_pytest((commands[target[0]],), (target[1],))
-        proposal = patch_for(original, sources)
-        if focused is None or not 0 < len(proposal) <= executor.limits.patch_bytes:
-            return None, ""
-        probe = _GuardBudget(budget, reserve=60)
+        if focused is None:
+            return False, ""
         focus = _GuardBudget(probe, wall_seconds=_STOCK_HUNK_SECONDS, reserve=0)
         runs = {}
+        checked = evidence(
+            executor, task, archive, focus, proposal, (focused,), pytest_runs=runs
+        )
+        run = runs.get(0)
+        if run is None or run.deselected:
+            return False, ""
+        if not checked and run.passed == 1:
+            return True, ""
+        node = target[1]
+        if not run.passed and run.failed == {node} and checked.keys() == {(0, node)}:
+            return False, checked[0, node]
+        return False, ""
+
+    def verify_guard_order(target, sources):
+        proposal = patch_for(original, sources)
+        if not 0 < len(proposal) <= executor.limits.patch_bytes:
+            return None, ""
+        probe = _GuardBudget(budget, reserve=60)
         try:
-            checked = evidence(
-                executor, task, archive, focus, proposal, (focused,), pytest_runs=runs
-            )
-            run = runs.get(0)
-            if (
-                not checked
-                and run is not None
-                and run.passed == 1
-                and not run.deselected
-            ):
-                return verify_stock_gain(target, sources, probe), ""
-            selected = (0, target[1])
-            if (
-                run is not None
-                and not run.passed
-                and not run.deselected
-                and run.failed == {target[1]}
-                and checked.keys() == {selected}
-            ):
-                return None, checked[selected]
+            passed, detail = focused_guard_trial(target, proposal, probe)
+            return (verify_stock_gain(target, sources, probe) if passed else None), detail
         except Cancelled:
             raise
         except (ExecutionError, ValueError):
             budget.remaining()
         return None, ""
 
-    def guard_order_with_operator_failures(target, operator_failures):
+    def verify_mixed_stock_gain(target, sources, probe):
+        proposal = patch_for(original, sources)
+        if not 0 < len(proposal) <= executor.limits.patch_bytes:
+            return None
+        operator_failures = {key for key in failures if key[0] < len(task.pull_checks)}
+        runs = {}
+        checked = evidence(
+            executor, task, archive, probe, proposal, commands, pytest_runs=runs
+        )
+        if (
+            not checked.keys() <= operator_failures
+            or not _preserved_stock_gain(target, pytest_runs, runs, checked)
+            or not _observed_operator_failures(
+                runs, checked.keys(), task.pull_checks, operator_cases
+            )
+            or any(
+                not _same_pytest_selection(pytest_runs.get(index), runs.get(index))
+                for index, command in enumerate(commands)
+                if check_label(command, ()) == "pytest"
+            )
+        ):
+            return None
+        selection = identify_stock_collection(target, patch, probe, failed=True)
+        if selection and identify_stock_collection(target, proposal, probe) == selection:
+            return sources, proposal, checked, runs
+        return None
+
+    def guard_order_with_operator_failures(
+        target, operator_failures, *, generate=swap_traced_filters
+    ):
         number, node = target
         baseline = pytest_runs.get(number)
         if (
@@ -1812,7 +1839,7 @@ def solve(executor, task, archive, budget, version):
                 pytest_runs, operator_failures, task.pull_checks, operator_cases
             )
         ):
-            return None
+            return None, None
         exact = node.partition("[")[0].removeprefix("/work/").removeprefix("./")
         test_path = exact.partition("::")[0]
         line = stock_integer_assertion_failure_line(archive, node, failures[target])
@@ -1821,7 +1848,11 @@ def solve(executor, task, archive, budget, version):
             or test_path in paths
             or (task.test_update or "").partition("::")[0] == test_path
         ):
-            return None
+            return None, None
+        fixture = stock_pytest_excerpt(archive, commands[number], node, failures[target])
+        if not fixture:
+            return None, None
+        stock_fixtures[target, failures[target]] = fixture
         try:
             trace = mock_call_diagnostic(
                 executor,
@@ -1836,45 +1867,26 @@ def solve(executor, task, archive, budget, version):
             )
             loop = counter_loop_reuse(trace)
             if loop is None or loop.node != exact or loop.assertion_line != line:
-                return None
+                return None, None
             allowed = {
                 path for path in paths if not _protected(path, task, new_test=False)
             }
-            sources = swap_traced_filters(current, allowed, loop)
+            sources = generate(current, allowed, loop)
             if sources is None:
-                return None
+                return None, None
             proposal = patch_for(original, sources)
             if not 0 < len(proposal) <= executor.limits.patch_bytes:
-                return None
+                return None, None
             probe = _GuardBudget(budget, wall_seconds=180, reserve=60)
-            runs = {}
-            checked = evidence(
-                executor, task, archive, probe, proposal, commands, pytest_runs=runs
-            )
-            if (
-                not checked.keys() <= operator_failures
-                or not _preserved_stock_gain(target, pytest_runs, runs, checked)
-                or not _observed_operator_failures(
-                    runs, checked.keys(), task.pull_checks, operator_cases
-                )
-                or any(
-                    not _same_pytest_selection(pytest_runs.get(index), runs.get(index))
-                    for index, command in enumerate(commands)
-                    if check_label(command, ()) == "pytest"
-                )
-            ):
-                return None
-            selection = identify_stock_collection(target, patch, probe, failed=True)
-            if (
-                selection
-                and identify_stock_collection(target, proposal, probe) == selection
-            ):
-                return sources, proposal, checked, runs
+            passed, detail = focused_guard_trial(target, proposal, probe)
+            if not passed:
+                return None, (trace, detail) if detail else None
+            return verify_mixed_stock_gain(target, sources, probe), None
         except Cancelled:
             raise
         except (ExecutionError, ValueError):
             budget.remaining()
-        return None
+        return None, None
 
     def save_verified_progress(checkpoint_patch, note, editor):
         nonlocal retained_failures, retained_identity
@@ -2521,7 +2533,9 @@ def solve(executor, task, archive, budget, version):
             ):
                 mixed_guard_attempted = True
                 stock = other_checks[0]
-                verified = guard_order_with_operator_failures(stock, set(operator))
+                verified, failed_trial = guard_order_with_operator_failures(
+                    stock, set(operator)
+                )
                 if verified is not None:
                     current, patch, failures, pytest_runs = verified
                     start_new_draft(stock)
@@ -2529,6 +2543,12 @@ def solve(executor, task, archive, budget, version):
                         "An adjacent stock filter reorder passed without new review failures"
                     )
                     continue
+                if failed_trial and (
+                    site := stock_failure_site(stock[1], failed_trial[1])
+                ):
+                    notes[stock] = (
+                        f"The trial guard reorder still failed this case at {site}."
+                    )
             precision_ready = (
                 eager_target is not None
                 and not precision_attempted

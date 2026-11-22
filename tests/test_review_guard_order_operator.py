@@ -24,7 +24,8 @@ solver_case = build_solver_case
 
 
 @pytest.mark.parametrize(
-    "scenario", ("accept", "trade_cases", "renamed_stock", "static_regression")
+    "scenario",
+    ("accept", "trade_cases", "renamed_stock", "static_regression", "failed_focus"),
 )
 def test_guard_order_with_existing_named_operator_failures(
     solver_case, monkeypatch, scenario
@@ -42,6 +43,8 @@ def test_guard_order_with_existing_named_operator_failures(
         "def test_review_cases(case):\n" + expectations
     )
     base = SOURCE_TEXT.replace(FIRST + SECOND, SECOND + FIRST)
+    if scenario == "failed_focus":
+        base = base.replace('"primary": 0', '"primary": 1')
     current = SOURCE_TEXT.replace("return -1", "return 1")
     reordered = current.replace(FIRST + SECOND, SECOND + FIRST)
     draft = DraftCheckpoint(
@@ -68,6 +71,8 @@ def test_guard_order_with_existing_named_operator_failures(
         "def test_stock():\n    item = {}\n"
         '    assert process([item, item])["primary"] == 0\n'
     )
+    if scenario == "failed_focus":
+        tracked = tracked.replace("== 0", "== 1")
     if scenario == "renamed_stock":
         tracked += (
             '\nreason = process([{}, {}])["primary"]\n'
@@ -83,12 +88,14 @@ def test_guard_order_with_existing_named_operator_failures(
             snapshot.addfile(item, BytesIO(data))
 
     runs = []
+    focused_runs = []
     actual = review_solver.evidence
 
     def evidence(*args, **kwargs):
         checked = actual(*args, **kwargs)
         if args[4] == reordered_patch:
-            runs.append({node for _, node in checked})
+            bucket = focused_runs if len(args[5]) == 1 else runs
+            bucket.append({node for _, node in checked})
         return checked
 
     monkeypatch.setattr(review_solver, "evidence", evidence)
@@ -98,15 +105,21 @@ def test_guard_order_with_existing_named_operator_failures(
 
         def complete(self, **kwargs):
             self.calls += 1
+            prompt = kwargs["messages"][-1]["content"]
             if self.calls == 1:
-                assert runs, "the one-shot guard trial must precede model requests"
-                prompt = kwargs["messages"][-1]["content"]
+                assert focused_runs, (
+                    "the one-shot guard trial must precede model requests"
+                )
                 assert "test_review_cases[pending]" in prompt.splitlines()[0]
                 checkout = prompt.partition("\nCurrent checkout:\n")[2]
                 original_order = checkout.index(FIRST.splitlines()[0]) < checkout.index(
                     SECOND.splitlines()[0]
                 )
                 assert original_order is (scenario != "accept")
+            if scenario == "failed_focus" and "test_stock" in prompt.splitlines()[0]:
+                assert (
+                    "The trial guard reorder still failed this case at line 6" in prompt
+                )
             if scenario != "accept":
                 raise ProviderExhausted(None, {"fixture": "not available"})
             return super().complete(**kwargs)
@@ -143,6 +156,12 @@ def test_guard_order_with_existing_named_operator_failures(
                 executor, task, archive.getvalue(), budget, "fixture-version"
             )
         assert not checkpoints
+    if scenario == "failed_focus":
+        assert focused_runs == [{"tests/test_existing.py::test_stock"}]
+        assert not runs
+        assert gateway.calls == 2
+        return
+    assert focused_runs == [set()]
     assert len(runs) == 1
     assert any(
         node.endswith("[preserve]" if scenario == "trade_cases" else "[pending]")
