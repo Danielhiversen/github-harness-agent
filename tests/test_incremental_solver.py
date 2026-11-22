@@ -720,7 +720,7 @@ def test_stock_repair_can_finish_two_dependent_edits_privately(solver_case, monk
     assert all(check.returncode == 0 for check in result.checks)
 
 
-@pytest.mark.parametrize("case", ("hedge", "single_slot", "no_budget", "unsaved"))
+@pytest.mark.parametrize("case", ("hedge", "continuation", "single_slot", "no_budget", "unsaved"))
 def test_delayed_stock_hedge_respects_durable_recovery_and_capacity(solver_case, monkeypatch, case):
     from concurrent.futures import ThreadPoolExecutor
 
@@ -728,6 +728,7 @@ def test_delayed_stock_hedge_respects_durable_recovery_and_capacity(solver_case,
     from github_harness_agent.review_solver import _goal_digest
 
     task, _, runner, _ = solver_case
+    hedged = case in {"hedge", "continuation"}
     Path(task.pull_checks[0][-1]).write_text(
         "from fixture_calc import first\n\ndef test_first():\n    assert first() == -1\n"
     )
@@ -743,12 +744,22 @@ def test_delayed_stock_hedge_respects_durable_recovery_and_capacity(solver_case,
         solver_recovery=(
             None if case == "unsaved" else SolverRecovery(digest, ((_goal_digest(target), 0, 2),))
         ),
-        require_new_tests=case == "hedge",
+        require_new_tests=hedged,
     )
+    source = BASE_SOURCE + "\ndef stock():\n    return -3\n"
+    if case == "continuation":
+        accepted = DraftCheckpoint(
+            "harness2/base", task.base_sha,
+            patch_for({SOURCE: source}, {SOURCE: "# Accepted draft\n" + source}),
+            guidance=_GUIDANCE,
+        )
+        task = replace(task, checkpoints={accepted.key: accepted})
+        monkeypatch.setattr("github_harness_agent.review_solver.mock_call_diagnostic", lambda *args: "Mock evidence")
+        monkeypatch.setattr("github_harness_agent.review_solver.stock_guard_diagnostic", lambda *args: "")
     archive = BytesIO()
     with tarfile.open(fileobj=archive, mode="w") as snapshot:
         for path, content in {
-            SOURCE: BASE_SOURCE + "\ndef stock():\n    return -3\n",
+            SOURCE: source,
             "tests/test_existing.py": "from fixture_calc import stock\n\ndef test_stock():\n    assert stock() == 3\n",
         }.items():
             data = content.encode()
@@ -771,13 +782,14 @@ def test_delayed_stock_hedge_respects_durable_recovery_and_capacity(solver_case,
                 stock_requests.append((messages, after_provider))
                 count = len(stock_requests)
                 first = 1 if case == "unsaved" else 2
-                fix = edit(SOURCE, "    return -3\n", "    return 3\n")
+                old = "    return -4\n" if case == "continuation" else "    return -3\n"
+                fix = edit(SOURCE, old, "    return 3\n")
                 if count < first:
                     route, content = "stalled", edit(SOURCE, "    return -3\n", "    return -4\n")
                 elif count == first:
                     primary_started.set()
                     assert release_primary.wait(35)
-                    route, content = "primary", fix if case != "hedge" else "Malformed late reply"
+                    route, content = "primary", "Malformed late reply" if hedged else fix
                 else:
                     alternate_started.set()
                     route, content = "alternate", fix
@@ -786,7 +798,7 @@ def test_delayed_stock_hedge_respects_durable_recovery_and_capacity(solver_case,
                 usage={"requests": 1}, tool_calls=(),
             )
 
-    requests = {"hedge": 5, "single_slot": 4, "no_budget": 3, "unsaved": 2}[case]
+    requests = {"hedge": 5, "continuation": 5, "single_slot": 4, "no_budget": 3, "unsaved": 2}[case]
     executor = PlainExecutor(
         runner, Gateway(), Limits(model_requests=requests, concurrent_probes=1 if case == "single_slot" else 2)
     )
@@ -798,7 +810,7 @@ def test_delayed_stock_hedge_respects_durable_recovery_and_capacity(solver_case,
             clock[0] = 59.0
             assert not alternate_started.wait(0.6)
             clock[0] = 60.0
-            if case == "hedge":
+            if hedged:
                 assert alternate_started.wait(8)
             else:
                 assert not alternate_started.wait(1)
@@ -809,12 +821,15 @@ def test_delayed_stock_hedge_respects_durable_recovery_and_capacity(solver_case,
 
     assert b"+    return 3\n" in result.patch
     assert all(check.returncode == 0 for check in result.checks)
-    if case == "hedge":
+    if hedged:
         assert stock_requests[-2:] == [(stock_requests[-1][0], "stalled")] * 2
         assert [entry.route for entry in result.route_trace] == ["planner", "stalled", "alternate", "test-author"]
         assert result.usage == {"requests": 4}
         assert NEW_TEST.encode() in result.patch
         assert budget.model_requests_remaining() == 0
+        if case == "continuation":
+            assert "This checkout includes one unpublished proposal" in stock_requests[-1][0][-1]["content"]
+            assert b"+# Accepted draft\n" in result.patch
     else:
         assert not alternate_started.is_set()
 

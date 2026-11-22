@@ -1433,14 +1433,14 @@ def solve(executor, task, archive, budget, version):
                         planning_attempts[target] = plan_count + 1, attempts[target]
                     rotation_key = None
                     exclude = ()
-                    if (
+                    unassisted_text = (
                         target != _TEST_GOAL
-                        and continuation is None
                         and repair is None
                         and planner_input is None
                         and advice is None
                         and not native
-                    ):
+                    )
+                    if unassisted_text and continuation is None:
                         rotation_key = (target, named_definitions)
                         counts = model_failures.setdefault(rotation_key, Counter())
                         if counts is not None:
@@ -1476,7 +1476,7 @@ def solve(executor, task, archive, budget, version):
                         and executor.limits.concurrent_probes >= 2
                         and stock_fixture
                         and failures.keys() == {target}
-                        and rotation_key is not None
+                        and unassisted_text
                         and retained_recovery is not None
                         and retained_recovery.identity == retained_identity
                         and any(
