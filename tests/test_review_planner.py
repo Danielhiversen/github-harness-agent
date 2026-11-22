@@ -5,7 +5,8 @@ from github_harness_agent.providers import ProviderExhausted
 from github_harness_agent.review_planner import (
     _SOURCE_LIMIT,
     _advice,
-    plan_coding_messages,
+    apply_coding_advice,
+    request_coding_advice,
 )
 
 
@@ -52,7 +53,7 @@ def test_brief_planner_timeout_preserves_normal_coding_prompt():
             raise ProviderExhausted(None, {"gateway": "request timed out"})
 
     executor = SimpleNamespace(gateway=object())
-    returned = plan_coding_messages(
+    advice = request_coding_advice(
         executor,
         Budget(),
         messages,
@@ -60,7 +61,7 @@ def test_brief_planner_timeout_preserves_normal_coding_prompt():
         "def test_x(): ...",
         "test_x failed",
     )
-    assert returned is messages
+    assert apply_coding_advice(messages, advice) is messages
     assert len(calls) == 1
     assert calls[0][1] == "planning"
     assert 25 < calls[0][3]["timeout_cap"] <= 60

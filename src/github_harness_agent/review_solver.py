@@ -38,7 +38,7 @@ from .review_definitions import (
     apply_definitions,
     apply_native_definition,
 )
-from .review_planner import plan_coding_messages
+from .review_planner import apply_coding_advice, request_coding_advice
 from .review_recovery import operator_acceptance_context
 from .review_solver_context import focused_check_excerpt, focused_source_excerpt
 from .task_context import compact_focused_review, excerpt
@@ -570,8 +570,16 @@ def _finish_review(executor, task, archive, budget, patch, actor, version):
 
 
 def _coding_completion(
-    executor, budget, messages, route, planner_input, native_source=None
+    executor, budget, messages, route, planner_input, native_source=None, advice=None
 ):
+    fresh_advice = None
+    if planner_input is not None:
+        fresh_advice = request_coding_advice(executor, budget, messages, *planner_input)
+    if fresh_advice is not None:
+        _LOG.info("Applying a free planning strategy to the current review goal")
+    elif advice is not None:
+        _LOG.info("Reusing a free planning strategy for the current review goal")
+    messages = apply_coding_advice(messages, advice or fresh_advice)
     if native_source is not None:
         focused = compact_focused_review(messages, max_bytes=12 * 1024) or messages
         request = focused[-1]["content"].removesuffix(DEFINITION_ENDING)
@@ -603,9 +611,7 @@ def _coding_completion(
             # return a valid structured edit for this goal.
             pass
         else:
-            return completion, candidate
-    if planner_input is not None:
-        messages = plan_coding_messages(executor, budget, messages, *planner_input)
+            return completion, candidate, fresh_advice
     completion = budget.complete(
         executor.gateway,
         "coding",
@@ -615,7 +621,7 @@ def _coding_completion(
             6144 if messages[-1]["content"].endswith(DEFINITION_ENDING) else 3072
         ),
     )
-    return completion, None
+    return completion, None, fresh_advice
 
 
 def _recovery_digest(task, fixtures, patch):
@@ -852,6 +858,7 @@ def solve(executor, task, archive, budget, version):
             retain_recovery(durable=True)
 
     planning_attempts = {}
+    retry_advice = {}
     max_proposals = min(36, budget.model_requests_remaining())
     editor = actor
     submitted = 0
@@ -927,8 +934,13 @@ def solve(executor, task, archive, budget, version):
                     if not launch_budget:
                         break
                     attempts[target] = attempts.get(target, 0) + 1
-                    continuation = continuations.pop(target, None)
                     repair = regression_repair if target == repair_target else None
+                    advice = retry_advice.pop(target, None)
+                    # Give the strategy one more attempt on its original draft.
+                    # Keep any unpublished continuation available as a fallback.
+                    continuation = (
+                        continuations.pop(target, None) if advice is None else None
+                    )
                     if continuation is None:
                         source, diagnostics = current, failures
                         note = notes.get(target, review.previous_failure)
@@ -1004,6 +1016,8 @@ def solve(executor, task, archive, budget, version):
                     if (
                         target in operator
                         and not native
+                        and advice is None
+                        and repair is None
                         and plan_count < 2
                         and attempts[target] - last_planned >= 3
                         and no_progress.get(target, 0) >= RECOVERY_MODE_THRESHOLD
@@ -1022,13 +1036,14 @@ def solve(executor, task, archive, budget, version):
                         last_routes.get(target),
                         planner_input,
                         source if native else None,
+                        advice,
                     )
                     pending[future] = (
                         target,
                         current,
                         continuation,
                         named_definitions,
-                        planner_input is not None,
+                        planner_input is not None or advice is not None,
                         repair,
                     )
                     cost = 2 if native or planner_input is not None else 1
@@ -1055,7 +1070,7 @@ def solve(executor, task, archive, budget, version):
             ) and snapshot is not current:
                 continue
             try:
-                completion, native_candidate = future.result()
+                completion, native_candidate, fresh_advice = future.result()
             except ProviderExhausted as error:
                 if repair is None:
                     unavailable[target] = error
@@ -1086,6 +1101,8 @@ def solve(executor, task, archive, budget, version):
                             else apply_blocks(completion.content, source, new_path)
                         )
                 except ValueError:
+                    if fresh_advice is not None:
+                        retry_advice[target] = fresh_advice
                     if (
                         target in failures
                         and check_label(commands[target[0]], ()) != "ruff"
@@ -1204,6 +1221,8 @@ def solve(executor, task, archive, budget, version):
                 and _named_operator_cases(old_operator | new_operator, commands)
             ):
                 repair_attempted.add(target)
+                retry_advice.clear()
+                continuations.pop(target, None)
                 regression_repair = _RegressionRepair(
                     target, candidate, after, gained, introduced
                 )
@@ -1244,6 +1263,8 @@ def solve(executor, task, archive, budget, version):
             ):
                 if snapshot is current and target in old_operator and "::" in target[1]:
                     count_recovery(no_progress, target)
+                if fresh_advice is not None and not introduced and target in after:
+                    retry_advice[target] = fresh_advice
                 if (
                     continuation is None
                     and snapshot is current
@@ -1251,8 +1272,9 @@ def solve(executor, task, archive, budget, version):
                     and "::" in target[1]
                     and after.keys() == failures.keys()
                 ):
-                    continuations[target] = candidate, after[target]
-                    continue
+                    continuations.setdefault(target, (candidate, after[target]))
+                    if fresh_advice is None:
+                        continue
                 # Keep only bounded prompt evidence, never the candidate or its full patch.
                 rejected[target] = _rejected_attempt(
                     source, candidate, target, failures, after
@@ -1270,6 +1292,7 @@ def solve(executor, task, archive, budget, version):
             repair_attempted.clear()
             rejected.clear()
             planning_attempts.clear()
+            retry_advice.clear()
             last_routes.pop(target, None)
             notes.pop(target, None)
             if prefix_progress:

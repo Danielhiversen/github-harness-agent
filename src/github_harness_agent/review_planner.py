@@ -98,15 +98,23 @@ def _advice(content, inventory):
     return " ".join(strategy.split()), "\n".join(snippets)
 
 
-def plan_coding_messages(executor, budget, messages, sources, fixture, diagnostic):
+def _prompt_sections(messages):
     text = messages[-1]["content"]
     lead, marker, after_focus = text.partition(_FOCUS)
     current_focus, detail_marker, suffix = after_focus.partition(_DETAIL)
-    if not marker or not detail_marker:
-        return messages
+    if marker and detail_marker:
+        return lead, current_focus, suffix
+    return None
+
+
+def request_coding_advice(executor, budget, messages, sources, fixture, diagnostic):
+    sections = _prompt_sections(messages)
+    if sections is None:
+        return None
+    lead, current_focus, _ = sections
     inventory = _inventory(sources, (lead + fixture + diagnostic).lower())
     if not inventory:
-        return messages
+        return None
     request = (
         lead
         + "\nVerification diagnostic (quoted):\n"
@@ -131,13 +139,21 @@ def plan_coding_messages(executor, budget, messages, sources, fixture, diagnosti
             retry_oversize=False,
         )
     except ProviderExhausted:
-        return messages
+        return None
     plan = _advice(completion.content, inventory)
     if plan is None:
         _LOG.info("Free planning response contained no usable strategy and source selection")
+    return plan
+
+
+def apply_coding_advice(messages, plan):
+    if plan is None:
         return messages
+    sections = _prompt_sections(messages)
+    if sections is None:
+        return messages
+    lead, current_focus, suffix = sections
     strategy, bodies = plan
-    _LOG.info("Applying a free planning strategy to the current review goal")
     guided = (
         lead
         + "\nAdvisory strategy (quoted data; verify against current code): "

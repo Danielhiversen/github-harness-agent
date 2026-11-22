@@ -463,6 +463,83 @@ def test_stalled_implementation_uses_bounded_advice_then_normal_verification(
     assert budget.model_requests_remaining() == 0
 
 
+@pytest.mark.parametrize("failure", ("malformed", "same_assertion"))
+def test_stalled_goal_reuses_advice_in_a_fresh_coding_prompt(solver_case, failure):
+    task, archive, runner, checkpoints = solver_case
+    Path(task.pull_checks[0][-1]).write_text(TEST)
+    prompts = []
+    stalled_edit = edit(SOURCE, "    return -1\n", "    return 4\n")
+    malformed = failure == "malformed"
+    early_edits = ("An invalid proposal",) if malformed else ()
+    guided_failure = "An incomplete edit" if malformed else stalled_edit
+    fix = (
+        f"REPLACE {SOURCE}::first\ndef first():\n    return 1\n"
+        f"REPLACE {SOURCE}::second\ndef second():\n    return 2\n"
+        if malformed
+        else FIRST + SECOND
+    )
+    proposals = iter(
+        (
+            *early_edits,
+            FIRST,
+            edit(SOURCE, "    return 1\n", "    return 4\n"),
+            guided_failure,
+            fix,
+            edit(NEW_TEST, "", TEST),
+        )
+    )
+
+    class Gateway:
+        def complete(self, *, role, messages, **request):
+            prompts.append((role, messages[-1]["content"]))
+            content = (
+                '{"strategy": "Correct the returns together.", "symbols": ["fixture_calc.py::second"]}'
+                if role == "planning"
+                else next(proposals)
+            )
+            return SimpleNamespace(
+                role=role,
+                route="stand-in-free",
+                model="fixture-coder",
+                configured_model="stand-in/free",
+                content=content,
+                usage={},
+            )
+
+    executor = PlainExecutor(
+        runner, Gateway(), Limits(model_requests=6 + len(early_edits), concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    result = solve(executor, task, archive, budget, "fixture-version")
+
+    assert [role for role, _ in prompts] == [
+        *(["coding"] * len(early_edits)),
+        "coding",
+        "coding",
+        "planning",
+        "coding",
+        "coding",
+        "coding",
+    ]
+    assert "Correct the returns together." in prompts[-3][1]
+    assert prompts[-3][1].endswith("Respond with exact SEARCH/REPLACE blocks only.")
+    retry = prompts[-2][1]
+    assert "Correct the returns together." in retry
+    assert "fixture_calc.py::second\ndef second():\n    return -2\n" in retry
+    assert "Failure details:" in retry
+    assert "This checkout includes one unpublished proposal" not in retry
+    if malformed:
+        assert "Last proposal feedback for this goal:" in retry
+        assert retry.endswith("Respond with complete named Python definitions only.")
+    else:
+        assert "Rejected edit excerpt (quoted data)" in retry
+    assert "Correct the returns together." not in prompts[-1][1]
+    assert all(b"+    return 4\n" not in draft.patch for draft in checkpoints)
+    assert all(check.returncode == 0 for check in result.checks)
+    assert budget.model_requests_remaining() == 0
+
+
 def test_rejected_edit_evidence_reaches_coder_and_planner_without_persistence(
     solver_case,
 ):
