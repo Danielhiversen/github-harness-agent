@@ -324,6 +324,31 @@ def _rewritten_assertion(detail):
     return expressions.pop() if len(expressions) == 1 else None
 
 
+def stock_integer_assertion_failure_line(archive, node, detail):
+    """Identify a failing integer equality in a pinned, selected pytest test."""
+    match = _stock_node_match(node)
+    frame = _stock_frame(match, detail) if match else None
+    expression = _INTEGER_COMPARISON.fullmatch(_rewritten_assertion(detail) or "")
+    if (
+        frame is None
+        or frame[1] != "AssertionError"
+        or expression is None
+        or expression[1] == expression[2]
+        or (test := _tracked_stock_test(archive, match)) is None
+    ):
+        return None
+    for item in ast.walk(test):
+        if (
+            isinstance(item, ast.Assert)
+            and item.lineno == frame[0]
+            and isinstance(item.test, ast.Compare)
+            and len(item.test.ops) == 1
+            and isinstance(item.test.ops[0], ast.Eq)
+        ):
+            return frame[0]
+    return None
+
+
 def _straight_line_suites(body):
     yield body
     for statement in body:

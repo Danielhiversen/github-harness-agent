@@ -91,6 +91,7 @@ from .review_solver_context import (
     stock_assertion_progress,
     stock_assertion_failure_line,
     stock_failure_site,
+    stock_integer_assertion_failure_line,
     stock_pytest_excerpt,
 )
 from .review_stock_collection import stock_collection
@@ -1100,6 +1101,21 @@ def _verified_operator_runs(before, after, failures, operator_commands, names):
     return reported == failures
 
 
+def _observed_operator_failures(runs, failures, operator_commands, names):
+    reported = set()
+    for number, command in enumerate(operator_commands):
+        if check_label(command, ()) != "pytest":
+            continue
+        run = runs.get(number)
+        if run is None:
+            return False
+        for node in run.failed:
+            if not _trusted_operator_node(node, command, names):
+                return False
+            reported.add((number, node))
+    return reported == failures
+
+
 def _qualified_stock_operator_cases(
     before, after, failures, commands, names, *, dependency_seed=False
 ):
@@ -1773,6 +1789,82 @@ def solve(executor, task, archive, budget, version):
             budget.remaining()
         return None
 
+    def guard_order_with_operator_failures(target, operator_failures):
+        number, node = target
+        baseline = pytest_runs.get(number)
+        if (
+            baseline is None
+            or baseline.failed != {node}
+            or not _named_operator_cases({target, *operator_failures}, commands)
+            or commands[: len(task.pull_checks)] != task.pull_checks
+            or not _observed_operator_failures(
+                pytest_runs, operator_failures, task.pull_checks, operator_cases
+            )
+        ):
+            return None
+        exact = node.partition("[")[0].removeprefix("/work/").removeprefix("./")
+        test_path = exact.partition("::")[0]
+        line = stock_integer_assertion_failure_line(archive, node, failures[target])
+        if (
+            line is None
+            or test_path in paths
+            or (task.test_update or "").partition("::")[0] == test_path
+        ):
+            return None
+        try:
+            trace = mock_call_diagnostic(
+                executor,
+                task,
+                archive,
+                budget,
+                commands[number],
+                node,
+                patch,
+                failure_line=line,
+                reviewed_sources=(original, current),
+            )
+            loop = counter_loop_reuse(trace)
+            if loop is None or loop.node != exact or loop.assertion_line != line:
+                return None
+            allowed = {
+                path for path in paths if not _protected(path, task, new_test=False)
+            }
+            sources = swap_traced_filters(current, allowed, loop)
+            if sources is None:
+                return None
+            proposal = patch_for(original, sources)
+            if not 0 < len(proposal) <= executor.limits.patch_bytes:
+                return None
+            probe = _GuardBudget(budget, wall_seconds=180, reserve=60)
+            runs = {}
+            checked = evidence(
+                executor, task, archive, probe, proposal, commands, pytest_runs=runs
+            )
+            if (
+                not checked.keys() <= operator_failures
+                or not _preserved_stock_gain(target, pytest_runs, runs, checked)
+                or not _observed_operator_failures(
+                    runs, checked.keys(), task.pull_checks, operator_cases
+                )
+                or any(
+                    not _same_pytest_selection(pytest_runs.get(index), runs.get(index))
+                    for index, command in enumerate(commands)
+                    if check_label(command, ()) == "pytest"
+                )
+            ):
+                return None
+            selection = identify_stock_collection(target, patch, probe, failed=True)
+            if (
+                selection
+                and identify_stock_collection(target, proposal, probe) == selection
+            ):
+                return sources, proposal, checked, runs
+        except Cancelled:
+            raise
+        except (ExecutionError, ValueError):
+            budget.remaining()
+        return None
+
     def save_verified_progress(checkpoint_patch, note, editor):
         nonlocal retained_failures, retained_identity
         budget.remaining()
@@ -2199,6 +2291,7 @@ def solve(executor, task, archive, budget, version):
         eager_target = None
     eager_trace, eager_advisory = None, ""
     precision_attempted = False
+    mixed_guard_attempted = False
     unavailable = {}
     test_draft = current.get(new_path, "")
     test_diagnostic = ""
@@ -2293,6 +2386,33 @@ def solve(executor, task, archive, budget, version):
             launch_budget = min(
                 max_proposals - submitted, budget.model_requests_remaining()
             )
+            if (
+                not mixed_guard_attempted
+                and operator
+                and len(other_checks) == 1
+                and not pending
+                and retired is None
+                and private is None
+                and alternate is None
+                and patch
+                and actor is not None
+                and actor.role == "coding"
+                and actor.configured_model
+                and executor.verification_runner is not executor.runner
+                and launch_budget >= 1 + int(needs_tests)
+                and budget.commands_remaining() >= 3 * len(commands) + 6
+                and budget.remaining() >= 150
+            ):
+                mixed_guard_attempted = True
+                stock = other_checks[0]
+                verified = guard_order_with_operator_failures(stock, set(operator))
+                if verified is not None:
+                    current, patch, failures, pytest_runs = verified
+                    start_new_draft(stock)
+                    _LOG.info(
+                        "An adjacent stock filter reorder passed without new review failures"
+                    )
+                    continue
             precision_ready = (
                 eager_target is not None
                 and not precision_attempted
