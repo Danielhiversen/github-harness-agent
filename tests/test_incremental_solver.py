@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 import tarfile
 from pathlib import Path
@@ -1966,3 +1967,125 @@ def test_solver_final_verifies_a_complete_checkpoint_without_a_new_request(solve
     assert result.patch == patch
     assert any(NEW_TEST in check.command for check in result.checks)
     assert not idle_gateway.prompts
+
+
+@pytest.mark.parametrize("named_failure", ["malformed", "nonimproving"])
+def test_localized_named_failure_tries_numbered_ranges_as_an_independent_remedy(
+    solver_case, monkeypatch, named_failure
+):
+    from github_harness_agent import review_solver
+
+    task, _, runner, _ = solver_case
+    task = replace(task, require_new_tests=False, excluded_models=("blocked/model",))
+    archive = BytesIO()
+    stock_method = "def stock_result():\n    return -3\n"
+    stock_test = (
+        "from fixture_calc import stock_result\n\n"
+        "def test_stock_result():\n    assert stock_result() == 3\n"
+    )
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, content in {
+            SOURCE: BASE_SOURCE + "\n" + stock_method,
+            "tests/test_existing.py": stock_test,
+        }.items():
+            data = content.encode()
+            entry = tarfile.TarInfo(path)
+            entry.size = len(data)
+            snapshot.addfile(entry, BytesIO(data))
+
+    def localize(
+        executor,
+        task,
+        archive,
+        budget,
+        command,
+        node,
+        original,
+        current,
+        fixture,
+        make_patch,
+    ):
+        line = current[SOURCE].splitlines().index("    return -3") + 1
+        return (
+            "Auxiliary counterfactual (quoted data, partial diagnostic only). "
+            f"{SOURCE}::stock_result, draft line {line}: causal evidence."
+        )
+
+    monkeypatch.setattr(review_solver, "stock_guard_diagnostic", localize)
+    calls = []
+    edits = iter(
+        (
+            FIRST + SECOND,
+            edit(SOURCE, "    return -3\n", "    return -4\n"),
+            edit(SOURCE, "    return -3\n", "    return -5\n"),
+        )
+    )
+
+    class Gateway:
+        def complete(self, *, role, messages, max_output_tokens, **request):
+            prompt = messages[-1]["content"]
+            system = messages[0]["content"]
+            calls.append((role, system, prompt, request, max_output_tokens))
+            if role == "planning":
+                content = json.dumps(
+                    {
+                        "strategy": "Trace the public inputs.",
+                        "symbols": [f"{SOURCE}::stock_result"],
+                    }
+                )
+            elif "single line-range JSON object" in prompt:
+                snapshot = re.search(r"\"snapshot\":\"([a-f0-9]{64})\"", prompt)[1]
+                content = json.dumps(
+                    {
+                        "snapshot": snapshot,
+                        "edits": [{"start": 2, "end": 2, "lines": ["    return 3"]}],
+                    }
+                )
+            elif prompt.endswith(
+                "Respond with complete named Python definitions only."
+            ):
+                content = (
+                    "bad named response"
+                    if named_failure == "malformed"
+                    else f"REPLACE {SOURCE}::stock_result\ndef stock_result():\n    return -8"
+                )
+            elif "Trace the public inputs." in prompt:
+                content = "bad search response"
+            else:
+                content = next(edits)
+            return SimpleNamespace(
+                role=role,
+                route="earlier-format-route",
+                model="fixture-coder",
+                configured_model="stand-in/free",
+                content=content,
+                usage={},
+            )
+
+    executor = PlainExecutor(
+        runner, Gateway(), Limits(model_requests=7, concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+    result = solve(executor, task, archive.getvalue(), budget, "fixture-version")
+
+    assert [item[0] for item in calls] == ["coding"] * 3 + ["planning"] + ["coding"] * 3
+    assert calls[4][2].endswith("Respond with exact SEARCH/REPLACE blocks only.")
+    assert calls[5][2].endswith("Respond with complete named Python definitions only.")
+    _, system, prompt, request, max_tokens = calls[6]
+    assert "single line-range JSON object" in prompt
+    assert "1 | def stock_result():" in prompt and "2 |     return -3" in prompt
+    assert prompt.count(stock_method) == 1
+    assert "Complete pinned baseline definition" in prompt
+    assert "causal evidence" in prompt and "Trace the public inputs." in prompt
+    assert "assert stock_result() == 3" in prompt
+    assert "Review notes" in prompt
+    assert "SEARCH" not in system and "REPLACE" not in system
+    assert "bad named response" not in prompt and "return -8" not in prompt
+    assert request.get("after_provider") is None
+    assert request.get("exclude") == ("blocked/model",)
+    assert max_tokens == 3072
+    assert all(check.returncode == 0 for check in result.checks)
+    assert (
+        b"+    return 3\n" in result.patch
+        and b"tests/test_existing.py" not in result.patch
+    )

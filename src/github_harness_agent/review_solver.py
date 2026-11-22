@@ -46,6 +46,11 @@ from .review_definitions import (
 from .review_guard_probe import stock_guard_diagnostic
 from .review_guards import guarded_sources
 from .review_mock_replay import mock_call_diagnostic
+from .review_line_ranges import (
+    LineRangeSnapshot,
+    apply_line_range_edit,
+    prepare_line_range_edit,
+)
 from .review_planner import (
     apply_coding_advice,
     localized_retry_symbol,
@@ -83,6 +88,11 @@ _SYSTEM_SUFFIX = """Use public production behavior. Never detect the verifier, h
 change checks, or relax the requested behavior."""
 _SYSTEM = _SYSTEM_PREFIX + _SEARCH_FORMAT + "\n" + _SYSTEM_SUFFIX
 _DEFINITION_SYSTEM = _SYSTEM_PREFIX + DEFINITION_FORMAT + "\n" + _SYSTEM_SUFFIX
+_LINE_RANGE_SYSTEM = (
+    _SYSTEM_PREFIX
+    + "Use only the numbered line-range JSON edit format in the request.\n"
+    + _SYSTEM_SUFFIX
+)
 _BLOCK = re.compile(
     r"^([^\n`]+\.py)\n<<<<<<< SEARCH\n(.*?)^=======\n(.*?)^>>>>>>> REPLACE[ \t]*(?:\n|$)",
     re.M | re.S,
@@ -673,6 +683,7 @@ def _coding_completion(
     advice=None,
     *,
     exclude=(),
+    line_snapshot=None,
 ):
     fresh_advice = None
     if planner_input is not None:
@@ -682,8 +693,13 @@ def _coding_completion(
     elif advice is not None:
         _LOG.info("Reusing a free planning strategy for the current review goal")
     messages = apply_coding_advice(
-        messages, advice or fresh_advice, reuse=advice is not None
+        messages,
+        advice or fresh_advice,
+        reuse=advice is not None,
+        line_snapshot=line_snapshot,
     )
+    if line_snapshot is not None:
+        messages = [{**messages[0], "content": _LINE_RANGE_SYSTEM}, *messages[1:]]
     causal_edit = localized_retry_symbol(advice or fresh_advice) is not None
     if causal_edit:
         messages = [
@@ -780,6 +796,12 @@ def _rejected_attempt(source, candidate, target, before, after):
         + "\nRejected edit excerpt (quoted data) against its applied source snapshot:\n"
         + excerpt(patch_for(source, candidate).decode("utf-8"), 1050)
     )
+
+
+@dataclass(frozen=True)
+class _LineRetry:
+    advice: object
+    snapshot: LineRangeSnapshot
 
 
 @dataclass(frozen=True)
@@ -1168,6 +1190,8 @@ def solve(executor, task, archive, budget, version):
 
     planning_attempts = {}
     retry_advice = {}
+    line_retries = {}
+    line_routes = {}
     stock_fixtures = {}
     mock_diagnostics = {}
     max_proposals = min(36, budget.model_requests_remaining())
@@ -1282,7 +1306,8 @@ def solve(executor, task, archive, budget, version):
                         break
                     attempts[target] = attempts.get(target, 0) + 1
                     repair = regression_repair if target == repair_target else None
-                    advice = retry_advice.pop(target, None)
+                    line_retry = line_retries.pop(target, None)
+                    advice = line_retry.advice if line_retry else retry_advice.pop(target, None)
                     # Give the strategy one more attempt on its original draft.
                     # Keep any unpublished continuation available as a fallback.
                     continuation = (
@@ -1348,6 +1373,18 @@ def solve(executor, task, archive, budget, version):
                     localized_retry = (
                         localized_retry_symbol(advice)
                         if stock_fixture and repair is None
+                        else None
+                    )
+                    numbered = (
+                        prepare_line_range_edit(source, localized_retry)
+                        if localized_retry is not None
+                        else None
+                    )
+                    if line_retry is not None and numbered != line_retry.snapshot:
+                        line_retry, advice, localized_retry = None, None, None
+                    line_followup = (
+                        _LineRetry(advice, numbered)
+                        if numbered is not None and line_retry is None and advice is not None
                         else None
                     )
                     native = (
@@ -1455,7 +1492,9 @@ def solve(executor, task, archive, budget, version):
                                 model for model, count in counts.items()
                                 if count >= _MODEL_FAILURE_THRESHOLD
                             )
-                    route = last_routes.get(target)
+                    route = (
+                        line_routes.get(target) if line_retry else last_routes.get(target)
+                    )
                     launched_at = time.monotonic()
                     future = pool.submit(
                         _coding_completion,
@@ -1467,6 +1506,7 @@ def solve(executor, task, archive, budget, version):
                         source if native else None,
                         advice,
                         exclude=exclude,
+                        line_snapshot=line_retry.snapshot if line_retry else None,
                     )
                     pending[future] = (
                         target,
@@ -1476,6 +1516,8 @@ def solve(executor, task, archive, budget, version):
                         planner_input is not None or advice is not None,
                         (rotation_key, bool(exclude)),
                         localized_retry,
+                        line_retry,
+                        line_followup,
                         repair,
                     )
                     if (
@@ -1522,6 +1564,8 @@ def solve(executor, task, archive, budget, version):
                 advised,
                 (rotation_key, rotated),
                 localized_retry,
+                line_retry,
+                line_followup,
                 repair,
             ) = pending.pop(future)
             if (
@@ -1533,7 +1577,11 @@ def solve(executor, task, archive, budget, version):
             except ProviderExhausted as error:
                 if paired and hedge_pair:
                     continue
-                if rotated:
+                if line_followup is not None:
+                    line_retries[target] = line_followup
+                elif line_retry is not None:
+                    _LOG.info("Numbered stock edit format had no available coding route")
+                elif rotated:
                     if snapshot is current:
                         # Reopen this goal's model choices for the rest of this draft.
                         # The next proposal uses the normal request budget and task exclusions.
@@ -1550,7 +1598,8 @@ def solve(executor, task, archive, budget, version):
                 continue
             if native_candidate is not None and snapshot is not current:
                 continue
-            last_routes[target] = completion.route
+            routes = line_routes if line_retry is not None else last_routes
+            routes[target] = completion.route
             editor = RouteEvidence.from_completion(completion)
             try:
                 source = current if continuation is None else continuation[0]
@@ -1560,6 +1609,10 @@ def solve(executor, task, archive, budget, version):
                     source = {new_path: test_draft}
                 try:
                     candidate = native_candidate
+                    if candidate is None and line_retry is not None:
+                        candidate = apply_line_range_edit(
+                            completion.content, source, line_retry.snapshot
+                        )
                     if candidate is None:
                         candidate = (
                             apply_definitions(
@@ -1586,7 +1639,7 @@ def solve(executor, task, archive, budget, version):
                         and check_label(commands[target[0]], ()) != "ruff"
                     ):
                         count_recovery(malformed, target)
-                        if named_definitions:
+                        if named_definitions and line_retry is None:
                             native_ready.add(target)
                     raise
                 if target == _TEST_GOAL:
@@ -1607,6 +1660,8 @@ def solve(executor, task, archive, budget, version):
                     executor, task, archive, budget, proposed, commands, pytest_runs=after_runs
                 )
             except ValueError as error:
+                if line_followup is not None and snapshot is current:
+                    line_retries[target] = line_followup
                 notes[target] = str(error)[:400]
                 if repair is not None and repair.stock_origin:
                     regression_repair = _retry_stock_repair(
@@ -1754,6 +1809,7 @@ def solve(executor, task, archive, budget, version):
                 if guarded is None:
                     repair_attempted.add(target)
                     retry_advice.clear()
+                    line_retries.clear()
                     continuations.pop(target, None)
                     regression_repair = _RegressionRepair(
                         target, candidate, after, gained, introduced, stock_origin=bool(stock_gain)
@@ -1833,6 +1889,8 @@ def solve(executor, task, archive, budget, version):
                     and (not introduced or localized_retry_symbol(fresh_advice) is not None)
                 ):
                     retry_advice[target] = fresh_advice
+                if line_followup is not None and target in after:
+                    line_retries[target] = line_followup
                 if (
                     continuation is None
                     and snapshot is current
@@ -1870,6 +1928,8 @@ def solve(executor, task, archive, budget, version):
             planning_attempts.clear()
             model_failures.clear()
             retry_advice.clear()
+            line_retries.clear()
+            line_routes.clear()
             mock_diagnostics.clear()
             last_routes.pop(target, None)
             notes.pop(target, None)

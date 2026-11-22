@@ -9,6 +9,8 @@ from pathlib import PurePosixPath
 
 from .review_definitions import _symbols, _unique_object
 
+LINE_RANGE_ENDING = "Respond with the single line-range JSON object only."
+
 _FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
 _MAX_EDITS = 6
 _MAX_FILE = 256 * 1024

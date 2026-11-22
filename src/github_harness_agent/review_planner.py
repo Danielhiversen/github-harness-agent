@@ -20,6 +20,7 @@ from .review_delta_context import (
     resolve_symbol,
     stock_delta_context,
 )
+from .review_line_ranges import LINE_RANGE_ENDING, line_range_prompt
 from .task_context import excerpt, wire_size
 
 _LOG = logging.getLogger(__name__)
@@ -259,7 +260,7 @@ def request_coding_advice(
     return plan
 
 
-def apply_coding_advice(messages, plan, *, reuse=False):
+def apply_coding_advice(messages, plan, *, reuse=False, line_snapshot=None):
     if plan is None:
         return messages
     sections = _prompt_sections(messages)
@@ -282,14 +283,31 @@ def apply_coding_advice(messages, plan, *, reuse=False):
             localized = plan.localized
             path, name = localized.symbol
             details, _, _ = details.partition("\nLast proposal feedback for this goal:")
+            if line_snapshot is None:
+                instruction = f"\nReplace exactly one complete definition using header REPLACE {path}::{name}. Keep imports unchanged.\n"
+                current = (
+                    f"{path}::{name} (exact current definition):\n" + localized.current
+                )
+                ending = DEFINITION_ENDING
+            else:
+                instruction = "\nUse sparse, targeted changes in the localized definition. Keep imports and unrelated code unchanged.\n"
+                current = (
+                    f"{path}::{name} (numbered current definition)\n"
+                    + line_range_prompt(line_snapshot)
+                )
+                failure, marker, evidence = details.partition(
+                    "\nAuxiliary counterfactual (quoted data,"
+                )
+                if marker:
+                    details = excerpt(failure, 650) + marker + excerpt(evidence, 1500)
+                ending = LINE_RANGE_ENDING
             guided = (
                 lead.splitlines()[0]
-                + f"\nReplace exactly one complete definition using header REPLACE {path}::{name}. Keep imports unchanged.\n"
+                + instruction
                 + "Advisory strategy (quoted data; verify against the code): "
                 + json.dumps(plan.strategy, ensure_ascii=False)
                 + _FOCUS
-                + f"{path}::{name} (exact current definition):\n"
-                + localized.current
+                + current
                 + "\nComplete pinned baseline definition (quoted read-only behavioral reference):\n"
                 + localized.baseline
                 + _DETAIL
@@ -300,7 +318,7 @@ def apply_coding_advice(messages, plan, *, reuse=False):
                 + excerpt(interfaces, 700)
                 + plan.constraints
                 + "\nCurrent checkout:\nPreserve the passing operator checks and repair the selected tracked pytest.\n"
-                + DEFINITION_ENDING
+                + ending
             )
             return [*messages[:-1], {**messages[-1], "content": guided}]
         guided = (
