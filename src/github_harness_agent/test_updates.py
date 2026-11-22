@@ -33,8 +33,18 @@ _DIRECTIVE = re.compile(
 )
 _SKIP_NAMES = {"skip", "skipif", "skipTest", "SkipTest", "xfail", "expectedFailure"}
 _ADD_TESTS = re.compile(
-    r"(?:please\s+)?add\s+(?:(?:a|an|some)\s+)?(?:new\s+)?"
-    r"(?:regression\s+)?(?:tests?\b|(?:test\s+|regression\s+)?coverage\b)",
+    r"(?:please\s+)?(?:only\s+)?add\s+(?:(?:a|an|one|some)\s+)?(?:new\s+)?"
+    r"(?:(?:self[- ]contained|independent|offline|standalone|focused|isolated)[,\s]+){0,4}"
+    r"(?:pytest\s+(?:regression\b|tests?\b)|(?:regression\s+)?tests?\b|"
+    r"(?:test\s+|regression\s+)?coverage\b)",
+    re.IGNORECASE,
+)
+_NEW_MODULE = r"(?:a\s+)?new\s+(?:(?:pytest\s+)?test\s+)?(?:module|file)"
+_TEST_ONLY_MODULE = re.compile(
+    rf"(?:(?:a\s+)?test[- ]only\s+(?:change|patch)\s+in\s+{_NEW_MODULE}"
+    rf"\s+is\s+(?:sufficient|required)"
+    rf"|(?:please\s+)?only\s+add\s+(?:new\s+)?(?:regression\s+)?tests?\s+in\s+{_NEW_MODULE}"
+    r"|(?:a\s+)?new\s+(?:pytest\s+)?test\s+(?:module|file)\s+is\s+all\s+that\s+is\s+needed)[.!]?",
     re.IGNORECASE,
 )
 _CONDITIONAL = re.compile(
@@ -90,8 +100,7 @@ def authorized_test_update(feedback: Iterable[Mapping]) -> str | None:
     return next(iter(directives)) if len(directives) == 1 else None
 
 
-def requests_new_tests(body: str) -> bool:
-    """Recognize an affirmative, direct request in a human review item."""
+def _review_sentences(body: str):
     body = re.sub(r"<!--.*?(?:-->|\Z)", " ", body, flags=re.DOTALL)
     for line in _review_prose(body):
         line = re.sub(r"(`+).*?\1", " ", line)
@@ -99,17 +108,26 @@ def requests_new_tests(body: str) -> bool:
         line = re.sub(r"(?<!\w)'[^']*'", " ", line)
         line = re.sub(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", "", line)
         for sentence in re.split(r"(?<=[.!?])\s+", line):
-            sentence = sentence.strip()
-            fixture_coverage = re.match(
-                r"(?:please\s+)?cover\s+.+?\s+with\s+(?:a\s+|an?\s+\w+\s+)?fixtures?\b",
-                sentence,
-                re.IGNORECASE,
-            )
-            if (
-                _ADD_TESTS.match(sentence) or fixture_coverage
-            ) and not _CONDITIONAL.search(sentence):
-                return True
+            yield sentence.strip()
+
+
+def requests_new_tests(body: str) -> bool:
+    """Recognize an affirmative, direct request in a human review item."""
+    for sentence in _review_sentences(body):
+        fixture_coverage = re.match(
+            r"(?:please\s+)?cover\s+.+?\s+with\s+(?:a\s+|an?\s+\w+\s+)?fixtures?\b",
+            sentence,
+            re.IGNORECASE,
+        )
+        if (_ADD_TESTS.match(sentence) or fixture_coverage) and not _CONDITIONAL.search(sentence):
+            return True
     return False
+
+
+def requests_test_only_module(body: str) -> bool:
+    return requests_new_tests(body) and any(
+        _TEST_ONLY_MODULE.fullmatch(sentence) for sentence in _review_sentences(body)
+    )
 
 
 def focused_pytest(checks, selectors, report=None, *, verbose=False):

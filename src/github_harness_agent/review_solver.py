@@ -1997,7 +1997,7 @@ def solve(executor, task, archive, budget, version):
     if not (
         review
         and task.pull_checks
-        and task.inline_review_threads >= 2
+        and (task.inline_review_threads >= 2 or review.test_only)
         and task.save_checkpoint
     ):
         return None
@@ -2005,6 +2005,11 @@ def solve(executor, task, archive, budget, version):
     if not paths or len(paths) > 3 or any(not path.endswith(".py") for path in paths):
         return None
     new_path = "tests/test_review_regressions.py"
+    if review.test_only and not (
+        task.inline_review_threads == 1 and task.require_new_tests and task.verify_base_first
+        and task.test_update is None and focused_pytest(task.checks, (new_path,))
+    ):
+        return None
     with executor.runner.workspace(archive, budget.remaining, budget.cancelled) as ws:
         tree = executor._stage_baseline(ws, budget)
         context = operator_acceptance_context(
@@ -2026,14 +2031,29 @@ def solve(executor, task, archive, budget, version):
         ):
             return None
         if task.require_new_tests:
-            if (
+            if review.test_only:
+                candidates = (
+                    new_path,
+                    *(f"tests/test_review_regressions_{index}.py" for index in range(2, 33)),
+                )
+                occupied = set(executor._git(
+                    ws, budget, "--literal-pathspecs", "ls-tree", "-z", "--name-only",
+                    tree, "--", *candidates,
+                ).stdout.split(b"\0"))
+                new_path = next((
+                    path for path in candidates
+                    if path.encode() not in occupied and not _protected(path, task, new_test=True)
+                ), None)
+                if new_path is None:
+                    return None
+            elif (
                 _protected(new_path, task, new_test=True)
                 or executor._git(ws, budget, "ls-tree", tree, "--", new_path).stdout
             ):
                 return None
             original[new_path] = ""
         current = original.copy()
-        draft = task.checkpoints.get(_CHECKPOINT)
+        draft = None if review.test_only else task.checkpoints.get(_CHECKPOINT)
         actor = None
         if draft and draft.guidance == _GUIDANCE and draft.base_sha == task.base_sha:
             executor._git(ws, budget, "apply", "--index", data=draft.patch)
@@ -2091,6 +2111,8 @@ def solve(executor, task, archive, budget, version):
     patch = patch_for(original, current)
     pytest_runs = {}
     failures = evidence(executor, task, archive, budget, patch, commands, pytest_runs=pytest_runs)
+    if review.test_only and failures:
+        raise ExecutionError("Required checks failed on the unchanged baseline for the test-only review")
     notes = {}
     rejected = {}
     last_routes = {}
@@ -4460,10 +4482,10 @@ def solve(executor, task, archive, budget, version):
                     raise
                 if target == _TEST_GOAL:
                     candidate = {**current, **candidate}
-                    if test_seed is not None and any(
+                    if (review.test_only or test_seed is not None) and any(
                         candidate[path] != current[path] for path in paths
                     ):
-                        raise ValueError("Keep the verified production edits and revise only the test module.")
+                        raise ValueError("Keep the verified production code unchanged and revise only the test module.")
                 if (
                     failures
                     and needs_tests

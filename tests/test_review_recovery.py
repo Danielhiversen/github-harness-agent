@@ -60,6 +60,28 @@ def test_recovery_needs_repeated_rejections_and_distinct_review_threads():
     assert plan_recovery(items, 3, "unfinished checks") is not None
 
 
+def test_explicit_test_only_module_uses_focused_recovery_on_first_attempt():
+    item = {
+        **feedback()[0],
+        "body": (
+            "Please add a self-contained, offline pytest regression for the empty response. "
+            "A test-only change in a new test module is sufficient."
+        ),
+    }
+    plan = plan_recovery([item], 0, "")
+    assert plan is not None and plan.test_only
+    assert plan_recovery([item, feedback()[1]], 0, "") is None
+    for separator in ("\n> ", "\n    ", '\n"'):
+        body = item["body"].replace(" A test-only", separator + "A test-only")
+        assert plan_recovery([{**item, "body": body}], 0, "") is None
+    assert plan_recovery([{**item, "path": "../module.py"}], 0, "") is None
+    for body in (
+        "Only add tests in a new module.",
+        "Add regression coverage for the empty response. A new test file is all that is needed.",
+    ):
+        assert plan_recovery([{**item, "body": body}], 0, "").test_only
+
+
 def test_recovery_includes_full_small_module_and_only_targets_reviewed_existing_text():
     plan = plan_recovery(feedback(), 3, "last attempt produced no patch")
     source = "# header\n" + ("value = 52\n" * 2200) + "# footer\n"

@@ -28,11 +28,12 @@ from github_harness_agent.executor import (
     TaskSnapshot,
     _Budget,
 )
+from github_harness_agent.harness2_adapter import verify_review_repair
 from github_harness_agent.review_assertions import (
     assertion_progress,
     operator_assertions,
 )
-from github_harness_agent.review_recovery import ReviewRecovery
+from github_harness_agent.review_recovery import ReviewRecovery, plan_recovery
 from github_harness_agent.task_context import compact_focused_review, wire_size
 from github_harness_agent.review_solver import (
     _GUIDANCE,
@@ -47,7 +48,7 @@ from github_harness_agent.review_solver import (
 from github_harness_agent.task_context import excerpt
 
 
-from github_harness_agent.worker import CommandOutputExceeded
+from github_harness_agent.worker import CommandOutputExceeded, ExecutionError
 
 SOURCE = "fixture_calc.py"
 NEW_TEST = "tests/test_review_regressions.py"
@@ -3152,6 +3153,69 @@ def test_solver_restores_independently_verified_test_seed(solver_case, scenario)
     assert b"def test_results()" in result.patch
     assert b"def test_keep()" in result.patch
     assert all(check.returncode == 0 for check in result.checks)
+
+
+@pytest.mark.parametrize("scenario", ("success", "baseline_failure", "no_collection"))
+def test_single_test_only_review_adds_an_independent_module(solver_case, scenario):
+    task, _, runner, checkpoints = solver_case
+    task = replace(
+        task,
+        inline_review_threads=1,
+        review_recovery=plan_recovery(
+            [{
+                "path": SOURCE, "line": 2, "thread": "review", "reply_to": 1,
+                "body": (
+                    "Please add an offline pytest regression for the reviewed behavior. "
+                    "A test-only change in a new test module is sufficient."
+                ),
+            }],
+            0,
+            "",
+        ),
+    )
+    archive = BytesIO()
+    fixed = BASE_SOURCE.replace("return -1", "return 1").replace("return -2", "return 2")
+    existing_test = "def test_prior_coverage():\n    assert True\n"
+    next_path = "tests/test_review_regressions_2.py"
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        contents = {
+            SOURCE: BASE_SOURCE if scenario == "baseline_failure" else fixed,
+            "tests/test_existing.py": existing_test,
+            NEW_TEST: existing_test,
+        }
+        for path, source in contents.items():
+            content = source.encode()
+            entry = tarfile.TarInfo(path)
+            entry.size = len(content)
+            snapshot.addfile(entry, BytesIO(content))
+    if scenario == "no_collection":
+        proposals = ("__test__ = False\n" + TEST,)
+    else:
+        proposals = (edit(SOURCE, "return 1\n", "return 3\n"), TEST)
+    gateway = FreeGateway(*proposals)
+    executor = PlainExecutor(runner, gateway, Limits(model_requests=len(proposals)))
+    budget = _Budget(executor.limits, lambda: False, task)
+    if scenario == "baseline_failure":
+        with pytest.raises(ExecutionError, match="unchanged baseline"):
+            verify_review_repair(executor, task, archive.getvalue(), budget)
+        assert not gateway.prompts
+    elif scenario == "no_collection":
+        with pytest.raises(AttemptRejected):
+            verify_review_repair(executor, task, archive.getvalue(), budget)
+        assert len(gateway.prompts) == 1
+    else:
+        result = verify_review_repair(executor, task, archive.getvalue(), budget)
+        assert len(gateway.prompts) == 2
+        assert next_path in gateway.prompts[0]
+        assert [line for line in result.patch.splitlines() if line.startswith((b"--- ", b"+++ "))] == [
+            b"--- /dev/null", f"+++ b/{next_path}".encode(),
+        ]
+        assert all(check.returncode == 0 for check in result.checks)
+        assert any(next_path in check.command for check in result.checks)
+        assert all(any(command == check.command for check in result.checks) for command in (
+            *task.checks, *task.pull_checks
+        ))
+    assert not checkpoints
 
 
 @pytest.mark.parametrize(

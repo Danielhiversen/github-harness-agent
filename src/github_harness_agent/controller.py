@@ -758,9 +758,9 @@ class Controller:
                         review_recovery=plan_recovery(
                             data.get("feedback", ()),
                             len(rejections),
-                            rejections[-1].get("reason") or "",
+                            (rejections[-1].get("reason") or "") if rejections else "",
                         )
-                        if stage == "repair" and rejections
+                        if stage == "repair"
                         else None,
                     )
 

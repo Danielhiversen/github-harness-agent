@@ -9,6 +9,7 @@ from pathlib import PurePosixPath
 
 from .file_edit import EDIT_TOOL, edit_payload
 from .task_context import _bounded_content, excerpt, wire_size
+from .test_updates import requests_test_only_module
 
 MAX_FILE_CONTEXT = 24 * 1024
 MAX_SOURCE_CONTEXT = 32 * 1024
@@ -347,6 +348,7 @@ class RecoveryRequest:
 class ReviewRecovery:
     feedback: tuple[tuple[str, int, str], ...]
     previous_failure: str
+    test_only: bool = False
 
     def request(self, read_source, checks, *, require_test=False, acceptance_source=""):
         paths = tuple(dict.fromkeys(path for path, _, _ in self.feedback))[:3]
@@ -409,7 +411,8 @@ class ReviewRecovery:
 
 
 def plan_recovery(feedback, rejection_count, previous_failure):
-    if rejection_count < 3:
+    test_only = len(feedback) == 1 and requests_test_only_module(feedback[0].get("body") or "")
+    if rejection_count < 3 and not test_only:
         return None
     notes = []
     threads = set()
@@ -438,6 +441,8 @@ def plan_recovery(feedback, rejection_count, previous_failure):
         )
         if len(notes) == 12:
             break
+    if test_only and notes and notes[0][0].endswith(".py"):
+        return ReviewRecovery(tuple(notes), excerpt(previous_failure, 600), test_only=True)
     return (
         ReviewRecovery(tuple(notes), excerpt(previous_failure, 600))
         if len(threads) >= 2
