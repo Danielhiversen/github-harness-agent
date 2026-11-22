@@ -1283,9 +1283,9 @@ def solve(executor, task, archive, budget, version):
                 proposed = verified_patch if production == sources else patch_for(original, sources)
                 if len(proposed) <= executor.limits.patch_bytes:
                     return (sources, proposed, checked, runs), editor
+            _LOG.info("The interactive edit still had outstanding verification failures")
         except Cancelled:
             raise
-            _LOG.info("The interactive edit still had outstanding verification failures")
         except (ExecutionError, ProviderExhausted, ValueError, OSError) as error:
             _LOG.info("Interactive review ended with %s", type(error).__name__)
             budget.remaining()
