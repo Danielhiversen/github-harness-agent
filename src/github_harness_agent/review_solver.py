@@ -1296,7 +1296,9 @@ def solve(executor, task, archive, budget, version):
             )
         return None
 
-    def reconcile_stock_gain(target, proposed_sources, regressions=None):
+    def reconcile_stock_gain(
+        target, proposed_sources, regressions=None, *, static_locations=()
+    ):
         if (
             budget.remaining() < _GUARD_MIN_REMAINING
             or budget.commands_remaining() < 3 * len(commands) + 1
@@ -1309,7 +1311,7 @@ def solve(executor, task, archive, budget, version):
             return None
         try:
             candidates = ()
-            if len(changed) == 1:
+            if len(changed) == 1 and not static_locations:
                 path = changed[0]
                 candidates = tuple(
                     {**current, path: source}
@@ -1323,12 +1325,16 @@ def solve(executor, task, archive, budget, version):
                     for path, row in check_locations(commands[number], diagnostic)
                 }
                 candidates = selective_reverts(
-                    current, proposed_sources, allowed, locations
+                    current,
+                    proposed_sources,
+                    allowed,
+                    locations,
+                    static_locations=static_locations,
                 )
-            probe_budget = _GuardBudget(budget, wall_seconds=45 if selective else None)
+            probe_budget = _GuardBudget(budget)
             for sources in candidates:
                 verified = verify_stock_gain(target, sources, probe_budget)
-                if verified is not None:
+                if verified is not None and (not static_locations or not verified[2]):
                     if selective:
                         _LOG.info(
                             "Selective reversion preserved the verified stock gain and review cases"
@@ -2101,17 +2107,24 @@ def solve(executor, task, archive, budget, version):
                 )
                 and _named_operator_cases(old_operator | new_operator, commands)
             ):
-                reconciled = (
-                    reconcile_stock_gain(
+                reconciled = None
+                fresh_provider_edit = source is current and bool(
+                    editor.configured_model
+                )
+                if stock_gain and (not static_failures or fresh_provider_edit):
+                    static_locations = {
+                        (path.removeprefix("/work/").removeprefix("./"), row)
+                        for number, _ in static_failures or ()
+                        for path, row in static_runs[number]
+                    }
+                    reconciled = reconcile_stock_gain(
                         target,
                         candidate,
                         {key: after[key] for key in introduced}
-                        if source is current and editor.configured_model
+                        if fresh_provider_edit
                         else None,
+                        static_locations=static_locations,
                     )
-                    if stock_gain and not static_failures
-                    else None
-                )
                 if reconciled is None:
                     repair_attempted.add(target)
                     retry_advice.clear()

@@ -89,7 +89,7 @@ def _apply_line_edits(base, edits):
     return merged
 
 
-def selective_reverts(base, proposal, allowed, locations):
+def selective_reverts(base, proposal, allowed, locations, *, static_locations=()):
     """Yield at most two exact subsets of a single small multi-hunk edit."""
     edits = small_line_edits(base, proposal, allowed, max_edits=6)
     if len(edits) < 3:
@@ -102,12 +102,17 @@ def selective_reverts(base, proposal, allowed, locations):
         shift = shifts.get(edit.path, 0)
         start = edit.start + shift + 1
         stop = start + max(1, len(edit.replacement))
+        static_hits = sum(
+            start <= row < stop for path, row in static_locations if path == edit.path
+        )
         hits = sum(start <= row < stop for path, row in locations if path == edit.path)
-        ranked.append((-hits, -(len(edit.original) + len(edit.replacement)), index))
+        ranked.append(
+            (-static_hits, -hits, -(len(edit.original) + len(edit.replacement)), index)
+        )
         shifts[edit.path] = shift + len(edit.replacement) - len(edit.original)
 
     yielded = 0
-    for _, _, omitted in sorted(ranked):
+    for *_, omitted in sorted(ranked):
         candidate = _apply_line_edits(base, (*edits[:omitted], *edits[omitted + 1 :]))
         if candidate is not None:
             yield candidate

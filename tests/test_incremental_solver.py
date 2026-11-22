@@ -1233,22 +1233,29 @@ def test_guard_uses_a_public_parameter_signature_or_existing_condition(
 
 
 @pytest.mark.parametrize(
-    "scenario", ("revert", "six_hunks", "required_hunk", "low_budget")
+    "scenario", ("revert", "six_hunks", "mixed", "required_hunk", "low_budget")
 )
 def test_selective_stock_revert_checks_both_suites(solver_case, monkeypatch, scenario):
     task, _, runner, checkpoints = solver_case
     task = replace(task, require_new_tests=False)
+    mixed = scenario == "mixed"
+    extra_operator_cases = (
+        "\ndef test_guard_type():\n    assert isinstance(guard(), int)\n"
+        "\ndef test_guard_truthiness():\n    assert not guard()\n"
+        if mixed
+        else ""
+    )
     Path(task.pull_checks[0][-1]).write_text(
         "from fixture_calc import first, guard\n\n"
         "def test_guard():\n    assert guard() == 0\n\n"
-        "def test_first():\n    assert first() == -1\n"
+        "def test_first():\n    assert first() == -1\n" + extra_operator_cases
     )
     stock_guard = (
         "\ndef test_required_guard():\n    with pytest.raises(ValueError):\n        guard()\n"
         if scenario == "required_hunk"
         else ""
     )
-    extra = (30, 40, 50) if scenario == "six_hunks" else ()
+    extra = (30, 40, 50) if scenario in {"six_hunks", "mixed"} else ()
     extra_source = "".join(
         f"\ndef extra_{value}():\n    return -{value}\n" for value in extra
     )
@@ -1262,7 +1269,7 @@ def test_selective_stock_revert_checks_both_suites(solver_case, monkeypatch, sce
             SOURCE: BASE_SOURCE
             + "\ndef left():\n    return -10\n\ndef right():\n    return -20\n"
             + extra_source
-            + "\ndef guard():\n    return 0\n",
+            + "\ndef guard() -> int:\n    return 0\n",
             "tests/test_existing.py": (
                 "import pytest\nfrom fixture_calc import left, right, guard\n\n"
                 "def test_stock():\n    assert (left(), right()) == (10, 20)\n"
@@ -1279,15 +1286,39 @@ def test_selective_stock_revert_checks_both_suites(solver_case, monkeypatch, sce
         if extra
         else "    return 10\n"
     )
+    guard_edit = (
+        '    return "0"\n' if mixed else "    raise ValueError('guard regression')\n"
+    )
     proposal = (
         edit(SOURCE, "    return -10\n", left_edit)
         + edit(SOURCE, "    return -20\n", "    return 20\n")
-        + edit(SOURCE, "    return 0\n", "    raise ValueError('guard regression')\n")
+        + edit(SOURCE, "    return 0\n", guard_edit)
         + "".join(
             edit(SOURCE, f"    return -{value}\n", f"    return {value}\n")
             for value in extra
         )
     )
+    if mixed:
+        mypy = ("mypy", ".")
+        task = replace(task, checks=(*task.checks, mypy))
+        checked_types = []
+        original_command = FixtureWorkspace.command
+
+        def command(workspace, argv, *args, **kwargs):
+            if tuple(argv) != mypy:
+                return original_command(workspace, argv, *args, **kwargs)
+            source = (workspace.root / SOURCE).read_text()
+            checked_types.append(source)
+            for row, line in enumerate(source.splitlines(), 1):
+                if line.strip() == 'return "0"':
+                    return SimpleNamespace(
+                        returncode=1,
+                        stdout=f"./{SOURCE}:{row}: error: Incompatible return value type [return-value]\nFound 1 error in 1 file\n".encode(),
+                        stderr=b"",
+                    )
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        monkeypatch.setattr(FixtureWorkspace, "command", command)
     gateway = FreeGateway(proposal, "An incomplete edit")
     executor = PlainExecutor(
         runner, gateway, Limits(model_requests=2, concurrent_probes=1)
@@ -1301,7 +1332,7 @@ def test_selective_stock_revert_checks_both_suites(solver_case, monkeypatch, sce
 
     probes = []
     needed = tuple(f"+    return {value}\n".encode() for value in (10, 20, *extra))
-    rejected = b"+    raise ValueError"
+    rejected = ("+" + guard_edit).encode()
     additions = (*needed, rejected)
 
     def record(*args, **kwargs):
@@ -1312,7 +1343,7 @@ def test_selective_stock_revert_checks_both_suites(solver_case, monkeypatch, sce
         return failures
 
     monkeypatch.setattr("github_harness_agent.review_solver.evidence", record)
-    if scenario in {"revert", "six_hunks"}:
+    if scenario in {"revert", "six_hunks", "mixed"}:
         result = solve(executor, task, archive.getvalue(), budget, "fixture-version")
         assert all(check.returncode == 0 for check in result.checks)
         assert all(line in result.patch for line in needed)
@@ -1320,6 +1351,10 @@ def test_selective_stock_revert_checks_both_suites(solver_case, monkeypatch, sce
         assert len(gateway.prompts) == 1
         assert result.route_trace[-1].configured_model == "stand-in/free"
         assert probes == [(result.patch, {})]
+        if mixed:
+            assert any('return "0"' in source for source in checked_types)
+            assert checked_types[-2:] == [checked_types[-1]] * 2
+            assert 'return "0"' not in checked_types[-1]
     else:
         with pytest.raises(AttemptRejected):
             solve(executor, task, archive.getvalue(), budget, "fixture-version")
