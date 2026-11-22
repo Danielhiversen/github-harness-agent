@@ -3007,6 +3007,7 @@ def solve(executor, task, archive, budget, version):
                 budget.remaining()
                 regression_repair = _retry_stock_repair(
                     repair,
+                    target,
                     f"{error} Try a different fix against the unchanged stock-passing draft.",
                     named_definitions,
                 )
