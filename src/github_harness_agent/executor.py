@@ -340,6 +340,14 @@ class _Budget:
         with self._lock:
             return self.limits.commands - self._calls["command"]
 
+    def route_usage(self):
+        with self._lock:
+            routes = tuple(self.routes)
+        usage = Counter()
+        for route in routes:
+            usage.update(route.usage)
+        return routes, dict(usage)
+
     def complete(
         self,
         gateway,
@@ -2039,16 +2047,12 @@ class PlainExecutor:
                 )
                 error.checks = tuple(checks)
             raise error
-        with budget._lock:
-            routes = tuple(budget.routes)
-        usage = Counter()
-        for route in routes:
-            usage.update(route.usage)
+        routes, usage = budget.route_usage()
         return ExecutionResult(
             patch,
             tuple(checks),
             routes,
-            dict(usage),
+            usage,
             hashlib.sha256(patch).hexdigest(),
             refinement,
         )

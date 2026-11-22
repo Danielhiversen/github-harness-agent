@@ -2909,6 +2909,87 @@ def test_solver_repairs_an_unpublished_regression_test_in_place(
     assert "fresh offline" in compact
 
 
+def test_review_fixture_audit_keeps_a_passing_draft_until_missing_coverage_is_added(solver_case):
+    task, archive, runner, _ = solver_case
+    fixed = BASE_SOURCE.replace("return -1", "return 1").replace("return -2", "return 2")
+    draft = DraftCheckpoint(
+        "harness2/base",
+        task.base_sha,
+        patch_for({SOURCE: BASE_SOURCE, NEW_TEST: ""}, {SOURCE: fixed, NEW_TEST: ""}),
+        guidance=_GUIDANCE,
+        last_editor=("fixture", "fixture/coder"),
+    )
+    task = replace(
+        task,
+        checkpoints={draft.key: draft},
+        review_recovery=replace(task.review_recovery, feedback=(
+            (SOURCE, 2, "Check the first result with a fixture for the first calculation."),
+            (SOURCE, 5, "Add a fixture for the second calculation."),
+        )),
+    )
+    incomplete = (
+        "from fixture_calc import first, second\n"
+        "\ndef test_first_result():\n    assert first() == 1\n"
+    )
+    repair = (
+        incomplete
+        + "\ndef test_second_result():\n    assert second() == 2\n"
+    )
+    first_case = {
+        "request": 1,
+        "covered": True,
+        "case": f"{NEW_TEST}::test_first_result",
+        "quote": "assert first() == 1",
+    }
+
+    class Gateway(FreeGateway):
+        audits = []
+
+        def complete(self, **kwargs):
+            if kwargs["role"] != "planning":
+                return super().complete(**kwargs)
+            request = kwargs["messages"][-1]["content"]
+            self.audits.append(request)
+            second_case = (
+                {
+                    "request": 2,
+                    "covered": True,
+                    "case": f"{NEW_TEST}::test_second_result",
+                    "quote": "assert second() == 2",
+                }
+                if "test_second_result" in request
+                else {**first_case, "request": 2, "covered": False}
+            )
+            return SimpleNamespace(
+                content=json.dumps([first_case, second_case]),
+                tool_calls=(), role="planning", route="stand-in-free",
+                model="fixture-auditor", configured_model="stand-in/auditor", usage={"requests": 1},
+            )
+
+    gateway = Gateway(incomplete, "# same case, still missing coverage\n" + incomplete, repair)
+    verification = runner.path / "independent"
+    verification.mkdir()
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=5, concurrent_probes=1),
+        verification_runner=FixtureRunner(verification),
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    result = solve(executor, task, archive, budget, "fixture-version")
+
+    assert len(gateway.audits) == 2
+    assert "with a fixture for the first calculation" in gateway.audits[0]
+    assert "fixture for the second calculation" in gateway.audits[0]
+    assert "fixture for the second calculation" in gateway.prompts[1]
+    assert "Preserve" in gateway.prompts[1]
+    assert "fixture for the second calculation" in gateway.prompts[2]
+    assert b"def test_first_result" in result.patch
+    assert b"def test_second_result" in result.patch
+    assert result.usage == {"requests": 2}
+    assert result.route_trace[-1].role == "planning"
+    assert all(check.returncode == 0 for check in result.checks)
+
+
 @pytest.mark.parametrize(
     "scenario", ("plain", "fenced", "retry", "named_retry", "accepted_content"),
 )

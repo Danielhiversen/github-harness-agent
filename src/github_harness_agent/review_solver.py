@@ -66,6 +66,7 @@ from .review_definitions import (
     apply_native_definition,
 )
 from .review_guard_probe import stock_guard_diagnostic
+from .review_fixture_audit import audit_fixture_requests, explicit_fixture_requests
 from .review_guard_order import swap_traced_filters
 from .review_parameter_use import (
     iteration_argument_owner,
@@ -3411,6 +3412,10 @@ def solve(executor, task, archive, budget, version):
         if test_seed else ""
     )
     test_rejection = None
+    fixture_requests = (
+        explicit_fixture_requests(review.feedback) if task.inline_review_threads >= 2 else ()
+    )
+    known_fixture_omissions = {}
     test_case_runs = {}
     focused_generated = focused_pytest(task.checks, (new_path,), verbose=True) if new_path else None
     test_checkout_snapshot = None
@@ -4668,7 +4673,32 @@ def solve(executor, task, archive, budget, version):
                             "omitted cases: " + ", ".join(test_seed.passing + test_seed.omitted)
                         )
                         continue
-                    return result
+                    coverage_revision = None
+                    if fixture_requests:
+                        test_syntax = ast.dump(ast.parse(next_draft))
+                        coverage_revision = test_checkout_digest, hashlib.sha256(test_syntax.encode()).digest()
+                    missing = known_fixture_omissions.get(coverage_revision, ())
+                    if (
+                        fixture_requests
+                        and not missing
+                        and (known_fixture_omissions or submitted < max_proposals)
+                        and budget.model_requests_remaining() >= (1 if known_fixture_omissions else 3)
+                    ):
+                        missing = audit_fixture_requests(
+                            executor, budget, fixture_requests, new_path, next_draft,
+                            next_case_runs.get("focused"),
+                        )
+                        route_trace, usage = budget.route_usage()
+                        result = replace(result, route_trace=route_trace, usage=usage)
+                    if not missing:
+                        return result
+                    known_fixture_omissions[coverage_revision] = missing
+                    next_diagnostic = (
+                        "Independent pytest verification passed. Preserve the passing cases. "
+                        "Add coverage for these explicit review fixture requests:\n"
+                        + "\n".join(f"- {request}" for request in missing)
+                    )
+                    _LOG.info("Retained passing pytest draft with %d missing fixture requests", len(missing))
                 if allow_test_module and snapshot is current:
                     retain_test_seed(candidate, next_case_runs)
                 test_draft = next_draft

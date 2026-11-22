@@ -111,17 +111,38 @@ def _review_sentences(body: str):
             yield sentence.strip()
 
 
+_FIXTURE_COVERAGE = re.compile(
+    r"^(?:please\s+)?cover\s+.+?\s+with\s+(?:a\s+|an?\s+\w+\s+)?fixtures?\b"
+    r"|\b(?:with|add|include|provide|write|use)\s+(?:a|an)\s+"
+    r"(?:[A-Za-z-]+\s+){0,3}fixture\s+for\s+\S", re.IGNORECASE,
+)
+_DECLINED_FIXTURE = re.compile(
+    r"\b(?:do not|don't|no need to|avoid|instead of)\s+"
+    r"(?:\w+\s+){0,2}(?:add(?:ing)?|includ(?:e|ing)|writ(?:e|ing)|us(?:e|ing)|provid(?:e|ing))\b",
+    re.IGNORECASE,
+)
+_FIXTURE_DIRECTIVE = re.compile(
+    r"^(?:please|add|include|provide|write|use|cover|check|verify|exercise|test|ensure|implement|prioriti[sz]e)\b",
+    re.IGNORECASE,
+)
+
+
+def fixture_request_sentences(body: str):
+    for sentence in _review_sentences(body):
+        if (
+            _FIXTURE_DIRECTIVE.match(sentence) and _FIXTURE_COVERAGE.search(sentence)
+            and not _CONDITIONAL.search(sentence)
+            and not _DECLINED_FIXTURE.search(sentence)
+        ):
+            yield sentence
+
+
 def requests_new_tests(body: str) -> bool:
     """Recognize an affirmative, direct request in a human review item."""
-    for sentence in _review_sentences(body):
-        fixture_coverage = re.match(
-            r"(?:please\s+)?cover\s+.+?\s+with\s+(?:a\s+|an?\s+\w+\s+)?fixtures?\b",
-            sentence,
-            re.IGNORECASE,
-        )
-        if (_ADD_TESTS.match(sentence) or fixture_coverage) and not _CONDITIONAL.search(sentence):
-            return True
-    return False
+    return any(fixture_request_sentences(body)) or any(
+        _ADD_TESTS.match(sentence) and not _CONDITIONAL.search(sentence)
+        for sentence in _review_sentences(body)
+    )
 
 
 def requests_test_only_module(body: str) -> bool:
