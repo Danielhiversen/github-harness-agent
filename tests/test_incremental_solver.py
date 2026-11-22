@@ -193,7 +193,9 @@ def test_ruff_goal_keeps_search_replace_after_malformed_proposals(
     budget = _Budget(executor.limits, lambda: False, task)
     monkeypatch.setattr(
         "github_harness_agent.review_solver.evidence",
-        lambda *args: {(1, "check 2 (exit 1)"): f"{SOURCE}:1:1: I001 Imports unsorted"},
+        lambda *args, pytest_runs=None: {
+            (1, "check 2 (exit 1)"): f"{SOURCE}:1:1: I001 Imports unsorted"
+        },
     )
 
     with pytest.raises(AttemptRejected):
