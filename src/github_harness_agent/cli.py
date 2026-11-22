@@ -137,6 +137,8 @@ def run_worker(store, config, once=False, *, pull: tuple[str, int] | None = None
             commands=_configured_limit(repo, cfg, "commands", defaults.commands, 512),
             rollout_requests=rollout_requests,
         )
+    # Allow the editor its full time budget plus time to revalidate and publish.
+    repo_ttls = {repo: max(1800, limit.wall_time + 300) for repo, limit in limits.items()}
     auth_mode = config.get("github_auth", "app")
     app = account = None
     if auth_mode == "app":
@@ -223,7 +225,7 @@ def run_worker(store, config, once=False, *, pull: tuple[str, int] | None = None
                 if payload["repository"]["full_name"] not in failed:
                     store.ack(event["id"])
             next_sync = time.monotonic() + 60
-        job = store.claim(ttl=1800, pull=pull)
+        job = store.claim(ttl=1800, pull=pull, repo_ttls=repo_ttls)
         if job:
             before = (job["data"]["stage"], job["data"].get("last_commit"))
             try:

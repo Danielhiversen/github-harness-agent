@@ -96,6 +96,9 @@ def test_targeted_once_uses_repo_limits_and_runs_only_exact_eligible_pull(
             self.store = store
 
         def run(self, job):
+            with self.store.tx() as db:
+                expiry, = db.execute("SELECT expires FROM tasks WHERE token=?", (job["token"],)).fetchone()
+            assert expiry - self.store.clock() == 3000
             run.append((job["repo"], job["kind"], job["issue"]))
             self.store.save(job, "queued", delay=30)
 

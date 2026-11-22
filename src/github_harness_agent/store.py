@@ -325,7 +325,7 @@ class Store:
                 ),
             )
 
-    def claim(self, ttl=900, *, pull: tuple[str, int] | None = None):
+    def claim(self, ttl=900, *, pull: tuple[str, int] | None = None, repo_ttls=None):
         now = self.clock()
         selection = ""
         parameters = (now, now)
@@ -348,6 +348,8 @@ class Store:
                 (row["repo"], row["kind"], row["issue"]),
             )
             token = uuid.uuid4().hex
+            if repo_ttls is not None:
+                ttl = repo_ttls.get(row["repo"], ttl)
             db.execute(
                 """UPDATE tasks SET token=?,state='running',expires=?,attempts=attempts+1
                 WHERE repo=? AND issue=? AND kind=?""",
