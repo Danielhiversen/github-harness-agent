@@ -3433,6 +3433,13 @@ def solve(executor, task, archive, budget, version):
                     completion.route, run.passed if run else "unknown",
                     len(run.failed) if run else "unknown", len(new_operator), ", ".join(check_types) or "none",
                 )
+            elif target in old_operator and len(old_operator) == 1:
+                remaining_checks = {check_label(commands[number], ()) or "configured" for number, _ in after}
+                _LOG.info(
+                    "Final review case verification via %s: selected case %s; remaining review cases=%d; checks=%s",
+                    completion.route, "failed" if target in after else "absent from failure list",
+                    len(new_operator), ", ".join(sorted(remaining_checks)) or "none",
+                )
             static_failures = _localized_static_failures(
                 after.keys() - new_operator, static_runs, candidate, paths
             )
