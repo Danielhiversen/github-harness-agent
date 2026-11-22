@@ -1768,6 +1768,136 @@ def test_solver_checkpoints_verified_tracked_assertion_progress(solver_case, sce
     )
 
 
+def test_individual_stock_hunks_require_exact_syntax_and_production_scope():
+    from github_harness_agent.review_composition import individual_line_edits
+
+    base_text = "VALUE = 1\n# spacer\n# end\n\n"
+    base_text += "\n".join(f"BASE_{index} = 0\n" for index in range(4))
+    base = {SOURCE: base_text}
+    proposal = {
+        SOURCE: (
+            base_text.replace("VALUE = 1", "VALUE = (")
+            .replace("# end", "  1)")
+            .replace(" = 0", " = 2")
+        )
+    }
+
+    variants = list(individual_line_edits(base, proposal, {SOURCE}, limit=3))
+
+    assert variants == [
+        {SOURCE: base_text.replace(f"BASE_{index} = 0", f"BASE_{index} = 2")}
+        for index in range(3)
+    ]
+    with_test = {**base, "tests/test_existing.py": ""}
+    out_of_scope = {**proposal, "tests/test_existing.py": "raise RuntimeError\n"}
+    assert not list(individual_line_edits(with_test, out_of_scope, {SOURCE}, limit=3))
+
+
+@pytest.mark.parametrize(
+    "scenario", ("partial", "focused_pass", "focused_pass_regresses", "static")
+)
+def test_isolates_stock_hunk_from_regressing_proposal(solver_case, monkeypatch, scenario):
+    task, _, runner, checkpoints = solver_case
+    task = replace(task, require_new_tests=False)
+    passing_focus = scenario.startswith("focused_pass")
+    rejected_focus = scenario == "focused_pass_regresses"
+    static_only = scenario == "static"
+    mypy = ("mypy", ".")
+    if static_only:
+        task = replace(task, checks=(*task.checks, mypy))
+    operator_assertion = "second() == -2" if static_only else "first() == -1"
+    Path(task.pull_checks[0][-1]).write_text(
+        "from fixture_calc import first, second, stock_value\n\n"
+        f"def test_operator():\n    assert {operator_assertion}\n"
+        + ("    assert stock_value() == 5\n" if rejected_focus else "")
+    )
+    stock = "tests/test_existing.py"
+    node = f"{stock}::test_stock"
+    original_line = "    return 5 if first() == -9 else 5\n"
+    if static_only:
+        original_line = "    return 5 if not isinstance(first(), int) else 5\n"
+    source = BASE_SOURCE.replace("def first():", "def first() -> int:")
+    source += "\ndef stock_value():\n" + original_line
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, content in {
+            SOURCE: source,
+            stock: (
+                "from fixture_calc import stock_value\n\n"
+                "def test_stock():\n    assert stock_value() == 1\n\n"
+                "def test_other_stock():\n    assert True\n"
+            ),
+        }.items():
+            body = content.encode()
+            entry = tarfile.TarInfo(path)
+            entry.size = len(body)
+            snapshot.addfile(entry, BytesIO(body))
+
+    # The bad hunk masks the result of the second hunk in the full proposal.
+    bad_line = '    return "bad"\n' if static_only else "    return -9\n"
+    first_hunk = edit(SOURCE, "    return -1\n", bad_line)
+    proposed_value = 1 if passing_focus else 3
+    isolated_line = original_line.replace("else 5", f"else {proposed_value}")
+    proposal = first_hunk + edit(SOURCE, original_line, isolated_line)
+    attempts = (
+        (proposal,)
+        if passing_focus
+        else (proposal, edit(SOURCE, isolated_line, "    return 1\n"))
+    )
+
+    checks = []
+    original_command = FixtureWorkspace.command
+
+    def command(workspace, argv, *args, **kwargs):
+        if tuple(argv[1:3]) == ("-m", "pytest"):
+            checks.append((tuple(argv), (workspace.root / SOURCE).read_text()))
+        if tuple(argv) == mypy:
+            checked_source = (workspace.root / SOURCE).read_text()
+            checks.append((mypy, checked_source))
+            if bad_line in checked_source:
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout=(
+                        f"./{SOURCE}:2: error: Incompatible return value type [return-value]\n"
+                        "Found 1 error in 1 file\n"
+                    ).encode(),
+                    stderr=b"",
+                )
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        return original_command(workspace, argv, *args, **kwargs)
+
+    monkeypatch.setattr(FixtureWorkspace, "command", command)
+    gateway = FreeGateway(*attempts)
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=len(attempts), concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+    if rejected_focus:
+        with pytest.raises(AttemptRejected):
+            solve(executor, task, archive.getvalue(), budget, "fixture-version")
+        assert not checkpoints
+    else:
+        result = solve(executor, task, archive.getvalue(), budget, "fixture-version")
+        assert all(check.returncode == 0 for check in result.checks)
+        assert ("+" + bad_line).encode() not in result.patch
+        if passing_focus:
+            assert not checkpoints
+            assert ("+" + isolated_line).encode() in result.patch
+        else:
+            assert len(checkpoints) == 1
+            assert ("+" + isolated_line).encode() in checkpoints[0].patch
+            assert ("+" + bad_line).encode() not in checkpoints[0].patch
+            assert b"+    return 1\n" in result.patch
+    focused = [source for argv, source in checks if argv[-1] == node]
+    assert 1 <= len(focused) <= 3
+    isolated_source = source.replace(original_line, isolated_line)
+    assert isolated_source in focused
+    assert all(
+        (configured, isolated_source) in checks
+        for configured in (*task.pull_checks, *task.checks)
+    )
+
+
 def test_private_stock_repair_keeps_selected_verified_donor_visible(solver_case):
     task, _, runner, _ = solver_case
     task = replace(task, require_new_tests=False)

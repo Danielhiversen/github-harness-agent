@@ -33,7 +33,12 @@ from .executor import (
     _protected,
 )
 from .providers import ProviderExhausted
-from .review_composition import compose_line_edits, selective_reverts, small_line_edits
+from .review_composition import (
+    compose_line_edits,
+    individual_line_edits,
+    selective_reverts,
+    small_line_edits,
+)
 from .review_delta_context import interactive_stock_focus
 from .review_assertions import assertion_progress, operator_assertions
 from .review_delta_context import private_operator_source
@@ -123,6 +128,8 @@ _INTERACTIVE_INSTRUCTIONS_BYTES = 4100
 _GUARD_SECONDS = 90
 _GUARD_MIN_REMAINING = 45
 _COMPOSITION_MIN_REMAINING = 60
+_STOCK_HUNK_PROBES = 3
+_STOCK_HUNK_SECONDS = 12
 _MODEL_FAILURE_THRESHOLD = 2
 _LONG_LOCALIZED_DEFINITION_BYTES = 6 * 1024
 _WORD = re.compile(r"[a-z]{3,}")
@@ -1523,6 +1530,71 @@ def solve(executor, task, archive, budget, version):
             budget.remaining()
             return None
 
+    def isolate_stock_hunk(target, proposal, checked, runs, introduced, static_runs):
+        nonlocal hunk_isolation_attempted
+        number, node = target
+        before, after = pytest_runs.get(number), runs.get(number)
+        if (
+            hunk_isolation_attempted
+            or not _named_operator_cases({target}, commands)
+            or not _same_pytest_selection(before, after)
+            or before.failed != {node}
+            or after.failed != {node}
+            or not _verified_operator_runs(
+                pytest_runs, runs, introduced, task.pull_checks, operator_cases
+            )
+            or budget.remaining() < _COMPOSITION_MIN_REMAINING
+            or budget.commands_remaining() < 2 * len(commands) + _STOCK_HUNK_PROBES + 1
+        ):
+            return None
+        allowed = {path for path in paths if not _protected(path, task, new_test=False)}
+        if not introduced and not _localized_static_failures(
+            checked.keys() - {target}, static_runs, proposal, allowed
+        ):
+            return None
+        focused = focused_pytest((commands[number],), (node,))
+        if focused is None:
+            return None
+        try:
+            probe_budget = _GuardBudget(budget)
+            for sources in individual_line_edits(
+                current, proposal, allowed, limit=_STOCK_HUNK_PROBES
+            ):
+                trial = patch_for(original, sources)
+                if not trial or len(trial) > executor.limits.patch_bytes:
+                    continue
+                hunk_isolation_attempted = True
+                focus_budget = _GuardBudget(
+                    probe_budget, wall_seconds=_STOCK_HUNK_SECONDS, reserve=0
+                )
+                focused_runs = {}
+                errors = evidence(
+                    executor,
+                    task,
+                    archive,
+                    focus_budget,
+                    trial,
+                    (focused,),
+                    pytest_runs=focused_runs,
+                )
+                run = focused_runs.get(0)
+                if run is None or run.deselected:
+                    continue
+                if (run.passed == 1 and not errors) or (
+                    not run.passed
+                    and run.failed == {node}
+                    and errors.keys() == {(0, node)}
+                    and tracked_assertion_note(target, sources, {target: errors[0, node]})
+                ):
+                    return verify_stock_candidate(
+                        target, sources, probe_budget, accept_partial=True
+                    )
+        except Cancelled:
+            raise
+        except (ExecutionError, ValueError):
+            budget.remaining()
+        return None
+
     planning_attempts = {}
     retry_advice = {}
     line_retries = {}
@@ -1545,6 +1617,7 @@ def solve(executor, task, archive, budget, version):
     continuations = {}
     stock_edits = ()
     composition_attempted = False
+    hunk_isolation_attempted = False
     regression_repair = None
     repair_attempted = set()
     unavailable = {}
@@ -2415,6 +2488,19 @@ def solve(executor, task, archive, budget, version):
                     continue
                 candidate, proposed, after, after_runs = reconciled
                 new_operator, introduced = set(), set()
+            if (
+                fresh_stock
+                and editor.configured_model
+                and target in after
+                and (introduced or static_runs)
+            ):
+                isolated = isolate_stock_hunk(
+                    target, candidate, after, after_runs, introduced, static_runs
+                )
+                if isolated is not None:
+                    (candidate, proposed, after, after_runs), _ = isolated
+                    new_operator, introduced = set(), set()
+                    _LOG.info("Full verification confirmed a gain from one stock repair hunk")
             progressed = new_operator < old_operator or (
                 new_operator == old_operator and after.keys() < failures.keys()
             )

@@ -89,6 +89,20 @@ def _apply_line_edits(base, edits):
     return merged
 
 
+def individual_line_edits(base, proposal, allowed, *, limit):
+    """Yield independently applicable hunks from one small multi-hunk proposal."""
+    edits = small_line_edits(base, proposal, allowed, max_edits=6)
+    if len(edits) < 2 or limit < 1:
+        return
+    for edit in edits:
+        candidate = _apply_line_edits(base, (edit,))
+        if candidate is not None:
+            yield candidate
+            limit -= 1
+            if not limit:
+                return
+
+
 def selective_reverts(base, proposal, allowed, locations, *, static_locations=()):
     """Yield at most two exact subsets of a single small multi-hunk edit."""
     edits = small_line_edits(base, proposal, allowed, max_edits=6)
