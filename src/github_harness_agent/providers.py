@@ -848,7 +848,31 @@ class ProviderRouter:
                             role=role,
                             review_windows=True,
                         )
+                groq_edit = (
+                    route.alias == "groq-free"
+                    and role == "coding"
+                    and not tools
+                    and max_output_tokens is not None
+                    and len(messages) == 2
+                    and (messages[1].get("content") or "").startswith(
+                        "Selected failure: "
+                    )
+                )
+                if groq_edit:
+                    # Free-tier token admission includes the requested output allowance.
+                    route_messages = (
+                        compact_focused_review(
+                            messages, max_bytes=_FOCUSED_RETRY_INPUT_BYTES
+                        )
+                        or route_messages
+                    )
+                    max_tokens = min(max_tokens, 2600)
                 payload = builder(route, route_messages, tools, max_tokens)
+                if groq_edit and route.model in {
+                    "openai/gpt-oss-120b",
+                    "openai/gpt-oss-20b",
+                }:
+                    payload["reasoning_effort"] = "low"
                 if (
                     route.local_input_bytes is not None
                     and wire_size(payload["messages"]) > route.local_input_bytes

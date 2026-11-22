@@ -129,11 +129,7 @@ def test_compact_groq_reasoning_leaves_output_for_the_actual_edit():
 
     def handle(request):
         calls.append(json.loads(request.content))
-        return (
-            httpx.Response(413)
-            if len(calls) == 1
-            else httpx.Response(200, json=openai_response())
-        )
+        return httpx.Response(200, json=openai_response())
 
     router = routed(deployment("groq-free/openai/gpt-oss-120b"), handle)
     request = (
@@ -150,8 +146,10 @@ def test_compact_groq_reasoning_leaves_output_for_the_actual_edit():
         ],
         max_output_tokens=3072,
     )
-    assert calls[1]["max_tokens"] == 2600
-    assert calls[1]["reasoning_effort"] == "low"
+    assert len(calls) == 1
+    assert len(json.dumps(calls[0])) <= 14 * 1024
+    assert calls[0]["max_tokens"] == 2600
+    assert calls[0]["reasoning_effort"] == "low"
 
 
 def quality_order():
