@@ -77,3 +77,75 @@ def test_detailed_plan_keeps_only_existing_symbols_and_preserves_source_evidence
     strategy, bodies = _advice(response, inventory)
     assert strategy == plan.strip()
     assert bodies == "demo.py::update\ndef update():\n    pass\n"
+
+
+def test_stock_planner_keeps_delta_contracts_and_exact_search_source():
+    padding = "        # long method\n" * 320
+    before = (
+        "class Queue:\n    def receive(self, key):\n"
+        + padding
+        + "        return self.old_lookup(key)\n"
+    )
+    current = before.replace("old_lookup", "new_lookup")
+    path = "src/demo/queue.py"
+    messages = [
+        {"role": "system", "content": "Use SEARCH/REPLACE."},
+        {
+            "role": "user",
+            "content": "Selected failure: tests/test_queue.py::test_tracked\n"
+            "Focused source from src/demo/queue.py:\n# abbreviated\n"
+            "Failure details:\nstock failure\n"
+            "Fixture for this goal:\nread-only test\nCurrent checkout:\n"
+            "old prompt source\nRespond with exact SEARCH/REPLACE blocks only.",
+        },
+    ]
+    fixtures = {
+        "operator.py": """
+def test_unrelated():
+    assert other("unrelated value")
+
+def test_verified(queue):
+    given = "external"
+    value = queue.receive(given)
+    assert value == "verified result"
+""",
+    }
+    notes = [(path, i, f"Independent review note {i}") for i in range(1, 5)]
+    calls = []
+
+    def complete(gateway, role, messages, **options):
+        calls.extend(messages)
+        return SimpleNamespace(
+            content=json.dumps(
+                {
+                    "strategy": "Compare the arguments in the two cases.",
+                    "symbols": ["src.demo.queue.Queue.receive"],
+                }
+            )
+        )
+
+    plan = request_coding_advice(
+        SimpleNamespace(gateway=object()),
+        SimpleNamespace(complete=complete),
+        messages,
+        {path: current},
+        'def test_tracked(queue):\n    assert queue.receive("internal") == "stock result"\n',
+        "stock failure",
+        "",
+        ({path: before}, fixtures, notes),
+    )
+    planner_prompt = calls[-1]["content"]
+    assert f"{path}::Queue.receive" in planner_prompt
+    assert "-        return self.old_lookup(key)" in planner_prompt
+    assert "+        return self.new_lookup(key)" in planner_prompt
+    for prompt in (planner_prompt, apply_coding_advice(messages, plan)[-1]["content"]):
+        assert "queue.receive(given)" in prompt
+        assert 'given = "external"' in prompt
+        assert 'assert value == "verified result"' in prompt
+        assert "unrelated value" not in prompt
+        assert all(body in prompt for _, _, body in notes)
+    coding = apply_coding_advice(messages, plan)[-1]["content"]
+    assert f"{path}::Queue.receive" in coding
+    assert "        return self.new_lookup(key)" in coding
+    assert "old_lookup" not in coding
+    assert coding.endswith("Respond with exact SEARCH/REPLACE blocks only.")

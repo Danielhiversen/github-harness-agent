@@ -1191,6 +1191,8 @@ def solve(executor, task, archive, budget, version):
                             executor, task, archive, budget, check_command, target[1], patch
                         )
                     mock_detail = mock_diagnostics.get(target, "")
+                    if stock_fixture and (plan or advice is not None):
+                        named_definitions = False
                     messages = _proposal_messages(
                         target,
                         source,
@@ -1219,7 +1221,10 @@ def solve(executor, task, archive, budget, version):
                         fixture = stock_fixture or _fixture_excerpt(
                             fixtures, target[1], selected_first=True
                         )
-                        planner_input = source, fixture, diagnostics[target], mock_detail
+                        planner_input = (
+                            source, fixture, diagnostics[target], mock_detail,
+                            (original, fixtures, review.feedback) if stock_fixture else None,
+                        )
                         planning_attempts[target] = plan_count + 1, attempts[target]
                     rotation_key = None
                     exclude = ()
