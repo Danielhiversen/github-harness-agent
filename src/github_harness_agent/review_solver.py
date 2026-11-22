@@ -68,7 +68,7 @@ from .review_planner import (
     apply_coding_advice,
     localized_retry_symbol,
     request_coding_advice,
-    restore_pinned_stock_definition,
+    prepare_pinned_stock_restore,
 )
 from .review_recovery import operator_acceptance_context
 from .review_solver_context import (
@@ -1321,15 +1321,15 @@ def solve(executor, task, archive, budget, version):
         }
         test_path = target[1].partition("::")[0].removeprefix("/work/").removeprefix("./")
         if (task.test_update or "").partition("::")[0] == test_path or test_path in allowed:
-            return None
-        sources = restore_pinned_stock_definition(
+            return None, ""
+        sources, advisory = prepare_pinned_stock_restore(
             advice, original, current, allowed, minimum_bytes=_LONG_LOCALIZED_DEFINITION_BYTES
         )
         if sources is None:
-            return None
+            return None, advisory
         restored_patch = patch_for(original, sources)
         if not restored_patch or len(restored_patch) > executor.limits.patch_bytes:
-            return None
+            return None, advisory
         probe_budget = _GuardBudget(budget, reserve=60)
         runs, static_runs = {}, {}
         try:
@@ -1348,17 +1348,17 @@ def solve(executor, task, archive, budget, version):
                     target, checked, runs, operator_failures, static_failures
                 )
             ):
-                return None
+                return None, advisory
             selection = identify_stock_collection(target, patch, probe_budget, failed=True)
             if not selection or (
                 identify_stock_collection(target, restored_patch, probe_budget) != selection
             ):
-                return None
+                return None, advisory
         except Cancelled:
             raise
         except (ExecutionError, ValueError):
             budget.remaining()
-            return None
+            return None, advisory
         return _RegressionRepair(
             target,
             sources,
@@ -1368,7 +1368,7 @@ def solve(executor, task, archive, budget, version):
             stock_origin=True,
             static_failures=static_failures,
             stock_collection_id=selection,
-        )
+        ), ""
 
     def verify_stock_candidate(target, sources, probe_budget, *, accept_partial=False):
         proposal = patch_for(original, sources)
@@ -1842,9 +1842,16 @@ def solve(executor, task, archive, budget, version):
                 and budget.remaining() >= 75
             ):
                 pinned_restore_attempted = True
-                regression_repair = probe_pinned_restore(
+                regression_repair, dependency_advisory = probe_pinned_restore(
                     interactive_target, pinned_restore_advice[interactive_target]
                 )
+                if dependency_advisory:
+                    mock_diagnostics[interactive_target] = "\n".join(
+                        filter(
+                            None,
+                            (mock_diagnostics.get(interactive_target), dependency_advisory),
+                        )
+                    )
                 if regression_repair is not None:
                     repair_attempted.add(interactive_target)
                     continuations.pop(interactive_target, None)

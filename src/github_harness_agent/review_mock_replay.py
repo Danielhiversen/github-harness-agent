@@ -22,7 +22,7 @@ _REPLAY_SECONDS = 20
 _DETAIL_BYTES = 900
 _COUNTER_HEADING = "Auxiliary mapping counter changes (quoted advisory data)."
 _OBSERVATION_BOUNDARY = re.compile(
-    r"(?m)^(?=Auxiliary (?:counterfactual|mapping counter changes|mock calls)\b)"
+    r"(?m)^(?=Auxiliary (?:counterfactual|mapping counter changes|mock calls|pinned dependencies)\b)"
 )
 
 

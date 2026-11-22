@@ -23,6 +23,7 @@ from .review_delta_context import (
 )
 from .review_line_ranges import LINE_RANGE_ENDING, _scope, line_range_prompt
 from .review_mock_replay import CounterCallerSite, compact_observations
+from .review_pinned_dependencies import pinned_restore_dependencies
 from .task_context import COUNTER_CALLER_EVIDENCE, excerpt, wire_size
 
 _LOG = logging.getLogger(__name__)
@@ -66,44 +67,67 @@ def localized_retry_symbol(advice):
     return None
 
 
-def restore_pinned_stock_definition(
-    advice, original, sources, allowed, *, minimum_bytes
-):
-    """Return an exact speculative restore of one bound definition."""
+def prepare_pinned_stock_restore(advice, original, sources, allowed, *, minimum_bytes):
+    """Build a speculative exact restore and describe its static dependencies."""
     symbol = localized_retry_symbol(advice)
     if symbol is None:
-        return None
+        return None, ""
     path, qualified = symbol
     if path not in allowed or path not in original or path not in sources:
-        return None
+        return None, ""
     located = advice.localized
     if (
         located.baseline == located.current
         or len(located.current.encode()) < minimum_bytes
         or hashlib.sha256(sources[path].encode()).hexdigest() != located.source_digest
     ):
-        return None
+        return None, ""
     try:
         before = _scope(original[path], qualified)
         after = _scope(sources[path], qualified)
         if before is None or after is None or type(before.node) is not type(after.node):
-            return None
+            return None, ""
         if (
             "".join(before.rows[before.start : before.node.end_lineno])
             != located.baseline
             or "".join(after.rows[after.start : after.node.end_lineno])
             != located.current
         ):
-            return None
-        restored = (
-            "".join(after.rows[: after.start])
-            + located.baseline
-            + "".join(after.rows[after.node.end_lineno :])
+            return None, ""
+        primary = (after.start, after.node.end_lineno, located.baseline)
+        extras, facts = pinned_restore_dependencies(before, after, qualified)
+        summary = (
+            excerpt(
+                "Auxiliary pinned dependencies (quoted advisory data). " + facts, 480
+            )
+            if facts
+            else ""
         )
-        compile(restored, path, "exec")
+        rows = after.rows.copy()
+        for start, end, replacement in sorted((primary, *extras), reverse=True):
+            rows[start:end] = replacement.splitlines(keepends=True)
+        restored = "".join(rows)
+        try:
+            compile(restored, path, "exec")
+        except (ValueError, SyntaxError, RecursionError):
+            restored = (
+                "".join(after.rows[: after.start])
+                + located.baseline
+                + "".join(after.rows[after.node.end_lineno :])
+            )
+            compile(restored, path, "exec")
     except (ValueError, SyntaxError, RecursionError):
-        return None
-    return {**sources, path: restored}
+        return None, ""
+    return {**sources, path: restored}, summary
+
+
+def restore_pinned_stock_definition(
+    advice, original, sources, allowed, *, minimum_bytes
+):
+    """Return the source of the speculative restore, if one can be built."""
+    return prepare_pinned_stock_restore(
+        advice, original, sources, allowed, minimum_bytes=minimum_bytes
+    )[0]
 
 
 def _counterfactual_site(mock_detail):
