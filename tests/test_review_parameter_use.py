@@ -15,17 +15,25 @@ def test_source_windows_include_a_seed_and_direct_child_record_declaration():
         "        if frame.depth < 3:\n"
         "            heappush(heap, Frame(frame.depth + 1))\n"
     )
+    ranges = []
     result = lost_iteration_argument(
         "visit(limit=1)",
         {"sample.py": prior},
         {"sample.py": current},
         source_windows=True,
+        current_ranges=ranges,
     )
     assert "7 |     heappush(heap, Frame(0))" in result
     assert "9 |         frame = heappop(heap)" in result
     assert "11 |             heappush(heap, Frame(frame.depth + 1))" in result
     assert "1 | class Frame:" in result and "3 |     depth: int" in result
     assert "2 |     for depth in range(limit):" in result
+    assert ranges and all(path == "sample.py" for path, _, _ in ranges)
+    assert all(
+        any(first <= row <= last for _, first, last in ranges)
+        for row in (1, 3, 7, 9, 11)
+    )
+    assert not any(first <= 2 <= last for _, first, last in ranges)
     ambiguous = lost_iteration_argument(
         "visit(limit=1)",
         {"a.py": prior, "b.py": prior},

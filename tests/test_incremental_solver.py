@@ -174,8 +174,10 @@ def solver_case(tmp_path, monkeypatch):
     return task, archive.getvalue(), FixtureRunner(tmp_path), checkpoints
 
 
+@pytest.mark.parametrize("nested", [False, True])
 def test_normal_operator_prompt_keeps_the_exercised_traversal_beyond_the_review_anchor(
     solver_case,
+    nested,
 ):
     task, _, runner, _ = solver_case
     task = replace(task, require_new_tests=False)
@@ -184,7 +186,7 @@ def test_normal_operator_prompt_keeps_the_exercised_traversal_beyond_the_review_
         stream.write(
             "\nfrom fixture_calc import Explorer\n\n"
             "def test_limit_applies_to_traversal():\n"
-            "    assert Explorer().walk(limit=1) == [0, 1]\n"
+            f"    assert Explorer().walk(limit=1) == {[0, 0, 1, 1] if nested else [0, 1]}\n"
         )
     filler = "# Unrelated details elsewhere in the reviewed production module.\n" * 420
     prior = (
@@ -217,6 +219,56 @@ def test_normal_operator_prompt_keeps_the_exercised_traversal_beyond_the_review_
         "    def _descend(self, parent):\n"
         "        return State(parent.depth + 1)\n"
     )
+    expected_sites = (
+        "        pending = [State(0)]",
+        "            state = pending.pop()",
+        "                child = self._descend(state)",
+        "                pending.append(child)",
+        "    def _descend(self, parent):",
+        "        return State(parent.depth + 1)",
+    )
+    if nested:
+        prior = prior.replace("result = [0]", "result = [0, 0]").replace(
+            "result.append(level + 1)", "result.extend([level + 1] * 2)"
+        )
+        before, _, tail = current.partition("        pending = [State(0)]\n")
+        _, _, after = tail.partition("        return result\n")
+        current = (
+            before.replace(
+                "\nclass State:", "\nfrom collections import deque\n\nclass State:"
+            )
+            + "        scheduler = ['b', 'a']\n"
+            "        work = {lane: deque([State(0)]) for lane in scheduler}\n"
+            "        result = []\n"
+            "        while scheduler:\n"
+            "            lane = scheduler.pop(0)\n"
+            "            local = work[lane]\n"
+            "            state = local.popleft()\n"
+            "            result.append(state.depth)\n"
+            "            if state.depth < 2:\n"
+            "                raw_parts = self._descend(state)\n"
+            "                parts = [part for part in raw_parts]\n"
+            "                work.setdefault(lane, deque()).extendleft(parts)\n"
+            "            if local:\n"
+            "                scheduler.append(lane)\n"
+            "        return result\n"
+            + after.replace(
+                "return State(parent.depth + 1)", "return [State(parent.depth + 1)]"
+            )
+        )
+        expected_sites = (
+            "        scheduler = ['b', 'a']",
+            "            lane = scheduler.pop(0)",
+            "                scheduler.append(lane)",
+            "            state = local.popleft()",
+            "                raw_parts = self._descend(state)",
+            "                parts = [part for part in raw_parts]",
+            "                work.setdefault(lane, deque()).extendleft(parts)",
+            "    def _descend(self, parent):",
+            "        return [State(parent.depth + 1)]",
+            "class State:",
+            "        self.depth = depth",
+        )
     checkpoint = DraftCheckpoint(
         "harness2/base",
         task.base_sha,
@@ -249,15 +301,10 @@ def test_normal_operator_prompt_keeps_the_exercised_traversal_beyond_the_review_
             focus = prompt.split("\nFocused source from ", 1)[1].split(
                 "\nFailure details:", 1
             )[0]
-            for row in (
-                "        pending = [State(0)]",
-                "            state = pending.pop()",
-                "                child = self._descend(state)",
-                "                pending.append(child)",
-                "    def _descend(self, parent):",
-                "        return State(parent.depth + 1)",
-            ):
+            for row in expected_sites:
                 assert f"{current.splitlines().index(row) + 1} | {row}" in focus
+            if nested:
+                assert "Candidate sites across worklists" in focus
             prior_row = "        for level in range(limit):"
             assert f"{prior.splitlines().index(prior_row) + 1} | {prior_row}" in focus
             assert (
