@@ -3009,7 +3009,9 @@ def test_solver_preserves_verified_passing_cases_in_unpublished_draft(solver_cas
 
     assert expected_draft in gateway.prompts[2]
     if proposal_kind == "collection":
-        assert "during collection" in gateway.prompts[2]
+        diagnostic = gateway.prompts[2].partition("Latest verification or edit feedback:")[2].partition("Focused source from ")[0]
+        assert f"ERROR collecting {NEW_TEST}" in diagnostic
+        assert "ImportError" in diagnostic and "unavailable" in diagnostic
     else:
         assert f"Selected failing case: {NEW_TEST}::test_results" in gateway.prompts[2]
         assert f"{NEW_TEST}::test_keep" in gateway.prompts[2]
