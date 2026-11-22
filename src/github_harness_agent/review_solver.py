@@ -40,7 +40,11 @@ from .review_definitions import (
 )
 from .review_planner import apply_coding_advice, request_coding_advice
 from .review_recovery import operator_acceptance_context
-from .review_solver_context import focused_check_excerpt, focused_source_excerpt
+from .review_solver_context import (
+    focused_check_excerpt,
+    focused_source_excerpt,
+    stock_pytest_excerpt,
+)
 from .task_context import compact_focused_review, excerpt
 from .test_updates import has_runnable_test
 
@@ -455,6 +459,7 @@ def _proposal_messages(
     named_definitions=False,
     check_command=(),
     rejection="",
+    stock_fixture=None,
 ):
     if target == _TEST_GOAL:
         return _test_authoring_messages(
@@ -464,7 +469,11 @@ def _proposal_messages(
         target,
         "Create runnable tests covering the requested behavior with offline fixtures.",
     )
-    fixture_query = words(_fixture_excerpt(fixtures, target[1], selected_only=True))
+    fixture_query = words(
+        _fixture_excerpt(fixtures, target[1], selected_only=True)
+        if stock_fixture is None
+        else stock_fixture
+    )
     query = words(target[1] + " " + diagnostic[:600])
     notes = sorted(
         review.feedback,
@@ -515,7 +524,11 @@ def _proposal_messages(
         + (rejection + "\n" if rejection else "")
         + lead
     )
-    fixture = _fixture_excerpt(fixtures, target[1], selected_first=True)
+    fixture = (
+        _fixture_excerpt(fixtures, target[1], selected_first=True)
+        if stock_fixture is None
+        else stock_fixture
+    )
     request = (
         goal
         + (f"Last proposal feedback for this goal: {note}\n" if note else "")
@@ -859,6 +872,7 @@ def solve(executor, task, archive, budget, version):
 
     planning_attempts = {}
     retry_advice = {}
+    stock_fixtures = {}
     max_proposals = min(36, budget.model_requests_remaining())
     editor = actor
     submitted = 0
@@ -963,6 +977,18 @@ def solve(executor, task, archive, budget, version):
                             if item
                         )
                     check_command = commands[target[0]] if target in diagnostics else ()
+                    stock_fixture = None
+                    if (
+                        target[0] >= len(task.pull_checks)
+                        and check_command
+                        and check_label(check_command, ()) == "pytest"
+                    ):
+                        cache_key = target, diagnostics[target]
+                        if cache_key not in stock_fixtures:
+                            stock_fixtures[cache_key] = stock_pytest_excerpt(
+                                archive, check_command, target[1], diagnostics[target]
+                            )
+                        stock_fixture = stock_fixtures[cache_key]
                     named_definitions = (
                         target in failures
                         and (
@@ -1003,6 +1029,7 @@ def solve(executor, task, archive, budget, version):
                         continuing=continuation is not None or repair is not None,
                         named_definitions=named_definitions,
                         check_command=check_command,
+                        stock_fixture=stock_fixture,
                         rejection=(
                             _private_repair_context(current, repair)
                             if repair is not None

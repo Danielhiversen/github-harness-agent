@@ -2,6 +2,8 @@
 
 import ast
 import re
+import tarfile
+from io import BytesIO
 from pathlib import PurePosixPath
 
 from .check_diagnostics import check_locations
@@ -11,9 +13,13 @@ _IMPORT = (ast.Import, ast.ImportFrom)
 _ASSIGNMENT = (ast.Assign, ast.AnnAssign)
 _LOOP = (ast.For, ast.AsyncFor, ast.While)
 _CONTROL = (*_LOOP, ast.If, ast.With, ast.AsyncWith, ast.Try, ast.TryStar, ast.Match)
+_STOCK_NODE = re.compile(
+    r"(?P<path>(?:[\w-][\w.-]*/)*[\w-][\w.-]*\.py)"
+    r"(?P<name>(?:::[A-Za-z_]\w*)*::test\w*)"
+)
 
 
-def _diagnostic_window(lines, imports, row, limit):
+def _diagnostic_window(lines, imports, row, limit, *, bounds=None):
     start, stop = max(1, row - 4), min(len(lines), row + 4)
     for index, (first, last) in enumerate(imports):
         if not first <= row <= last:
@@ -37,6 +43,8 @@ def _diagnostic_window(lines, imports, row, limit):
         stop = max(stop, last)
         break
     start, stop = max(start, row - 40), min(stop, row + 40)
+    if bounds is not None:
+        start, stop = max(start, bounds[0]), min(stop, bounds[1])
     while start <= row <= stop:
         text = f"# Lines {start}-{stop} (diagnostic at line {row})\n" + "".join(
             lines[start - 1 : stop]
@@ -91,6 +99,146 @@ def focused_check_excerpt(command, diagnostic, sources, *, max_chars=2800):
         if chunk:
             chunks.append(chunk)
     return (focus_path, "".join(chunks)) if chunks else None
+
+
+def _tracked_python(snapshot, path):
+    try:
+        member = snapshot.getmember(path)
+        if (
+            member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE)
+            or member.size > 128 * 1024
+        ):
+            return None
+        with snapshot.extractfile(member) as source:
+            text = source.read().decode()
+        return text.splitlines(keepends=True), ast.parse(text).body
+    except (KeyError, UnicodeDecodeError, SyntaxError, ValueError, RecursionError):
+        return None
+
+
+def _pytest_fixtures(body):
+    for node in body:
+        if not isinstance(node, _FUNCTION):
+            continue
+        for decorator in node.decorator_list:
+            call = decorator if isinstance(decorator, ast.Call) else None
+            symbol = decorator.func if call else decorator
+            if not (
+                isinstance(symbol, ast.Name) and symbol.id == "fixture"
+                or isinstance(symbol, ast.Attribute) and symbol.attr == "fixture"
+            ):
+                continue
+            options = {item.arg: item.value for item in call.keywords} if call else {}
+            name = options.get("name")
+            name = (
+                name.value
+                if isinstance(name, ast.Constant) and isinstance(name.value, str)
+                else node.name
+            )
+            autouse = options.get("autouse")
+            yield name, node, isinstance(autouse, ast.Constant) and autouse.value is True
+            break
+
+
+def _fixture_arguments(node):
+    arguments = node.args
+    dependencies = {
+        arg.arg for arg in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)
+    }
+    for marker in node.decorator_list:
+        if isinstance(marker, ast.Call) and getattr(marker.func, "attr", "") == "usefixtures":
+            dependencies.update(
+                arg.value
+                for arg in marker.args
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+            )
+    return dependencies
+
+
+def stock_pytest_excerpt(archive, command, node, diagnostic):
+    """Read a pytest node and local fixture declarations from the pinned Git archive."""
+    target = node.split("[", 1)[0].removeprefix("/work/").removeprefix("./")
+    match = _STOCK_NODE.fullmatch(target) if len(target) <= 512 else None
+    if match is None:
+        return ""
+    path = match["path"]
+    *owners, name = match["name"].split("::")[1:]
+    try:
+        with tarfile.open(fileobj=BytesIO(archive), mode="r:") as snapshot:
+            module = _tracked_python(snapshot, path)
+            if module is None:
+                return ""
+            lines, body = module
+            scope = body
+            for owner in owners:
+                declaration = next(
+                    (item for item in scope if isinstance(item, ast.ClassDef) and item.name == owner),
+                    None,
+                )
+                if declaration is None:
+                    return ""
+                scope = declaration.body
+            test = next(
+                (item for item in scope if isinstance(item, _FUNCTION) and item.name == name),
+                None,
+            )
+            if test is None:
+                return ""
+            scopes = [(path, lines, scope)]
+            if scope is not body:
+                scopes.append((path, lines, body))
+            parents = list(PurePosixPath(path).parents)
+            for parent in dict.fromkeys((*parents[:3], *parents[-1:])):
+                config_path = str(parent / "conftest.py")
+                if config_path != path and (config := _tracked_python(snapshot, config_path)):
+                    scopes.append((config_path, *config))
+    except (tarfile.TarError, OSError, EOFError):
+        return ""
+
+    def definition(label, source, item, cap):
+        start = _start(item)
+        text = "".join(source[start - 1 : item.end_lineno])
+        if len(text) > cap:
+            text = text[:cap] + "\n# Definition excerpt truncated\n"
+        return f"# {label}:{start}\n{text}\n"
+
+    chunks = ["# Read-only repository test context\n"]
+    row = next(
+        (
+            row for reported, row in check_locations(command, diagnostic)
+            if reported.removeprefix("/work/").removeprefix("./") == path
+            and test.lineno <= row <= test.end_lineno
+        ),
+        None,
+    )
+    if row is not None:
+        window, _, _ = _diagnostic_window(
+            lines, (), row, 1000, bounds=(test.lineno, test.end_lineno)
+        )
+        if window:
+            chunks.append(f"# {path}\n{window}\n")
+    chunks.append(definition(path, lines, test, 2700))
+    visible = {}
+    wanted = _fixture_arguments(test)
+    for label, source, scope in scopes:
+        for fixture, item, autouse in _pytest_fixtures(scope):
+            visible.setdefault(fixture, (label, source, item))
+            if autouse:
+                wanted.add(fixture)
+    shown = set()
+    # Follow a bounded chain of dependencies across the visible fixture scopes.
+    for _ in range(4):
+        selected = (wanted - shown) & visible.keys()
+        if not selected:
+            break
+        shown.update(selected)
+        for fixture in sorted(selected):
+            label, source, item = visible[fixture]
+            wanted.update(_fixture_arguments(item))
+            chunks.append(definition(label, source, item, 850))
+            if sum(map(len, chunks)) >= 6000:
+                return "".join(chunks)[:6000]
+    return "".join(chunks)
 
 
 def _words(text):

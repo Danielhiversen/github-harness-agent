@@ -540,6 +540,29 @@ def test_stalled_goal_reuses_advice_in_a_fresh_coding_prompt(solver_case, failur
     assert budget.model_requests_remaining() == 0
 
 
+def test_stock_pytest_goal_includes_the_tracked_test_without_edit_access(solver_case):
+    task, archive, runner, _ = solver_case
+    Path(task.pull_checks[0][-1]).write_text(
+        TEST + "\ndef unrelated_operator_helper():\n    return 'operator only'\n"
+    )
+    stock_regression = edit(SOURCE, "def first():\n", "broken_stock = True\n\ndef first():\n")
+    stock_fix = edit(SOURCE, "broken_stock = True\n\n", "")
+    gateway = FreeGateway(FIRST + SECOND + stock_regression, stock_fix, edit(NEW_TEST, "", TEST))
+    executor = PlainExecutor(runner, gateway, Limits(model_requests=3, concurrent_probes=1))
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    result = solve(executor, task, archive, budget, "fixture-version")
+
+    prompt = gateway.prompts[1]
+    assert "Selected failure: tests/test_existing.py::test_existing" in prompt
+    assert "def test_existing():" in prompt
+    assert "assert not getattr(fixture_calc, 'broken_stock', False)" in prompt
+    assert "unrelated_operator_helper" not in prompt
+    assert f"Editable checkout paths (use these exact names): {SOURCE}\n" in prompt
+    assert b"tests/test_existing.py" not in result.patch
+    assert all(check.returncode == 0 for check in result.checks)
+
+
 def test_rejected_edit_evidence_reaches_coder_and_planner_without_persistence(
     solver_case,
 ):

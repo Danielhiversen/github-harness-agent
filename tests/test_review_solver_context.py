@@ -1,13 +1,74 @@
+import tarfile
+from io import BytesIO
+
 import pytest
 
 from github_harness_agent.review_solver_context import (
     focused_check_excerpt,
     focused_source_excerpt,
+    stock_pytest_excerpt,
 )
 from github_harness_agent.task_context import compact_focused_review
 from github_harness_agent.review_solver import _proposal_messages
 from github_harness_agent.review_recovery import ReviewRecovery
 from github_harness_agent.task_context import wire_size
+
+
+@pytest.fixture
+def tracked_stock_tests():
+    archive = BytesIO()
+    test = (
+        "class TestWeather:\n"
+        "    def test_forecast(self, calibrated):\n"
+        + "        # large test setup\n" * 150
+        + "        assert calibrated == 24\n"
+        "\n    def test_unrelated(self):\n        assert False\n"
+    )
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, contents in {
+            "tests/test_weather.py": test,
+            "tests/conftest.py": (
+                "import pytest\n"
+                "@pytest.fixture\n"
+                "def calibrated(raw):\n    return raw + 1\n"
+                "@pytest.fixture\n"
+                "def unrelated():\n    return 'unrelated fixture'\n"
+            ),
+            "conftest.py": "import pytest\n@pytest.fixture\ndef raw():\n    return 23\n",
+        }.items():
+            data = contents.encode()
+            entry = tarfile.TarInfo(path)
+            entry.size = len(data)
+            snapshot.addfile(entry, BytesIO(data))
+        link = tarfile.TarInfo("tests/test_link.py")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "test_weather.py"
+        snapshot.addfile(link)
+    return archive.getvalue()
+
+
+def test_stock_pytest_excerpt_prioritizes_the_assertion_and_relevant_fixtures(tracked_stock_tests):
+    excerpt = stock_pytest_excerpt(
+        tracked_stock_tests,
+        ("uv", "run", "pytest"),
+        "tests/test_weather.py::TestWeather::test_forecast[param]",
+        "/work/tests/test_weather.py:153: AssertionError",
+    )
+    assert excerpt.index("assert calibrated == 24") < excerpt.index("def test_forecast")
+    assert "def calibrated(raw):\n    return raw + 1" in excerpt
+    assert "def raw():\n    return 23" in excerpt
+    assert "unrelated" not in excerpt
+    assert len(excerpt) <= 6000
+
+
+@pytest.mark.parametrize("path", ("/tmp/tests/test_weather.py", "../tests/test_weather.py", "tests/test_link.py", "tests/missing.py"))
+def test_stock_pytest_excerpt_rejects_paths_outside_exact_regular_tracked_files(tracked_stock_tests, path):
+    assert stock_pytest_excerpt(
+        tracked_stock_tests,
+        ("pytest",),
+        f"{path}::TestWeather::test_forecast",
+        "tests/test_weather.py:153: AssertionError",
+    ) == ""
 
 
 def test_matching_method_includes_owner_imports_and_referenced_definitions():
