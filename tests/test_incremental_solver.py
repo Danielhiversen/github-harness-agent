@@ -175,14 +175,16 @@ def solver_case(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("scenario", (
-    "ordinary", "nested_ordinary", "malformed", "nested", "no_change", "rejected", "outside",
+    "ordinary", "nested_ordinary", "cross_ordinary", "cross_numbered",
+    "malformed", "nested", "no_change", "rejected", "outside",
 ))
 def test_operator_limit_uses_traversal_windows_and_verified_retry(
     solver_case, scenario,
 ):
     task, _, runner, _ = solver_case
-    nested = scenario in {"nested", "nested_ordinary"}
-    ordinary_only = scenario in {"ordinary", "nested_ordinary"}
+    nested = scenario in {"nested", "nested_ordinary", "cross_ordinary", "cross_numbered"}
+    cross_key = scenario.startswith("cross_")
+    ordinary_only = scenario in {"ordinary", "nested_ordinary", "cross_ordinary"}
     excluded = (("excluded", "configured-excluded"),)
     task = replace(task, require_new_tests=False, excluded_models=excluded)
     acceptance = Path(task.pull_checks[0][-1])
@@ -273,6 +275,40 @@ def test_operator_limit_uses_traversal_windows_and_verified_retry(
             "class State:",
             "        self.depth = depth",
         )
+    if cross_key:
+        enqueue = (
+            "                    work.setdefault(key, deque()).extendleft(reversed(child_list))"
+            + "  # "
+            + "documented ordering " * 9
+        )
+        current = current.replace(
+            "        self.depth = depth\n",
+            "        self.depth = depth\n\n"
+            "    def code(self):\n        return self.depth\n\n"
+            "    def expand(self):\n        return [State(self.depth + 1)]\n",
+        ).replace(
+            "            if state.depth < 2:\n"
+            "                raw_parts = self._descend(state)\n"
+            "                parts = [part for part in raw_parts]\n"
+            "                work.setdefault(lane, deque()).extendleft(parts)\n",
+            "            classification = state.code()\n"
+            "            if state.depth < 2:\n"
+            "                parts = state.expand()\n"
+            "                groups = {}\n"
+            "                for child in parts:\n"
+            "                    groups.setdefault(lane, []).append(child)\n"
+            "                for key, child_list in groups.items():\n"
+            "                    # Pass all grouped items to the appropriate worklist.\n"
+            + enqueue
+            + "\n",
+        )
+        expected_sites = (
+            *expected_sites[:4],
+            "            if state.depth < 2:\n".rstrip("\n"),
+            "                parts = state.expand()",
+            "                for child in parts:",
+            enqueue,
+        )
     checkpoint = DraftCheckpoint(
         "harness2/base",
         task.base_sha,
@@ -316,6 +352,8 @@ def test_operator_limit_uses_traversal_windows_and_verified_retry(
                     "                raw_parts = self._descend(state)"
                     if nested else "                child = self._descend(state)"
                 )
+                if cross_key:
+                    child = "                parts = state.expand()"
                 row = int(re.search(r"(?m)^(\d+) \| " + re.escape(child) + "$", prompt)[1])
                 adjusted = "limit + 1" if scenario == "rejected" else "limit"
                 lines = [
@@ -343,6 +381,9 @@ def test_operator_limit_uses_traversal_windows_and_verified_retry(
                 assert f"{current.splitlines().index(row) + 1} | {row}" in focus
             if nested:
                 assert "Candidate sites across worklists" in focus
+            if cross_key:
+                assert "result.append(state.depth)" not in focus
+                assert "classification = state.code()" not in focus
             prior_row = "        for level in range(limit):"
             assert f"{prior.splitlines().index(prior_row) + 1} | {prior_row}" in focus
             assert (

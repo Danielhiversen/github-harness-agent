@@ -9,6 +9,8 @@ from .review_definitions import _symbols
 _PUSH = {"append", "appendleft", "extend", "extendleft", "insert", "put"}
 _POP = {"pop", "popleft", "get", "popitem"}
 _HEAP = {"heappush": "push", "heappop": "pop"}
+_SUBORDINATE_BYTES = 2 * 1024
+_SUBORDINATE_ROWS = 24
 
 
 @dataclass(frozen=True)
@@ -72,24 +74,35 @@ def _binding(node):
         resource, key = node.func.value, node.args[0]
     else:
         return ()
-    if isinstance(resource, (ast.Name, ast.Attribute)) and isinstance(
-        key, (ast.Name, ast.Constant)
-    ):
+    if isinstance(resource, (ast.Name, ast.Attribute)):
         if base := _binding(resource):
-            return (*base, f"[{ast.dump(key)}]")
+            index = ast.dump(key) if isinstance(key, (ast.Name, ast.Constant)) else "?"
+            return (*base, f"[{index}]")
     return ()
 
 
-def _numbered(source, first, last, limit=360, *, path=None, current_ranges=None):
+def _numbered(
+    source,
+    first,
+    last,
+    limit=360,
+    *,
+    path=None,
+    current_ranges=None,
+    max_rows=8,
+    complete=False,
+):
     lines = source.splitlines()
     first, last = max(1, first), min(len(lines), last)
     rows = []
-    for number in range(first, min(last, first + 7) + 1):
+    for number in range(first, min(last, first + max_rows - 1) + 1):
         row = f"{number} | {lines[number - 1]}\n"
         if len(row.encode()) > limit:
             break
         rows.append(row)
         limit -= len(row.encode())
+    if complete and len(rows) != last - first + 1:
+        return ""
     if rows and path is not None and current_ranges is not None:
         current_ranges.append((path, first, first + len(rows) - 1))
     return "".join(rows)
@@ -256,23 +269,87 @@ def _producer_sources(arguments, bindings, before):
     return values, assignments
 
 
-def _requeues_consumed_token(consumer, producer_args, assignments):
-    token = next(
+def _assigned_name(statement):
+    if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+        target = statement.targets[0]
+    elif isinstance(statement, ast.AnnAssign):
+        target = statement.target
+    else:
+        return None
+    return target.id if isinstance(target, ast.Name) else None
+
+
+def _consumed_name(consumer, statements):
+    return next(
         (
-            item.targets[0].id
-            for item in assignments
-            if isinstance(item, ast.Assign)
-            and item.value is consumer
-            and len(item.targets) == 1
-            and isinstance(item.targets[0], ast.Name)
+            name
+            for item in statements
+            if getattr(item, "value", None) is consumer
+            and (name := _assigned_name(item)) is not None
         ),
         None,
     )
+
+
+def _requeues_consumed_token(consumer, producer_args, assignments):
+    token = _consumed_name(consumer, assignments)
     return (
         bool(token)
         and len(producer_args) == 1
         and (isinstance(producer_args[0], ast.Name) and producer_args[0].id == token)
     )
+
+
+def _mapping(key):
+    return key[:-1] if key and key[-1].startswith("[") else ()
+
+
+def _iterating_result(name, statements, after, end):
+    if name is None:
+        return None
+    return min(
+        (
+            item
+            for item in statements
+            if isinstance(item, ast.For)
+            and after < item.lineno <= end
+            and isinstance(item.iter, ast.Name)
+            and item.iter.id == name
+        ),
+        key=lambda item: item.lineno,
+        default=None,
+    )
+
+
+def _consumed_expansion(pop, statements, end):
+    name = _consumed_name(pop, statements)
+    if name is None:
+        return None
+    candidates = []
+    for item in statements:
+        if (
+            not isinstance(item, (ast.Assign, ast.AnnAssign, ast.For))
+            or not pop.lineno < item.lineno <= end
+        ):
+            continue
+        value = item.iter if isinstance(item, ast.For) else item.value
+        if value is None:
+            continue
+        for call in (node for node in ast.walk(value) if isinstance(node, ast.Call)):
+            receiver = call.func.value if isinstance(call.func, ast.Attribute) else None
+            direct = isinstance(receiver, ast.Name) and receiver.id == name
+            if direct or any(
+                isinstance(arg, ast.Name) and arg.id == name for arg in call.args
+            ):
+                child_loop = _iterating_result(
+                    _assigned_name(item), statements, item.lineno, end
+                )
+                iterated = isinstance(item, ast.For) or child_loop is not None
+                candidates.append(
+                    (not iterated, not direct, item.lineno, item, value, child_loop)
+                )
+                break
+    return min(candidates, key=lambda entry: entry[:3])[3:] if candidates else None
 
 
 def _subordinate_windows(
@@ -298,33 +375,110 @@ def _subordinate_windows(
         key=lambda entry: entry[2].lineno,
     )[:2]
     keys = {entry[0] for entry in pops}
+    mappings = {_mapping(key) for key in keys} - {()}
     first_pop = min((entry[2].lineno for entry in pops), default=consumer.lineno)
     pushes = [
         entry for entry in others if entry[1] == "push" and entry[2].lineno >= first_pop
     ]
-    matching = [entry for entry in pushes if entry[0] in keys]
-    pushes = sorted(matching or pushes, key=lambda entry: entry[2].lineno)[:2]
+    matching = [
+        entry for entry in pushes if entry[0] in keys or _mapping(entry[0]) in mappings
+    ]
+    pushes = sorted(
+        matching or pushes, key=lambda entry: (entry[0] not in keys, entry[2].lineno)
+    )[:2]
     sections, values = [], []
-    for _, action, call, arguments in (*pops, *pushes):
-        rows = current_source(call.lineno - 1, call.end_lineno + 1, limit=210)
+    remaining_bytes, remaining_rows = _SUBORDINATE_BYTES, _SUBORDINATE_ROWS
+
+    def append(label, first, last, cap=None):
+        nonlocal remaining_bytes, remaining_rows
+        heading = f"{label}:\n"
+        room = remaining_bytes - len(heading.encode())
+        if room <= 0 or remaining_rows < last - first + 1:
+            return False
+        rows = current_source(
+            first,
+            last,
+            limit=min(room, cap or room),
+            max_rows=remaining_rows,
+            complete=True,
+        )
         if not rows:
-            continue
+            return False
+        sections.append(heading + rows)
+        remaining_bytes -= len((heading + rows).encode())
+        remaining_rows -= last - first + 1
+        return True
+
+    for _, action, call, arguments in (*pops, *pushes):
         label = (
             "Candidate item consumption"
             if action == "pop"
             else "Candidate expansion or scheduling"
         )
-        sections.append(f"{label}:\n{rows}")
+        if not append(
+            label, call.lineno, call.end_lineno, cap=600 if action == "push" else 300
+        ):
+            continue
         if action == "push":
             traced, producers = _producer_sources(arguments, bindings, call.lineno)
             values.extend(traced)
             for assignment in producers[:2]:
-                if assignment.end_lineno < call.lineno - 1:
-                    rows = current_source(
-                        assignment.lineno, assignment.end_lineno, limit=160
+                if assignment.end_lineno < call.lineno:
+                    append(
+                        "Candidate input to that update",
+                        assignment.lineno,
+                        assignment.end_lineno,
+                        cap=130,
                     )
-                    if rows:
-                        sections.append(f"Candidate input to that update:\n{rows}")
+    for _, _, popped, _ in pops[:1]:
+        if expansion := _consumed_expansion(popped, items, end):
+            statement, value, child_loop = expansion
+            values.insert(0, value)
+            stop = (
+                value.end_lineno
+                if isinstance(statement, ast.For)
+                else statement.end_lineno
+            )
+            branch = min(
+                (
+                    item
+                    for item in items
+                    if isinstance(item, ast.If)
+                    and popped.lineno
+                    < item.lineno
+                    < statement.lineno
+                    <= item.end_lineno
+                    <= end
+                ),
+                key=lambda item: item.end_lineno - item.lineno,
+                default=None,
+            )
+            if branch is None or not append(
+                "Candidate branch expanding the consumed item",
+                branch.lineno,
+                branch.end_lineno,
+                cap=520,
+            ):
+                append(
+                    "Candidate expansion of the consumed item",
+                    statement.lineno,
+                    stop,
+                    cap=420,
+                )
+                if branch is not None:
+                    append(
+                        "Candidate expansion guard",
+                        branch.lineno,
+                        branch.test.end_lineno,
+                        cap=180,
+                    )
+            if child_loop is not None:
+                append(
+                    "Candidate loop over produced items",
+                    child_loop.lineno,
+                    child_loop.iter.end_lineno,
+                    cap=250,
+                )
     return "".join(sections), values
 
 
@@ -335,8 +489,10 @@ def _traversal_windows(
     items = list(_statements(function))
     emitted = []
 
-    def current_source(first, last, limit=360):
-        return _numbered(source, first, last, limit, path=path, current_ranges=emitted)
+    def current_source(first, last, limit=360, **options):
+        return _numbered(
+            source, first, last, limit, path=path, current_ranges=emitted, **options
+        )
 
     assignments = sorted(
         (item for item in items if isinstance(item, (ast.Assign, ast.AnnAssign))),
