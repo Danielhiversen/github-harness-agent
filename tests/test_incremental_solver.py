@@ -848,6 +848,72 @@ def test_private_operator_regressions_are_repaired_without_trading_passing_cases
     assert all(check.returncode == 0 for check in result.checks)
 
 
+@pytest.mark.parametrize("followup", ("repair", "lose_stock", "operator_remains", "partial_stock"))
+def test_private_repair_reconciles_a_stock_gain_without_storing_regressions(solver_case, followup):
+    task, _, runner, checkpoints = solver_case
+    task = replace(task, require_new_tests=False)
+    Path(task.pull_checks[0][-1]).write_text(
+        "from fixture_calc import first, second\n\n"
+        "def test_first():\n    assert first() == -1\n\n"
+        "def test_second():\n    assert second() == -2\n"
+    )
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, content in {
+            SOURCE: BASE_SOURCE + "\ndef stock():\n    return -3\n\ndef stock_guard():\n    return 0\n",
+            "tests/test_existing.py": (
+                "from fixture_calc import stock, stock_guard\n\n"
+                "def test_stock_goal():\n    assert stock() == 3\n\n"
+                "def test_stock_guard():\n    assert stock_guard() == 0\n"
+            ),
+        }.items():
+            data = content.encode()
+            entry = tarfile.TarInfo(path)
+            entry.size = len(data)
+            snapshot.addfile(entry, BytesIO(data))
+
+    stock_fix = edit(SOURCE, "    return -3\n", "    return 3\n")
+    break_stock_guard = edit(SOURCE, "    return 0\n", "    return 1\n")
+    restore_first = edit(SOURCE, "    return 1\n", "    return -1\n")
+    restore_second = edit(SOURCE, "    return 2\n", "    return -2\n")
+    initial = stock_fix + FIRST + SECOND
+    followups = {
+        "repair": (restore_first, restore_second),
+        "lose_stock": (restore_first + restore_second + break_stock_guard,),
+        "operator_remains": (restore_first, edit(SOURCE, "    return 2\n", "    return 4\n")),
+        "partial_stock": ("An incomplete edit",),
+    }[followup]
+    if followup == "partial_stock":
+        initial += break_stock_guard
+    gateway = FreeGateway(initial, *followups)
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=len(followups) + 1, concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    if followup == "repair":
+        result = solve(executor, task, archive.getvalue(), budget, "fixture-version")
+        assert b"+    return 3\n" in result.patch
+        assert b"+    return 1\n" not in result.patch
+        assert b"+    return 2\n" not in result.patch
+        assert all(check.returncode == 0 for check in result.checks)
+    else:
+        with pytest.raises(AttemptRejected):
+            solve(executor, task, archive.getvalue(), budget, "fixture-version")
+
+    assert not checkpoints
+    assert "test_stock_goal" in gateway.prompts[0].splitlines()[0]
+    if followup == "partial_stock":
+        assert "test_stock_goal" in gateway.prompts[1].splitlines()[0]
+        assert "Private regression repair" not in gateway.prompts[1]
+    else:
+        for prompt, case in zip(gateway.prompts[1:], ("test_first", "test_second")):
+            assert case in prompt.splitlines()[0]
+            assert "Private regression repair" in prompt
+            assert "test_stock_goal" in prompt
+    assert len(gateway.prompts) == len(followups) + 1
+
+
 def test_private_regression_repair_is_discarded_if_a_concurrent_draft_advances(
     solver_case,
 ):

@@ -35,6 +35,7 @@ from .review_definitions import (
     DEFINITION_ENDING,
     DEFINITION_FORMAT,
     NATIVE_DEFINITION_TOOL,
+    _symbols,
     apply_definitions,
     apply_native_definition,
 )
@@ -78,6 +79,8 @@ _TEST_RESULT = re.compile(r"^(FAILED|ERROR) ([^\s]+::[^\s]+)", re.M)
 _TEST_SECTION = re.compile(r"^_{5,} (.+?) _{5,}$", re.M)
 _PYTEST_SECTION = re.compile(r"^={5,} ([^\n]+?) ={5,}$", re.M)
 _PYTEST_CRASH_LINE = re.compile(r"^\S[^\n]*?\.py:[1-9][0-9]*: .+$")
+_PYTEST_TOTALS = re.compile(r"(?:\d+ [a-z]+, )*\d+ [a-z]+ in \d+(?:\.\d+)?s(?: \([\d:]+\))?")
+_STOCK_REPAIR_CASE_LIMIT = 4
 _WORD = re.compile(r"[a-z]{3,}")
 _STOP = set(
     "self test check review request fixture calls builder return catalog assert tests with this from that they when have with which should".split()
@@ -210,7 +213,42 @@ def _line_failure_details(output):
     return dict(zip(nodes, reports, strict=True))
 
 
-def evidence(executor, task, archive, budget, patch, commands):
+@dataclass(frozen=True)
+class _PytestRun:
+    passed: int
+    failed: frozenset[str]
+    deselected: int
+
+
+def _complete_pytest_run(outcome):
+    if outcome.returncode not in (0, 1) or not outcome.stdout:
+        return None
+    text = re.sub(r"\x1b\[[0-9;]*m", "", outcome.stdout.decode("utf-8", "replace"))
+    lines = text.rstrip().splitlines()
+    if not lines or not _PYTEST_TOTALS.fullmatch(lines[-1].strip(" =")):
+        return None
+    counts = {
+        label: int(value)
+        for value, label in re.findall(r"(\d+) ([a-z]+)", lines[-1].split(" in ", 1)[0])
+    }
+    if counts.keys() - {"passed", "failed", "deselected", "warning", "warnings"}:
+        return None
+    passed, failed = counts.get("passed", 0), counts.get("failed", 0)
+    if not passed + failed or bool(failed) != bool(outcome.returncode):
+        return None
+    sections = _PYTEST_SECTION.split(text)
+    summaries = [
+        body for title, body in zip(sections[1::2], sections[2::2], strict=True)
+        if title == "short test summary info"
+    ]
+    cases = _TEST_RESULT.findall(summaries[-1]) if summaries else []
+    nodes = frozenset(node for status, node in cases if status == "FAILED")
+    if len(cases) != failed or len(nodes) != failed:
+        return None
+    return _PytestRun(passed, nodes, counts.get("deselected", 0))
+
+
+def evidence(executor, task, archive, budget, patch, commands, *, pytest_runs=None):
     with executor.verification_runner.workspace(
         archive, budget.remaining, budget.cancelled
     ) as ws:
@@ -222,6 +260,8 @@ def evidence(executor, task, archive, budget, patch, commands):
         for number, command in enumerate(commands):
             budget.claim("command", budget.limits.commands)
             outcome = executor._command(ws, budget, command, checked=False)
+            if pytest_runs is not None and check_label(command, ()) == "pytest":
+                pytest_runs[number] = _complete_pytest_run(outcome)
             if outcome.returncode:
                 output = _combined(outcome)
                 nodes = [node for _, node in _TEST_RESULT.findall(output)]
@@ -707,6 +747,7 @@ class _RegressionRepair:
     gained: set[tuple[int, str]]
     introduced: set[tuple[int, str]]
     attempts: int = 0
+    stock_origin: bool = False
 
 
 def _named_operator_cases(keys, commands):
@@ -728,8 +769,87 @@ def _named_operator_cases(keys, commands):
     )
 
 
+def _operator_case_names(fixtures):
+    names = {}
+    for path, source in fixtures.items():
+        try:
+            body = ast.parse(source).body
+        except (SyntaxError, ValueError, RecursionError):
+            continue
+        names[f"{review_recovery.OPERATOR_CHECK_ROOT}/{path}"] = {
+            name.replace(".", "::")
+            for name, node in _symbols(body)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test")
+        }
+    return names
+
+
+def _trusted_operator_node(node, command, names):
+    path, _, selection = node.partition("::")
+    if not selection:
+        return False
+    original_path = path
+    while path.startswith("../"):
+        path = path[3:]
+    path = path.removeprefix("./")
+    plain_selection = selection.split("[", 1)[0]
+    matches = 0
+    for argument in command:
+        configured, _, selected = argument.partition("::")
+        if plain_selection not in names.get(configured, ()):
+            continue
+        if original_path != configured and (
+            path.startswith("/") or not configured.endswith("/" + path)
+        ):
+            continue
+        if not selected or selection == selected or selection.startswith(
+            (selected + "::", selected + "[")
+        ):
+            matches += 1
+    return matches == 1
+
+
+def _same_pytest_selection(before, after):
+    return (
+        before is not None
+        and after is not None
+        and before.passed + len(before.failed) == after.passed + len(after.failed)
+        and before.deselected == after.deselected
+    )
+
+
+def _preserved_stock_gain(origin, baseline, candidate, failures):
+    number, node = origin
+    before, after = baseline.get(number), candidate.get(number)
+    return (
+        _same_pytest_selection(before, after)
+        and node in before.failed
+        and not after.failed
+        and all(failed_check != number for failed_check, _ in failures)
+    )
+
+
+def _verified_operator_runs(before, after, failures, operator_commands, names):
+    reported = set()
+    for number, command in enumerate(operator_commands):
+        if check_label(command, ()) != "pytest":
+            continue
+        baseline, candidate = before.get(number), after.get(number)
+        if not _same_pytest_selection(baseline, candidate) or baseline.failed:
+            return False
+        for node in candidate.failed:
+            if not _trusted_operator_node(node, command, names):
+                return False
+            reported.add((number, node))
+    return reported == failures
+
+
 def _private_repair_context(current, repair):
-    gained = ", ".join(excerpt(node, 160) for _, node in sorted(repair.gained)[:4])
+    if repair.stock_origin:
+        gained = "the entire repository pytest check containing " + excerpt(repair.origin[1], 160)
+    else:
+        gained = ", ".join(excerpt(node, 160) for _, node in sorted(repair.gained)[:4])
     return (
         "Private regression repair. Fix the selected newly failing case. "
         "Preserve all previously passing cases and the improvement in: "
@@ -835,8 +955,10 @@ def solve(executor, task, archive, budget, version):
                     interfaces.append(local + "\n" + "\n".join(outline)[:2200])
     commands = tuple(dict.fromkeys((*task.pull_checks, *task.checks)))
     assertions = operator_assertions(fixtures, review_recovery.OPERATOR_CHECK_ROOT)
+    operator_cases = _operator_case_names(fixtures)
     patch = patch_for(original, current)
-    failures = evidence(executor, task, archive, budget, patch, commands)
+    pytest_runs = {}
+    failures = evidence(executor, task, archive, budget, patch, commands, pytest_runs=pytest_runs)
     notes = {}
     rejected = {}
     last_routes = {}
@@ -1177,7 +1299,10 @@ def solve(executor, task, archive, budget, version):
                 proposed = patch_for(original, candidate)
                 if len(proposed) > executor.limits.patch_bytes:
                     raise ValueError("Patch exceeds the configured byte limit")
-                after = evidence(executor, task, archive, budget, proposed, commands)
+                after_runs = {}
+                after = evidence(
+                    executor, task, archive, budget, proposed, commands, pytest_runs=after_runs
+                )
             except ValueError as error:
                 notes[target] = str(error)[:400]
                 _LOG.info(
@@ -1227,6 +1352,17 @@ def solve(executor, task, archive, budget, version):
             new_operator = {item for item in after if item[0] < len(task.pull_checks)}
             introduced = new_operator - old_operator
             gained = old_operator - new_operator
+            stock_gain = (
+                not old_operator
+                and 0 < len(introduced) <= _STOCK_REPAIR_CASE_LIMIT
+                and snapshot is current
+                and stock_fixtures.get((target, failures.get(target)))
+                and _named_operator_cases({target}, commands)
+                and _preserved_stock_gain(target, pytest_runs, after_runs, after)
+                and _verified_operator_runs(
+                    pytest_runs, after_runs, new_operator, task.pull_checks, operator_cases
+                )
+            )
             if repair is not None:
                 improved = (
                     not (repair.gained & new_operator)
@@ -1246,6 +1382,15 @@ def solve(executor, task, archive, budget, version):
                         )
                     )
                 )
+                if repair.stock_origin:
+                    improved = (
+                        improved
+                        and _preserved_stock_gain(repair.origin, pytest_runs, after_runs, after)
+                        and _verified_operator_runs(
+                            pytest_runs, after_runs, new_operator, task.pull_checks, operator_cases
+                        )
+                        and (introduced or after.keys() < failures.keys())
+                    )
                 if not improved or introduced:
                     if improved and repair.attempts == 0:
                         regression_repair = replace(
@@ -1263,7 +1408,7 @@ def solve(executor, task, archive, budget, version):
                     continue
             elif (
                 introduced
-                and gained
+                and (gained or stock_gain)
                 and snapshot is current
                 and target not in repair_attempted
                 and regression_repair is None
@@ -1277,7 +1422,7 @@ def solve(executor, task, archive, budget, version):
                 retry_advice.clear()
                 continuations.pop(target, None)
                 regression_repair = _RegressionRepair(
-                    target, candidate, after, gained, introduced
+                    target, candidate, after, gained, introduced, stock_origin=bool(stock_gain)
                 )
                 continue
             progressed = new_operator < old_operator or (
@@ -1347,6 +1492,7 @@ def solve(executor, task, archive, budget, version):
                 )
                 continue
             current, failures, patch, actor = candidate, after, proposed, editor
+            pytest_runs = after_runs
             continuations.clear()
             regression_repair = None
             repair_attempted.clear()
