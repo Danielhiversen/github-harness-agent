@@ -2,6 +2,7 @@
 
 import ast
 import difflib
+import hashlib
 import json
 import logging
 import re
@@ -10,7 +11,12 @@ from dataclasses import replace
 
 from . import review_recovery
 from .check_artifacts import check_label
-from .checkpoint import DraftCheckpoint
+from .checkpoint import (
+    RECOVERY_GOAL_LIMIT,
+    RECOVERY_MODE_THRESHOLD,
+    DraftCheckpoint,
+    SolverRecovery,
+)
 from .executor import (
     AttemptRejected,
     CandidateEvidence,
@@ -563,6 +569,27 @@ def _coding_completion(executor, budget, messages, route, planner_input):
     )
 
 
+def _recovery_digest(task, fixtures, patch):
+    context = (
+        _GUIDANCE,
+        task.repository,
+        task.base_sha,
+        task.checkpoint_scope,
+        task.checks,
+        task.pull_checks,
+        task.require_new_tests,
+        fixtures,
+    )
+    digest = hashlib.sha256(json.dumps(context, sort_keys=True).encode())
+    digest.update(b"\x00")
+    digest.update(patch)
+    return digest.hexdigest()
+
+
+def _goal_digest(goal):
+    return hashlib.sha256(json.dumps(goal).encode()).hexdigest()
+
+
 def solve(executor, task, archive, budget, version):
     review = task.review_recovery
     if not (
@@ -665,6 +692,46 @@ def solve(executor, task, archive, budget, version):
     attempts = {}
     malformed = {}
     no_progress = {}
+    retained_failures = failures
+    retained_identity = _recovery_digest(task, fixtures, patch)
+    retained_recovery = task.solver_recovery
+    if retained_recovery and retained_recovery.identity == retained_identity:
+        goals = {goal: (bad, stalled) for goal, bad, stalled in retained_recovery.goals}
+        for target in failures:
+            bad, stalled = goals.get(_goal_digest(target), (0, 0))
+            if bad:
+                malformed[target] = bad
+            if stalled:
+                no_progress[target] = stalled
+
+    def retain_recovery(durable=False):
+        nonlocal retained_recovery
+        if task.save_solver_recovery is None:
+            return
+        goals = [
+            (_goal_digest(target), malformed.get(target, 0), no_progress.get(target, 0))
+            for target in retained_failures
+            if malformed.get(target) or no_progress.get(target)
+        ]
+        goals.sort(key=lambda goal: (-max(goal[1:]), goal[0]))
+        state = (
+            SolverRecovery(retained_identity, tuple(goals[:RECOVERY_GOAL_LIMIT]))
+            if goals
+            else None
+        )
+        if state != retained_recovery:
+            task.save_solver_recovery(state, durable)
+            retained_recovery = state
+
+    def count_recovery(counter, target):
+        previous = counter.get(target, 0)
+        next_count = min(RECOVERY_MODE_THRESHOLD, previous + 1)
+        counter[target] = next_count
+        if previous != next_count and next_count == RECOVERY_MODE_THRESHOLD:
+            # Persist mode changes before the worker can lose its lease. Shorter
+            # attempts and verified checkpoint writes coalesce other updates.
+            retain_recovery(durable=True)
+
     planned = set()
     max_proposals = min(36, budget.model_requests_remaining())
     editor = actor
@@ -742,7 +809,7 @@ def solve(executor, task, archive, budget, version):
                     check_command = commands[target[0]] if target in diagnostics else ()
                     named_definitions = (
                         target in failures
-                        and malformed.get(target, 0) >= 2
+                        and malformed.get(target, 0) >= RECOVERY_MODE_THRESHOLD
                         # Import blocks cannot be replaced by naming a definition.
                         and (not check_command or check_label(check_command, ()) != "ruff")
                     )
@@ -764,7 +831,7 @@ def solve(executor, task, archive, budget, version):
                     if (
                         target in operator
                         and target not in planned
-                        and no_progress.get(target, 0) >= 2
+                        and no_progress.get(target, 0) >= RECOVERY_MODE_THRESHOLD
                         and continuation is None
                         and launch_budget >= 2
                         and budget.remaining() > 30
@@ -831,7 +898,8 @@ def solve(executor, task, archive, budget, version):
                         else apply_blocks(completion.content, source, new_path)
                     )
                 except ValueError:
-                    malformed[target] = malformed.get(target, 0) + 1
+                    if target in failures and check_label(commands[target[0]], ()) != "ruff":
+                        count_recovery(malformed, target)
                     raise
                 if target == _TEST_GOAL:
                     candidate = {**current, **candidate}
@@ -911,7 +979,7 @@ def solve(executor, task, archive, budget, version):
             )
             if stale_regression or not (progressed or partial or prefix_progress):
                 if snapshot is current and target in old_operator and "::" in target[1]:
-                    no_progress[target] = no_progress.get(target, 0) + 1
+                    count_recovery(no_progress, target)
                 if (
                     continuation is None
                     and snapshot is current
@@ -959,6 +1027,12 @@ def solve(executor, task, archive, budget, version):
                 len(after),
             )
             budget.remaining()
+            # A new durable draft retires the earlier draft's recovery metadata.
+            malformed.clear()
+            no_progress.clear()
+            retained_failures = failures
+            retained_identity = _recovery_digest(task, fixtures, patch)
+            retain_recovery()
             task.save_checkpoint(
                 DraftCheckpoint(
                     _CHECKPOINT,
@@ -975,6 +1049,7 @@ def solve(executor, task, archive, budget, version):
     finally:
         # A running gateway request is already bounded by the shared deadline.
         pool.shutdown(wait=False, cancel_futures=True)
+        retain_recovery()
     if test_rejection is not None:
         raise test_rejection
     budget.reject(

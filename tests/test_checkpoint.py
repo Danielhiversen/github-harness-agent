@@ -1,7 +1,12 @@
 import pytest
 
-from github_harness_agent.checkpoint import DraftCheckpoint
-from github_harness_agent.controller import draft_scope, restore_drafts
+from github_harness_agent.checkpoint import DraftCheckpoint, SolverRecovery
+from github_harness_agent.controller import (
+    _retire_drafts,
+    draft_scope,
+    restore_drafts,
+    restore_solver_recovery,
+)
 from github_harness_agent.rebase import BOT_IDENTITY, RebaseConflict, TargetBase, git
 from github_harness_agent.store import Store
 
@@ -19,6 +24,29 @@ def commit(path, message):
         message,
     )
     return git(path, "rev-parse", "HEAD").decode().strip()
+
+
+def test_solver_recovery_admits_only_matching_scope_head_parent_and_bounded_counts():
+    state = SolverRecovery("a" * 64, (("b" * 64, 2, 1),))
+    envelope = {
+        "scope": "review",
+        "head": "head",
+        "parent": "parent",
+        "solver_recovery": state.to_data(),
+    }
+    assert restore_solver_recovery(envelope, "review", "head", "parent") == state
+    assert restore_solver_recovery(envelope, "new review", "head", "parent") is None
+    assert restore_solver_recovery(envelope, "review", "new head", "parent") is None
+    assert restore_solver_recovery(envelope, "review", "head", "new parent") is None
+    envelope["solver_recovery"]["goals"][0][1] = 3
+    assert restore_solver_recovery(envelope, "review", "head", "parent") is None
+
+
+def test_retiring_recovery_only_envelope_does_not_signal_a_saved_draft():
+    recovery = SolverRecovery("a" * 64, (("b" * 64, 0, 2),))
+    data = {"draft_checkpoints": {"drafts": {}, "solver_recovery": recovery.to_data()}}
+    assert not _retire_drafts(data)
+    assert not data
 
 
 @pytest.mark.parametrize("conflict", [False, True])

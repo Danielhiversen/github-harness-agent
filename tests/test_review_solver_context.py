@@ -7,7 +7,7 @@ from github_harness_agent.review_solver_context import (
 from github_harness_agent.task_context import compact_focused_review
 from github_harness_agent.review_solver import _proposal_messages
 from github_harness_agent.review_recovery import ReviewRecovery
-from github_harness_agent.task_context import compact_focused_review, wire_size
+from github_harness_agent.task_context import wire_size
 
 
 def test_matching_method_includes_owner_imports_and_referenced_definitions():

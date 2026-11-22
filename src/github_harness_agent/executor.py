@@ -18,7 +18,7 @@ from uuid import uuid4
 from .activity import observed_call
 from .check_artifacts import STAT_FILES_COMMAND, check_label
 from .check_diagnostics import check_failure_summary, required_review_checks
-from .checkpoint import DraftCheckpoint
+from .checkpoint import DraftCheckpoint, SolverRecovery
 from .file_edit import EDIT_COMMAND, EDIT_TOOL, InvalidEdit, edit_payload
 from .repair_context import repair_source_context
 from .review_recovery import (
@@ -184,6 +184,8 @@ class TaskSnapshot:
     pull_checks: tuple[tuple[str, ...], ...] = ()
     review_recovery: ReviewRecovery | None = None
     repair_failure: tuple["CheckEvidence", ...] = field(default=(), repr=False)
+    solver_recovery: SolverRecovery | None = None
+    save_solver_recovery: Callable[[SolverRecovery | None, bool], None] | None = None
 
 
 @dataclass(frozen=True)

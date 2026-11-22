@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 from threading import Lock
 
-from .checkpoint import DraftCheckpoint
+from .checkpoint import DraftCheckpoint, SolverRecovery
 from .ci import CI_BATCH_SIZE, format_ci_feedback, read_ci_report
 from .executor import AttemptRejected, ExecutionError, NeedsClarification, TaskSnapshot
 from .intake import adoptable_pull, eligible, maintainer
@@ -201,6 +201,28 @@ def restore_drafts(api, checkout, repo, origin, parent, scope, envelope):
             git(checkout, "checkout", "--detach", "--force", parent)
     except (KeyError, TypeError, ValueError) as error:
         raise RebaseConflict("saved draft metadata could not be recovered") from error
+
+
+def restore_solver_recovery(envelope, scope, head, parent):
+    if (envelope.get("scope"), envelope.get("head"), envelope.get("parent")) != (
+        scope,
+        head,
+        parent,
+    ):
+        return None
+    try:
+        return SolverRecovery.from_data(envelope.get("solver_recovery"))
+    except ValueError:
+        # Invalid optional counters must never retire a valid independent draft.
+        return None
+
+
+def _retire_drafts(data):
+    envelope = data.pop("draft_checkpoints", None)
+    if envelope and envelope.get("drafts"):
+        data["retired_draft_checkpoints"] = envelope
+        return True
+    return False
 
 
 class Controller:
@@ -400,10 +422,7 @@ class Controller:
                 if batch.head != data["review_head"]:
                     data["stage"] = "watch"
                     data.pop("ci_feedback", None)
-                    if "draft_checkpoints" in data:
-                        data["retired_draft_checkpoints"] = data.pop(
-                            "draft_checkpoints"
-                        )
+                    if _retire_drafts(data):
                         raise RebaseConflict(
                             "Pull request head changed. The previous draft was retired. "
                             "Use resume to remap outstanding feedback on the current head."
@@ -415,10 +434,7 @@ class Controller:
                 previous_keys = {item["key"] for item in data.get("feedback", ())}
                 current_keys = {item.key for item in batch.items}
                 if current_keys != previous_keys:
-                    if "draft_checkpoints" in data:
-                        data["retired_draft_checkpoints"] = data.pop(
-                            "draft_checkpoints"
-                        )
+                    _retire_drafts(data)
                     data.pop("model_attempt_failures", None)
                     data.pop("prior_model_attempt_failures", None)
                 for item in batch.handled:
@@ -625,6 +641,11 @@ class Controller:
                             key: draft.to_data() for key, draft in checkpoints.items()
                         },
                     }
+                    solver_recovery = restore_solver_recovery(
+                        existing, scope, origin, parent
+                    )
+                    if solver_recovery is not None:
+                        saved["solver_recovery"] = solver_recovery.to_data()
                     checkpoint_lock = Lock()
                     retry_offset = data.get("provider_retry_count", 0)
                     if (
@@ -634,24 +655,40 @@ class Controller:
                     ):
                         retry_offset = max(retry_offset, 1)
 
+                    def require_current_draft():
+                        if data["stage"] != stage or (
+                            stage == "repair" and data.get("review_head") != origin
+                        ):
+                            raise LeaseLost()
+
+                    def retain_envelope():
+                        if saved["drafts"] or "solver_recovery" in saved:
+                            data["draft_checkpoints"] = saved
+                        else:
+                            data.pop("draft_checkpoints", None)
+
                     def save_checkpoint(draft):
                         with checkpoint_lock:
-                            if (
-                                data["stage"] != stage
-                                or draft.base_sha != parent
-                                or data.get("review_head") != origin
-                                and stage == "repair"
-                            ):
+                            require_current_draft()
+                            if draft.base_sha != parent:
                                 raise LeaseLost()
                             if draft.patch:
                                 saved["drafts"][draft.key] = draft.to_data()
                             else:
                                 saved["drafts"].pop(draft.key, None)
-                            if saved["drafts"]:
-                                data["draft_checkpoints"] = saved
-                            else:
-                                data.pop("draft_checkpoints", None)
+                            retain_envelope()
                             store.save(job)
+
+                    def save_solver_recovery(recovery, durable):
+                        with checkpoint_lock:
+                            require_current_draft()
+                            if recovery is None:
+                                saved.pop("solver_recovery", None)
+                            else:
+                                saved["solver_recovery"] = recovery.to_data()
+                            retain_envelope()
+                            if durable:
+                                store.save(job)
 
                     context = current_context()
                     task = TaskSnapshot(
@@ -666,6 +703,8 @@ class Controller:
                         checkpoint_scope=scope,
                         checkpoints=checkpoints,
                         save_checkpoint=save_checkpoint,
+                        solver_recovery=solver_recovery,
+                        save_solver_recovery=save_solver_recovery,
                         observe_model=lambda *event: store.observe_model(job, *event),
                         context=context,
                         verify_base_first=stage == "repair"

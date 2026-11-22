@@ -150,7 +150,9 @@ def test_line_traceback_does_not_guess_when_a_location_is_missing():
     assert _line_failure_details(output) == {}
 
 
-def test_ruff_goal_keeps_search_replace_after_malformed_proposals(solver_case, monkeypatch):
+def test_ruff_goal_keeps_search_replace_after_malformed_proposals(
+    solver_case, monkeypatch
+):
     task, archive, runner, _ = solver_case
     task = replace(task, checks=(("ruff", "check", "."),))
     gateway = FreeGateway("prose", "still prose", "more prose")
@@ -255,6 +257,102 @@ def test_solver_continues_a_compound_assertion_before_checkpointing(solver_case)
     assert b"+    return 1\n" in checkpoints[0].patch
     assert b"+    return 2\n" in checkpoints[0].patch
     assert NEW_TEST.encode() in result.patch
+
+
+@pytest.mark.parametrize("same_draft", (True, False))
+@pytest.mark.parametrize("mode", ("stalled", "malformed"))
+def test_solver_restores_stalled_goal_mode_only_on_the_validated_draft(
+    solver_case, same_draft, mode
+):
+    task, archive, runner, checkpoints = solver_case
+    Path(task.pull_checks[0][-1]).write_text(TEST)
+    states = []
+    task = replace(
+        task,
+        save_solver_recovery=lambda state, durable: states.append((state, durable)),
+    )
+    first = (
+        FreeGateway(FIRST, edit(SOURCE, "    return 1\n", "    return 4\n"))
+        if mode == "stalled"
+        else FreeGateway("prose", "still prose", "more prose", "another invalid edit")
+    )
+    executor = PlainExecutor(
+        runner,
+        first,
+        Limits(model_requests=2 if mode == "stalled" else 4, concurrent_probes=1),
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+    with pytest.raises(AttemptRejected):
+        solve(executor, task, archive, budget, "fixture-version")
+    assert len(states) == 1
+    assert not checkpoints
+    state, durable = states[0]
+    assert durable
+    assert [goal[1:] for goal in state.goals] == [
+        (0, 2) if mode == "stalled" else (2, 0)
+    ]
+
+    drafts = {}
+    if not same_draft:
+        changed = patch_for(
+            {SOURCE: BASE_SOURCE},
+            {SOURCE: BASE_SOURCE.replace("return -1", "return 1")},
+        )
+        draft = DraftCheckpoint(
+            "harness2/base", task.base_sha, changed, guidance=_GUIDANCE
+        )
+        drafts[draft.key] = draft
+    resumed = replace(
+        task, checkpoints=drafts, solver_recovery=type(state).from_data(state.to_data())
+    )
+    roles = []
+    named_definitions = mode == "malformed" and same_draft
+    fix = FIRST + SECOND if same_draft else SECOND
+    if named_definitions:
+        fix = (
+            f"REPLACE {SOURCE}::first\ndef first():\n    return 1\n"
+            f"REPLACE {SOURCE}::second\ndef second():\n    return 2\n"
+        )
+    proposals = iter((fix, edit(NEW_TEST, "", TEST)))
+
+    class Gateway:
+        def complete(self, *, role, messages, **request):
+            roles.append(role)
+            if role == "coding" and roles.count("coding") == 1:
+                assert (
+                    messages[-1]["content"].endswith(
+                        "Respond with complete named Python definitions only."
+                    )
+                    == named_definitions
+                )
+            content = (
+                '{"strategy": "Fix both outputs.", "symbols": ["fixture_calc.py::first"]}'
+                if role == "planning"
+                else next(proposals)
+            )
+            return SimpleNamespace(
+                content=content,
+                tool_calls=(),
+                role=role,
+                route="stand-in-free",
+                model="fixture-coder",
+                configured_model="stand-in/free",
+                usage={},
+            )
+
+    executor = PlainExecutor(
+        runner, Gateway(), Limits(model_requests=3, concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, resumed)
+    result = solve(executor, resumed, archive, budget, "fixture-version")
+    assert roles == (
+        ["planning", "coding", "coding"]
+        if same_draft and mode == "stalled"
+        else ["coding", "coding"]
+    )
+    assert all(check.returncode == 0 for check in result.checks)
+    assert len(states) == 2
+    assert states[-1] == (None, False)
 
 
 @pytest.mark.parametrize(

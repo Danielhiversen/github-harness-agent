@@ -4,6 +4,49 @@ import base64
 import re
 from dataclasses import dataclass
 
+RECOVERY_MODE_THRESHOLD = 2
+RECOVERY_GOAL_LIMIT = 24
+
+
+@dataclass(frozen=True)
+class SolverRecovery:
+    identity: str
+    goals: tuple[tuple[str, int, int], ...]
+
+    def to_data(self):
+        return {"identity": self.identity, "goals": [list(goal) for goal in self.goals]}
+
+    @classmethod
+    def from_data(cls, value):
+        if not isinstance(value, dict):
+            raise ValueError("Invalid solver recovery state")
+        identity, goals = value.get("identity"), value.get("goals")
+        if (
+            not isinstance(identity, str)
+            or not re.fullmatch(r"[a-f0-9]{64}", identity)
+            or not isinstance(goals, list)
+            or not 1 <= len(goals) <= RECOVERY_GOAL_LIMIT
+        ):
+            raise ValueError("Invalid solver recovery state")
+        records = {}
+        for goal in goals:
+            if not isinstance(goal, list) or len(goal) != 3:
+                raise ValueError("Invalid solver recovery goal")
+            key, malformed, stalled = goal
+            if (
+                not isinstance(key, str)
+                or not re.fullmatch(r"[a-f0-9]{64}", key)
+                or key in records
+                or any(
+                    type(count) is not int or not 0 <= count <= RECOVERY_MODE_THRESHOLD
+                    for count in (malformed, stalled)
+                )
+                or not (malformed or stalled)
+            ):
+                raise ValueError("Invalid solver recovery goal")
+            records[key] = (malformed, stalled)
+        return cls(identity, tuple((key, *counts) for key, counts in records.items()))
+
 
 @dataclass(frozen=True)
 class DraftCheckpoint:
