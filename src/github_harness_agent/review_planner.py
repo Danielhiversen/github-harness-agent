@@ -21,7 +21,7 @@ from .review_delta_context import (
     resolve_symbol,
     stock_delta_context,
 )
-from .review_line_ranges import LINE_RANGE_ENDING, line_range_prompt
+from .review_line_ranges import LINE_RANGE_ENDING, _scope, line_range_prompt
 from .review_mock_replay import CounterCallerSite, compact_observations
 from .task_context import COUNTER_CALLER_EVIDENCE, excerpt, wire_size
 
@@ -48,6 +48,7 @@ class _LocalizedDefinition:
     symbol: tuple[str, str]
     baseline: str
     current: str
+    source_digest: str
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,46 @@ def localized_retry_symbol(advice):
     if isinstance(advice, _StockAdvice) and advice.localized is not None:
         return advice.localized.symbol
     return None
+
+
+def restore_pinned_stock_definition(
+    advice, original, sources, allowed, *, minimum_bytes
+):
+    """Return an exact speculative restore of one bound definition."""
+    symbol = localized_retry_symbol(advice)
+    if symbol is None:
+        return None
+    path, qualified = symbol
+    if path not in allowed or path not in original or path not in sources:
+        return None
+    located = advice.localized
+    if (
+        located.baseline == located.current
+        or len(located.current.encode()) < minimum_bytes
+        or hashlib.sha256(sources[path].encode()).hexdigest() != located.source_digest
+    ):
+        return None
+    try:
+        before = _scope(original[path], qualified)
+        after = _scope(sources[path], qualified)
+        if before is None or after is None or type(before.node) is not type(after.node):
+            return None
+        if (
+            "".join(before.rows[before.start : before.node.end_lineno])
+            != located.baseline
+            or "".join(after.rows[after.start : after.node.end_lineno])
+            != located.current
+        ):
+            return None
+        restored = (
+            "".join(after.rows[: after.start])
+            + located.baseline
+            + "".join(after.rows[after.node.end_lineno :])
+        )
+        compile(restored, path, "exec")
+    except (ValueError, SyntaxError, RecursionError):
+        return None
+    return {**sources, path: restored}
 
 
 def _counterfactual_site(mock_detail):
@@ -85,7 +126,8 @@ def _localized_definition(original, sources, key, line):
     baseline, current = "".join(old[1]), "".join(new[1])
     if max(wire_size(baseline), wire_size(current)) > STOCK_SOURCE_LIMIT:
         return None
-    return _LocalizedDefinition((path, name), baseline, current)
+    digest = hashlib.sha256(sources[path].encode()).hexdigest()
+    return _LocalizedDefinition((path, name), baseline, current, digest)
 
 
 def _localized_counter_definition(original, sources, inventory, site):

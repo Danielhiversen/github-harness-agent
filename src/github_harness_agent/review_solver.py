@@ -68,6 +68,7 @@ from .review_planner import (
     apply_coding_advice,
     localized_retry_symbol,
     request_coding_advice,
+    restore_pinned_stock_definition,
 )
 from .review_recovery import operator_acceptance_context
 from .review_solver_context import (
@@ -78,6 +79,7 @@ from .review_solver_context import (
     stock_failure_site,
     stock_pytest_excerpt,
 )
+from .review_stock_collection import stock_collection
 from .task_context import MESSAGE_BYTES, compact_focused_review, excerpt, wire_size
 from .test_updates import focused_pytest, has_runnable_test
 from .worker import Cancelled, ExecutionError, LimitExceeded
@@ -897,6 +899,7 @@ class _RegressionRepair:
     retry_note: str = ""
     retry_named: bool = False
     static_failures: dict[tuple[int, str], int] = field(default_factory=dict)
+    stock_collection_id: str | None = None
 
     def next_target(self, commands):
         if self.static_failures:
@@ -1281,6 +1284,92 @@ def solve(executor, task, archive, budget, version):
             changed_paths=changed_paths,
         )
 
+    def qualified_stock_gain(
+        target, checked, runs, operator_failures, static_failures
+    ):
+        return (
+            len(operator_failures) <= _STOCK_REPAIR_CASE_LIMIT
+            and stock_fixtures.get((target, failures.get(target)))
+            and _named_operator_cases({target}, commands)
+            and _preserved_stock_gain(target, pytest_runs, runs, checked)
+            and (
+                static_failures
+                or (operator_failures and (checked.keys() - operator_failures) < failures.keys())
+            )
+            and _verified_operator_runs(
+                pytest_runs, runs, operator_failures, task.pull_checks, operator_cases
+            )
+        )
+
+    def identify_stock_collection(target, draft_patch, probe_budget, *, failed=False):
+        run = pytest_runs[target[0]]
+        return stock_collection(
+            executor,
+            task,
+            archive,
+            probe_budget,
+            draft_patch,
+            commands[target[0]],
+            target[1],
+            run.passed + len(run.failed),
+            failed=failed,
+        )
+
+    def probe_pinned_restore(target, advice):
+        allowed = {
+            path for path in paths if not _protected(path, task, new_test=False)
+        }
+        test_path = target[1].partition("::")[0].removeprefix("/work/").removeprefix("./")
+        if (task.test_update or "").partition("::")[0] == test_path or test_path in allowed:
+            return None
+        sources = restore_pinned_stock_definition(
+            advice, original, current, allowed, minimum_bytes=_LONG_LOCALIZED_DEFINITION_BYTES
+        )
+        if sources is None:
+            return None
+        restored_patch = patch_for(original, sources)
+        if not restored_patch or len(restored_patch) > executor.limits.patch_bytes:
+            return None
+        probe_budget = _GuardBudget(budget, reserve=60)
+        runs, static_runs = {}, {}
+        try:
+            checked = evidence(
+                executor, task, archive, probe_budget, restored_patch, commands,
+                pytest_runs=runs, static_runs=static_runs,
+            )
+            operator_failures = {key for key in checked if key[0] < len(task.pull_checks)}
+            static_failures = _localized_static_failures(
+                checked.keys() - operator_failures, static_runs, sources, allowed
+            )
+            if (
+                not checked
+                or static_failures is None
+                or not qualified_stock_gain(
+                    target, checked, runs, operator_failures, static_failures
+                )
+            ):
+                return None
+            selection = identify_stock_collection(target, patch, probe_budget, failed=True)
+            if not selection or (
+                identify_stock_collection(target, restored_patch, probe_budget) != selection
+            ):
+                return None
+        except Cancelled:
+            raise
+        except (ExecutionError, ValueError):
+            budget.remaining()
+            return None
+        return _RegressionRepair(
+            target,
+            sources,
+            checked,
+            set(),
+            operator_failures,
+            stock_origin=True,
+            static_failures=static_failures,
+            stock_collection_id=selection,
+        )
+
     def verify_stock_candidate(target, sources, probe_budget, *, accept_partial=False):
         proposal = patch_for(original, sources)
         if not proposal or len(proposal) > executor.limits.patch_bytes:
@@ -1624,6 +1713,8 @@ def solve(executor, task, archive, budget, version):
     hunk_isolation_attempted = False
     regression_repair = None
     repair_attempted = set()
+    pinned_restore_attempted = False
+    pinned_restore_advice = {}
     unavailable = {}
     test_draft = current.get(new_path, "")
     test_diagnostic = ""
@@ -1639,6 +1730,7 @@ def solve(executor, task, archive, budget, version):
         continuations.clear()
         stock_edits, composition_attempted = (), False
         regression_repair = None
+        pinned_restore_advice.clear()
         repair_attempted.clear()
         unavailable.clear()
         rejected.clear()
@@ -1727,6 +1819,38 @@ def solve(executor, task, archive, budget, version):
                     )
                 ):
                     interactive_target, interactive_symbol = sole_target, None
+            if (
+                interactive_target is not None
+                and interactive_symbol is not None
+                and localized_retry_symbol(pinned_restore_advice.get(interactive_target))
+                == interactive_symbol
+                and not pinned_restore_attempted
+                and not pending
+                and retired is None
+                and private is None
+                and failures.keys() == {interactive_target}
+                and patch
+                and actor is not None
+                and actor.role == "coding"
+                and actor.configured_model
+                and interactive_target not in line_retries
+                and interactive_target not in retry_advice
+                and (stock_run := pytest_runs.get(interactive_target[0])) is not None
+                and stock_run.failed == {interactive_target[1]}
+                and launch_budget >= 1 + int(needs_tests)
+                and budget.commands_remaining() >= 3 * len(commands) + 4
+                and budget.remaining() >= 75
+            ):
+                pinned_restore_attempted = True
+                regression_repair = probe_pinned_restore(
+                    interactive_target, pinned_restore_advice[interactive_target]
+                )
+                if regression_repair is not None:
+                    repair_attempted.add(interactive_target)
+                    continuations.pop(interactive_target, None)
+                    unavailable.clear()
+                    _LOG.info("Verified pinned definition restore entered private stock repair")
+                    continue
             if (
                 interactive_target is not None
                 and not interactive_attempted
@@ -2152,6 +2276,8 @@ def solve(executor, task, archive, budget, version):
                 continue
             except _RequestBudgetExceeded:
                 continue
+            if localized_retry_symbol(fresh_advice) is not None:
+                pinned_restore_advice[target] = fresh_advice
             if completion is None:
                 retry_advice[target] = fresh_advice
                 _LOG.info("First numbered stock edit had no available coding route")
@@ -2327,22 +2453,8 @@ def solve(executor, task, archive, budget, version):
             )
             stock_gain = (
                 not old_operator
-                and len(introduced) <= _STOCK_REPAIR_CASE_LIMIT
                 and snapshot is current
-                and stock_fixtures.get((target, failures.get(target)))
-                and _named_operator_cases({target}, commands)
-                and _preserved_stock_gain(target, pytest_runs, after_runs, after)
-                and (
-                    static_failures
-                    or (introduced and (after.keys() - new_operator) < failures.keys())
-                )
-                and _verified_operator_runs(
-                    pytest_runs,
-                    after_runs,
-                    new_operator,
-                    task.pull_checks,
-                    operator_cases,
-                )
+                and qualified_stock_gain(target, after, after_runs, introduced, static_failures)
             )
             if repair is not None:
                 improved = (
@@ -2395,6 +2507,20 @@ def solve(executor, task, archive, budget, version):
                         or sum(pending_static.values())
                         < sum(repair.static_failures.values())
                     )
+                    if improved and repair.stock_collection_id is not None:
+                        try:
+                            improved = (
+                                editor.role == "coding"
+                                and bool(editor.configured_model)
+                                and identify_stock_collection(
+                                    repair.origin, proposed, _GuardBudget(budget, reserve=25)
+                                ) == repair.stock_collection_id
+                            )
+                        except Cancelled:
+                            raise
+                        except (ExecutionError, ValueError):
+                            budget.remaining()
+                            improved = False
                     if not improved:
                         reason = (
                             "The selected case still fails on the proposed edit."

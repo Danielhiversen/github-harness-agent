@@ -3281,3 +3281,150 @@ def test_scoped_rollout_paces_exact_edit_then_restores_verification(
         assert counts["shell_actions"] == (4 if scenario.startswith("stale") else 3)
     else:
         assert not counts
+
+
+@pytest.mark.parametrize("different_selection", [False, True])
+def test_pinned_stock_counterfactual_only_feeds_verified_private_repair(
+    solver_case, monkeypatch, different_selection
+):
+    from github_harness_agent import review_solver
+
+    task, _, runner, checkpoints = solver_case
+    task = replace(
+        task,
+        checks=((sys.executable, "-m", "pytest", "-q", "tests"),),
+        require_new_tests=False,
+    )
+    acceptance = Path(task.pull_checks[0][-1])
+    with acceptance.open("a") as stream:
+        stream.write(
+            "\nfrom fixture_calc import stock_value\n"
+            "\ndef test_review_value():\n    assert stock_value(review=True) == 8\n"
+        )
+    method = (
+        "\ndef stock_value(*, review=False):\n"
+        "    if review:\n"
+        "        return 7\n"
+        + "    # preserve the existing definition and its lengthy comments\n" * 110
+        + "    return 3\n"
+    )
+    original = BASE_SOURCE + method
+    test = (
+        "from fixture_calc import stock_value\n"
+        "import pytest\n\n"
+        "def test_stock():\n    assert stock_value() == 3\n"
+    )
+    if different_selection:
+        test += (
+            '\n@pytest.mark.parametrize("value", [None], ids=[str(stock_value())])\n'
+            "def test_additional(value):\n    assert value is None\n"
+        )
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, text in {SOURCE: original, "tests/test_stock.py": test}.items():
+            data = text.encode()
+            member = tarfile.TarInfo(path)
+            member.size = len(data)
+            snapshot.addfile(member, BytesIO(data))
+
+    def localize(
+        executor,
+        task,
+        archive,
+        budget,
+        command,
+        node,
+        original,
+        current,
+        fixture,
+        make_patch,
+    ):
+        line = current[SOURCE].splitlines().index("    return -3") + 1
+        return (
+            "Auxiliary counterfactual (quoted data, partial diagnostic only). "
+            f"{SOURCE}::stock_value, draft line {line}: causal evidence."
+        )
+
+    monkeypatch.setattr(review_solver, "stock_guard_diagnostic", localize)
+    monkeypatch.setattr(
+        review_solver, "mock_call_diagnostic", lambda *args, **kwargs: ""
+    )
+    probes = []
+    actual_collect = review_solver.stock_collection
+
+    def collect(*args, **kwargs):
+        fingerprint = actual_collect(*args, **kwargs)
+        probes.append(fingerprint)
+        return fingerprint
+
+    monkeypatch.setattr(review_solver, "stock_collection", collect)
+    prompts = []
+    early_edits = iter(
+        (
+            FIRST
+            + SECOND
+            + edit(SOURCE, "        return 7\n", "        return 8\n")
+            + edit(SOURCE, "    return 3\n", "    return -3\n"),
+            edit(
+                SOURCE,
+                "def stock_value(*, review=False):\n",
+                "# first stall\ndef stock_value(*, review=False):\n",
+            ),
+            edit(
+                SOURCE,
+                "def stock_value(*, review=False):\n",
+                "# second stall\ndef stock_value(*, review=False):\n",
+            ),
+        )
+    )
+
+    class Gateway:
+        def complete(self, *, role, messages, **kwargs):
+            prompt = messages[-1]["content"]
+            prompts.append(prompt)
+            if role == "planning":
+                content = json.dumps(
+                    {
+                        "strategy": "Trace the public modes.",
+                        "symbols": [f"{SOURCE}::stock_value"],
+                    }
+                )
+            elif "Private regression repair." in prompt:
+                assert checkpoints and b"+    return -3\n" in checkpoints[-1].patch
+                assert "    return 3" in prompt
+                content = edit(SOURCE, "        return 7\n", "        return 8\n")
+            elif "Advisory strategy" in prompt:
+                content = "unusable format"
+            elif len(prompts) <= 3:
+                content = next(early_edits)
+            elif "Respond with complete named Python definitions only." in prompt:
+                content = f"REPLACE {SOURCE}::stock_value\n" + method.replace(
+                    "return 7", "return 8"
+                )
+            else:
+                content = edit(SOURCE, "    return -3\n", "    return 3\n")
+            return SimpleNamespace(
+                role=role,
+                route="fixture-free",
+                model="fixture-coder",
+                configured_model="fixture/free",
+                content=content,
+                tool_calls=(),
+                usage={},
+            )
+
+    executor = PlainExecutor(
+        runner, Gateway(), Limits(model_requests=10, concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+    result = solve(executor, task, archive.getvalue(), budget, "fixture")
+    assert all(check.returncode == 0 for check in result.checks)
+    private = [prompt for prompt in prompts if "Private regression repair." in prompt]
+    assert len(private) == (0 if different_selection else 1)
+    assert len(probes) == (2 if different_selection else 3)
+    if different_selection:
+        assert all(probes) and probes[0] != probes[1]
+    else:
+        assert all(probe == probes[0] for probe in probes) and probes[0]
+    assert b"tests/test_stock.py" not in result.patch
+    assert b"+        return 8\n" in result.patch
