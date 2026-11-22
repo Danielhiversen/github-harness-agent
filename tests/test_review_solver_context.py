@@ -1,4 +1,6 @@
 from github_harness_agent.review_solver_context import focused_source_excerpt
+from github_harness_agent.review_solver import _proposal_messages
+from github_harness_agent.review_recovery import ReviewRecovery
 
 
 def test_matching_method_includes_owner_imports_and_referenced_definitions():
@@ -66,3 +68,84 @@ def test_large_active_method_leaves_room_for_constructor_and_relevant_lines():
     assert len(result) <= 520
     unanchored = focused_source_excerpt(source, "test_decode", max_chars=520)
     assert "self.encoding = encoding" in unanchored
+
+
+def test_anchor_beats_matching_wrapper_and_unrelated_class():
+    source = """class ExportPreview:
+    def preview(self):
+        return "distractor"
+
+class Reader:
+    def __init__(self):
+        self.offset = 1
+
+    def decode(self, data):
+        return data + self.offset
+
+def export_preview(reader, data):
+    return reader.decode(data)
+"""
+    result = focused_source_excerpt(
+        source, "test_export_preview", review_note="Fix export preview", anchor=10
+    )
+    assert result.startswith("# Line 9\n    def decode")
+    assert "def export_preview" in result
+    assert "self.offset = 1" in result
+    assert "distractor" not in result
+
+
+def test_top_level_assignment_anchor_includes_consuming_function():
+    source = """DEFAULT_LIMIT = 4
+
+def keep_first(values):
+    return values[:DEFAULT_LIMIT]
+
+def read_large_export(values):
+    return values
+"""
+    result = focused_source_excerpt(source, "test_read_large_export", anchor=1)
+    assert result.startswith("# Line 1\nDEFAULT_LIMIT = 4")
+    assert "def keep_first(values):" in result
+    assert "def read_large_export" not in result
+
+
+def test_innermost_function_wins_when_two_definitions_contain_anchor():
+    source = """def export(values):
+    def normalize(value):
+        return value.strip()
+    return [normalize(value) for value in values]
+"""
+    result = focused_source_excerpt(source, "test_export", anchor=3)
+    assert result.startswith("# Line 2\n    def normalize")
+
+
+def test_prompt_matches_review_note_using_selected_fixture_body():
+    source = """def trim(values):
+    return values[:4]
+
+def normalize(values):
+    return values
+"""
+    review = ReviewRecovery(
+        (
+            ("module.py", 2, "Preserve trim behavior"),
+            ("module.py", 5, "Normalize the numeric category"),
+        ),
+        "",
+    )
+    target = (0, "tests/test_shared_name.py::test_case")
+    fixtures = {
+        "elsewhere/test_shared_name.py": "def test_case():\n    assert trim(values)\n",
+        "test_shared_name.py": (
+            "def test_other():\n    assert trim(values)\n"
+            "def test_case():\n    assert normalize(numeric_category)\n"
+        ),
+    }
+    messages = _proposal_messages(
+        target, {"module.py": source}, {target: ""}, False, "", review, fixtures, (), ""
+    )
+    prompt = messages[-1]["content"]
+    assert prompt.startswith("Selected failure:")
+    assert "Editable checkout paths" in prompt
+    assert "Reviewer feedback: Normalize the numeric category" in prompt
+    assert "Focused source from module.py:\n# Line 4\ndef normalize" in prompt

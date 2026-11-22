@@ -34,6 +34,7 @@ def _references(nodes):
         for node in roots
         for child in ast.walk(node)
         if (name := getattr(child, "id", None) or getattr(child, "attr", None))
+        and not isinstance(getattr(child, "ctx", None), ast.Store)
     }
 
 
@@ -42,8 +43,42 @@ def _bindings(node):
         return {alias.asname or alias.name.split(".", 1)[0] for alias in node.names}
     if isinstance(node, _ASSIGNMENT):
         targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
-        return _references(targets)
+        return {
+            child.id
+            for target in targets
+            for child in ast.walk(target)
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+        }
     return {getattr(node, "name", None)}
+
+
+def _definitions(root):
+    pending = [(root, None)]
+    while pending:
+        node, owner = pending.pop()
+        if isinstance(node, ast.ClassDef):
+            yield node, None
+            owner = node
+        elif isinstance(node, _FUNCTION):
+            yield node, owner
+        pending.extend(
+            (child, owner) for child in reversed(list(ast.iter_child_nodes(node)))
+        )
+
+
+def _consumers(active, candidates):
+    bindings = _bindings(active)
+    for node, _ in candidates:
+        if not isinstance(node, _FUNCTION) or node is active:
+            continue
+        if isinstance(active, _ASSIGNMENT):
+            references = _references((node,))
+        else:
+            references = _references(
+                child.func for child in ast.walk(node) if isinstance(child, ast.Call)
+            )
+        if bindings & references:
+            yield node
 
 
 def focused_source_excerpt(
@@ -61,35 +96,35 @@ def focused_source_excerpt(
 
     targets = _words(target)
     notes = _words(review_note)
-    candidates = []
-    for node in module.body:
-        if isinstance(node, ast.ClassDef):
-            candidates.append((node, None))
-            candidates.extend(
-                (child, node) for child in node.body if isinstance(child, _FUNCTION)
-            )
-        elif isinstance(node, _FUNCTION):
-            candidates.append((node, None))
+    candidates = list(_definitions(module))
+    candidates.extend(
+        (node, None) for node in module.body if isinstance(node, _ASSIGNMENT)
+    )
     if not candidates:
         return source[:max_chars]
 
     def rank(candidate):
         node, owner = candidate
-        names = _words(node.name)
+        names = set().union(*(_words(name) for name in _bindings(node) if name))
         scope = _words(owner.name) if owner else set()
         at_anchor = anchor is not None and _start(node) <= anchor <= node.end_lineno
+        anchored_definition = at_anchor and not isinstance(node, ast.ClassDef)
+        start = _start(node)
         end = node.lineno if isinstance(node, ast.ClassDef) else node.end_lineno
         return (
+            anchored_definition,
+            -(end - start) if anchored_definition else 0,
             8 * len(names & targets)
             + 3 * len((names | scope) & notes)
             + 5 * at_anchor
-            + min(4, len(_words("".join(lines[_start(node) - 1 : end])) & targets)),
+            + min(4, len(_words("".join(lines[start - 1 : end])) & targets)),
             at_anchor,
             isinstance(node, _FUNCTION),
             -(node.end_lineno - node.lineno),
         )
 
     active, owner = max(candidates, key=rank)
+    consumers = list(_consumers(active, candidates)) if anchor is not None else []
     seen = set()
     excerpts = []
     remaining = max_chars
@@ -132,9 +167,11 @@ def focused_source_excerpt(
     if isinstance(active, ast.ClassDef):
         declaration(active)
     else:
-        append(active, clip_to=max_chars * 2 // 3)
+        append(active, clip_to=max_chars * (55 if consumers else 66) // 100)
     if owner is not None:
         declaration(owner)
+    for node in consumers[:2]:
+        append(node, clip_to=min(max_chars // 4, remaining))
 
     related = [active, *seen]
     for _ in range(2):

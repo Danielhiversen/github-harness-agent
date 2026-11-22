@@ -1,5 +1,6 @@
 import sys
 import tarfile
+from pathlib import Path
 from dataclasses import replace
 from io import BytesIO
 from threading import Event
@@ -141,6 +142,86 @@ TEST = (
     "def test_results():\n"
     "    assert (first(), second()) == (1, 2)\n"
 )
+
+
+def test_solver_continues_a_compound_assertion_before_checkpointing(solver_case):
+    task, archive, runner, checkpoints = solver_case
+    Path(task.pull_checks[0][-1]).write_text(TEST)
+    followup = edit(
+        SOURCE,
+        "    return 1\n\ndef second():\n    return -2\n",
+        "    return 1\n\ndef second():\n    return 2\n",
+    )
+    gateway = FreeGateway(FIRST, followup, edit(NEW_TEST, "", TEST))
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=3, concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    result = solve(executor, task, archive, budget, "fixture-version")
+
+    assert "assert (1, -2) == (1, 2)" in gateway.prompts[1]
+    assert "    return 1\n\ndef second():" in gateway.prompts[1]
+    assert len(checkpoints) == 1
+    assert b"+    return 1\n" in checkpoints[0].patch
+    assert b"+    return 2\n" in checkpoints[0].patch
+    assert NEW_TEST.encode() in result.patch
+
+
+def test_solver_discards_a_continuation_when_another_goal_advances(solver_case):
+    task, archive, runner, checkpoints = solver_case
+    continuation_started = Event()
+    other_goal_saved = Event()
+
+    def save(checkpoint):
+        checkpoints.append(checkpoint)
+        if b"+    return 2\n" in checkpoint.patch:
+            other_goal_saved.set()
+
+    class Gateway:
+        def complete(self, *, role, messages, **request):
+            prompt = messages[-1]["content"]
+            goal = prompt.splitlines()[0]
+            if "test_second" in goal:
+                assert continuation_started.wait(20)
+                proposal = SECOND
+            elif "unpublished proposal" in prompt:
+                assert "assert 0 == 1" in prompt
+                assert "assert -2 == 2" not in prompt
+                assert "Correct the second result." not in prompt
+                continuation_started.set()
+                assert other_goal_saved.wait(20)
+                proposal = FIRST + edit(
+                    SOURCE, "def first():\n", "continued = True\n\ndef first():\n"
+                )
+            elif "test_first" in goal and not continuation_started.is_set():
+                proposal = edit(SOURCE, "    return -1\n", "    return 0\n")
+            elif "test_first" in goal:
+                assert "return 0" not in prompt
+                proposal = FIRST
+            else:
+                proposal = edit(NEW_TEST, "", TEST)
+            return SimpleNamespace(
+                content=proposal,
+                tool_calls=(),
+                role=role,
+                route="stand-in-free",
+                model="fixture-coder",
+                configured_model="stand-in/free",
+                usage={},
+            )
+
+    task = replace(task, save_checkpoint=save)
+    executor = PlainExecutor(
+        runner, Gateway(), Limits(model_requests=5, concurrent_probes=2)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    result = solve(executor, task, archive, budget, "fixture-version")
+
+    assert b"+    return 2\n" in checkpoints[0].patch
+    assert all(b"continued = True" not in draft.patch for draft in checkpoints)
+    assert b"continued = True" not in result.patch
 
 
 def test_solver_keeps_verified_progress_across_free_gateway_proposals(solver_case):

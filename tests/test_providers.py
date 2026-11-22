@@ -60,6 +60,70 @@ def openai_response():
     }
 
 
+@pytest.mark.parametrize(
+    "statuses,oversized,elapsed,expected_routes",
+    [
+        ([413], True, 1, ["kilo-free", "kilo-free"]),
+        ([413, 413], True, 1, ["kilo-free", "kilo-free", "ollama-local"]),
+        ([413], False, 1, ["kilo-free", "ollama-local"]),
+        ([413], True, 20, ["kilo-free", "ollama-local"]),
+        ([429], True, 1, ["kilo-free", "ollama-local"]),
+        ([401], True, 1, ["kilo-free", "ollama-local"]),
+    ],
+)
+def test_focused_review_retries_an_oversized_413_once_before_fallback(
+    monkeypatch, statuses, oversized, elapsed, expected_routes
+):
+    calls = []
+    responses = iter(statuses)
+    now = 0
+    monkeypatch.setattr(
+        providers, "time", SimpleNamespace(monotonic=lambda: now, time=time.time)
+    )
+
+    def handle(request):
+        nonlocal now
+        calls.append(
+            (
+                request.url.host.split(".")[0],
+                json.loads(request.content),
+                request.extensions["timeout"]["read"],
+            )
+        )
+        now += elapsed
+        return httpx.Response(next(responses, 200), json=openai_response())
+
+    router = routed(deployment(KILO, OLLAMA), handle)
+    focused = (
+        "Selected failure: test_edit\nReviewer feedback: preserve ordered values\n"
+        "Focused source from module.py:\ndef edit():\n    return current_value\n"
+        "Failure details:\nwrong result\nLast proposal feedback for this goal: try again\n"
+        "\nFixture for this goal:\nassert edit()\n"
+        "\nOther reviewer feedback:\n"
+        + ("noise " * 5000 if oversized else "noise")
+        + "\nCurrent checkout:\nmodule.py\nRespond with exact SEARCH/REPLACE blocks only."
+    )
+    router.complete(
+        role="coding",
+        messages=[
+            {"role": "system", "content": "Edit source."},
+            {"role": "user", "content": focused},
+        ],
+        max_output_tokens=3072,
+    )
+    assert [alias for alias, _, _ in calls] == expected_routes
+    if expected_routes[0] == expected_routes[1]:
+        _, payload, timeout = calls[1]
+        assert payload["max_tokens"] == 1536
+        assert len(json.dumps(payload)) <= 14 * 1024
+        content = payload["messages"][1]["content"]
+        assert "preserve ordered values" in content
+        assert "return current_value" in content
+        assert "try again" in content
+        assert "Respond with exact SEARCH/REPLACE blocks only." in content
+        assert timeout == calls[0][2] - elapsed
+
+
 def quality_order():
     config = deployment(OPENROUTER, OPENROUTER_SIBLING, KILO, OLLAMA)
     config[1]["url"] = config[0]["url"]

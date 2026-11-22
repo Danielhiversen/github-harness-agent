@@ -450,6 +450,45 @@ def _review_content(text: str, max_wire: int) -> str:
     return prefix + marker + compacted + span_evidence + suffix
 
 
+def compact_focused_review(messages, *, max_bytes):
+    """Retain the active review goal and focused source while dropping bulk context."""
+    if [item.get("role") for item in messages] != ["system", "user"] or wire_size(
+        messages
+    ) <= max_bytes:
+        return None
+    system, request = messages
+    text = request.get("content")
+    if not isinstance(text, str) or not text.startswith("Selected failure: "):
+        return None
+    context, checkout_marker, _ = text.partition("\nCurrent checkout:\n")
+    goal, _, _ = context.partition("\nOther reviewer feedback:\n")
+    ending = "Respond with exact SEARCH/REPLACE blocks only."
+    if (
+        not checkout_marker
+        or "\nFocused source from " not in goal
+        or not text.endswith(ending)
+    ):
+        return None
+    test_path = next(
+        (
+            line
+            for line in reversed(context.splitlines())
+            if line.startswith("New test file: ")
+        ),
+        "",
+    )
+    footer = f"\n{test_path}\n{ending}"
+    envelope = [system, {**request, "content": footer}]
+    budget = max_bytes - wire_size(envelope)
+    if budget <= 0:
+        return None
+    lead, marker, fixture = goal.partition("\nFixture for this goal:\n")
+    kept = _bounded_content(lead, budget)
+    kept += _bounded_content(marker + fixture, budget - wire_size(kept))
+    compact = [system, {**request, "content": kept + footer}]
+    return compact if wire_size(compact) <= max_bytes else None
+
+
 def compact_messages(
     messages: Sequence[Mapping[str, Any]],
     *,

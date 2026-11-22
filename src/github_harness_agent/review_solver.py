@@ -44,6 +44,7 @@ _BLOCK = re.compile(
 )
 _MARKER = re.compile(r"^(?:<{5,}|={5,}|>{5,})(?:[ \t]|$)", re.M)
 _TEST_RESULT = re.compile(r"^(FAILED|ERROR) ([^\s]+::[^\s]+)", re.M)
+_TEST_SECTION = re.compile(r"^_{5,} (.+?) _{5,}$", re.M)
 _WORD = re.compile(r"[a-z]{3,}")
 _STOP = set(
     "self test check review request fixture calls builder return catalog assert tests with this from that they when have with which should".split()
@@ -79,7 +80,9 @@ def apply_blocks(response, sources, new_path):
             raise ValueError("Incomplete or nested SEARCH/REPLACE block")
         path = path.strip()
         if path not in sources:
-            raise ValueError("File is outside the editable source list")
+            raise ValueError(
+                "File is outside the editable source list. Use the exact listed checkout path."
+            )
         source = result[path]
         if not old:
             if path != new_path or source:
@@ -121,6 +124,20 @@ def patch_for(original, sources):
     return "".join(diff).encode()
 
 
+def _test_detail(output, node):
+    name = node.split("::", 1)[1].replace("::", ".")
+    heading = re.compile(rf"(?:ERROR at \w+ of )?{re.escape(name)}")
+    sections = _TEST_SECTION.split(output)
+    for title, body in zip(sections[1::2], sections[2::2], strict=True):
+        if heading.fullmatch(title):
+            lines = [
+                line for line in body.splitlines() if line.startswith(("E ", "> "))
+            ]
+            if lines:
+                return "\n".join(lines)[:1600]
+    return next((line for line in output.splitlines() if node in line), node)
+
+
 def evidence(executor, task, archive, budget, patch, commands):
     with executor.verification_runner.workspace(
         archive, budget.remaining, budget.cancelled
@@ -141,13 +158,7 @@ def evidence(executor, task, archive, budget, patch, commands):
                 ]:
                     key = (number, node)
                     failures[key] = (
-                        output[-3000:]
-                        if not nodes
-                        else "\n".join(
-                            line
-                            for line in output.splitlines()
-                            if node in line or line.startswith("E ")
-                        )[-1200:]
+                        output[-3000:] if not nodes else _test_detail(output, node)
                     )
                 if outcome.returncode >= 125 or outcome.returncode < 0:
                     from .worker import ExecutionError
@@ -195,37 +206,65 @@ def source_excerpt(source, target, max_chars=16000):
     )
 
 
-def _fixture_excerpt(fixtures, target):
+def _fixture_excerpt(fixtures, target, *, selected_only=False):
     selected = []
-    for path, source in fixtures.items():
+    source_name, _, selection = target.split("[", 1)[0].partition("::")
+    test_name = selection.rsplit("::", 1)[-1]
+    matching_paths = [
+        path
+        for path in fixtures
+        if source_name == path or source_name.endswith("/" + path)
+    ]
+    sources = (
+        (fixtures[max(matching_paths, key=len)],)
+        if matching_paths
+        else fixtures.values()
+    )
+    for source in sources:
         lines = source.splitlines(True)
-        for item in ast.parse(source).body:
-            if not isinstance(item, ast.FunctionDef):
+        tree = ast.parse(source)
+        items = ast.walk(tree) if selected_only else tree.body
+        for item in items:
+            if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             name = item.name
-            if name.startswith("test_") and name not in target:
+            if (selected_only or name.startswith("test_")) and name != test_name:
                 continue
             selected.append("".join(lines[item.lineno - 1 : item.end_lineno]))
     return "".join(selected)[:6000]
 
 
 def _proposal_messages(
-    target, current, failures, needs_tests, note, review, fixtures, interfaces, new_path
+    target,
+    current,
+    failures,
+    needs_tests,
+    note,
+    review,
+    fixtures,
+    interfaces,
+    new_path,
+    *,
+    continuing=False,
 ):
     diagnostic = failures.get(
         target,
         "Create runnable tests covering the requested behavior with offline fixtures.",
     )
+    fixture_query = words(_fixture_excerpt(fixtures, target[1], selected_only=True))
     query = words(target[1] + " " + diagnostic[:600])
     notes = sorted(
         review.feedback,
-        key=lambda item: len(words(item[2]) & query),
+        key=lambda item: (
+            len(words(item[2]) & fixture_query),
+            len(words(item[2]) & query),
+        ),
         reverse=True,
     )
     path, line, body = notes[0]
-    query |= words(body)
+    query |= words(body) | fixture_query
     focus = focused_source_excerpt(
-        current[path], target[1], review_note=body, anchor=line, max_chars=3000
+        current[path], target[1], review_note=body, anchor=line, max_chars=4800
     )
     source = "\n".join(
         f"FILE {name}\n"
@@ -237,8 +276,13 @@ def _proposal_messages(
         for name, content in current.items()
         if content
     )
+    editable = [
+        name for name, text in current.items() if text or (needs_tests and not failures)
+    ]
     goal = (
-        f"Selected failure: {target[1]}\nReviewer feedback: {body}\n"
+        f"Selected failure: {target[1]}\n"
+        f"Editable checkout paths (use these exact names): {', '.join(editable)}\n"
+        f"Reviewer feedback: {body}\n"
         f"Focused source from {path}:\n{focus}\n"
         f"Failure details:\n{diagnostic}\n"
     )
@@ -250,8 +294,12 @@ def _proposal_messages(
         + fixture
         + "\nImported API declarations:\n"
         + "\n".join(interfaces)
-        + "\nOther reviewer feedback:\n"
-        + "\n".join(item[2] for item in notes[1:])
+        + (
+            ""
+            if continuing
+            else "\nOther reviewer feedback:\n"
+            + "\n".join(item[2] for item in notes[1:])
+        )
         + (f"\nNew test file: {new_path}\n" if needs_tests and not failures else "")
         + "\nCurrent checkout:\n"
         + source
@@ -367,6 +415,7 @@ def solve(executor, task, archive, budget, version):
     editor = actor
     submitted = 0
     pending = {}
+    continuations = {}
     unavailable = {}
     pool = ThreadPoolExecutor(max_workers=executor.limits.concurrent_probes)
     try:
@@ -400,14 +449,14 @@ def solve(executor, task, archive, budget, version):
             operator = [key for key in failures if key[0] < len(task.pull_checks)]
             remaining = operator or list(failures) or [(-1, "new regression tests")]
             limit = executor.limits.concurrent_probes if operator else 1
-            active = {target for target, _ in pending.values()}
+            active = {target for target, _, _ in pending.values()}
             available = sorted(
                 (
                     key
                     for key in remaining
                     if key not in active and key not in unavailable
                 ),
-                key=lambda key: (attempts.get(key, 0), key),
+                key=lambda key: (key not in continuations, attempts.get(key, 0), key),
             )
             slots = min(
                 max_proposals - submitted,
@@ -417,16 +466,28 @@ def solve(executor, task, archive, budget, version):
             if not ready and slots > 0:
                 for target in available[:slots]:
                     attempts[target] = attempts.get(target, 0) + 1
+                    continuation = continuations.pop(target, None)
+                    if continuation is None:
+                        source, diagnostics = current, failures
+                        note = notes.get(target, review.previous_failure)
+                    else:
+                        source, diagnostic = continuation
+                        diagnostics = {**failures, target: diagnostic}
+                        note = (
+                            "This checkout includes one unpublished proposal. The same "
+                            "assertion still fails. Continue from these edits once."
+                        )
                     messages = _proposal_messages(
                         target,
-                        current,
-                        failures,
+                        source,
+                        diagnostics,
                         needs_tests,
-                        notes.get(target, review.previous_failure),
+                        note,
                         review,
                         fixtures,
                         interfaces,
                         new_path,
+                        continuing=continuation is not None,
                     )
                     future = pool.submit(
                         budget.complete,
@@ -436,7 +497,7 @@ def solve(executor, task, archive, budget, version):
                         after_provider=last_routes.get(target),
                         max_output_tokens=3072,
                     )
-                    pending[future] = target, current
+                    pending[future] = target, current, continuation
                     submitted += 1
             if not pending:
                 for target in remaining:
@@ -451,7 +512,9 @@ def solve(executor, task, archive, budget, version):
             if not done:
                 continue
             future = next(future for future in pending if future in done)
-            target, snapshot = pending.pop(future)
+            target, snapshot, continuation = pending.pop(future)
+            if continuation is not None and snapshot is not current:
+                continue
             try:
                 completion = future.result()
             except ProviderExhausted as error:
@@ -465,7 +528,8 @@ def solve(executor, task, archive, budget, version):
             last_routes[target] = completion.route
             editor = RouteEvidence.from_completion(completion)
             try:
-                candidate = apply_blocks(completion.content, current, new_path)
+                source = current if continuation is None else continuation[0]
+                candidate = apply_blocks(completion.content, source, new_path)
                 if (
                     failures
                     and needs_tests
@@ -502,11 +566,24 @@ def solve(executor, task, archive, budget, version):
                 snapshot is not current and not after.keys() <= failures.keys()
             )
             if stale_regression or (not progressed and not (test_added and not after)):
+                if (
+                    continuation is None
+                    and snapshot is current
+                    and target in old_operator
+                    and "::" in target[1]
+                    and after.keys() == failures.keys()
+                ):
+                    continuations[target] = candidate, after[target]
+                    continue
+                details = [
+                    (key, value)
+                    for key, value in after.items()
+                    if continuation is None or key == target
+                ][:5]
                 notes[target] = (
                     "Proposal was discarded. Remaining diagnostics on that proposal: "
                     + " ".join(
-                        f"{name}: {value[-450:]}"
-                        for (_, name), value in list(after.items())[:5]
+                        f"{name}: {value[-450:]}" for (_, name), value in details
                     )
                 )[-2200:]
                 _LOG.info(
@@ -516,6 +593,7 @@ def solve(executor, task, archive, budget, version):
                 )
                 continue
             current, failures, patch, actor = candidate, after, proposed, editor
+            continuations.clear()
             last_routes.pop(target, None)
             notes.pop(target, None)
             if not failures and (

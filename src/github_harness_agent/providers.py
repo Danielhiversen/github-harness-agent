@@ -29,11 +29,18 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from .task_context import MESSAGE_BYTES, compact_messages, wire_size
+from .task_context import (
+    MESSAGE_BYTES,
+    compact_focused_review,
+    compact_messages,
+    wire_size,
+)
 
 logger = logging.getLogger(__name__)
 DEFAULT_REQUEST_TIMEOUT = 60
 MAX_REQUEST_TIMEOUT = 900
+_FOCUSED_RETRY_INPUT_BYTES = 12 * 1024
+_FOCUSED_RETRY_OUTPUT_TOKENS = 1536
 _OLLAMA_ORIGIN = "http://127.0.0.1:11434"
 _OLLAMA_API = f"{_OLLAMA_ORIGIN}/v1"
 _LOCAL_MODEL_NAME = re.compile(
@@ -795,7 +802,9 @@ class ProviderRouter:
         )
         for route in routes:
             key = (route.alias, route.model)
-            attempt_timeout = min(route.attempt_timeout, deadline - time.monotonic())
+            now = time.monotonic()
+            attempt_deadline = min(deadline, now + route.attempt_timeout)
+            attempt_timeout = attempt_deadline - now
             if attempt_timeout <= 0:
                 failures["gateway"] = "deadline exceeded"
                 break
@@ -815,24 +824,29 @@ class ProviderRouter:
                 )
                 if route.protocol == "gemini":
                     url = f"{route.url}/models/{quote(route.model, safe='')}:generateContent"
-                    payload = _gemini_payload(route, messages, tools, max_tokens)
+                    builder = _gemini_payload
+                    route_messages = messages
                 else:
                     url = f"{route.url}/chat/completions"
+                    builder = _chat_payload
                     route_messages = messages
                     if route.local_input_bytes is not None:
-                        route_messages = compact_messages(
+                        focused = compact_focused_review(messages, max_bytes=route.local_input_bytes) if (
+                            role == "coding" and not tools and max_output_tokens is not None
+                        ) else None
+                        route_messages = focused or compact_messages(
                             messages,
                             max_bytes=route.local_input_bytes,
                             role=role,
                             review_windows=True,
                         )
-                    payload = _chat_payload(route, route_messages, tools, max_tokens)
-                    if (
-                        route.local_input_bytes is not None
-                        and wire_size(payload["messages"]) > route.local_input_bytes
-                    ):
-                        failures[route.alias] = "local input limit exceeded"
-                        continue
+                payload = builder(route, route_messages, tools, max_tokens)
+                if (
+                    route.local_input_bytes is not None
+                    and wire_size(payload["messages"]) > route.local_input_bytes
+                ):
+                    failures[route.alias] = "local input limit exceeded"
+                    continue
                 logger.info(
                     "Provider attempt provider=%s configured_model=%s",
                     route.alias,
@@ -844,28 +858,61 @@ class ProviderRouter:
                         _post_pinned_ollama(
                             route,
                             payload,
-                            min(attempt_timeout, deadline - time.monotonic()),
+                            attempt_deadline - time.monotonic(),
                         )
                     )
                     if response is None:
                         failures[route.alias] = "model unavailable"
                         continue
                 else:
-                    response = self.client.post(
-                        url,
-                        json=payload,
-                        headers=route.headers,
-                        timeout=attempt_timeout,
-                        follow_redirects=False,
-                    )
+
+                    def post(body):
+                        remaining = attempt_deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError
+                        return self.client.post(
+                            url,
+                            json=body,
+                            headers=route.headers,
+                            timeout=remaining,
+                            follow_redirects=False,
+                        )
+
+                    response = post(payload)
+                    if (
+                        response.status_code == 413
+                        and role == "coding"
+                        and not tools
+                        and max_output_tokens is not None
+                    ):
+                        compact = compact_focused_review(
+                            route_messages, max_bytes=_FOCUSED_RETRY_INPUT_BYTES
+                        )
+                        if compact is not None and time.monotonic() < attempt_deadline:
+                            retry_payload = builder(
+                                route,
+                                compact,
+                                tools,
+                                min(max_tokens, _FOCUSED_RETRY_OUTPUT_TOKENS),
+                            )
+                            logger.info(
+                                "Provider retrying compact review provider=%s configured_model=%s",
+                                route.alias,
+                                route.model,
+                            )
+                            response = post(retry_payload)
                 retry_after = response.headers.get("Retry-After")
                 if (
                     response.status_code == 429
                     or response.status_code == 503
                     and retry_after
                 ):
-                    logger.info("Provider deferred provider=%s configured_model=%s status=%d",
-                                route.alias, route.model, response.status_code)
+                    logger.info(
+                        "Provider deferred provider=%s configured_model=%s status=%d",
+                        route.alias,
+                        route.model,
+                        response.status_code,
+                    )
                     cooldown = _retry_time(retry_after)
                     with self._lock:
                         self._quota_cooldown[route.quota_key] = cooldown
@@ -890,8 +937,12 @@ class ProviderRouter:
                 return
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
-                logger.info("Provider rejected provider=%s configured_model=%s status=%d",
-                            route.alias, route.model, status)
+                logger.info(
+                    "Provider rejected provider=%s configured_model=%s status=%d",
+                    route.alias,
+                    route.model,
+                    status,
+                )
                 failures[route.alias] = {
                     401: "invalid or missing credentials",
                     403: "account or model ineligible",
@@ -900,7 +951,11 @@ class ProviderRouter:
                 if status is not None and status >= 500:
                     retry_times.append(self._defer_model(key))
             except (httpx.TimeoutException, TimeoutError):
-                logger.info("Provider timed out provider=%s configured_model=%s", route.alias, route.model)
+                logger.info(
+                    "Provider timed out provider=%s configured_model=%s",
+                    route.alias,
+                    route.model,
+                )
                 failures[route.alias] = "upstream timeout"
                 retry_times.append(self._defer_model(key))
             except httpx.RequestError:
