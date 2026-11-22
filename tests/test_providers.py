@@ -1176,6 +1176,94 @@ def mock_async_local(monkeypatch, handler):
     )
 
 
+@pytest.mark.parametrize("timeout_error", [httpx.ReadTimeout, TimeoutError])
+def test_long_inference_timeout_defers_only_the_timed_out_model(monkeypatch, timeout_error):
+    clock = [1000.0]
+    monkeypatch.setattr(
+        providers, "time",
+        SimpleNamespace(monotonic=lambda: clock[0], time=lambda: clock[0]),
+    )
+    cloud_model = KILO.split("/", 1)[1]
+    sibling = "harness-alternate-coder:14b"
+    attempts = []
+
+    async def local(request):
+        if request.method == "GET":
+            inventory = local_inventory()
+            inventory["models"].append({"name": sibling, "digest": LOCAL_DIGEST, "size": 300000})
+            return httpx.Response(200, json=inventory)
+        model = json.loads(request.content)["model"]
+        attempts.append(model)
+        if model == LOCAL_MODEL and attempts.count(LOCAL_MODEL) == 1:
+            assert request.extensions["timeout"]["read"] == 480
+            clock[0] += 480
+            raise timeout_error("fixture")
+        return httpx.Response(200, json={**openai_response(), "model": model})
+
+    def cloud(request):
+        attempts.append(json.loads(request.content)["model"])
+        return httpx.Response(200, json=openai_response())
+
+    mock_async_local(monkeypatch, local)
+    cloud_route, = deployment(KILO)
+    cloud_route["quality_priority"] = 2
+    router = routed(
+        [
+            pinned_local(quality_priority=3),
+            cloud_route,
+            pinned_local(model=f"ollama-local/{sibling}", quality_priority=1),
+        ],
+        cloud,
+    )
+    options = {"role": "plain", "messages": [], "timeout": 600}
+
+    assert router.complete(**options).configured_model == cloud_model
+    clock[0] += 20
+    assert router.complete(**options).configured_model == cloud_model
+    assert router.complete(**options, exclude=[("kilo-free", cloud_model)]).configured_model == sibling
+    clock[0] = 2379
+    assert router.complete(**options).configured_model == cloud_model
+    clock[0] = 2380
+    assert router.complete(**options).configured_model == LOCAL_MODEL
+    assert router.complete(**options).configured_model == LOCAL_MODEL
+    assert attempts == [LOCAL_MODEL, cloud_model, cloud_model, sibling, cloud_model, LOCAL_MODEL, LOCAL_MODEL]
+
+
+@pytest.mark.parametrize(
+    "failure_method,failure", [
+        ("POST", httpx.ConnectTimeout),
+        ("POST", httpx.ConnectError),
+        ("POST", 500),
+        ("GET", httpx.ReadTimeout),
+    ],
+)
+def test_network_and_server_failures_keep_short_model_backoff(monkeypatch, failure_method, failure):
+    clock = [1000.0]
+    monkeypatch.setattr(
+        providers, "time",
+        SimpleNamespace(monotonic=lambda: clock[0], time=lambda: clock[0]),
+    )
+    attempts = []
+
+    async def handle(request):
+        if request.method == failure_method and not attempts:
+            attempts.append(request)
+            if failure == 500:
+                return httpx.Response(500)
+            raise failure("fixture")
+        if request.method == "GET":
+            return httpx.Response(200, json=local_inventory())
+        return httpx.Response(200, json={**openai_response(), "model": LOCAL_MODEL})
+
+    mock_async_local(monkeypatch, handle)
+    router = ProviderRouter(load_manifest(), [pinned_local()])
+    with pytest.raises(ProviderExhausted) as error:
+        router.complete(role="plain", messages=[])
+    assert error.value.retry_at == 1015
+    clock[0] = 1015
+    assert router.complete(role="plain", messages=[]).configured_model == LOCAL_MODEL
+
+
 @pytest.mark.parametrize("route_cap,requested", [(4096, None), (2048, 3072)])
 def test_pinned_unlisted_ollama_model_uses_loopback_inventory_and_completion(
     monkeypatch,

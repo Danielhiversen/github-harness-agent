@@ -50,6 +50,8 @@ _LOCAL_MODEL_NAME = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
 )
 _LOCAL_ATTEMPT_MAX = 480
+_MODEL_BACKOFF_SECONDS = 15
+_INFERENCE_BACKOFF_MAX_SECONDS = 900
 
 PUBLIC_ALIASES = frozenset(
     {
@@ -511,6 +513,10 @@ def _local_spec(item: dict, alias: str, model: str) -> tuple[int, str] | None:
     return max_tokens, digest
 
 
+class _LocalInferenceTimeout(TimeoutError):
+    pass
+
+
 async def _post_pinned_ollama(
     route: _Route, payload: dict, timeout: float
 ) -> httpx.Response | None:
@@ -518,28 +524,35 @@ async def _post_pinned_ollama(
         raise TimeoutError
     # An HTTP read timeout only bounds individual reads. Keep one deadline for
     # the inventory check and the complete local response.
-    async with asyncio.timeout(timeout):
-        async with httpx.AsyncClient(follow_redirects=False, trust_env=False) as client:
-            inventory = await client.get(
-                f"{_OLLAMA_ORIGIN}/api/tags", timeout=min(5, timeout)
-            )
-            inventory.raise_for_status()
-            rows = inventory.json().get("models")
-            if not isinstance(rows, list) or not any(
-                isinstance(row, dict)
-                and (row.get("name") or row.get("model")) == route.model
-                and not (row.get("remote_model") or row.get("remote_host"))
-                and type(row.get("size")) is int
-                and row["size"] > 0
-                and isinstance(row.get("digest"), str)
-                and row["digest"].lower().removeprefix("sha256:")
-                == route.local_model_digest
-                for row in rows
-            ):
-                return None
-            return await client.post(
-                f"{_OLLAMA_API}/chat/completions", json=payload, timeout=timeout
-            )
+    inference_started = False
+    try:
+        async with asyncio.timeout(timeout):
+            async with httpx.AsyncClient(follow_redirects=False, trust_env=False) as client:
+                inventory = await client.get(
+                    f"{_OLLAMA_ORIGIN}/api/tags", timeout=min(5, timeout)
+                )
+                inventory.raise_for_status()
+                rows = inventory.json().get("models")
+                if not isinstance(rows, list) or not any(
+                    isinstance(row, dict)
+                    and (row.get("name") or row.get("model")) == route.model
+                    and not (row.get("remote_model") or row.get("remote_host"))
+                    and type(row.get("size")) is int
+                    and row["size"] > 0
+                    and isinstance(row.get("digest"), str)
+                    and row["digest"].lower().removeprefix("sha256:")
+                    == route.local_model_digest
+                    for row in rows
+                ):
+                    return None
+                inference_started = True
+                return await client.post(
+                    f"{_OLLAMA_API}/chat/completions", json=payload, timeout=timeout
+                )
+    except (httpx.ReadTimeout, TimeoutError) as exc:
+        if inference_started:
+            raise _LocalInferenceTimeout from exc
+        raise
 
 
 def _completion_timeout(timeout: float | None) -> float:
@@ -1082,14 +1095,20 @@ class ProviderRouter:
                 }.get(status, f"upstream HTTP {status}")
                 if status is not None and status >= 500:
                     retry_times[key] = self._defer_model(key)
-            except (httpx.TimeoutException, TimeoutError):
+            except (httpx.TimeoutException, TimeoutError) as exc:
                 logger.info(
                     "Provider timed out provider=%s configured_model=%s",
                     route.alias,
                     route.model,
                 )
                 failures[route.alias] = "upstream timeout"
-                retry_times[key] = self._defer_model(key)
+                delay = _MODEL_BACKOFF_SECONDS
+                if isinstance(exc, _LocalInferenceTimeout):
+                    delay = max(
+                        _MODEL_BACKOFF_SECONDS,
+                        min(2 * route.attempt_timeout, _INFERENCE_BACKOFF_MAX_SECONDS),
+                    )
+                retry_times[key] = self._defer_model(key, delay)
             except httpx.RequestError:
                 failures[route.alias] = "upstream connection failed"
                 retry_times[key] = self._defer_model(key)
@@ -1101,8 +1120,10 @@ class ProviderRouter:
 
         raise ProviderExhausted(min(retry_times.values(), default=None), failures)
 
-    def _defer_model(self, key: tuple[str, str]) -> float:
-        retry_at = time.time() + 15
+    def _defer_model(
+        self, key: tuple[str, str], delay: float = _MODEL_BACKOFF_SECONDS
+    ) -> float:
+        retry_at = time.time() + delay
         with self._lock:
             self._model_cooldown[key] = retry_at
         return retry_at
