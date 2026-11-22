@@ -97,3 +97,13 @@ def test_private_static_ruff_locations_require_complete_lint_diagnostics():
         ordinary_static_locations(command, output.replace("Found 2", "Found 3")) == ()
     )
     assert ordinary_static_locations(command, "ruff failed\n" + output) == ()
+
+
+
+def test_one_static_check_can_report_multiple_local_errors_in_private_recovery():
+    from github_harness_agent.review_solver import _localized_static_failures
+
+    source = {"core.py": "a = 1\nb = 2\nc = 3\n"}
+    key = (3, "check 4 (exit 1)")
+    runs = {3: (("core.py", 1), ("core.py", 2), ("core.py", 3))}
+    assert _localized_static_failures({key}, runs, source, set(source)) == {key: 3}

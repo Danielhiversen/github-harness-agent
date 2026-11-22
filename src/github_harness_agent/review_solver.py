@@ -868,18 +868,17 @@ def _retry_stock_repair(repair, note, named_definitions):
 
 
 def _localized_static_failures(keys, static_runs, sources, allowed):
-    total = 0
+    if len(keys) > _STOCK_REPAIR_STATIC_LIMIT:
+        return None
+    line_counts = {path: len(sources[path].splitlines()) for path in allowed}
     checked = {}
     for number, node in keys:
         locations = static_runs.get(number)
         if not locations or node != f"check {number + 1} (exit 1)":
             return None
-        total += len(locations)
-        if total > _STOCK_REPAIR_STATIC_LIMIT:
-            return None
         for path, row in locations:
             path = path.removeprefix("/work/").removeprefix("./")
-            if path not in allowed or not 1 <= row <= len(sources[path].splitlines()):
+            if not 1 <= row <= line_counts.get(path, 0):
                 return None
         checked[number, node] = len(locations)
     return checked
