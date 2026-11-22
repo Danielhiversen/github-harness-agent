@@ -1654,6 +1654,16 @@ def solve(executor, task, archive, budget, version):
             new_operator = {item for item in after if item[0] < len(task.pull_checks)}
             introduced = new_operator - old_operator
             gained = old_operator - new_operator
+            if stock_fixtures.get((target, failures.get(target))):
+                # Record checked behavior, without exposing a model reply or test values.
+                run = after_runs.get(target[0])
+                check_types = sorted({check_label(commands[number], ()) or "configured" for number, _ in after})
+                _LOG.info(
+                    "Tracked repair verification via %s: repository pytest passed=%s failed=%s; "
+                    "failing review cases=%d; outstanding checks=%s",
+                    completion.route, run.passed if run else "unknown",
+                    len(run.failed) if run else "unknown", len(new_operator), ", ".join(check_types) or "none",
+                )
             stock_gain = (
                 not old_operator
                 and 0 < len(introduced) <= _STOCK_REPAIR_CASE_LIMIT
