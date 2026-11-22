@@ -464,6 +464,61 @@ def stock_assertion_evaluated(archive, node, before, after):
     return stock_assertion_progress(archive, node, before, after) == _LOOKUP_PROGRESS
 
 
+def stock_missing_count_after_reorder(archive, node, before, after, expected_line):
+    """Describe the observed loss of a literal mapping entry at one pinned count assertion."""
+    selected = _stock_node_match(node)
+    if selected is None or (
+        _stock_frame(selected, before) != (expected_line, "AssertionError")
+        or _stock_frame(selected, after) != (expected_line, "KeyError")
+    ):
+        return ""
+    comparison = _INTEGER_COMPARISON.fullmatch(_rewritten_assertion(before) or "")
+    test = _tracked_stock_test(archive, selected)
+    if comparison is None or test is None:
+        return ""
+    assertions = [
+        node.test
+        for node in ast.walk(test)
+        if isinstance(node, ast.Assert) and node.lineno == expected_line
+    ]
+    if len(assertions) != 1:
+        return ""
+    assertion = assertions[0]
+    if (
+        not isinstance(assertion, ast.Compare)
+        or len(assertion.ops) != 1
+        or not isinstance(assertion.ops[0], ast.Eq)
+        or not isinstance(assertion.left, ast.Subscript)
+        or not isinstance(assertion.left.slice, ast.Constant)
+        or type(assertion.left.slice.value) not in {str, int}
+        or not isinstance(expected := assertion.comparators[0], ast.Constant)
+        or type(expected.value) is not int
+    ):
+        return ""
+    recorded, wanted = map(int, comparison.groups())
+    if wanted != expected.value or recorded == wanted:
+        return ""
+    observed_keys = set(
+        re.findall(
+            r"(?:^E[ \t]+|^.+\.py:[0-9]+: )KeyError: ([^\n]{1,160})$", after, re.M
+        )
+    )
+    if len(observed_keys) != 1:
+        return ""
+    try:
+        missing = ast.literal_eval(observed_keys.pop())
+    except (ValueError, SyntaxError, RecursionError):
+        return ""
+    key = assertion.left.slice.value
+    if type(missing) is not type(key) or missing != key:
+        return ""
+    return (
+        f"The unchanged tracked assertion observed a count of {recorded} instead of {wanted}. "
+        "Exchanging the adjacent filters in an isolated trial raised KeyError for the required "
+        "mapping entry at that same assertion. The trial was discarded."
+    )
+
+
 def _start(node):
     return min(
         [

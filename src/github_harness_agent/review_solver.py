@@ -93,6 +93,7 @@ from .review_solver_context import (
     stock_assertion_failure_line,
     stock_failure_site,
     stock_integer_assertion_failure_line,
+    stock_missing_count_after_reorder,
     stock_pytest_excerpt,
 )
 from .review_stock_collection import stock_collection
@@ -1768,7 +1769,7 @@ def solve(executor, task, archive, budget, version):
         focused = focused_pytest((commands[target[0]],), (target[1],))
         proposal = patch_for(original, sources)
         if focused is None or not 0 < len(proposal) <= executor.limits.patch_bytes:
-            return None
+            return None, ""
         probe = _GuardBudget(budget, reserve=60)
         focus = _GuardBudget(probe, wall_seconds=_STOCK_HUNK_SECONDS, reserve=0)
         runs = {}
@@ -1783,12 +1784,21 @@ def solve(executor, task, archive, budget, version):
                 and run.passed == 1
                 and not run.deselected
             ):
-                return verify_stock_gain(target, sources, probe)
+                return verify_stock_gain(target, sources, probe), ""
+            selected = (0, target[1])
+            if (
+                run is not None
+                and not run.passed
+                and not run.deselected
+                and run.failed == {target[1]}
+                and checked.keys() == {selected}
+            ):
+                return None, checked[selected]
         except Cancelled:
             raise
         except (ExecutionError, ValueError):
             budget.remaining()
-        return None
+        return None, ""
 
     def guard_order_with_operator_failures(target, operator_failures):
         number, node = target
@@ -1886,7 +1896,9 @@ def solve(executor, task, archive, budget, version):
             )
         )
 
-    def precision_stock_gain(target, signal):
+    def precision_stock_gain(
+        target, signal, *, counterfactual="", paired_source="", verify=None
+    ):
         node = target[1]
         exact = node.partition("[")[0].removeprefix("/work/").removeprefix("./")
         test_path = exact.partition("::")[0]
@@ -1904,26 +1916,36 @@ def solve(executor, task, archive, budget, version):
         for site in (signal.owner, signal.mutation):
             source = current.get(site.path, "")
             if (
-                site.path not in paths or _protected(site.path, task, new_test=False)
-                or not source or hashlib.sha256(source.encode()).hexdigest() != site.source_digest
+                site.path not in paths
+                or _protected(site.path, task, new_test=False)
+                or not source
+                or hashlib.sha256(source.encode()).hexdigest() != site.source_digest
             ):
                 return None
         symbol = signal.owner.path, signal.owner.name
         scoped = prepare_loop_line_range_edit(
-            current, symbol, signal.body_line, signal.variable, signal.owner.line,
+            current,
+            symbol,
+            signal.body_line,
+            signal.variable,
+            signal.owner.line,
         )
         if scoped is None:
             return None
         snapshot, visible_rows, allowed_rows = scoped
         mutation = signal.mutation
         rows = current[mutation.path].splitlines()
-        nearby = "\n".join(rows[max(0, mutation.line - 3):mutation.line + 2])
+        nearby = "\n".join(rows[max(0, mutation.line - 3) : mutation.line + 2])
         if wire_size(fixture) > 1700:
             window = stock_pytest_excerpt(
-                archive, commands[target[0]], node, diagnostic, failure_window_only=True,
+                archive,
+                commands[target[0]],
+                node,
+                diagnostic,
+                failure_window_only=True,
             )
             fixture = window + "\n" + excerpt(fixture, 1050)
-        instructions = (
+        detail = (
             f"Selected failure: {node}\n"
             "Repair repeated logical processing with a small scoped edit. Identify the durable domain "
             "identity and when the record should count. Distinct records must still be processed. "
@@ -1937,31 +1959,59 @@ def solve(executor, task, archive, budget, version):
             f"{mutation.path}:{mutation.line} {mutation.name}\n{excerpt(nearby, 390)}\n"
             f"Immutable failing pytest input and setup (quoted):\n{fixture}\n"
             f"Observed pytest failure (quoted):\n{excerpt(diagnostic, 450)}\n"
-            + line_range_prompt(snapshot, visible_rows=visible_rows)
-            + LINE_RANGE_ENDING
+        )
+        if counterfactual:
+            detail += (
+                f"Verified order-only counterfactual (quoted observation):\n{counterfactual}\n"
+                "Compare stable record keys and the current and pinned processing. Consider when a "
+                "logical record should create or increment the metric. Keep unrelated rules intact.\n"
+            )
+        context = (
+            f"Pinned caller excerpt (quoted, read-only):\n{excerpt(paired_source, 410)}\n"
+            if counterfactual and paired_source
+            else ""
+        )
+        ending = (
+            line_range_prompt(snapshot, visible_rows=visible_rows) + LINE_RANGE_ENDING
         )
         messages = [
             {"role": "system", "content": _LINE_RANGE_SYSTEM},
-            {"role": "user", "content": instructions},
+            {"role": "user", "content": detail + context + ending},
         ]
+        if context and wire_size(messages) > 7500:
+            messages[-1]["content"] = detail + ending
         if wire_size(messages) > 7500:
             return None
         try:
             completion = budget.complete(
-                executor.gateway, "coding", messages,
-                after_provider=actor.route, max_output_tokens=2048, retry_oversize=False,
+                executor.gateway,
+                "coding",
+                messages,
+                after_provider=actor.route,
+                max_output_tokens=2048,
+                retry_oversize=False,
                 timeout_cap=_LOOP_PRECISION_MODEL_SECONDS,
             )
             editor = RouteEvidence.from_completion(completion)
             if editor.role != "coding" or not editor.configured_model:
                 return None
             proposed = apply_line_range_edit(
-                completion.content, current, snapshot, allowed_rows=allowed_rows,
+                completion.content,
+                current,
+                snapshot,
+                allowed_rows=allowed_rows,
             )
-            verified = verify_stock_candidate(
-                target, proposed, _GuardBudget(budget, reserve=_LOOP_PRECISION_RESERVE_SECONDS),
-                accept_partial=True,
-            )
+            probe = _GuardBudget(budget, reserve=_LOOP_PRECISION_RESERVE_SECONDS)
+            if verify is not None:
+                qualification = verify(target, proposed, probe)
+                verified = (qualification, "") if qualification is not None else None
+            else:
+                verified = verify_stock_candidate(
+                    target,
+                    proposed,
+                    probe,
+                    accept_partial=not counterfactual,
+                )
             if verified is not None:
                 return *verified, editor
         except Cancelled:
@@ -1970,9 +2020,74 @@ def solve(executor, task, archive, budget, version):
             budget.remaining()
         return None
 
+    def try_guard_precision(target, trace, focused_failure, *, verify=None):
+        nonlocal current, failures, patch, pytest_runs, actor, editor
+        nonlocal precision_attempted, submitted
+        needs_regression = task.require_new_tests and not has_runnable_test(
+            new_path, current[new_path].encode()
+        )
+        if (
+            precision_attempted
+            or not focused_failure
+            or actor is None
+            or actor.role != "coding"
+            or not actor.configured_model
+            or target not in failures
+            or (failures.keys() != {target} and verify is None)
+            or executor.verification_runner is executor.runner
+            or min(max_proposals - submitted, budget.model_requests_remaining())
+            < 1 + int(needs_regression)
+            or budget.commands_remaining() < 3 * len(commands) + 4
+            or budget.remaining()
+            < _LOOP_PRECISION_MODEL_SECONDS
+            + _LOOP_PRECISION_RESERVE_SECONDS
+            + _GUARD_MIN_REMAINING
+            or (signal := counter_loop_reuse(trace)) is None
+        ):
+            return False
+        observation = stock_missing_count_after_reorder(
+            archive, target[1], failures[target], focused_failure, signal.assertion_line
+        )
+        if not observation:
+            return False
+        site = counter_caller_site(trace)
+        pinned = (
+            site.excerpts.partition("\nDraft caller source")[0]
+            if site is not None
+            else ""
+        )
+        precision_attempted = True
+        before = budget.model_requests_remaining()
+        _LOG.info(
+            "Trying scoped precision after a verified filter-order counterfactual"
+        )
+        proposed = precision_stock_gain(
+            target,
+            signal,
+            counterfactual=observation,
+            paired_source=pinned,
+            verify=verify,
+        )
+        submitted += before - budget.model_requests_remaining()
+        if proposed is None:
+            return False
+        (_, _, checked, runs), _, _ = proposed
+        if not checked.keys() < failures.keys() or not _preserved_stock_gain(
+            target, pytest_runs, runs, checked
+        ):
+            return False
+        (current, patch, failures, pytest_runs), note, actor = proposed
+        editor = actor
+        start_new_draft(target)
+        if failures or needs_regression:
+            save_verified_progress(patch, note, editor)
+        return True
+
     def interactive_stock_gain(target, symbol, probe):
         reviewed = {
-            path: current[path] for path in paths if not _protected(path, task, new_test=False)
+            path: current[path]
+            for path in paths
+            if not _protected(path, task, new_test=False)
         }
         if not reviewed:
             return None
@@ -2453,7 +2568,9 @@ def solve(executor, task, archive, budget, version):
                         command,
                         eager_target[1],
                         patch,
-                        failure_line=stock_assertion_failure_line(eager_target[1], diagnostic),
+                        failure_line=stock_assertion_failure_line(
+                            eager_target[1], diagnostic
+                        ),
                         reviewed_sources=(original, current),
                     )
                     loop = counter_loop_reuse(eager_trace)
@@ -2477,7 +2594,9 @@ def solve(executor, task, archive, budget, version):
                         }
                         reordered = swap_traced_filters(current, allowed, loop)
                         if reordered is not None:
-                            verified = verify_guard_order(eager_target, reordered)
+                            verified, focused_failure = verify_guard_order(
+                                eager_target, reordered
+                            )
                             if verified is not None:
                                 current, patch, failures, pytest_runs = verified
                                 start_new_draft(eager_target)
@@ -2485,6 +2604,14 @@ def solve(executor, task, archive, budget, version):
                                     "An adjacent stock filter reorder passed all configured checks"
                                 )
                                 continue
+                            if try_guard_precision(
+                                eager_target, eager_trace, focused_failure
+                            ):
+                                continue
+                            launch_budget = min(
+                                max_proposals - submitted,
+                                budget.model_requests_remaining(),
+                            )
                     located = pinned_counter_location(
                         original, current, counter_caller_site(eager_trace)
                     )
@@ -2492,7 +2619,9 @@ def solve(executor, task, archive, budget, version):
                         not pinned_restore_attempted
                         and located is not None
                         and located.current != located.baseline
-                        and len(located.current.encode()) >= _LONG_LOCALIZED_DEFINITION_BYTES
+                        and len(located.current.encode())
+                        >= _LONG_LOCALIZED_DEFINITION_BYTES
+                        and launch_budget >= 1 + int(needs_tests)
                         and budget.remaining() >= 75
                     ):
                         pinned_restore_attempted = True
@@ -2511,6 +2640,7 @@ def solve(executor, task, archive, budget, version):
                 and current is eager_source
                 and failures.keys() == {eager_target}
                 and precision_ready
+                and not precision_attempted
                 and (signal := counter_loop_reuse(eager_trace)) is not None
                 and not pending
                 and retired is None
