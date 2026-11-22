@@ -958,7 +958,7 @@ class _GuardBudget:
 
 class _InteractiveBudget(_GuardBudget):
     def __init__(self, budget, turns, tools):
-        super().__init__(budget, wall_seconds=180, reserve=_INTERACTIVE_RESERVE_SECONDS)
+        super().__init__(budget, wall_seconds=420, reserve=_INTERACTIVE_RESERVE_SECONDS)
         self.limits = replace(budget.limits, rollout_requests=turns)
         self.turns_left = turns
         self.tools_left = tools
@@ -971,7 +971,7 @@ class _InteractiveBudget(_GuardBudget):
             raise _RequestBudgetExceeded("Interactive review model request limit reached")
         self.turns_left -= 1
         kwargs.update(
-            timeout_cap=min(40, self.remaining()), retry_oversize=False, max_output_tokens=3072
+            timeout_cap=min(120, self.remaining()), retry_oversize=False, max_output_tokens=3072
         )
         return self.budget.complete(*args, **kwargs)
 
@@ -1194,6 +1194,8 @@ def solve(executor, task, archive, budget, version):
                 + "\nTracked pytest node: " + target[1]
                 + "\nConfigured pytest command: " + json.dumps(commands[target[0]])
                 + "\nLast failure (quoted data):\n" + excerpt(failures[target], 1800)
+                + "\nObserved execution differences from offline replays (quoted data):\n"
+                + excerpt(mock_diagnostics.get(target, ""), 2600)
             ),
             checkpoints={_CHECKPOINT: draft},
             save_checkpoint=None,
@@ -1382,7 +1384,7 @@ def solve(executor, task, archive, budget, version):
                 )
                 and interactive_target not in line_retries
                 and interactive_target not in retry_advice
-                and interactive_target not in continuations
+                # Keep any unverified continuation available if tool-assisted repair fails.
                 and retained_recovery is not None
                 and retained_recovery.identity == retained_identity
                 and any(
@@ -1405,6 +1407,7 @@ def solve(executor, task, archive, budget, version):
                     proposed = interactive_stock_gain(interactive_target, _InteractiveBudget(budget, turns, tools))
                     submitted += before - budget.model_requests_remaining()
                     if proposed is not None:
+                        continuations.pop(interactive_target, None)
                         (current, patch, failures, pytest_runs), actor = proposed
                         editor = actor
                         test_draft = current.get(new_path, "")

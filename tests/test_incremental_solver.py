@@ -2196,7 +2196,7 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
     assert phases == expected
     assert len(checkpoints) == 1 and b"+    return 3\n" not in checkpoints[0].patch
     assert any(durable for _, durable in recovery)
-    assert all(0 < timeout <= 40 for timeout in tool_turns)
+    assert all(0 < timeout <= 120 for timeout in tool_turns)
     assert b"+    return 3\n" in result.patch and NEW_TEST.encode() in result.patch
     assert b"outside.py" not in result.patch
     assert all(check.returncode == 0 for check in result.checks)
