@@ -729,7 +729,7 @@ class ProviderRouter:
         failures = {}
         groups: dict[tuple, list[_Route]] = {}
         degraded = set()
-        deferred = []
+        deferred = {}
         preferred = None
         with self._lock:
             now = time.time()
@@ -750,7 +750,7 @@ class ProviderRouter:
                     degraded.add(route.quota_key)
                     groups.setdefault(route.quota_key, [])
                 elif self._quota_block(route, now):
-                    deferred.append(route)
+                    deferred[route.alias, route.model] = route
                 else:
                     group = groups.setdefault(route.quota_key, [])
                     if (route.alias, route.model) == affinity:
@@ -779,7 +779,7 @@ class ProviderRouter:
             ordered.insert(0, preferred)
         # A cooldown may expire while trying other providers. Check again if
         # those attempts did not produce a usable completion.
-        return ordered + deferred, failures
+        return [*ordered, *deferred.values()], failures, deferred
 
     def _complete(self, *args, **kwargs):
         for event in self._events(*args, **kwargs):
@@ -801,7 +801,8 @@ class ProviderRouter:
         max_output_tokens=None,
     ):
         deadline = time.monotonic() + _completion_timeout(timeout)
-        routes, failures = self._ordered_routes(
+        rank = {(route.alias, route.model): index for index, route in enumerate(routes)}
+        routes, failures, deferred = self._ordered_routes(
             routes,
             tools,
             exclusions,
@@ -812,39 +813,69 @@ class ProviderRouter:
             # Several public aliases can share a credential and its quota.
             previous = {r.quota_key for r in self.routes if r.alias == after_provider}
             routes.sort(key=lambda r: r.quota_key in previous)
-        retry_times = []
+        pending = {(route.alias, route.model): route for route in routes}
+        single_account = len({route.quota_key for route in routes}) == 1
+        failed_accounts = set()
+        retry_times = {}
         needs_initial_tool = (
             tools
             and role in {"coding", "probe"}
             and not any(message.get("role") == "tool" for message in messages)
         )
-        for route in routes:
-            key = (route.alias, route.model)
-            now = time.monotonic()
-            attempt_limit = route.attempt_timeout
-            if route.model == _NEMOTRON and not (
-                role == "coding"
-                and not tools
-                and messages
-                and str(messages[-1].get("content") or "").endswith(DEFINITION_ENDING)
-            ):
-                attempt_limit = min(60, attempt_limit)
-            attempt_deadline = min(deadline, now + attempt_limit)
-            attempt_timeout = attempt_deadline - now
-            if attempt_timeout <= 0:
-                failures["gateway"] = "deadline exceeded"
-                break
+        while pending or (failed_accounts and deferred):
             with self._lock:
-                blocked = self._quota_block(route, time.time())
+                now = time.monotonic()
+                if now >= deadline:
+                    failures["gateway"] = "deadline exceeded"
+                    break
+                wall_time = time.time()
+                key = next(iter(pending), None)
+                if failed_accounts:
+                    # After a real failure, revisit higher-ranked routes that were
+                    # blocked. Check availability and reserve within the same lock.
+                    distinct_failures = len(failed_accounts) > 1
+                    next_rank = rank[key] if key is not None else len(rank)
+                    key = min(
+                        (
+                            candidate
+                            for candidate, route in deferred.items()
+                            if rank[candidate] < next_rank
+                            and (
+                                single_account
+                                or distinct_failures
+                                or route.quota_key not in failed_accounts
+                            )
+                            and self._quota_block(route, wall_time) is None
+                        ),
+                        key=rank.__getitem__,
+                        default=key,
+                    )
+                if key is None:
+                    break
+                route = pending.pop(key) if key in pending else deferred[key]
+                blocked = self._quota_block(route, wall_time)
                 if blocked is None:
+                    deferred.pop(key, None)
                     self._in_flight.add(route.quota_key)
+                else:
+                    deferred[key] = route
             if blocked is not None:
                 reason, retry_at = blocked
                 failures[route.alias] = reason
-                retry_times.append(retry_at)
+                retry_times[key] = retry_at
                 continue
 
+            retry_times.pop(key, None)
             try:
+                attempt_limit = route.attempt_timeout
+                if route.model == _NEMOTRON and not (
+                    role == "coding"
+                    and not tools
+                    and messages
+                    and str(messages[-1].get("content") or "").endswith(DEFINITION_ENDING)
+                ):
+                    attempt_limit = min(60, attempt_limit)
+                attempt_deadline = min(deadline, now + attempt_limit)
                 max_tokens = min(
                     route.max_tokens, max_output_tokens or route.max_tokens
                 )
@@ -913,6 +944,7 @@ class ProviderRouter:
                     route.model,
                 )
                 yield {"provider": route.alias, "model": route.model}
+                failed_accounts.add(route.quota_key)
                 if route.local_model_digest is not None:
                     response = asyncio.run(
                         _post_pinned_ollama(
@@ -989,7 +1021,7 @@ class ProviderRouter:
                     cooldown = _retry_time(retry_after)
                     with self._lock:
                         self._quota_cooldown[route.quota_key] = cooldown
-                    retry_times.append(cooldown)
+                    retry_times[key] = cooldown
                     failures[route.alias] = "rate limited"
                     continue
                 response.raise_for_status()
@@ -1022,7 +1054,7 @@ class ProviderRouter:
                     404: "model unavailable",
                 }.get(status, f"upstream HTTP {status}")
                 if status is not None and status >= 500:
-                    retry_times.append(self._defer_model(key))
+                    retry_times[key] = self._defer_model(key)
             except (httpx.TimeoutException, TimeoutError):
                 logger.info(
                     "Provider timed out provider=%s configured_model=%s",
@@ -1030,17 +1062,17 @@ class ProviderRouter:
                     route.model,
                 )
                 failures[route.alias] = "upstream timeout"
-                retry_times.append(self._defer_model(key))
+                retry_times[key] = self._defer_model(key)
             except httpx.RequestError:
                 failures[route.alias] = "upstream connection failed"
-                retry_times.append(self._defer_model(key))
+                retry_times[key] = self._defer_model(key)
             except (AttributeError, IndexError, KeyError, TypeError, ValueError):
                 failures[route.alias] = "malformed request or upstream response"
             finally:
                 with self._lock:
                     self._in_flight.remove(route.quota_key)
 
-        raise ProviderExhausted(min(retry_times, default=None), failures)
+        raise ProviderExhausted(min(retry_times.values(), default=None), failures)
 
     def _defer_model(self, key: tuple[str, str]) -> float:
         retry_at = time.time() + 15

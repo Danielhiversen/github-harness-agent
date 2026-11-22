@@ -956,6 +956,101 @@ def test_concurrent_requests_skip_models_sharing_an_active_account():
         assert first.result().route == "kilo-free"
 
 
+@pytest.mark.parametrize("after_provider", [None, "openrouter-free"])
+def test_failed_alternate_rechecks_top_model_released_by_concurrent_request(
+    after_provider,
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    started, release = Event(), Event()
+    attempts = []
+    primary, alternate = (model.split("/", 1)[1] for model in (OPENROUTER, KILO))
+
+    def handle(request):
+        payload = json.loads(request.content)
+        if payload["messages"]:
+            assert payload["model"] == primary
+            started.set()
+            assert release.wait(3)
+        else:
+            attempts.append(payload["model"])
+            if payload["model"] == alternate:
+                release.set()
+                assert first.result(timeout=3).route == "openrouter-free"
+                raise httpx.ReadTimeout("fixture")
+        return httpx.Response(200, json=openai_response())
+
+    router = routed(quality_order(), handle)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(
+            router.complete,
+            role="plain",
+            messages=[{"role": "user", "content": "Concurrent request"}],
+        )
+        try:
+            assert started.wait(3)
+            result = router.complete(
+                role="plain", messages=[], after_provider=after_provider
+            )
+        finally:
+            release.set()
+
+    assert result.route == "openrouter-free"
+    assert attempts == [alternate, primary]
+
+
+@pytest.mark.parametrize("use_alternate", [True, False])
+def test_recovered_model_preempts_untried_siblings(monkeypatch, use_alternate):
+    clock = [0.0]
+    monkeypatch.setattr(
+        providers,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock[0], time=lambda: clock[0]),
+    )
+    models = [
+        KILO,
+        "kilo-free/reflection/beam-free",
+        "kilo-free/google/gemma-4-31b-it:free",
+    ]
+    if use_alternate:
+        models.append(OLLAMA)
+    primary, sibling, *_ = (model.split("/", 1)[1] for model in models)
+    alternate = OLLAMA.split("/", 1)[1]
+    config = deployment(*models)
+    for priority, item in enumerate(reversed(config), start=1):
+        item["quality_priority"] = priority
+
+    attempts = []
+
+    def handle(request):
+        model = json.loads(request.content)["model"]
+        attempts.append(model)
+        if clock[0] == 0:
+            raise httpx.ReadTimeout("fixture")
+        if model == alternate:
+            return httpx.Response(404)
+        if model == sibling:
+            clock[0] = 16
+            return httpx.Response(404)
+        return httpx.Response(200, json=openai_response())
+
+    router = routed(config, handle)
+    with pytest.raises(ProviderExhausted):
+        router.complete(
+            role="plain",
+            messages=[],
+            exclude=[tuple(model.split("/", 1)) for model in models[1:]],
+        )
+    assert attempts == [primary]
+
+    attempts.clear()
+    clock[0] = 1
+    router.complete(role="plain", messages=[], after_provider="kilo-free")
+    expected = [alternate] if use_alternate else []
+    assert attempts == [*expected, sibling, primary]
+
+
 def test_temporary_failure_defers_unhealthy_model_between_requests():
     calls = []
 
