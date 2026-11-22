@@ -55,6 +55,7 @@ from .review_solver_context import (
     focused_check_excerpt,
     focused_source_excerpt,
     stock_assertion_evaluated,
+    stock_failure_site,
     stock_pytest_excerpt,
 )
 from .task_context import MESSAGE_BYTES, compact_focused_review, excerpt, wire_size
@@ -1672,6 +1673,10 @@ def solve(executor, task, archive, budget, version):
                 and _verified_operator_runs(pytest_runs, after_runs, set(), task.pull_checks, operator_cases)
             )
             if isolated_stock_failure:
+                previous_site = stock_failure_site(target[1], failures[target])
+                next_site = stock_failure_site(target[1], after[target])
+                if previous_site and next_site:
+                    _LOG.info("Tracked pytest verification for %s: %s -> %s", target[1], previous_site, next_site)
                 partial = stock_assertion_evaluated(archive, target[1], failures[target], after[target])
                 if partial:
                     _LOG.info("The tracked pytest comparison now evaluates at the previous lookup failure")

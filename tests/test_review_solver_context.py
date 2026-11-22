@@ -347,3 +347,10 @@ def test_compact_review_keeps_middle_of_caller_and_selected_fixture():
     assert "Keep scheduling order" in content
     assert "Earlier proposal omitted the dispatch body" in content
     assert "def test_unrelated" not in content
+def test_stock_failure_site_logs_only_the_tracked_location_and_exception():
+    from github_harness_agent.review_solver_context import stock_failure_site
+
+    node = "tests/test_counts.py::test_report"
+    assert stock_failure_site(node, "tests/test_counts.py:8: KeyError: 'private value'") == "line 8 (KeyError)"
+    assert stock_failure_site(node, "/work/tests/test_counts.py:9: assert 2 == 1") == "line 9 (AssertionError)"
+    assert stock_failure_site(node, "other.py:8: AssertionError") == ""

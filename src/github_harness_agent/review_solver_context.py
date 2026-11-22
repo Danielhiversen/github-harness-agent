@@ -246,6 +246,22 @@ def _words(text):
     return set(re.findall(r"[A-Za-z][A-Za-z0-9]*", separated.lower()))
 
 
+def stock_failure_site(node, detail):
+    """Describe a traceback in the selected test without logging assertion data."""
+    selected = node.split("[", 1)[0].removeprefix("/work/").removeprefix("./")
+    match = _STOCK_NODE.fullmatch(selected) if len(selected) <= 512 else None
+    if not match:
+        return ""
+    location = re.match(
+        rf"^(?:/work/|\./)?{re.escape(match['path'])}:([1-9][0-9]{{0,6}}): "
+        r"(assert|[A-Za-z]{1,48}(?:Error|Exception))\b", detail,
+    )
+    if not location:
+        return ""
+    kind = "AssertionError" if location[2] == "assert" else location[2]
+    return f"line {location[1]} ({kind})"
+
+
 def stock_assertion_evaluated(archive, node, before, after):
     """A tracked comparison now evaluates both sides instead of raising during lookup."""
     selected = node.split("[", 1)[0].removeprefix("/work/").removeprefix("./")
