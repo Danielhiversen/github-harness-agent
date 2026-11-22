@@ -41,6 +41,7 @@ from github_harness_agent.review_solver import (
     patch_for,
     solve,
 )
+from github_harness_agent.worker import CommandOutputExceeded
 
 SOURCE = "fixture_calc.py"
 NEW_TEST = "tests/test_review_regressions.py"
@@ -1597,7 +1598,11 @@ def test_private_repair_reconciles_a_stock_gain_without_storing_regressions(solv
 
 
 @pytest.mark.parametrize(
-    "scenario", ("mixed", "static_only", "external", "infra", "unrecognized")
+    "scenario",
+    (
+        "mixed", "static_only", "external", "infra", "unrecognized",
+        "output_limit", "preflight_limit",
+    ),
 )
 def test_private_static_repair_preserves_stock_and_rechecks_every_gate(
     solver_case, monkeypatch, scenario
@@ -1611,7 +1616,7 @@ def test_private_static_repair_preserves_stock_and_rechecks_every_gate(
             "def test_first():\n    assert first() == -1\n\n"
             "def test_second():\n    assert second() == -2\n\n"
             "def test_third():\n    assert first() + second() == -3\n"
-            if scenario == "static_only"
+            if scenario in {"static_only", "output_limit", "preflight_limit"}
             else "def test_first():\n    assert isinstance(stock(), int)\n\n"
             "def test_second():\n    assert stock() < 10\n\n"
             "def test_third():\n    assert stock() % 2 == 1 and first() == -1\n"
@@ -1639,6 +1644,13 @@ def test_private_static_repair_preserves_stock_and_rechecks_every_gate(
             return original_command(workspace, argv, *args, **kwargs)
         source = (workspace.root / SOURCE).read_text()
         mypy_runs.append(source)
+        if "NOISY_PROPOSAL" in source or scenario == "preflight_limit":
+            return original_command(
+                workspace,
+                (sys.executable, "-c", "print('PRIVATE-OUTPUT' * 10000)"),
+                *args,
+                **kwargs,
+            )
         if 'return "3"' not in source:
             return SimpleNamespace(
                 returncode=0,
@@ -1682,13 +1694,49 @@ def test_private_static_repair_preserves_stock_and_rechecks_every_gate(
         if good
         else ("An incomplete edit",)
     )
-    gateway = FreeGateway(initial, *attempts)
+    if scenario == "output_limit":
+        attempts = (
+            edit(SOURCE, '    return "3"\n', '    return 3  # NOISY_PROPOSAL\n'),
+            edit(SOURCE, '    return "3"\n', '    return 3\n'),
+            edit(
+                NEW_TEST,
+                "",
+                "from fixture_calc import stock\n\ndef test_stock_value():\n    assert stock() == 3\n",
+            ),
+        )
+    exclusions = []
+
+    class Gateway(FreeGateway):
+        def complete(self, **kwargs):
+            exclusions.append(kwargs.get("exclude", ()))
+            result = super().complete(**kwargs)
+            if scenario == "output_limit":
+                result.configured_model = f"model-{len(self.prompts)}"
+            return result
+
+    gateway = Gateway(initial, *attempts)
     executor = PlainExecutor(
         runner, gateway, Limits(model_requests=len(attempts) + 1, concurrent_probes=1)
     )
     budget = _Budget(executor.limits, lambda: False, task)
 
-    if good:
+    if scenario == "preflight_limit":
+        with pytest.raises(CommandOutputExceeded, match="Command output exceeded"):
+            solve(executor, task, archive.getvalue(), budget, "fixture-version")
+        assert not gateway.prompts and not checkpoints
+    elif scenario == "output_limit":
+        result = solve(executor, task, archive.getvalue(), budget, "fixture-version")
+        assert all(check.returncode == 0 for check in result.checks)
+        assert b"+    return 3\n" in result.patch and NEW_TEST.encode() in result.patch
+        assert b"NOISY_PROPOSAL" not in result.patch
+        assert len(gateway.prompts) == 4
+        assert exclusions[2] == (("stand-in-free", "model-2"),)
+        prompt = gateway.prompts[2]
+        assert "Required check 2 (mypy) exceeded the command output limit" in prompt
+        assert "unchanged stock-passing draft" in prompt and 'return "3"' in prompt
+        assert "NOISY_PROPOSAL" not in prompt and "PRIVATE-OUTPUT" not in prompt
+        assert len(checkpoints) == 1 and b"NOISY_PROPOSAL" not in checkpoints[0].patch
+    elif good:
         result = solve(executor, task, archive.getvalue(), budget, "fixture-version")
         assert all(check.returncode == 0 for check in result.checks)
         assert b"+    return 3\n" in result.patch and NEW_TEST.encode() in result.patch

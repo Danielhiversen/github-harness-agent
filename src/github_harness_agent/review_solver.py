@@ -89,7 +89,7 @@ from .review_solver_context import (
 from .review_stock_collection import stock_collection
 from .task_context import MESSAGE_BYTES, compact_focused_review, excerpt, wire_size
 from .test_updates import focused_pytest, has_runnable_test
-from .worker import Cancelled, ExecutionError, LimitExceeded
+from .worker import Cancelled, CommandOutputExceeded, ExecutionError, LimitExceeded
 
 _LOG = logging.getLogger(__name__)
 _CHECKPOINT = "harness2/base"
@@ -311,6 +311,10 @@ def _complete_pytest_run(outcome):
     return _PytestRun(passed, nodes, counts.get("deselected", 0))
 
 
+class _PrivateCheckOutputExceeded(CommandOutputExceeded):
+    """A configured check exceeded its output limit on a private proposal."""
+
+
 def evidence(
     executor,
     task,
@@ -323,6 +327,7 @@ def evidence(
     static_runs=None,
     unused_import_checks=None,
     on_staged=None,
+    private_proposal=False,
 ):
     with executor.verification_runner.workspace(
         archive, budget.remaining, budget.cancelled
@@ -336,7 +341,20 @@ def evidence(
         failures = {}
         for number, command in enumerate(commands):
             budget.claim("command", budget.limits.commands)
-            outcome = executor._command(ws, budget, command, checked=False)
+            try:
+                outcome = executor._command(ws, budget, command, checked=False)
+            except CommandOutputExceeded:
+                if not private_proposal:
+                    raise
+                if command in task.pull_checks:
+                    ordinal = task.pull_checks.index(command) + 1
+                    check = f"Operator acceptance check {ordinal}"
+                else:
+                    check = f"Required check {task.checks.index(command) + 1}"
+                category = check_label(command, ()) or "configured"
+                raise _PrivateCheckOutputExceeded(
+                    f"{check} ({category}) exceeded the command output limit."
+                ) from None
             if pytest_runs is not None and check_label(command, ()) == "pytest":
                 pytest_runs[number] = _complete_pytest_run(outcome)
             if outcome.returncode:
@@ -919,6 +937,7 @@ class _RegressionRepair:
     stock_collection_id: str | None = None
     dependency_seed: bool = False
     unused_import_checks: frozenset[int] = frozenset()
+    excluded_models: tuple[tuple[str, str], ...] = ()
 
     def next_target(self, commands):
         static = self.static_failures
@@ -2469,7 +2488,7 @@ def solve(executor, task, archive, budget, version):
                         )
                         planning_attempts[target] = plan_count + 1, attempts[target]
                     rotation_key = None
-                    exclude = ()
+                    exclude = repair.excluded_models if repair is not None else ()
                     unassisted_text = (
                         target != _TEST_GOAL
                         and repair is None
@@ -2690,11 +2709,29 @@ def solve(executor, task, archive, budget, version):
                     commands,
                     pytest_runs=after_runs,
                     static_runs=static_runs,
+                    private_proposal=repair is not None and repair.stock_origin,
                     **(
                         {"unused_import_checks": unused_import_checks}
                         if repair is not None and repair.dependency_seed else {}
                     ),
                 )
+            except _PrivateCheckOutputExceeded as error:
+                budget.remaining()
+                regression_repair = _retry_stock_repair(
+                    repair,
+                    f"{error} Try a different fix against the unchanged stock-passing draft.",
+                    named_definitions,
+                )
+                if regression_repair is not None and editor.configured_model:
+                    model = (editor.route, editor.configured_model)
+                    regression_repair = replace(
+                        regression_repair,
+                        excluded_models=tuple(
+                            dict.fromkeys((*repair.excluded_models, model))
+                        ),
+                    )
+                _LOG.info("Rejected private review proposal: %s", error)
+                continue
             except ValueError as error:
                 if fresh_stock:
                     interactive_misses[target] += 1
@@ -2875,6 +2912,7 @@ def solve(executor, task, archive, budget, version):
                             retries=0,
                             retry_note="",
                             retry_named=False,
+                            excluded_models=(),
                             static_failures=pending_static,
                             unused_import_checks=frozenset(unused_import_checks),
                         )
