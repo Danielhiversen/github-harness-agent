@@ -61,6 +61,7 @@ from .review_definitions import (
     apply_native_definition,
 )
 from .review_guard_probe import stock_guard_diagnostic
+from .review_guard_order import swap_traced_filters
 from .review_guards import guarded_sources
 from .review_mock_replay import (
     compact_observations,
@@ -1746,6 +1747,32 @@ def solve(executor, task, archive, budget, version):
         verified = verify_stock_candidate(target, sources, probe_budget)
         return verified[0] if verified else None
 
+    def verify_guard_order(target, sources):
+        focused = focused_pytest((commands[target[0]],), (target[1],))
+        proposal = patch_for(original, sources)
+        if focused is None or not 0 < len(proposal) <= executor.limits.patch_bytes:
+            return None
+        probe = _GuardBudget(budget, reserve=60)
+        focus = _GuardBudget(probe, wall_seconds=_STOCK_HUNK_SECONDS, reserve=0)
+        runs = {}
+        try:
+            checked = evidence(
+                executor, task, archive, focus, proposal, (focused,), pytest_runs=runs
+            )
+            run = runs.get(0)
+            if (
+                not checked
+                and run is not None
+                and run.passed == 1
+                and not run.deselected
+            ):
+                return verify_stock_gain(target, sources, probe)
+        except Cancelled:
+            raise
+        except (ExecutionError, ValueError):
+            budget.remaining()
+        return None
+
     def save_verified_progress(checkpoint_patch, note, editor):
         nonlocal retained_failures, retained_identity
         budget.remaining()
@@ -2308,6 +2335,35 @@ def solve(executor, task, archive, budget, version):
                         failure_line=stock_assertion_failure_line(eager_target[1], diagnostic),
                         reviewed_sources=(original, current),
                     )
+                    loop = counter_loop_reuse(eager_trace)
+                    if (
+                        loop is not None
+                        and needs_tests
+                        and not current.get(new_path)
+                        and loop.node
+                        == eager_target[1]
+                        .split("[", 1)[0]
+                        .removeprefix("/work/")
+                        .removeprefix("./")
+                        and loop.assertion_line
+                        == stock_assertion_failure_line(eager_target[1], diagnostic)
+                        and budget.remaining() >= 90
+                    ):
+                        allowed = {
+                            path
+                            for path in paths
+                            if not _protected(path, task, new_test=False)
+                        }
+                        reordered = swap_traced_filters(current, allowed, loop)
+                        if reordered is not None:
+                            verified = verify_guard_order(eager_target, reordered)
+                            if verified is not None:
+                                current, patch, failures, pytest_runs = verified
+                                start_new_draft(eager_target)
+                                _LOG.info(
+                                    "An adjacent stock filter reorder passed all configured checks"
+                                )
+                                continue
                     located = pinned_counter_location(
                         original, current, counter_caller_site(eager_trace)
                     )
