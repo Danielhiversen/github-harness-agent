@@ -174,13 +174,17 @@ def solver_case(tmp_path, monkeypatch):
     return task, archive.getvalue(), FixtureRunner(tmp_path), checkpoints
 
 
-@pytest.mark.parametrize("nested", [False, True])
-def test_normal_operator_prompt_keeps_the_exercised_traversal_beyond_the_review_anchor(
-    solver_case,
-    nested,
+@pytest.mark.parametrize("scenario", (
+    "ordinary", "nested_ordinary", "malformed", "nested", "no_change", "rejected", "outside",
+))
+def test_operator_limit_uses_traversal_windows_and_verified_retry(
+    solver_case, scenario,
 ):
     task, _, runner, _ = solver_case
-    task = replace(task, require_new_tests=False)
+    nested = scenario in {"nested", "nested_ordinary"}
+    ordinary_only = scenario in {"ordinary", "nested_ordinary"}
+    excluded = (("excluded", "configured-excluded"),)
+    task = replace(task, require_new_tests=False, excluded_models=excluded)
     acceptance = Path(task.pull_checks[0][-1])
     with acceptance.open("a") as stream:
         stream.write(
@@ -289,15 +293,49 @@ def test_normal_operator_prompt_keeps_the_exercised_traversal_beyond_the_review_
             snapshot.addfile(entry, BytesIO(data))
 
     class Gateway(FreeGateway):
+        calls = 0
+
         def complete(self, **kwargs):
+            self.calls += 1
             messages = kwargs["messages"]
             compact = compact_focused_review(messages, max_bytes=8192) or messages
             prompt = compact[-1]["content"]
+            assert kwargs["exclude"] == excluded
             assert (
                 prompt.startswith("Selected failure:")
                 and "test_limit_applies_to_traversal" in prompt.splitlines()[0]
             )
             assert wire_size(compact) <= 8192
+            if self.calls == 2 and not ordinary_only:
+                assert kwargs["after_provider"] == "stand-in-free"
+                assert kwargs["max_output_tokens"] == 2048
+                assert prompt.endswith("Respond with the single line-range JSON object only.")
+                assert "Pinned iteration bound" not in prompt and "Current checkout:" not in prompt
+                signature = re.search(r'"snapshot":"([a-f0-9]+)"', prompt)[1]
+                child = (
+                    "                raw_parts = self._descend(state)"
+                    if nested else "                child = self._descend(state)"
+                )
+                row = int(re.search(r"(?m)^(\d+) \| " + re.escape(child) + "$", prompt)[1])
+                adjusted = "limit + 1" if scenario == "rejected" else "limit"
+                lines = [
+                    f"                if state.depth >= {adjusted}:",
+                    "                    continue",
+                    child,
+                ]
+                if nested:
+                    assert "state = local.popleft()" in prompt and "extendleft(parts)" in prompt
+                    lines = [child + " if state.depth < limit else []"]
+                if scenario == "outside":
+                    row = 2  # Unshown validation row, inside the definition body.
+                    assert not re.search(r"(?m)^2 \|", prompt)
+                return SimpleNamespace(
+                    content=json.dumps({"snapshot": signature, "edits": [
+                        {"start": row, "end": row, "lines": lines},
+                    ]}),
+                    role="coding", route="numbered-free", model="fixture-coder",
+                    configured_model="numbered/free", usage={}, tool_calls=(),
+                )
             focus = prompt.split("\nFocused source from ", 1)[1].split(
                 "\nFailure details:", 1
             )[0]
@@ -314,15 +352,23 @@ def test_normal_operator_prompt_keeps_the_exercised_traversal_beyond_the_review_
             assert prompt.endswith("Respond with exact SEARCH/REPLACE blocks only.")
             return super().complete(**kwargs)
 
-    gateway = Gateway(
-        edit(
-            SOURCE,
-            "            if state.depth < 2:\n",
-            "            if state.depth < min(2, limit):\n",
-        )
+    ordinary = edit(
+        SOURCE,
+        "            if state.depth < 2:\n",
+        "            if state.depth < min(2, limit):\n",
     )
+    first = (
+        edit(SOURCE, "        result = []\n", "        result = list()\n")
+        if scenario == "no_change"
+        else f"{SOURCE}\n<<<<<<< SEARCH\n        result = []\n"
+    )
+    reports = 1 if ordinary_only else 3 if scenario in {"rejected", "outside"} else 2
+    gateway = Gateway(ordinary) if ordinary_only else Gateway(first, ordinary)
+    verification = runner.path / "verification"
+    verification.mkdir()
     executor = PlainExecutor(
-        runner, gateway, Limits(model_requests=1, concurrent_probes=1)
+        runner, gateway, Limits(model_requests=reports, concurrent_probes=1),
+        verification_runner=FixtureRunner(verification),
     )
     result = solve(
         executor,
@@ -332,6 +378,14 @@ def test_normal_operator_prompt_keeps_the_exercised_traversal_beyond_the_review_
         "fixture",
     )
     assert all(check.returncode == 0 for check in result.checks)
+    assert gateway.calls == reports
+    assert b"result = list()" not in result.patch and b"limit + 1" not in result.patch
+    if scenario == "rejected":
+        assert any(
+            "state.depth >= limit + 1" in (work / SOURCE).read_text()
+            for work in executor.verification_runner.workspaces
+            if (work / SOURCE).is_file()
+        )
 def test_evidence_pairs_line_traceback_locations_with_each_pytest_node(solver_case):
     task, archive, runner, _ = solver_case
     executor = PlainExecutor(runner, FreeGateway())

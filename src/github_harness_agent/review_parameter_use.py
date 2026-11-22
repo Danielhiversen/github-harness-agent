@@ -1,6 +1,7 @@
 """Identify an exercised keyword that ceased to bound iteration in a review edit."""
 
 import ast
+from dataclasses import dataclass
 from textwrap import dedent
 
 from .review_definitions import _symbols
@@ -8,6 +9,14 @@ from .review_definitions import _symbols
 _PUSH = {"append", "appendleft", "extend", "extendleft", "insert", "put"}
 _POP = {"pop", "popleft", "get", "popitem"}
 _HEAP = {"heappush": "push", "heappop": "pop"}
+
+
+@dataclass(frozen=True)
+class IterationWindows:
+    symbol: tuple[str, str]
+    spans: tuple[tuple[int, int], ...]
+    note: str
+    related: str
 
 
 def _reads(node, name):
@@ -355,7 +364,7 @@ def _traversal_windows(
         if operations.keys() == {"push", "pop"} and resource in bindings
     ]
     if not active:
-        return ""
+        return "", ""
     resource, operations = min(
         active, key=lambda group: min(entry[0].lineno for entry in group[1]["pop"])
     )
@@ -369,7 +378,7 @@ def _traversal_windows(
         None,
     )
     if created is None:
-        return ""
+        return "", ""
     multiple = any(
         key != resource and "pop" in group for key, group in queues.items()
     ) or _requeues_consumed_token(consumer, arguments, assignments)
@@ -389,7 +398,7 @@ def _traversal_windows(
     consume = current_source(consumer.lineno - 1, consumer.end_lineno + 1, limit=limit)
     update = current_source(producer.lineno - 1, producer.end_lineno + 1, limit=limit)
     if not all((setup, consume, update)):
-        return ""
+        return "", ""
     values, expansions = _producer_sources(arguments, bindings, producer.lineno)
     if expansions and expansions[0].end_lineno < producer.lineno - 1 and not multiple:
         assignment = expansions[0]
@@ -415,7 +424,7 @@ def _traversal_windows(
     )
     if current_ranges is not None:
         current_ranges.extend((*emitted[primary_count:], *emitted[:primary_count]))
-    return (
+    text = (
         f"\nCurrent traversal of {qualified} in {path} (exact source with line numbers):\n"
         + (f"Pinned iteration bound (read-only):\n{old}" if old else "")
         + (
@@ -427,11 +436,10 @@ def _traversal_windows(
         + declaration
         + f"Worklist initialization:\n{setup}Consumer:\n{consume}Worklist update:\n{update}"
     )
+    return text, declaration
 
 
-def lost_iteration_argument(
-    fixture, pinned, current, *, source_windows=False, current_ranges=None
-):
+def _iteration_loss(fixture, pinned, current, *, unique):
     signal = None
     try:
         calls = {
@@ -488,16 +496,51 @@ def lost_iteration_argument(
                             "input validation or omits it entirely. Check how this public limit affects "
                             "the new traversal and the observed calls in the fixture."
                         )
-                        if not source_windows:
-                            return note
+                        if not unique:
+                            return note, None
                         if signal is not None:
-                            return signal[0]
+                            return signal[0], None
                         signal = note, path, qualified, func, prior_loop
         if signal is not None:
-            note, path, qualified, function, prior_loop = signal
-            return note + _traversal_windows(
-                path, qualified, function, pinned, current, prior_loop, current_ranges
-            )
+            return signal[0], signal[1:]
     except (SyntaxError, ValueError, RecursionError):
-        return signal[0] if signal is not None else ""
-    return ""
+        pass
+    return (signal[0], None) if signal is not None else ("", None)
+
+
+def lost_iteration_argument(
+    fixture, pinned, current, *, source_windows=False, current_ranges=None
+):
+    note, signal = _iteration_loss(fixture, pinned, current, unique=source_windows)
+    if signal is None:
+        return note
+    path, qualified, function, prior_loop = signal
+    try:
+        windows, _ = _traversal_windows(
+            path, qualified, function, pinned, current, prior_loop, current_ranges
+        )
+    except (SyntaxError, ValueError, RecursionError):
+        return note
+    return note + windows
+
+
+def iteration_edit_windows(fixture, pinned, current):
+    note, signal = _iteration_loss(fixture, pinned, current, unique=True)
+    if signal is None:
+        return None
+    path, qualified, function, prior_loop = signal
+    spans = []
+    try:
+        _, related = _traversal_windows(
+            path, qualified, function, pinned, current, prior_loop, spans
+        )
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    writable = tuple(
+        (first, last) for filename, first, last in spans if filename == path
+    )
+    return (
+        IterationWindows((path, qualified), writable, note, related)
+        if writable
+        else None
+    )

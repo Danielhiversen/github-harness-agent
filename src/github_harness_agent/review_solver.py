@@ -62,7 +62,7 @@ from .review_definitions import (
 )
 from .review_guard_probe import stock_guard_diagnostic
 from .review_guard_order import swap_traced_filters
-from .review_parameter_use import lost_iteration_argument
+from .review_parameter_use import iteration_edit_windows, lost_iteration_argument
 from .review_semantic_key import guard_traced_counter_once
 from .review_guards import guarded_sources
 from .review_mock_replay import (
@@ -78,6 +78,7 @@ from .review_line_ranges import (
     line_range_prompt,
     prepare_line_range_edit,
     prepare_loop_line_range_edit,
+    prepare_window_line_range_edit,
 )
 from .review_planner import (
     apply_coding_advice,
@@ -787,6 +788,7 @@ def _coding_completion(
     *,
     exclude=(),
     line_snapshot=None,
+    scoped_line=False,
 ):
     fresh_advice = None
     if planner_input is not None:
@@ -867,7 +869,11 @@ def _coding_completion(
             messages,
             exclude=exclude,
             after_provider=route,
-            max_output_tokens=3072 if fresh_line_snapshot is not None else max_tokens,
+            max_output_tokens=(
+                2048 if scoped_line
+                else 3072 if fresh_line_snapshot is not None else max_tokens
+            ),
+            retry_oversize=not scoped_line,
         )
     except ProviderExhausted:
         if fresh_line_snapshot is None:
@@ -929,6 +935,8 @@ def _rejected_attempt(source, candidate, target, before, after):
 class _LineRetry:
     advice: object
     snapshot: LineRangeSnapshot
+    allowed_rows: frozenset[int] | None = None
+    prompt: str = ""
 
 
 @dataclass(frozen=True)
@@ -2417,6 +2425,54 @@ def solve(executor, task, archive, budget, version):
     retry_advice = {}
     line_retries = {}
     line_routes = {}
+    iteration_attempted = set()
+
+    def queue_iteration_retry(target, snapshot):
+        number, node = target
+        run = pytest_runs.get(number)
+        if (
+            snapshot is not current
+            or target in iteration_attempted
+            or not 0 <= number < len(task.pull_checks)
+            or target not in failures
+            or executor.verification_runner is executor.runner
+            or run is None
+            or node not in run.failed
+            or commands[number] != task.pull_checks[number]
+            or not _named_operator_cases({target}, commands)
+            or not _trusted_operator_node(node, commands[number], operator_cases)
+        ):
+            return False
+        fixture = _fixture_excerpt(fixtures, node, selected_only=True)
+        windows = iteration_edit_windows(fixture, original, current)
+        if windows is None:
+            return False
+        path, _ = windows.symbol
+        if path not in paths or _protected(path, task, new_test=False):
+            return False
+        scope = prepare_window_line_range_edit(current, windows.symbol, windows.spans)
+        if scope is None:
+            return False
+        exact, visible, allowed = scope
+        prompt = (
+            f"Selected failure: {node}\n{windows.note}\n"
+            "Repair the public iteration limit in the current traversal. Preserve the other "
+            "passing behavior and edit only the shown body rows.\n"
+            f"Selected operator fixture (quoted):\n{excerpt(fixture, 1200)}\n"
+            f"Verified failure (quoted):\n{excerpt(failures[target], 600)}\n"
+            + (
+                f"Related definition (read-only):\n{windows.related}\n"
+                if windows.related else ""
+            )
+            + line_range_prompt(exact, visible_rows=visible)
+            + LINE_RANGE_ENDING
+        )
+        if wire_size([{"role": "user", "content": prompt}]) > 7500:
+            return False
+        iteration_attempted.add(target)
+        continuations.pop(target, None)
+        line_retries[target] = _LineRetry(None, exact, allowed, prompt)
+        return True
     stock_fixtures = {}
     mock_diagnostics = {}
     counter_sites = {}
@@ -2882,7 +2938,12 @@ def solve(executor, task, archive, budget, version):
                         break
                     attempts[target] = attempts.get(target, 0) + 1
                     repair = regression_repair if target == repair_target else None
+                    if repair is None and target in operator and malformed.get(target):
+                        queue_iteration_retry(target, current)
                     line_retry = line_retries.pop(target, None)
+                    scoped_line = (
+                        line_retry is not None and line_retry.allowed_rows is not None
+                    )
                     advice = (
                         line_retry.advice
                         if line_retry
@@ -2969,7 +3030,10 @@ def solve(executor, task, archive, budget, version):
                         if localized_retry is not None
                         else None
                     )
-                    if line_retry is not None and numbered != line_retry.snapshot:
+                    if (
+                        line_retry is not None and not scoped_line
+                        and numbered != line_retry.snapshot
+                    ):
                         line_retry, advice, localized_retry = None, None, None
                     line_followup = (
                         _LineRetry(advice, numbered)
@@ -2978,6 +3042,7 @@ def solve(executor, task, archive, budget, version):
                     )
                     native = (
                         named_definitions
+                        and not scoped_line
                         and localized_retry is None
                         and target in native_ready
                         and target not in native_attempted
@@ -2989,6 +3054,7 @@ def solve(executor, task, archive, budget, version):
                     plan_count, last_planned = planning_attempts.get(target, (0, -3))
                     plan = (
                         can_plan
+                        and not scoped_line
                         and not native
                         and advice is None
                         and repair is None
@@ -3103,6 +3169,11 @@ def solve(executor, task, archive, budget, version):
                             else ""
                         ),
                     )
+                    if scoped_line:
+                        messages = [
+                            {"role": "system", "content": _LINE_RANGE_SYSTEM},
+                            {"role": "user", "content": line_retry.prompt},
+                        ]
                     planner_input = None
                     if plan:
                         fixture = stock_fixture or _fixture_excerpt(
@@ -3132,7 +3203,8 @@ def solve(executor, task, archive, budget, version):
                                 if count >= _MODEL_FAILURE_THRESHOLD
                             )
                     route = (
-                        line_routes.get(target) if line_retry else last_routes.get(target)
+                        line_routes.get(target)
+                        if line_retry and not scoped_line else last_routes.get(target)
                     )
                     advice_source = "planning" if planner_input is not None else "guided" if advice is not None else None
                     launched_at = time.monotonic()
@@ -3147,6 +3219,7 @@ def solve(executor, task, archive, budget, version):
                         advice,
                         exclude=exclude,
                         line_snapshot=line_retry.snapshot if line_retry else None,
+                        scoped_line=scoped_line,
                     )
                     pending[future] = (
                         target,
@@ -3208,11 +3281,16 @@ def solve(executor, task, archive, budget, version):
                 line_followup,
                 repair,
             ) = pending.pop(future)
+            scoped_line = line_retry is not None and line_retry.allowed_rows is not None
             if (
-                paired or continuation is not None or advised or repair is not None
+                paired or continuation is not None or advised
+                or repair is not None or scoped_line
             ) and snapshot is not current:
                 continue
-            if snapshot is current and (line_retry is not None or (localized_retry is not None and line_followup is None)):
+            if (
+                snapshot is current and not scoped_line
+                and (line_retry is not None or (localized_retry is not None and line_followup is None))
+            ):
                 interactive_target = target
                 interactive_symbol = line_retry.snapshot.symbol if line_retry else localized_retry
             try:
@@ -3225,7 +3303,7 @@ def solve(executor, task, archive, budget, version):
                 if line_followup is not None:
                     line_retries[target] = line_followup
                 elif line_retry is not None:
-                    _LOG.info("Numbered stock edit format had no available coding route")
+                    _LOG.info("Numbered review edit format had no available coding route")
                 elif rotated:
                     if snapshot is current:
                         # Reopen this goal's model choices for the rest of this draft.
@@ -3267,7 +3345,10 @@ def solve(executor, task, archive, budget, version):
                 continue
             if native_candidate is not None and snapshot is not current:
                 continue
-            routes = line_routes if active_line_snapshot is not None else last_routes
+            routes = (
+                line_routes if active_line_snapshot is not None and not scoped_line
+                else last_routes
+            )
             routes[target] = completion.route
             editor = RouteEvidence.from_completion(completion)
             try:
@@ -3280,7 +3361,8 @@ def solve(executor, task, archive, budget, version):
                     candidate = native_candidate
                     if candidate is None and active_line_snapshot is not None:
                         candidate = apply_line_range_edit(
-                            completion.content, source, active_line_snapshot
+                            completion.content, source, active_line_snapshot,
+                            allowed_rows=line_retry.allowed_rows if scoped_line else None,
                         )
                     if candidate is None:
                         candidate = (
@@ -3291,6 +3373,8 @@ def solve(executor, task, archive, budget, version):
                             else apply_blocks(completion.content, source, new_path)
                         )
                 except ValueError:
+                    if repair is None and not scoped_line:
+                        queue_iteration_retry(target, snapshot)
                     if stock_fixtures.get((target, failures.get(target))):
                         raw = completion.content or ""
                         _LOG.info(
@@ -3304,7 +3388,8 @@ def solve(executor, task, archive, budget, version):
                     if fresh_advice is not None:
                         retry_advice[target] = fresh_advice
                     if (
-                        target in failures
+                        not scoped_line
+                        and target in failures
                         and check_label(commands[target[0]], ()) != "ruff"
                     ):
                         count_recovery(malformed, target)
@@ -3727,7 +3812,13 @@ def solve(executor, task, archive, budget, version):
                 if line_followup is not None and target in after:
                     line_retries[target] = line_followup
                 if (
+                    repair is None and not scoped_line and after.keys() == failures.keys()
+                    and queue_iteration_retry(target, snapshot)
+                ):
+                    continue
+                if (
                     continuation is None
+                    and not scoped_line
                     and snapshot is current
                     and (target in old_operator or (isolated_stock_failure and mock_diagnostics.get(target)))
                     and "::" in target[1]

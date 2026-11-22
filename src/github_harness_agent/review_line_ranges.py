@@ -122,6 +122,36 @@ def prepare_line_range_edit(sources, symbol):
         return None
 
 
+def prepare_window_line_range_edit(sources, symbol, source_spans):
+    """Bind independently localized source rows to the current definition snapshot."""
+    if not _valid_symbol(symbol):
+        return None
+    try:
+        scope = _scope(sources.get(symbol[0]), symbol[1])
+    except (ValueError, SyntaxError, RecursionError):
+        return None
+    if scope is None:
+        return None
+    snapshot = _snapshot(sources, symbol, scope)
+    first = snapshot.first_body_line
+    headers = frozenset(range(1, first))
+    allowed = frozenset()
+    for start, end in source_spans:
+        rows = frozenset(
+            range(
+                max(first, start - scope.start),
+                min(len(snapshot.lines), end - scope.start) + 1,
+            )
+        )
+        trial = allowed | rows | headers
+        if (
+            len(trial) <= 26
+            and sum(len(snapshot.lines[row - 1].encode()) for row in trial) <= 2300
+        ):
+            allowed |= rows
+    return (snapshot, allowed | headers, allowed) if allowed else None
+
+
 def prepare_loop_line_range_edit(sources, symbol, body_line, variable, caller_line):
     """Show only entry, verified loop and mutation windows of one definition."""
     if not _valid_symbol(symbol):
