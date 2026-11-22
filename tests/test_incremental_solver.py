@@ -2083,7 +2083,8 @@ def test_localized_named_failure_tries_numbered_ranges_as_an_independent_remedy(
     assert "bad named response" not in prompt and "return -8" not in prompt
     assert request.get("after_provider") is None
     assert request.get("exclude") == ("blocked/model",)
-    assert max_tokens == 3072
+    assert max_tokens == 6144
+    assert system.endswith(review_solver.CAUSAL_EDIT_GUIDANCE)
     assert all(check.returncode == 0 for check in result.checks)
     assert (
         b"+    return 3\n" in result.patch
