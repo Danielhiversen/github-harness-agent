@@ -1,9 +1,16 @@
 import pytest
 
-from github_harness_agent.review_solver import _apply_test_reply, _complete_test_module
+from github_harness_agent.review_solver import _apply_test_reply, _complete_test_module, apply_blocks
 
 PATH = "tests/test_review_regressions.py"
 MODULE = "from math import sqrt\n\ndef test_positive():\n    assert sqrt(4) == 2\n"
+
+
+def test_visually_blank_search_can_create_only_the_designated_absent_file():
+    block = f"{PATH}\n<<<<<<< SEARCH\n \n=======\n{MODULE}>>>>>>> REPLACE\n"
+    assert apply_blocks(block, {PATH: ""}, PATH) == {PATH: MODULE}
+    with pytest.raises(ValueError, match="must match exactly once"):
+        apply_blocks(block, {PATH: MODULE}, PATH)
 
 
 @pytest.mark.parametrize(

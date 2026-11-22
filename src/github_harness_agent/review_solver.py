@@ -191,6 +191,11 @@ _TEST_ERROR_KINDS = re.compile(
     r"\b(?:AssertionError|AttributeError|FileNotFoundError|ImportError|IndexError|"
     r"KeyError|ModuleNotFoundError|NameError|RuntimeError|TypeError|ValueError)\b"
 )
+_DRAFT_EXCEPTION = re.compile(
+    r"^(?:E[ \t]+|(?:FAILED|ERROR) \S+ - |\S+\.py:[1-9][0-9]*: )"
+    r"([\w.]*(?:Error|Exception):[ \t]*\S[^\n]*)$",
+    re.M,
+)
 _PYTEST_TOTALS = re.compile(r"(?:\d+ [a-z]+, )*\d+ [a-z]+ in \d+(?:\.\d+)?s(?: \([\d:]+\))?")
 _STOCK_REPAIR_CASE_LIMIT = 4
 _DEPENDENCY_SEED_CASE_LIMIT = 6
@@ -254,7 +259,7 @@ def apply_blocks(response, sources, new_path):
                 "File is outside the editable source list. Use the exact listed checkout path."
             )
         source = result[path]
-        if not old:
+        if not old or (path == new_path and not source and not old.strip()):
             if path != new_path or source:
                 raise ValueError("Empty SEARCH is only permitted for the new test file")
             result[path] = new
@@ -393,6 +398,38 @@ def _test_detail(output, node):
             if lines:
                 return excerpt("\n".join(lines), 1600)
     return next((line for line in output.splitlines() if node in line), node)
+
+
+def _failed_test_feedback(failures, path):
+    cases = {}
+    for (_, node), detail in failures.items():
+        if node.removeprefix("./").startswith(path + "::"):
+            cases.setdefault(node, detail)
+    if not cases:
+        return "\n".join(
+            f"{name}: {excerpt(detail, 1000)}"
+            for (_, name), detail in list(failures.items())[:4]
+        )
+
+    signatures = {
+        node: match[1].strip()
+        for node, detail in cases.items()
+        if (match := _DRAFT_EXCEPTION.search(detail)) and not match[1].rstrip().endswith("...")
+    }
+    counts = Counter(signatures.values())
+    selected = max(cases, key=lambda node: counts[signatures.get(node)])
+    lines = [f"Selected failing case: {selected}", excerpt(cases[selected], 800)]
+    if (count := counts[signatures.get(selected)]) > 1:
+        lines.append(
+            f"{count} cases report the same exception and message. "
+            "They may share a fixture or setup error."
+        )
+    remaining = [node for (_, node) in failures if node != selected]
+    if remaining:
+        lines.append("Other failing cases or checks: " + excerpt(
+            ", ".join(dict.fromkeys(remaining)), 470
+        ))
+    return "\n".join(lines)
 
 
 def _line_failure_details(output):
@@ -705,14 +742,16 @@ def _test_authoring_messages(
         "Selected failure: new regression tests\n"
         f"Edit only {new_path}. "
         + (
-            TEST_REPAIR_GUIDANCE + " Keep existing fixtures and coverage where they already work. "
+            TEST_REPAIR_GUIDANCE
+            + " Start with the selected failing case if listed. Keep existing fixtures and coverage where they already work. "
             if repair_failed_tests else
-            "Write fresh offline pytest tests for the distinct requested behaviors. "
-            "Keep the complete module concise so it fits in one reply. "
-            "Share setup and parameterize examples for the same behavior. "
+            "Write fresh offline pytest tests for the repository regressions explicitly requested in the review. "
+            "Use two or three focused cases when enough, and cover every distinct requested fixture. "
+            "Keep the module concise. Combine overlapping examples with shared setup or parameters. "
         )
         + "Use public APIs and independent fixtures. "
-        "Use the operator examples as behavior and setup references, without copying them.\n"
+        "Use the already-passing acceptance suite as behavior and setup context only. "
+        "Avoid copying its cases or reproducing its inventory in the repository tests.\n"
         "Requested behaviors (quoted review notes):\n"
         + "\n".join(f"- {excerpt(body, 320)}" for body in behaviors if body)
         + (OPERATOR_API_CONTRACT + operator_contract + "\n" if operator_contract else "")
@@ -3913,10 +3952,7 @@ def solve(executor, task, archive, budget, version):
                         "Verifying a new pytest module via %s left %d check diagnostic(s); categories=%s",
                         completion.route, len(after), ",".join(sorted(kinds)) or "check failure",
                     )
-                    test_diagnostic = "\n".join(
-                        f"{name}: {excerpt(detail, 1000)}"
-                        for (_, name), detail in list(after.items())[:4]
-                    )
+                    test_diagnostic = _failed_test_feedback(after, new_path)
                 elif not has_runnable_test(new_path, test_draft.encode()):
                     test_diagnostic = (
                         "Add at least one runnable pytest test to this draft."
@@ -3932,15 +3968,17 @@ def solve(executor, task, archive, budget, version):
                             raise
                         test_rejection = error
                         _LOG.info("Final verification rejected the new pytest module via %s", completion.route)
-                        test_diagnostic = (
-                            str(rejection)
-                            + "\n"
-                            + "\n".join(
-                                excerpt(check.output, 1400)
-                                for check in rejection.checks
-                                if check.returncode
-                            )
-                        )
+                        failures_by_check = {}
+                        for index, check in enumerate(rejection.checks):
+                            if not check.returncode:
+                                continue
+                            nodes = [node for _, node in _TEST_RESULT.findall(check.output)]
+                            for node in nodes:
+                                failures_by_check[index, node] = _test_detail(check.output, node)
+                            if not nodes:
+                                failures_by_check[index, f"check {index + 1}"] = check.output
+                        test_diagnostic = _failed_test_feedback(failures_by_check, new_path)
+                        test_diagnostic += "\n" + str(rejection)
                 continue
             # Never trade a passing operator test for another one. Stock diagnostics
             # can change while a behavior is corrected; finish those before publishing.

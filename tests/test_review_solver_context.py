@@ -15,6 +15,7 @@ from github_harness_agent.review_solver import _proposal_messages
 from github_harness_agent.review_recovery import ReviewRecovery
 from github_harness_agent.task_context import MESSAGE_BYTES, wire_size
 from github_harness_agent.task_context import TEST_MODULE_REPLY_ENDING
+from github_harness_agent import review_solver
 
 
 @pytest.fixture
@@ -196,6 +197,56 @@ def test_fresh_test_context_keeps_grounded_usage_from_oversized_tracked_test():
         assert "preserve passing cases" in prompt
         assert "NameError: report" in prompt
         assert prompt.endswith(TEST_MODULE_REPLY_ENDING)
+
+
+def test_fresh_test_prompt_distinguishes_requested_fixtures_from_acceptance_inventory():
+    path = "src/example/formatting.py"
+    new_path = "tests/test_review_regressions.py"
+    review = ReviewRecovery(
+        feedback=(
+            (path, 1, "Include a regression fixture for decimal amounts."),
+            (path, 2, "Include a fixture for negative amounts."),
+        ),
+        previous_failure="",
+    )
+    messages = _proposal_messages(
+        (-1, "new regression tests"),
+        {path: "def format_amount(amount):\n    return str(amount)\n", new_path: ""},
+        {}, True, "", review,
+        {"operator/checks.py": "def test_operator_matrix():\n    assert True\n"},
+        [], new_path, allow_test_module=True,
+    )
+
+    prompt = messages[-1]["content"]
+    assert "two or three focused cases" in prompt
+    assert "cover every distinct requested fixture" in prompt
+    assert "Combine overlapping examples" in prompt
+    assert "test_operator_matrix" in prompt and "already-passing acceptance suite" in prompt
+    assert all(body in prompt for _, _, body in review.feedback)
+
+
+@pytest.mark.parametrize("shared", (True, False))
+def test_failed_test_feedback_selects_one_traceback_and_names_other_cases(shared):
+    path = "tests/test_review_regressions.py"
+    first, second, third = (f"{path}::test_{item}" for item in ("a", "b", "c"))
+    failures = {
+        (0, first): f"{path}:13: AssertionError\nE   AssertionError: different value",
+        (0, second): f"{path}:20: TypeError\nE   TypeError: missing 'inputs'",
+        (0, third): "E   TypeError: " + ("missing 'inputs'" if shared else "missing 'output'"),
+    }
+
+    note = review_solver._failed_test_feedback(failures, path)
+
+    if shared:
+        assert note.startswith(f"Selected failing case: {second}\n")
+        assert f"{path}:20: TypeError" in note and "E   TypeError: missing 'inputs'" in note
+        assert "may share a fixture or setup error" in note
+        assert "different value" not in note
+    else:
+        assert note.startswith(f"Selected failing case: {first}\n")
+        assert f"{path}:13: AssertionError" in note and "different value" in note
+        assert "may share" not in note and "missing 'inputs'" not in note
+    assert all(node in note for node in (first, second, third))
 
 
 @pytest.mark.parametrize("scope,await_call", [("with", ""), ("async with", "await ")])

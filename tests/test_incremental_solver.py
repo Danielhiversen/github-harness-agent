@@ -2890,6 +2890,7 @@ def test_solver_accepts_only_authorized_complete_test_modules(solver_case, scena
     if scenario == "named_retry":
         assert f"REPLACE {NEW_TEST}::" not in gateway.prompts[0]
         assert f"REPLACE {NEW_TEST}::" in gateway.prompts[1]
+        assert f"Selected failing case: {NEW_TEST}::test_results" in gateway.prompts[1]
         assert b"def test_passing():" in result.patch
     request = gateway.prompts[-1].replace(
         "\nCurrent checkout:\n", "\nCurrent checkout:\n" + "unused context\n" * 2000
