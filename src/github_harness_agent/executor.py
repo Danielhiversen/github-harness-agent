@@ -1823,13 +1823,15 @@ class PlainExecutor:
                 )
                 error.checks = tuple(checks)
             raise error
+        with budget._lock:
+            routes = tuple(budget.routes)
         usage = Counter()
-        for route in budget.routes:
+        for route in routes:
             usage.update(route.usage)
         return ExecutionResult(
             patch,
             tuple(checks),
-            tuple(budget.routes),
+            routes,
             dict(usage),
             hashlib.sha256(patch).hexdigest(),
             refinement,

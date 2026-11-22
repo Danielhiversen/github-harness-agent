@@ -716,6 +716,105 @@ def test_stock_repair_can_finish_two_dependent_edits_privately(solver_case, monk
     assert all(check.returncode == 0 for check in result.checks)
 
 
+@pytest.mark.parametrize("case", ("hedge", "single_slot", "no_budget", "unsaved"))
+def test_delayed_stock_hedge_respects_durable_recovery_and_capacity(solver_case, monkeypatch, case):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from github_harness_agent.checkpoint import SolverRecovery
+    from github_harness_agent.review_solver import _goal_digest
+
+    task, _, runner, _ = solver_case
+    Path(task.pull_checks[0][-1]).write_text(
+        "from fixture_calc import first\n\ndef test_first():\n    assert first() == -1\n"
+    )
+    digest = "4" * 64
+    target = (1, "tests/test_existing.py::test_stock")
+    monkeypatch.setattr("github_harness_agent.review_solver._recovery_digest", lambda *args: digest)
+    clock = [0.0]
+    monkeypatch.setattr(
+        "github_harness_agent.review_solver.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    task = replace(
+        task,
+        solver_recovery=(
+            None if case == "unsaved" else SolverRecovery(digest, ((_goal_digest(target), 0, 2),))
+        ),
+        require_new_tests=case == "hedge",
+    )
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, content in {
+            SOURCE: BASE_SOURCE + "\ndef stock():\n    return -3\n",
+            "tests/test_existing.py": "from fixture_calc import stock\n\ndef test_stock():\n    assert stock() == 3\n",
+        }.items():
+            data = content.encode()
+            entry = tarfile.TarInfo(path)
+            entry.size = len(data)
+            snapshot.addfile(entry, BytesIO(data))
+
+    primary_started, alternate_started, release_primary = Event(), Event(), Event()
+    stock_requests = []
+
+    class Gateway:
+        def complete(self, *, role, messages, after_provider=None, **request):
+            if role == "planning":
+                route, content = "planner", "No usable strategy"
+            elif messages[-1]["content"].startswith("Selected failure: new regression tests\n"):
+                route, content = "test-author", edit(
+                    NEW_TEST, "", "from fixture_calc import stock\n\ndef test_stock_fix():\n    assert stock() == 3\n"
+                )
+            else:
+                stock_requests.append((messages, after_provider))
+                count = len(stock_requests)
+                first = 1 if case == "unsaved" else 2
+                fix = edit(SOURCE, "    return -3\n", "    return 3\n")
+                if count < first:
+                    route, content = "stalled", edit(SOURCE, "    return -3\n", "    return -4\n")
+                elif count == first:
+                    primary_started.set()
+                    assert release_primary.wait(35)
+                    route, content = "primary", fix if case != "hedge" else "Malformed late reply"
+                else:
+                    alternate_started.set()
+                    route, content = "alternate", fix
+            return SimpleNamespace(
+                role=role, route=route, model=route, configured_model=route, content=content,
+                usage={"requests": 1}, tool_calls=(),
+            )
+
+    requests = {"hedge": 5, "single_slot": 4, "no_budget": 3, "unsaved": 2}[case]
+    executor = PlainExecutor(
+        runner, Gateway(), Limits(model_requests=requests, concurrent_probes=1 if case == "single_slot" else 2)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+    with ThreadPoolExecutor(max_workers=1) as threads:
+        future = threads.submit(solve, executor, task, archive.getvalue(), budget, "fixture-version")
+        try:
+            assert primary_started.wait(30)
+            clock[0] = 59.0
+            assert not alternate_started.wait(0.6)
+            clock[0] = 60.0
+            if case == "hedge":
+                assert alternate_started.wait(8)
+            else:
+                assert not alternate_started.wait(1)
+                release_primary.set()
+            result = future.result(timeout=30)
+        finally:
+            release_primary.set()
+
+    assert b"+    return 3\n" in result.patch
+    assert all(check.returncode == 0 for check in result.checks)
+    if case == "hedge":
+        assert stock_requests[-2:] == [(stock_requests[-1][0], "stalled")] * 2
+        assert [entry.route for entry in result.route_trace] == ["planner", "stalled", "alternate", "test-author"]
+        assert result.usage == {"requests": 4}
+        assert NEW_TEST.encode() in result.patch
+        assert budget.model_requests_remaining() == 0
+    else:
+        assert not alternate_started.is_set()
+
+
 def test_stalled_stock_pytest_uses_advice_and_named_fallback(solver_case):
     task, _, runner, _ = solver_case
     task = replace(task, require_new_tests=False)

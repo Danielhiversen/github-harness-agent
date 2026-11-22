@@ -8,7 +8,7 @@ import logging
 import re
 import time
 from collections import Counter
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 
 from . import review_recovery
@@ -94,6 +94,7 @@ _PYTEST_CRASH_LINE = re.compile(r"^\S[^\n]*?\.py:[1-9][0-9]*: .+$")
 _PYTEST_TOTALS = re.compile(r"(?:\d+ [a-z]+, )*\d+ [a-z]+ in \d+(?:\.\d+)?s(?: \([\d:]+\))?")
 _STOCK_REPAIR_CASE_LIMIT = 4
 _STOCK_REPAIR_RETRIES = 2
+_STOCK_HEDGE_DELAY = 60
 _GUARD_SECONDS = 90
 _GUARD_MIN_REMAINING = 45
 _COMPOSITION_MIN_REMAINING = 60
@@ -775,6 +776,15 @@ def _rejected_attempt(source, candidate, target, before, after):
 
 
 @dataclass(frozen=True)
+class _StockHedge:
+    primary: Future
+    due: float
+    messages: list[dict[str, str]]
+    route: str | None
+    exclude: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
 class _RegressionRepair:
     origin: tuple[int, str]
     sources: dict[str, str]
@@ -1157,6 +1167,10 @@ def solve(executor, task, archive, budget, version):
     editor = actor
     submitted = 0
     pending = {}
+    stock_hedge = None
+    hedge_used = False
+    hedge_pair = set()
+    retired = None
     continuations = {}
     stock_edits = ()
     composition_attempted = False
@@ -1169,6 +1183,8 @@ def solve(executor, task, archive, budget, version):
     pool = ThreadPoolExecutor(max_workers=executor.limits.concurrent_probes)
     try:
         while True:
+            if retired is not None and retired.done():
+                retired = None
             needs_tests = task.require_new_tests and not has_runnable_test(
                 new_path, current[new_path].encode()
             )
@@ -1224,7 +1240,35 @@ def solve(executor, task, archive, budget, version):
             launch_budget = min(
                 max_proposals - submitted, budget.model_requests_remaining()
             )
-            slots = min(launch_budget, limit - len(pending))
+            if (
+                stock_hedge is not None
+                and len(pending) == 1
+                and retired is None
+                and private is None
+                and launch_budget > 0
+                and not stock_hedge.primary.done()
+                and pending[stock_hedge.primary][1] is current
+                and time.monotonic() >= stock_hedge.due
+                and budget.remaining() > 30
+            ):
+                primary = stock_hedge.primary
+                alternate = pool.submit(
+                    _coding_completion,
+                    executor,
+                    budget,
+                    stock_hedge.messages,
+                    stock_hedge.route,
+                    None,
+                    exclude=stock_hedge.exclude,
+                )
+                pending[alternate] = pending[primary]
+                hedge_pair = {primary, alternate}
+                stock_hedge, hedge_used = None, True
+                submitted += 1
+                launch_budget -= 1
+            # A running sibling still occupies its worker after it becomes obsolete.
+            capacity = executor.limits.concurrent_probes - len(pending) - int(retired is not None)
+            slots = min(launch_budget, limit - len(pending), capacity)
             if not ready and slots > 0:
                 for target in available[:slots]:
                     if not launch_budget:
@@ -1395,12 +1439,14 @@ def solve(executor, task, archive, budget, version):
                                 model for model, count in counts.items()
                                 if count >= _MODEL_FAILURE_THRESHOLD
                             )
+                    route = last_routes.get(target)
+                    launched_at = time.monotonic()
                     future = pool.submit(
                         _coding_completion,
                         executor,
                         budget,
                         messages,
-                        last_routes.get(target),
+                        route,
                         planner_input,
                         source if native else None,
                         advice,
@@ -1416,6 +1462,22 @@ def solve(executor, task, archive, budget, version):
                         localized_retry,
                         repair,
                     )
+                    if (
+                        not hedge_used
+                        and executor.limits.concurrent_probes >= 2
+                        and stock_fixture
+                        and failures.keys() == {target}
+                        and rotation_key is not None
+                        and retained_recovery is not None
+                        and retained_recovery.identity == retained_identity
+                        and any(
+                            goal == _goal_digest(target) and stalled >= RECOVERY_MODE_THRESHOLD
+                            for goal, _, stalled in retained_recovery.goals
+                        )
+                    ):
+                        stock_hedge = _StockHedge(
+                            future, launched_at + _STOCK_HEDGE_DELAY, messages, route, exclude
+                        )
                     cost = 2 if native or planner_input is not None else 1
                     submitted += cost
                     launch_budget -= cost
@@ -1432,6 +1494,10 @@ def solve(executor, task, archive, budget, version):
             if not done:
                 continue
             future = next(future for future in pending if future in done)
+            if stock_hedge is not None and stock_hedge.primary is future:
+                stock_hedge = None
+            paired = future in hedge_pair
+            hedge_pair.discard(future)
             (
                 target,
                 snapshot,
@@ -1443,12 +1509,14 @@ def solve(executor, task, archive, budget, version):
                 repair,
             ) = pending.pop(future)
             if (
-                continuation is not None or advised or repair is not None
+                paired or continuation is not None or advised or repair is not None
             ) and snapshot is not current:
                 continue
             try:
                 completion, native_candidate, fresh_advice = future.result()
             except ProviderExhausted as error:
+                if paired and hedge_pair:
+                    continue
                 if rotated:
                     if snapshot is current:
                         # Reopen this goal's model choices for the rest of this draft.
@@ -1751,7 +1819,13 @@ def solve(executor, task, archive, budget, version):
                     completion.route,
                 )
                 continue
+            if paired and hedge_pair:
+                sibling = hedge_pair.pop()
+                pending.pop(sibling)
+                if not sibling.cancel() and not sibling.done():
+                    retired = sibling
             current, failures, patch, actor = candidate, after, proposed, editor
+            hedge_used = False
             pytest_runs = after_runs
             continuations.clear()
             stock_edits, composition_attempted = (), False
