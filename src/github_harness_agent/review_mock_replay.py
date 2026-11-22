@@ -1,5 +1,6 @@
 """Compare a stalled stock pytest case with its passing pinned baseline."""
 
+import ast
 import inspect
 import json
 import re
@@ -191,7 +192,100 @@ def _counter_paths(task, runner, reviewed_paths, test_path):
     )[:3]
 
 
-def _counter_difference(baseline, candidate, node):
+_CALLER_SOURCE_BYTES = 1024
+
+
+def _caller_source(label, location, sources):
+    path, function, row = location
+    source = sources.get(path)
+    if not source:
+        return ""
+    lines = source.splitlines(keepends=True)
+    if not 1 <= row <= len(lines):
+        return ""
+    try:
+        module = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError):
+        return ""
+    scopes = (
+        node
+        for node in ast.walk(module)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == function.rsplit(".", 1)[-1]
+        and node.lineno <= row <= node.end_lineno
+    )
+    scope = max(scopes, key=lambda node: node.lineno, default=None)
+    if scope is None:
+        return ""
+    nodes = list(ast.walk(scope))
+    header = f"\n{label} caller source (quoted): {path}:{row} {function}\n"
+    allowance = _CALLER_SOURCE_BYTES // 2 - len(header.encode())
+
+    def source_lines(start, end):
+        return "".join(lines[start - 1 : end]).rstrip("\r\n") + "\n"
+
+    calls = [
+        item
+        for item in nodes
+        if isinstance(item, ast.Call)
+        and item.lineno <= row <= item.end_lineno <= item.lineno + 5
+    ]
+    call = max(calls, key=lambda item: item.end_lineno - item.lineno, default=None)
+    start, end = (call.lineno, call.end_lineno) if call else (row, row)
+    guards = [
+        item
+        for item in nodes
+        if isinstance(item, ast.If)
+        and item.lineno < start <= item.end_lineno
+        and item.test.end_lineno < start
+    ]
+    guard = max(guards, key=lambda item: item.lineno, default=None)
+    windows = (
+        (max(scope.lineno, start - 1), min(scope.end_lineno, end + 1)),
+        (start, end),
+        (row, row),
+    )
+    if guard is not None:
+        guard_end = guard.body[0].lineno - 1
+        for first, last in windows:
+            prefix = (
+                source_lines(guard.lineno, min(guard_end, first - 1))
+                if guard.lineno < first
+                else ""
+            )
+            if guard_end + 1 < first:
+                prefix += "# …\n"
+            snippet = prefix + source_lines(first, last)
+            if len(snippet.encode()) <= allowance:
+                return header + snippet
+    for first, last in windows:
+        snippet = source_lines(first, last)
+        if len(snippet.encode()) <= allowance:
+            return header + snippet
+    return ""
+
+
+def _divergent_caller_source(old, new, sources):
+    for pinned, draft in zip(old, new):
+        base_stack, draft_stack = pinned[0], draft[0]
+        if pinned[1:] != draft[1:] or base_stack[0][:2] != draft_stack[0][:2]:
+            continue
+        pair = next(
+            (
+                (before, after)
+                for before, after in zip(base_stack[1:], draft_stack[1:])
+                if before[:2] != after[:2]
+            ),
+            None,
+        )
+        if pair is not None:
+            base = _caller_source("Pinned", pair[0], sources[0])
+            attempted = _caller_source("Draft", pair[1], sources[1])
+            return base + attempted if base and attempted else ""
+    return ""
+
+
+def _counter_difference(baseline, candidate, node, reviewed_sources=None):
     if baseline is None or candidate is None or baseline[0] != candidate[0]:
         return ""
     line, failed, windows = candidate
@@ -253,6 +347,11 @@ def _counter_difference(baseline, candidate, node):
         f"The pinned case passed and the draft failed at {node} line {line} (evaluation {failed + 1}). "
         "Locations show where the probe observed each change, with reviewed callers.\n"
         + "\n".join(rows)
+        + (
+            _divergent_caller_source(old[first:], new[first:], reviewed_sources)
+            if reviewed_sources
+            else ""
+        )
     )
 
 
@@ -267,6 +366,7 @@ def mock_call_diagnostic(
     *,
     reviewed_paths=None,
     failure_line=None,
+    reviewed_sources=None,
 ):
     node = node.removeprefix("/work/").removeprefix("./")
     base_node, bracket, parameter = node.partition("[")
@@ -322,7 +422,9 @@ def mock_call_diagnostic(
         filter(
             None,
             (
-                _counter_difference(baseline[1], candidate[1], base_node),
+                _counter_difference(
+                    baseline[1], candidate[1], base_node, reviewed_sources
+                ),
                 _differences(baseline[0], candidate[0]),
             ),
         )

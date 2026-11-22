@@ -1721,6 +1721,7 @@ def solve(executor, task, archive, budget, version):
                             failure_line=stock_assertion_failure_line(
                                 target[1], diagnostics[target]
                             ),
+                            reviewed_sources=(original, source),
                         )
                         counterfactual = stock_guard_diagnostic(
                             executor, task, archive, budget, check_command, target[1],
@@ -1737,6 +1738,7 @@ def solve(executor, task, archive, budget, version):
                             failure_line=stock_assertion_failure_line(
                                 target[1], diagnostics[target]
                             ),
+                            reviewed_sources=(original, source),
                         )
                         saved_trace = "Observations from before the unpublished edit:\n" + mock_detail
                         mock_detail = (
