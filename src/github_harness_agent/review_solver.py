@@ -589,6 +589,11 @@ def _test_detail(output, node):
                     break
                 if _PYTEST_CRASH_LINE.fullmatch(line.lstrip()):
                     frame_lines.append(line)
+                elif (
+                    title.startswith("ERROR at setup of ")
+                    and _PYTEST_FILE_FRAME.fullmatch(line.strip())
+                ):
+                    frame_lines.append(line.strip())
                 elif line.startswith(("E ", "> ")):
                     lines.append(line)
             lines = [*frame_lines[:4], *lines]
@@ -836,6 +841,51 @@ def _focused_generated_run(checks, command):
         if observed == command:
             return _parse_complete_pytest(check.returncode, check.output)
     return None
+
+
+def _failed_test_line_snapshot(path, draft, diagnostic, run):
+    """Bind the selected failure to a named case from the complete focused run."""
+    heading, _, detail = diagnostic.partition("\n")
+    if not heading.startswith("Selected failing case: ") or not run or run.named_cases is None:
+        return None
+    selected = heading.removeprefix("Selected failing case: ")
+    if selected not in run.failed or not selected.startswith(path + "::"):
+        return None
+    if not any(
+        row.startswith(("E ", "> ")) or _PYTEST_CRASH_LINE.fullmatch(row)
+        for row in detail.splitlines()
+    ):
+        return None
+    qualified = selected.removeprefix(path + "::").split("[", 1)[0].replace("::", ".")
+    snapshot = prepare_line_range_edit({path: draft}, (path, qualified))
+    if (
+        snapshot is not None and len(snapshot.lines) <= 26
+        and sum(len(row.encode()) + 1 for row in snapshot.lines) <= 2400
+    ):
+        return snapshot
+    return None
+
+
+def _test_line_messages(snapshot, note, current):
+    path, _ = snapshot.symbol
+    production = {name: code for name, code in current.items() if name != path}
+    failure_source = test_failure_focus(production, note)
+    failure_source = (
+        TEST_VERIFICATION_SOURCE + excerpt(failure_source, 750) + "\n" if failure_source else ""
+    )
+    return [
+        {"role": "system", "content": _LINE_RANGE_SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                excerpt(note, 1300) + "\n"
+                "Repair the failing test setup or call and keep the tested behavior and assertions. "
+                "Use the sample JSON structure with your actual replacement lines.\n"
+                + failure_source
+                + line_range_prompt(snapshot) + LINE_RANGE_ENDING
+            ),
+        },
+    ]
 
 
 def _project_generated_seed(path, source, run):
@@ -1160,9 +1210,17 @@ def _test_authoring_messages(
             anchor=int(position[1]) if position else None,
             max_chars=4400,
         )
+    setup_detail, setup_kind = _pytest_report_diagnostic("", note)
+    setup_guidance = (
+        f"\nSelected pytest setup failure (quoted data):\n{setup_detail}\n"
+        "Pytest fixtures defined only in another test module are unavailable here. "
+        "Use self-contained setup in the failing case or a fixture available in this module's scope.\n"
+        if repair_failed_tests and setup_kind == "fixture not found" else ""
+    )
     request = (
         "Selected failure: new regression tests\n"
-        f"Edit only {new_path}. "
+        + setup_guidance
+        + f"Edit only {new_path}. "
         + (
             TEST_REPAIR_GUIDANCE
             + " Start with the selected failing case if listed. Keep existing fixtures and coverage where they already work. "
@@ -3346,6 +3404,7 @@ def solve(executor, task, archive, budget, version):
     test_format_revision = None
     test_format_failures = 0
     test_tool_attempts = set()
+    test_line_attempts = set()
     repository_example = None
     repository_usage = ""
     repository_models = ""
@@ -3871,6 +3930,7 @@ def solve(executor, task, archive, budget, version):
                         )
                     allow_test_module = False
                     native_test = False
+                    test_line_snapshot = None
                     if target == _TEST_GOAL:
                         if test_checkout_snapshot is not current:
                             test_checkout_snapshot = current
@@ -3901,6 +3961,14 @@ def solve(executor, task, archive, budget, version):
                             # Each stored digest pair costs a reserved proposal.
                             test_tool_attempts.add(revision)
                             _LOG.info("Trying structured pytest module reply after repeated format errors")
+                        elif (
+                            allow_test_module and test_format_failures and revision not in test_line_attempts
+                        ):
+                            test_line_snapshot = _failed_test_line_snapshot(
+                                new_path, test_draft, test_diagnostic, test_case_runs.get("focused"),
+                            )
+                            if test_line_snapshot is not None:
+                                test_line_attempts.add(revision)
                         source = {**current, new_path: test_draft}
                         note = "\n".join(
                             item
@@ -4121,7 +4189,9 @@ def solve(executor, task, archive, budget, version):
                             else ""
                         ),
                     )
-                    if scoped_line:
+                    if test_line_snapshot is not None:
+                        messages = _test_line_messages(test_line_snapshot, note, source)
+                    elif scoped_line:
                         messages = [
                             {"role": "system", "content": _LINE_RANGE_SYSTEM},
                             {"role": "user", "content": line_retry.prompt},
@@ -4185,6 +4255,7 @@ def solve(executor, task, archive, budget, version):
                         line_retry,
                         line_followup,
                         allow_test_module,
+                        test_line_snapshot,
                         repair,
                     )
                     if (
@@ -4234,12 +4305,13 @@ def solve(executor, task, archive, budget, version):
                 line_retry,
                 line_followup,
                 allow_test_module,
+                test_line_snapshot,
                 repair,
             ) = pending.pop(future)
             scoped_line = line_retry is not None and line_retry.allowed_rows is not None
             if (
                 paired or continuation is not None or advised
-                or repair is not None or scoped_line
+                or repair is not None or scoped_line or test_line_snapshot is not None
             ) and snapshot is not current:
                 continue
             if (
@@ -4259,6 +4331,8 @@ def solve(executor, task, archive, budget, version):
                     line_retries[target] = line_followup
                 elif line_retry is not None:
                     _LOG.info("Numbered review edit format had no available coding route")
+                elif test_line_snapshot is not None:
+                    _LOG.info("Numbered pytest edit format had no available coding route")
                 elif rotated:
                     if snapshot is current:
                         # Reopen this goal's model choices for the rest of this draft.
@@ -4314,19 +4388,26 @@ def solve(executor, task, archive, budget, version):
                     source = {new_path: test_draft}
                 try:
                     candidate = native_candidate
-                    if target == _TEST_GOAL and candidate is None:
-                        candidate = _apply_test_reply(
-                            completion.content,
-                            source,
-                            new_path,
-                            allow_module=(
-                                allow_test_module
-                                and original[new_path] == current[new_path] == ""
-                                and not _protected(new_path, task, new_test=True)
-                            ),
-                            failed_draft=bool(test_draft and test_diagnostic),
-                            limit=executor.limits.patch_bytes,
-                        )
+                    if target == _TEST_GOAL:
+                        if test_line_snapshot is not None:
+                            candidate = apply_line_range_edit(
+                                completion.content, source, test_line_snapshot,
+                            )
+                        elif candidate is None:
+                            candidate = _apply_test_reply(
+                                completion.content,
+                                source,
+                                new_path,
+                                allow_module=(
+                                    allow_test_module
+                                    and original[new_path] == current[new_path] == ""
+                                    and not _protected(new_path, task, new_test=True)
+                                ),
+                                failed_draft=bool(test_draft and test_diagnostic),
+                                limit=executor.limits.patch_bytes,
+                            )
+                        if candidate == source:
+                            raise ValueError("The pytest edit did not change the draft.")
                     if candidate is None and active_line_snapshot is not None:
                         candidate = apply_line_range_edit(
                             completion.content, source, active_line_snapshot,

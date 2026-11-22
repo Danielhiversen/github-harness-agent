@@ -199,6 +199,38 @@ def test_fresh_test_context_keeps_grounded_usage_from_oversized_tracked_test():
         assert prompt.endswith(TEST_MODULE_REPLY_ENDING)
 
 
+def test_test_repair_prioritizes_the_missing_fixture_and_setup_frame():
+    path = "src/example/formatting.py"
+    new_path = "tests/test_review_regressions.py"
+    node = f"{new_path}::test_formatter"
+    output = (
+        "===== ERRORS =====\n"
+        "_____ ERROR at setup of test_formatter _____\n"
+        f"file /work/{new_path}, line 2\n"
+        "  def test_formatter(local_formatter):\n"
+        "E       fixture 'local_formatter' not found\n"
+        "===== short test summary info =====\n"
+        f"ERROR {node}\n"
+    )
+    report = review_solver._test_detail(output, node)
+    note = review_solver._failed_test_feedback({(0, node): report}, new_path)
+    messages = _proposal_messages(
+        (-1, "new regression tests"),
+        {
+            path: "def build_formatter():\n    return str\n",
+            new_path: "def test_formatter(local_formatter):\n    assert local_formatter('x') == 'x'\n",
+        },
+        {}, True, note,
+        ReviewRecovery(feedback=((path, 1, "cover the formatter"),), previous_failure=""),
+        {}, [], new_path, allow_test_module=True, repair_failed_tests=True,
+    )
+
+    lead = messages[-1]["content"].partition("Edit only")[0]
+    assert "fixture 'local_formatter' not found" in lead
+    assert f"/work/{new_path}:2" in lead
+    assert "a fixture available in this module's scope" in lead
+
+
 def test_fresh_test_prompt_distinguishes_requested_fixtures_from_acceptance_inventory():
     path = "src/example/formatting.py"
     new_path = "tests/test_review_regressions.py"

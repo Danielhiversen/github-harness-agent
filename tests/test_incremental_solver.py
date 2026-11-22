@@ -3020,6 +3020,63 @@ def test_solver_preserves_verified_passing_cases_in_unpublished_draft(solver_cas
     assert not checkpoints
 
 
+@pytest.mark.parametrize("numbered_reply", ("valid", "stale", "outside", "unchanged"))
+def test_solver_retries_failed_pytest_case_with_scoped_numbered_edit(solver_case, numbered_reply):
+    task, archive, runner, _ = solver_case
+    fixed = BASE_SOURCE.replace("return -1", "return 1").replace("return -2", "return 2")
+    checkpoint = DraftCheckpoint(
+        "harness2/base",
+        task.base_sha,
+        patch_for({SOURCE: BASE_SOURCE}, {SOURCE: fixed}),
+        guidance=_GUIDANCE,
+        last_editor=("fixture", "fixture/coder"),
+    )
+    task = replace(task, checkpoints={checkpoint.key: checkpoint})
+    keep = "\n\ndef test_keep():\n    assert second() == 2\n"
+    previous = TEST.replace("(1, 2)", "(0, 0)") + keep
+
+    class Gateway(FreeGateway):
+        def complete(self, **kwargs):
+            reply = super().complete(**kwargs)
+            if len(self.prompts) != 3:
+                return reply
+            prompt = self.prompts[-1]
+            if match := re.search(r'"snapshot":"([0-9a-f]{64})"', prompt):
+                payload = {
+                    "snapshot": "0" * 64 if numbered_reply == "stale" else match[1],
+                    "edits": [{
+                        "start": 3 if numbered_reply == "outside" else 2,
+                        "end": 3 if numbered_reply == "outside" else 2,
+                        "lines": [
+                            "    assert (first(), second()) == "
+                            + ("(0, 0)" if numbered_reply == "unchanged" else "(1, 2)")
+                        ],
+                    }],
+                }
+                reply.content = "```json\n" + json.dumps(payload) + "\n```"
+            return reply
+
+    gateway = Gateway(previous, previous, "No numbered edit supplied.", TEST + keep)
+    independent = runner.path / "numbered-verifier"
+    independent.mkdir()
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=4),
+        verification_runner=FixtureRunner(independent),
+    )
+    result = solve(executor, task, archive, _Budget(executor.limits, lambda: False, task), "fixture")
+
+    prompt = gateway.prompts[2]
+    assert prompt.startswith(f"Selected failing case: {NEW_TEST}::test_results\n")
+    assert "assert (1, 2) == (0, 0)" in prompt
+    assert "2 |     assert (first(), second()) == (0, 0)" in prompt
+    assert "def test_keep()" not in prompt
+    assert len(gateway.prompts) == (3 if numbered_reply == "valid" else 4)
+    assert b"assert (first(), second()) == (1, 2)" in result.patch
+    assert b"def test_keep():\n+    assert second() == 2" in result.patch
+    assert all(check.returncode == 0 for check in result.checks)
+    assert any(NEW_TEST in check.command for check in result.checks)
+
+
 @pytest.mark.parametrize("scenario", ("resume", "different_scope", "projection_fails"))
 def test_solver_restores_independently_verified_test_seed(solver_case, scenario):
     task, archive, runner, checkpoints = solver_case
