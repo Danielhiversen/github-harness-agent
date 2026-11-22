@@ -29,7 +29,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from .review_definitions import DEFINITION_ENDING
+from .review_definitions import DEFINITION_ENDING, LOCALIZED_METHOD_HEADING
 from .task_context import (
     MESSAGE_BYTES,
     compact_focused_review,
@@ -880,12 +880,12 @@ class ProviderRouter:
             retry_times.pop(key, None)
             try:
                 attempt_limit = route.attempt_timeout
-                if route.model == _NEMOTRON and not (
-                    role == "coding"
-                    and not tools
-                    and messages
-                    and str(messages[-1].get("content") or "").endswith(DEFINITION_ENDING)
-                ):
+                last_prompt = str(messages[-1].get("content") or "") if messages else ""
+                extended = not tools and (
+                    (role == "coding" and last_prompt.endswith(DEFINITION_ENDING))
+                    or (role == "planning" and LOCALIZED_METHOD_HEADING in last_prompt)
+                )
+                if route.model == _NEMOTRON and not extended:
                     attempt_limit = min(60, attempt_limit)
                 attempt_deadline = min(deadline, now + attempt_limit)
                 max_tokens = min(

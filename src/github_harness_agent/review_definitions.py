@@ -8,6 +8,7 @@ from collections import defaultdict
 from pathlib import PurePosixPath
 
 DEFINITION_ENDING = "Respond with complete named Python definitions only."
+LOCALIZED_METHOD_HEADING = "Exact current method localized by the offline replay:"
 DEFINITION_FORMAT = """Use only definition edit blocks. Begin each with an exact header:
 REPLACE relative/path.py::Class.method
 Then include the complete replacement definition, optionally in a Python code fence.

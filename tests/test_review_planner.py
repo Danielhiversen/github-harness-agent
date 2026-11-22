@@ -180,6 +180,7 @@ def test_stock_coding_prompt_keeps_complete_large_selected_method():
 
     def complete(gateway, role, messages, **options):
         assert method in messages[-1]["content"]
+        assert options["timeout_cap"] == 120
         return SimpleNamespace(
             content=json.dumps(
                 {

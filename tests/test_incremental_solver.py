@@ -105,6 +105,17 @@ def test_round_preference_is_used_for_only_the_first_model_request(solver_case):
     )
     assert preferred == [("previous-provider", 12), (None, 0), ("chosen-for-goal", 0)]
 
+    # A fresh strategy is independent of the previous unsuccessful coding route.
+    class Roles:
+        def complete(self, **request):
+            preferred.append((request.get("after_provider"), request.get("provider_offset", 0)))
+            return SimpleNamespace(role=request["role"], route="free", model="free", usage={})
+
+    budget = _Budget(Limits(model_requests=2), lambda: False, task)
+    for role in ("planning", "coding"):
+        budget.complete(Roles(), role, messages)
+    assert preferred[-2:] == [(None, 0), (None, 0)]
+
 
 @pytest.fixture
 def solver_case(tmp_path, monkeypatch):

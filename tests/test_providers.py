@@ -190,8 +190,11 @@ def test_nemotron_planner_has_its_own_reasoning_budget():
     assert payloads[0]["max_tokens"] == 4096
 
 
-@pytest.mark.parametrize("named", [False, True])
-def test_nemotron_extended_deadline_is_for_named_repair_only(named):
+@pytest.mark.parametrize(("role", "named", "localized"), [
+    ("coding", False, False), ("coding", True, False),
+    ("planning", False, True), ("coding", False, True),
+])
+def test_nemotron_extended_deadline_for_focused_reasoning(role, named, localized):
     requests = []
 
     def handle(request):
@@ -204,17 +207,19 @@ def test_nemotron_extended_deadline_is_for_named_repair_only(named):
     content = "Selected failure: test_index_order\n"
     if named:
         content += providers.DEFINITION_ENDING
+    if localized:
+        content += providers.LOCALIZED_METHOD_HEADING
     router.complete(
-        role="coding",
+        role=role,
         messages=[{"role": "system", "content": "Edit."}, {"role": "user", "content": content}],
         max_output_tokens=6144,
         timeout=115,
     )
     payload = json.loads(requests[0].content)
-    assert payload["chat_template_kwargs"]["enable_thinking"] == named
+    assert payload["chat_template_kwargs"]["enable_thinking"] == (named or role == "planning")
     assert payload["max_tokens"] == 6144
     timeout = requests[0].extensions["timeout"]["read"]
-    limit = 110 if named else 60
+    limit = 110 if named or (role == "planning" and localized) else 60
     assert limit - 3 < timeout <= limit
 
 

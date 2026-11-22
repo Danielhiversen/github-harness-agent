@@ -362,7 +362,9 @@ class _Budget:
         def send(payload):
             request_number = self.claim("model request", self.limits.model_requests)
             request_options = options.copy()
-            if request_number == 1 and not after_provider:
+            if request_number == 1 and not after_provider and not (
+                self.task.review_recovery and role == "planning"
+            ):
                 if self.task.review_recovery and self.task.provider_offset:
                     request_options["provider_offset"] = self.task.provider_offset
                 if self.task.retry_after_provider:

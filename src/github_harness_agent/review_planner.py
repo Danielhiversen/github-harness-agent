@@ -7,7 +7,7 @@ import re
 from collections import Counter
 
 from .providers import ProviderExhausted
-from .review_definitions import _symbols
+from .review_definitions import LOCALIZED_METHOD_HEADING, _symbols
 from .review_delta_context import (
     STOCK_SOURCE_LIMIT,
     resolve_symbol,
@@ -143,7 +143,7 @@ def request_coding_advice(
         if mock_detail.startswith("Auxiliary counterfactual (quoted data,"):
             site = re.search(r" ([\w./-]+\.py::[\w.]+), draft line [1-9][0-9]*:", mock_detail)
             if site and site[1] in inventory:
-                located = "\nExact current method localized by the offline replay:\n" + excerpt(
+                located = f"\n{LOCALIZED_METHOD_HEADING}\n" + excerpt(
                     inventory[site[1]], 12000
                 )
         # Changed symbols come first so important IDs survive inventory limits.
@@ -186,7 +186,7 @@ def request_coding_advice(
                 },
                 {"role": "user", "content": request},
             ],
-            timeout_cap=60,
+            timeout_cap=120 if located else 60,
             max_output_tokens=4096,
             retry_oversize=False,
         )
