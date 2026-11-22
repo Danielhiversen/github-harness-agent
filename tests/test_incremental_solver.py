@@ -2471,6 +2471,9 @@ def test_localized_named_failure_tries_numbered_ranges_as_an_independent_remedy(
         (True, "localized"),
         (False, "outage"),
         (False, "outage_regression"),
+        (True, "outage_partial_retry"),
+        (False, "outage_missing_tests_retry"),
+        (False, "outage_unrequested_tests"),
         (False, "unlocalized"),
         (False, "long_evidence"),
         (False, "one_attempt"),
@@ -2487,7 +2490,12 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
     task, _, runner, checkpoints = solver_case
     recovery = []
     long_evidence = scenario == "long_evidence"
-    outage = scenario in {"outage", "outage_regression"}
+    outage = scenario.startswith("outage")
+    partial_retry = scenario == "outage_partial_retry"
+    retry_after_outage = partial_retry or scenario == "outage_missing_tests_retry"
+    unrequested_tests = scenario == "outage_unrequested_tests"
+    if unrequested_tests:
+        task = replace(task, require_new_tests=False)
     localized = scenario == "localized" or long_evidence or outage
     acceptance = Path(task.pull_checks[0][-1])
     with acceptance.open("a") as file:
@@ -2509,7 +2517,8 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
         test_body += "".join(f"    checked_input_{row} = {row}\n" for row in range(160))
         fixture_body += "".join(f"    fixture_input_{row} = {row}\n" for row in range(55))
     assertion_line = len(test_body.splitlines()) + 1
-    test_body += "    assert stock_result() == tracked_stock_seed\n"
+    expectation = "3" if partial_retry else "tracked_stock_seed"
+    test_body += f"    assert stock_result() == {expectation}\n"
     fixture_body += "    return int('03')\n"
     if scenario == "wrong_snapshot":
         target = (1, "tests/test_existing.py::test_stock_result")
@@ -2600,7 +2609,7 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
             assert "lookup on current [3]" in task_prompt
         if not outputs:
             if not long_evidence:
-                assert "def test_stock_result(tracked_stock_seed):\n    assert stock_result() == tracked_stock_seed" in task_prompt
+                assert f"def test_stock_result(tracked_stock_seed):\n    assert stock_result() == {expectation}" in task_prompt
                 assert "def tracked_stock_seed():\n    return int('03')" in task_prompt
             assert "def test_stock_baseline():\n    assert stock_result(baseline=True) == 7" in task_prompt
             command_text = re.search(r"(?m)^Focused pytest argv: (.+)$", task_prompt)
@@ -2622,11 +2631,13 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
             if scenario == "outage_regression":
                 old, new = "        return 7\n    return -3\n", "        return 8\n    return 3\n"
             else:
-                old, new = "    return -3\n", "    return 3\n"
+                old, new = "    return -3\n", "    return -1\n" if partial_retry else "    return 3\n"
             calls = (call("edit_file", {"path": SOURCE, "old_text": old, "new_text": new}),)
-            if interactive_tests:
+            if interactive_tests or unrequested_tests:
                 calls += (call("edit_file", {"path": NEW_TEST, "new_text": regression}),)
         elif len(tool_turns) == 3:
+            if unrequested_tests:
+                assert "outside the scoped review" in outputs[-1]
             calls = (call("run", {"argv": focused_command}),)
         else:
             assert "1 passed" in outputs[-1]
@@ -2640,6 +2651,8 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
         def complete(self, *, role, messages, tools, timeout, **kwargs):
             prompt = messages[-1]["content"]
             calls = ()
+            if retry_after_outage and "provider outage" in phases:
+                raise ProviderExhausted(None, {"fixture": "waiting for provider retry"})
             if tools:
                 if scenario == "outage_regression" and {tool["function"]["name"] for tool in tools} == {"replace_python_definition"}:
                     raise ProviderExhausted(None, {"fixture": "native tool unavailable"})
@@ -2653,8 +2666,10 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
             elif prompt.startswith("Selected failure: new regression tests"):
                 phases.append("author")
                 if scenario in {"localized", "unlocalized", "long_evidence", "outage"}:
-                    assert len(checkpoints) == 1
+                    assert len(checkpoints) == 2
                     assert b"+    return 3\n" not in checkpoints[0].patch
+                    assert b"+    return 3\n" in checkpoints[-1].patch
+                    assert NEW_TEST.encode() not in checkpoints[-1].patch
                 content = edit(NEW_TEST, "", regression)
             elif "single line-range JSON object" in prompt:
                 phases.append("numbered")
@@ -2687,6 +2702,39 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
         verification_runner=FixtureRunner(verifier_root),
     )
     budget = _Budget(executor.limits, lambda: False, task)
+    if retry_after_outage:
+        with pytest.raises((ProviderExhausted, ReviewRoundExhausted)):
+            solve(executor, task, archive.getvalue(), budget, "fixture")
+        initial, saved = checkpoints
+        assert initial.patch != saved.patch and NEW_TEST.encode() not in saved.patch
+        assert "provider outage" in phases and "author" not in phases
+        if partial_retry:
+            assert b"+    return -1\n" in saved.patch
+            assert saved.progress == (
+                "The tracked pytest integer comparison moved closer to its expected value.",
+            )
+        else:
+            assert b"+    return 3\n" in saved.patch
+        resumed = replace(task, checkpoints={saved.key: saved})
+        edits = (
+            [edit(SOURCE, "    return -1\n", "    return 3\n")] if partial_retry else []
+        ) + [edit(NEW_TEST, "", regression)]
+        resumed_gateway = FreeGateway(*edits)
+        resumed_executor = PlainExecutor(
+            runner,
+            resumed_gateway,
+            Limits(model_requests=len(edits), concurrent_probes=1),
+            verification_runner=executor.verification_runner,
+        )
+        resumed_budget = _Budget(resumed_executor.limits, lambda: False, resumed)
+        result = solve(
+            resumed_executor, resumed, archive.getvalue(), resumed_budget, "fixture"
+        )
+        first_goal = "test_stock_result" if partial_retry else "new regression tests"
+        assert first_goal in resumed_gateway.prompts[0].splitlines()[0]
+        assert all(check.returncode == 0 for check in result.checks)
+        assert b"+    return 3\n" in result.patch and NEW_TEST.encode() in result.patch
+        return
     if scenario == "outage_regression":
         with pytest.raises(ReviewRoundExhausted):
             solve(executor, task, archive.getvalue(), budget, "fixture")
@@ -2709,7 +2757,7 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
         assert any(durable for _, durable in recovery)
     else:
         assert not any(durable for _, durable in recovery)
-    if not interactive_tests:
+    if not interactive_tests and not unrequested_tests:
         expected.append("author")
     assert phases == expected
     if scenario == "reserved":
@@ -2717,7 +2765,9 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
     if scenario != "wrong_snapshot":
         assert b"+    return 3\n" not in checkpoints[0].patch
     assert all(0 < tokens <= 3072 for tokens in tool_turns)
-    assert b"+    return 3\n" in result.patch and NEW_TEST.encode() in result.patch
+    assert b"+    return 3\n" in result.patch
+    assert (NEW_TEST.encode() in result.patch) is not unrequested_tests
+    assert all(NEW_TEST.encode() not in checkpoint.patch for checkpoint in checkpoints)
     assert b"outside.py" not in result.patch
     assert all(check.returncode == 0 for check in result.checks)
 

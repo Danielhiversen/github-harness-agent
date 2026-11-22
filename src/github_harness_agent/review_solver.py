@@ -1213,7 +1213,35 @@ def solve(executor, task, archive, budget, version):
         if counts is not None and snapshot is current and editor.configured_model:
             counts[editor.route, editor.configured_model] += 1
 
-    def verify_stock_gain(target, sources, probe_budget):
+    def is_isolated_stock_failure(target, checked, runs):
+        return (
+            failures.keys() == checked.keys() == {target}
+            and stock_fixtures.get((target, failures[target]))
+            and _same_pytest_selection(pytest_runs.get(target[0]), runs.get(target[0]))
+            and pytest_runs[target[0]].failed == runs[target[0]].failed == {target[1]}
+            and _verified_operator_runs(
+                pytest_runs, runs, set(), task.pull_checks, operator_cases
+            )
+        )
+
+    def tracked_assertion_note(target, sources, checked):
+        if not _named_operator_cases({target}, commands):
+            return ""
+        changed_paths = {
+            path
+            for path in current.keys() | sources.keys()
+            if current.get(path) != original.get(path)
+            or sources.get(path) != original.get(path)
+        }
+        return stock_assertion_progress(
+            archive,
+            target[1],
+            failures[target],
+            checked[target],
+            changed_paths=changed_paths,
+        )
+
+    def verify_stock_candidate(target, sources, probe_budget, *, accept_partial=False):
         proposal = patch_for(original, sources)
         if not proposal or len(proposal) > executor.limits.patch_bytes:
             return None
@@ -1228,8 +1256,36 @@ def solve(executor, task, archive, budget, version):
                 pytest_runs, runs, set(), task.pull_checks, operator_cases
             )
         ):
-            return sources, proposal, checked, runs
+            return (sources, proposal, checked, runs), ""
+        if accept_partial and is_isolated_stock_failure(target, checked, runs):
+            note = tracked_assertion_note(target, sources, checked)
+            if note:
+                return (sources, proposal, checked, runs), note
         return None
+
+    def verify_stock_gain(target, sources, probe_budget):
+        verified = verify_stock_candidate(target, sources, probe_budget)
+        return verified[0] if verified else None
+
+    def save_verified_progress(checkpoint_patch, note, editor):
+        nonlocal retained_failures, retained_identity
+        budget.remaining()
+        malformed.clear()
+        native_ready.clear()
+        no_progress.clear()
+        retained_failures = failures
+        retained_identity = _recovery_digest(task, fixtures, checkpoint_patch)
+        retain_recovery()
+        task.save_checkpoint(
+            DraftCheckpoint(
+                _CHECKPOINT,
+                task.base_sha,
+                checkpoint_patch,
+                (note,) if note else (),
+                _GUIDANCE,
+                (editor.route, editor.configured_model),
+            )
+        )
 
     def interactive_stock_gain(target, symbol, probe):
         reviewed = {
@@ -1321,17 +1377,29 @@ def solve(executor, task, archive, budget, version):
             )
             sources = {**current, **reviewed}
             # Prove the production fix with the accepted test selection first.
-            production = {**sources, new_path: current[new_path]} if new_path in sources else sources
-            if production == current or editor is None or not editor.configured_model:
-                _LOG.info("Interactive review ended without a new attributable production edit")
+            production = (
+                {**sources, new_path: original[new_path]}
+                if new_path in sources
+                else sources
+            )
+            if (
+                not any(production[path] != current[path] for path in paths)
+                or editor is None
+                or not editor.configured_model
+            ):
+                _LOG.info(
+                    "Interactive review ended without a new attributable production edit"
+                )
                 return None
-            verified = verify_stock_gain(target, production, budget)
+            verified = verify_stock_candidate(
+                target, production, budget, accept_partial=True
+            )
             if verified is not None:
-                _, verified_patch, checked, runs = verified
-                proposed = verified_patch if production == sources else patch_for(original, sources)
-                if len(proposed) <= executor.limits.patch_bytes:
-                    return (sources, proposed, checked, runs), editor
-            _LOG.info("The interactive edit still had outstanding verification failures")
+                checked, note = verified
+                return checked, editor, note, sources.get(new_path)
+            _LOG.info(
+                "The interactive edit still had outstanding verification failures"
+            )
         except Cancelled:
             raise
         except (ExecutionError, ProviderExhausted, ValueError, OSError) as error:
@@ -1446,6 +1514,32 @@ def solve(executor, task, archive, budget, version):
     test_draft = current.get(new_path, "")
     test_diagnostic = ""
     test_rejection = None
+
+    def start_new_draft(target):
+        nonlocal interactive_target, interactive_symbol, hedge_used
+        nonlocal stock_edits, composition_attempted, regression_repair
+        interactive_target = interactive_symbol = None
+        interactive_misses.clear()
+        unlocalized_plans.clear()
+        hedge_used = False
+        continuations.clear()
+        stock_edits, composition_attempted = (), False
+        regression_repair = None
+        repair_attempted.clear()
+        unavailable.clear()
+        rejected.clear()
+        planning_attempts.clear()
+        model_failures.clear()
+        retry_advice.clear()
+        line_retries.clear()
+        line_routes.clear()
+        mock_diagnostics.clear()
+        last_routes.pop(target, None)
+        notes.pop(target, None)
+        malformed.pop(target, None)
+        native_ready.discard(target)
+        no_progress.pop(target, None)
+
     pool = ThreadPoolExecutor(max_workers=executor.limits.concurrent_probes)
     try:
         while True:
@@ -1557,13 +1651,32 @@ def solve(executor, task, archive, budget, version):
                     proposed = interactive_stock_gain(interactive_target, interactive_symbol, _InteractiveBudget(budget, turns, tools))
                     submitted += before - budget.model_requests_remaining()
                     if proposed is not None:
-                        continuations.pop(interactive_target, None)
-                        (current, patch, failures, pytest_runs), actor = proposed
+                        (
+                            (current, patch, failures, pytest_runs),
+                            actor,
+                            progress_note,
+                            tentative_tests,
+                        ) = proposed
                         editor = actor
-                        test_draft = current.get(new_path, "")
-                        # Keep this candidate in memory until ordinary regression authoring and final verification.
+                        start_new_draft(interactive_target)
+                        if progress_note:
+                            _LOG.info("%s", progress_note)
+                        if failures or task.require_new_tests:
+                            save_verified_progress(patch, progress_note, editor)
+                        # Speculative tests are never written into this checkpoint.
+                        if task.require_new_tests and tentative_tests:
+                            test_draft = tentative_tests
+                            if not failures and has_runnable_test(
+                                new_path, test_draft.encode()
+                            ):
+                                with_tests = {**current, new_path: test_draft}
+                                combined = patch_for(original, with_tests)
+                                if len(combined) <= executor.limits.patch_bytes:
+                                    current, patch = with_tests, combined
                         continue
-                    launch_budget = min(max_proposals - submitted, budget.model_requests_remaining())
+                    launch_budget = min(
+                        max_proposals - submitted, budget.model_requests_remaining()
+                    )
             if (
                 stock_hedge is not None
                 and len(pending) == 1
@@ -2260,17 +2373,7 @@ def solve(executor, task, archive, budget, version):
             stock_progress = ""
             isolated_stock_failure = (
                 snapshot is current
-                and failures.keys() == after.keys() == {target}
-                and stock_fixtures.get((target, failures[target]))
-                and _same_pytest_selection(
-                    pytest_runs.get(target[0]), after_runs.get(target[0])
-                )
-                and pytest_runs[target[0]].failed
-                == after_runs[target[0]].failed
-                == {target[1]}
-                and _verified_operator_runs(
-                    pytest_runs, after_runs, set(), task.pull_checks, operator_cases
-                )
+                and is_isolated_stock_failure(target, after, after_runs)
             )
             if isolated_stock_failure:
                 previous_site = stock_failure_site(target[1], failures[target])
@@ -2282,20 +2385,7 @@ def solve(executor, task, archive, budget, version):
                         previous_site,
                         next_site,
                     )
-                if _named_operator_cases({target}, commands):
-                    changed_paths = {
-                        path
-                        for path in current.keys() | candidate.keys()
-                        if current.get(path) != original.get(path)
-                        or candidate.get(path) != original.get(path)
-                    }
-                    stock_progress = stock_assertion_progress(
-                        archive,
-                        target[1],
-                        failures[target],
-                        after[target],
-                        changed_paths=changed_paths,
-                    )
+                stock_progress = tracked_assertion_note(target, candidate, after)
                 partial = bool(stock_progress)
                 if partial:
                     _LOG.info("%s", stock_progress)
@@ -2380,29 +2470,10 @@ def solve(executor, task, archive, budget, version):
                 if not sibling.cancel() and not sibling.done():
                     retired = sibling
             current, failures, patch, actor = candidate, after, proposed, editor
-            interactive_target = interactive_symbol = None
-            interactive_misses.clear()
-            unlocalized_plans.clear()
-            hedge_used = False
             pytest_runs = after_runs
-            continuations.clear()
-            stock_edits, composition_attempted = (), False
-            regression_repair = None
-            repair_attempted.clear()
-            rejected.clear()
-            planning_attempts.clear()
-            model_failures.clear()
-            retry_advice.clear()
-            line_retries.clear()
-            line_routes.clear()
-            mock_diagnostics.clear()
-            last_routes.pop(target, None)
-            notes.pop(target, None)
+            start_new_draft(target)
             if prefix_progress:
                 notes[target] = prefix_progress
-            malformed.pop(target, None)
-            native_ready.discard(target)
-            no_progress.pop(target, None)
             if not failures and (
                 not task.require_new_tests
                 or has_runnable_test(new_path, current[new_path].encode())
@@ -2415,33 +2486,16 @@ def solve(executor, task, archive, budget, version):
                 completion.route,
                 len(after),
             )
-            budget.remaining()
-            # A new durable draft retires the earlier draft's recovery metadata.
-            malformed.clear()
-            native_ready.clear()
-            no_progress.clear()
-            retained_failures = failures
-            retained_identity = _recovery_digest(task, fixtures, patch)
-            retain_recovery()
-            progress_note = prefix_progress or stock_progress
-            task.save_checkpoint(
-                DraftCheckpoint(
-                    _CHECKPOINT,
-                    task.base_sha,
-                    patch,
-                    (progress_note,)
-                    if progress_note
-                    else (
-                        (
-                            "An operator case reached a later assertion and still failed.",
-                        )
-                        if partial
-                        else ()
-                    ),
-                    _GUIDANCE,
-                    (editor.route, editor.configured_model),
+            progress_note = (
+                prefix_progress
+                or stock_progress
+                or (
+                    "An operator case reached a later assertion and still failed."
+                    if partial
+                    else ""
                 )
             )
+            save_verified_progress(patch, progress_note, editor)
     finally:
         # A running gateway request is already bounded by the shared deadline.
         pool.shutdown(wait=False, cancel_futures=True)
