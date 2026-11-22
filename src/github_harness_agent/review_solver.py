@@ -401,7 +401,127 @@ def _retry_test_definition(response, draft, path, limit):
     return result
 
 
+def _wrapped_test_search(code, draft, path, labeled):
+    if labeled and code.startswith("<<<<<<< SEARCH\n"):
+        code = f"{path}\n{code}"
+    block = _BLOCK.fullmatch(code)
+    if not block or block[1] != path or not block[2].strip():
+        raise ValueError
+    result = apply_blocks(code, {path: draft}, path)
+    original = ast.parse(draft, filename=path).body
+    candidate = ast.parse(result[path], filename=path).body
+    # The exact search must lie inside one top-level function body. Comparing its
+    # siblings also detects edits that escape the body through a dedent or string.
+    offset = draft.index(block[2])
+    first_line = draft.count("\n", 0, offset) + 1
+    last_line = first_line + block[2].rstrip("\n").count("\n")
+    functions = (ast.FunctionDef, ast.AsyncFunctionDef)
+    if len(original) != len(candidate):
+        raise ValueError
+    inside_function = False
+    for old, new in zip(original, candidate, strict=True):
+        if isinstance(old, functions) and old.lineno < first_line <= last_line <= old.end_lineno:
+            inside_function = True
+            if type(new) is not type(old) or new.name != old.name:
+                raise ValueError
+        elif ast.dump(old) != ast.dump(new):
+            raise ValueError
+    if not inside_function:
+        raise ValueError
+    return result
+
+
+def _test_module_declarations(body):
+    functions = (ast.FunctionDef, ast.AsyncFunctionDef)
+    owners = [
+        ("", body),
+        *((node.name, node.body) for node in body if isinstance(node, ast.ClassDef)),
+    ]
+    declarations = Counter(
+        (owner, node.name)
+        for owner, statements in owners
+        for node in statements
+        if isinstance(node, functions) and node.name.startswith("test")
+    )
+    declarations.update(
+        ast.dump(node) for node in body if isinstance(node, (ast.Import, ast.ImportFrom))
+    )
+    return declarations
+
+
+def _wrapped_test_repair(response, draft, path, limit):
+    """Recover a single edit from a labeled or prose-wrapped draft repair."""
+    if not isinstance(response, str):
+        return None
+    text = response.replace("\r\n", "\n").strip()
+    fences = list(_FENCE_LINE.finditer(text))
+    if not fences:
+        return None
+    if len(fences) != 2:
+        raise ValueError("Pytest repair declined (ambiguous-fences)")
+    start, close = (fence.start() for fence in fences)
+    end = text.find("\n", close)
+    end = len(text) if end < 0 else end
+    before, after = text[:start].strip(), text[end:].strip()
+    if not before and not after:
+        return None
+    if not after and re.fullmatch(r"REPLACE \S+\.py::[\w.]+", before):
+        return None  # The canonical definition header may precede its fenced body.
+
+    if len(response.encode()) > min(limit, 80_000):
+        raise ValueError("Pytest repair declined (response-size)")
+    outside = "\n".join(part for part in (before, after) if part)
+    if len(outside) > 600 or len(outside.splitlines()) > 6:
+        raise ValueError("Pytest repair declined (wrapper-size)")
+    target = re.escape(path)
+    labeled = False
+    for line in outside.splitlines():
+        if re.fullmatch(
+            rf"(?:(?i:file|filename|path):[ \t]*)?(?:{target}|`{target}`|\*\*{target}\*\*):?",
+            line.strip(),
+        ):
+            if labeled:
+                raise ValueError("Pytest repair declined (duplicate-wrapper-label)")
+            labeled = True
+        elif re.search(r"(?i)\.py|(?:[\w.-]+/)+[\w.-]+", line):
+            raise ValueError("Pytest repair declined (wrapper-path)")
+        elif _MARKER.search(line.strip()) or re.match(
+            r"\s*(?:diff |@@|REPLACE\b|IMPORTS\b|--- |\+\+\+ |(?:file|filename|path):)",
+            line, re.I,
+        ):
+            raise ValueError("Pytest repair declined (wrapper-operation)")
+
+    fence = _PYTHON_FENCE.fullmatch(text[start:end].strip())
+    if not fence:
+        raise ValueError("Pytest repair declined (fence-format)")
+    code = fence["code"]
+    try:
+        if code.startswith("REPLACE "):
+            result = apply_definitions(code, {path: draft}, single_function=True)
+        elif _MARKER.search(code):
+            result = _wrapped_test_search(code, draft, path, labeled)
+        else:
+            result = _retry_test_definition(code, draft, path, limit)
+            if result is None and (module := _complete_test_module(code, path, limit)):
+                proposed = ast.parse(module, filename=path).body
+                original = ast.parse(draft, filename=path).body
+                if (
+                    len(proposed) > 1
+                    and _test_module_declarations(original) <= _test_module_declarations(proposed)
+                ):
+                    result = {path: module}
+        if result is not None:
+            compile(result[path], path, "exec", dont_inherit=True)
+            return result
+    except (SyntaxError, ValueError, RecursionError):
+        raise ValueError("Pytest repair declined (invalid-wrapped-edit)") from None
+    raise ValueError("Pytest repair declined (unrecognized-wrapped-edit)")
+
+
 def _apply_test_reply(response, sources, path, *, allow_module, failed_draft, limit):
+    if allow_module and failed_draft and (draft := sources.get(path)):
+        if wrapped := _wrapped_test_repair(response, draft, path, limit):
+            return wrapped
     try:
         return apply_blocks(response, sources, path)
     except ValueError:
@@ -4226,9 +4346,15 @@ def solve(executor, task, archive, budget, version):
                     if target == _TEST_GOAL:
                         if snapshot is current:
                             test_format_failures += 1
+                        raw = completion.content or ""
                         _LOG.info(
-                            "New pytest module reply via %s did not parse (characters=%d)",
-                            completion.route, len(completion.content or ""),
+                            "New pytest module reply via %s did not parse "
+                            "(characters=%d fences=%d search_markers=%d "
+                            "replace_markers=%d named_headers=%d diff_hunks=%d)",
+                            completion.route, len(raw), len(_FENCE_LINE.findall(raw)),
+                            raw.count("<<<<<<< SEARCH"), raw.count(">>>>>>> REPLACE"),
+                            len(re.findall(r"(?m)^REPLACE ", raw)),
+                            len(re.findall(r"(?m)^@@ ", raw)),
                         )
                     if stock_fixtures.get((target, failures.get(target))):
                         raw = completion.content or ""

@@ -119,6 +119,59 @@ def test_unlabelled_complete_module_still_works_when_not_a_matching_definition(f
     ) == {PATH: reply}
 
 
+@pytest.mark.parametrize("prefix", ("Here is the repaired test.", f"File: `{PATH}`"))
+@pytest.mark.parametrize("qualified", (False, True))
+def test_wrapped_repair_keeps_draft_imports_and_siblings(prefix, qualified):
+    draft = MODULE + "\ndef test_sibling():\n    assert sqrt(16) == 4\n"
+    repaired = "def test_positive():\n    assert sqrt(9) == 3"
+    header = f"REPLACE {PATH}::test_positive\n" if qualified else ""
+    reply = f"{prefix}\n```python\n{header}{repaired}\n```\nThe test uses the existing import."
+
+    assert _apply_test_reply(
+        reply, {PATH: draft}, PATH, allow_module=True, failed_draft=True, limit=4096,
+    ) == {PATH: draft.replace("sqrt(4) == 2", "sqrt(9) == 3")}
+
+
+def test_wrapped_search_repair_uses_the_exact_labeled_target():
+    block = "<<<<<<< SEARCH\n    assert sqrt(4) == 2\n=======\n    assert sqrt(9) == 3\n>>>>>>> REPLACE"
+    reply = f"File: `{PATH}`\n```\n{block}\n```"
+    assert _apply_test_reply(
+        reply, {PATH: MODULE}, PATH, allow_module=True, failed_draft=True, limit=4096,
+    ) == {PATH: MODULE.replace("sqrt(4) == 2", "sqrt(9) == 3")}
+
+
+def test_wrapped_complete_module_preserves_existing_tests_and_imports():
+    draft = MODULE + "\nclass TestValues:\n    def test_sibling(self):\n        assert sqrt(16) == 4\n"
+    repaired = draft.replace("sqrt(4) == 2", "sqrt(9) == 3")
+    reply = f"Here is the repaired module.\n```python\n{repaired}```\nThe fixture is offline."
+    options = dict(allow_module=True, failed_draft=True, limit=4096)
+
+    assert _apply_test_reply(reply, {PATH: draft}, PATH, **options) == {PATH: repaired}
+    for missing in ("from math import sqrt\n\n", repaired[repaired.index("\nclass "):]):
+        with pytest.raises(ValueError, match="unrecognized-wrapped-edit"):
+            _apply_test_reply(reply.replace(missing, "", 1), {PATH: draft}, PATH, **options)
+
+
+@pytest.mark.parametrize(
+    ("prefix", "content", "suffix", "reason"),
+    (
+        ("Edit src/other.py instead.", f"REPLACE {PATH}::test_positive\n" + MODULE.split("\n\n")[1], "", "wrapper-path"),
+        ("File: src/other.py", f"{PATH}\n<<<<<<< SEARCH\n{MODULE}=======\n{MODULE}>>>>>>> REPLACE", "", "wrapper-path"),
+        ("Here is the fix.", "def test_new():\n    assert abs(-2) == 2", "", "unrecognized-wrapped-edit"),
+        ("Here is the fix.", "def test_positive():\n    assert abs(-2) == 2", "\n```python\npass\n```", "ambiguous-fences"),
+        ("Here is the fix.", f"REPLACE {PATH}::test_positive\ndef test_positive():\n    assert abs(-2) == 2\nIMPORTS {PATH}\nimport os", "", "invalid-wrapped-edit"),
+        ("Here is the fix.", f"{PATH}\n<<<<<<< SEARCH\nfrom math import sqrt\n=======\nfrom math import floor\n>>>>>>> REPLACE", "", "invalid-wrapped-edit"),
+        ("Here is the fix.", f"{PATH}\n<<<<<<< SEARCH\n    assert sqrt(4) == 2\n=======\n    assert sqrt(9) == 3\nimport os\n>>>>>>> REPLACE", "", "invalid-wrapped-edit"),
+    ),
+)
+def test_ambiguous_wrapped_repairs_are_rejected_with_shape_only_reason(prefix, content, suffix, reason):
+    reply = f"{prefix}\n```python\n{content}\n```{suffix}"
+    with pytest.raises(ValueError, match=f"^Pytest repair declined \\({reason}\\)$"):
+        _apply_test_reply(
+            reply, {PATH: MODULE}, PATH, allow_module=True, failed_draft=True, limit=4096,
+        )
+
+
 @pytest.mark.parametrize(
     ("reply", "allow_module", "failed_draft", "error"),
     (
