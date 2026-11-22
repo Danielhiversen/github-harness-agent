@@ -2341,16 +2341,35 @@ def test_solver_final_verifies_a_complete_checkpoint_without_a_new_request(solve
     assert not idle_gateway.prompts
 
 
-@pytest.mark.parametrize("named_failure", ["malformed", "nonimproving"])
-def test_localized_named_failure_tries_numbered_ranges_as_an_independent_remedy(
-    solver_case, monkeypatch, named_failure
+@pytest.mark.parametrize(
+    ("failure", "fresh_sparse"),
+    [
+        ("malformed", False),
+        ("nonimproving", False),
+        ("success", True),
+        ("sparse_stale", True),
+        ("sparse_nonimproving", True),
+        ("sparse_outage", True),
+    ],
+)
+def test_localized_stock_repairs_choose_numbered_and_named_formats(
+    solver_case, monkeypatch, failure, fresh_sparse
 ):
     from github_harness_agent import review_solver
+    from github_harness_agent.providers import ProviderExhausted
 
     task, _, runner, _ = solver_case
     task = replace(task, require_new_tests=False, excluded_models=("blocked/model",))
     archive = BytesIO()
-    stock_method = "def stock_result():\n    return -3\n"
+    stock_method = (
+        "def stock_result():\n"
+        + (
+            "    # preserve the existing method body and comments\n" * 125
+            if fresh_sparse
+            else ""
+        )
+        + "    return -3\n"
+    )
     stock_test = (
         "from fixture_calc import stock_result\n\n"
         "def test_stock_result():\n    assert stock_result() == 3\n"
@@ -2406,11 +2425,21 @@ def test_localized_named_failure_tries_numbered_ranges_as_an_independent_remedy(
                     }
                 )
             elif "single line-range JSON object" in prompt:
+                if failure == "sparse_outage":
+                    raise ProviderExhausted(None, {"local": "upstream timeout"})
+                row = int(re.search(r"(?m)^([0-9]+) \|     return -3$", prompt)[1])
                 snapshot = re.search(r"\"snapshot\":\"([a-f0-9]{64})\"", prompt)[1]
+                if failure == "sparse_stale":
+                    snapshot = "0" * 64
+                replacement = (
+                    "    return -8"
+                    if failure == "sparse_nonimproving"
+                    else "    return 3"
+                )
                 content = json.dumps(
                     {
                         "snapshot": snapshot,
-                        "edits": [{"start": 2, "end": 2, "lines": ["    return 3"]}],
+                        "edits": [{"start": row, "end": row, "lines": [replacement]}],
                     }
                 )
             elif prompt.endswith(
@@ -2418,8 +2447,11 @@ def test_localized_named_failure_tries_numbered_ranges_as_an_independent_remedy(
             ):
                 content = (
                     "bad named response"
-                    if named_failure == "malformed"
-                    else f"REPLACE {SOURCE}::stock_result\ndef stock_result():\n    return -8"
+                    if failure == "malformed"
+                    else f"REPLACE {SOURCE}::stock_result\n"
+                    + stock_method.replace(
+                        "return -3", "return 3" if fresh_sparse else "return -8"
+                    )
                 )
             elif "Trace the public inputs." in prompt:
                 content = "bad search response"
@@ -2440,12 +2472,27 @@ def test_localized_named_failure_tries_numbered_ranges_as_an_independent_remedy(
     budget = _Budget(executor.limits, lambda: False, task)
     result = solve(executor, task, archive.getvalue(), budget, "fixture-version")
 
-    assert [item[0] for item in calls] == ["coding"] * 3 + ["planning"] + ["coding"] * 3
-    assert calls[4][2].endswith("Respond with exact SEARCH/REPLACE blocks only.")
-    assert calls[5][2].endswith("Respond with complete named Python definitions only.")
-    _, system, prompt, request, max_tokens = calls[6]
+    if fresh_sparse:
+        expected = ["coding"] * 3 + ["planning", "coding"]
+        if failure != "success":
+            expected.append("coding")
+            assert calls[-1][2].endswith(
+                "Respond with complete named Python definitions only."
+            )
+        assert [item[0] for item in calls] == expected
+        _, system, prompt, request, max_tokens = calls[4]
+    else:
+        assert [item[0] for item in calls] == ["coding"] * 3 + ["planning"] + [
+            "coding"
+        ] * 3
+        assert calls[4][2].endswith("Respond with exact SEARCH/REPLACE blocks only.")
+        assert calls[5][2].endswith(
+            "Respond with complete named Python definitions only."
+        )
+        _, system, prompt, request, max_tokens = calls[6]
     assert "single line-range JSON object" in prompt
-    assert "1 | def stock_result():" in prompt and "2 |     return -3" in prompt
+    assert "1 | def stock_result():" in prompt
+    assert f"{len(stock_method.splitlines())} |     return -3" in prompt
     assert prompt.count(stock_method) == 1
     assert "Complete pinned baseline definition" in prompt
     assert "causal evidence" in prompt and "Trace the public inputs." in prompt
@@ -2455,14 +2502,13 @@ def test_localized_named_failure_tries_numbered_ranges_as_an_independent_remedy(
     assert "bad named response" not in prompt and "return -8" not in prompt
     assert request.get("after_provider") is None
     assert request.get("exclude") == ("blocked/model",)
-    assert max_tokens == 6144
+    assert max_tokens == (3072 if fresh_sparse else 6144)
     assert system.endswith(review_solver.CAUSAL_EDIT_GUIDANCE)
     assert all(check.returncode == 0 for check in result.checks)
     assert (
         b"+    return 3\n" in result.patch
         and b"tests/test_existing.py" not in result.patch
     )
-
 
 @pytest.mark.parametrize(
     ("interactive_tests", "scenario"),

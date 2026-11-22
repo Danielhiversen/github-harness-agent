@@ -124,6 +124,7 @@ _GUARD_SECONDS = 90
 _GUARD_MIN_REMAINING = 45
 _COMPOSITION_MIN_REMAINING = 60
 _MODEL_FAILURE_THRESHOLD = 2
+_LONG_LOCALIZED_DEFINITION_BYTES = 6 * 1024
 _WORD = re.compile(r"[a-z]{3,}")
 _STOP = set(
     "self test check review request fixture calls builder return catalog assert tests with this from that they when have with which should".split()
@@ -730,6 +731,20 @@ def _coding_completion(
         _LOG.info("Applying a free planning strategy to the current review goal")
     elif advice is not None:
         _LOG.info("Reusing a free planning strategy for the current review goal")
+    fresh_line_snapshot = None
+    if (
+        line_snapshot is None
+        and native_source is None
+        and (symbol := localized_retry_symbol(fresh_advice)) is not None
+    ):
+        numbered = prepare_line_range_edit(planner_input[0], symbol)
+        if (
+            numbered is not None
+            and sum(len(row.encode()) + 1 for row in numbered.lines)
+            >= _LONG_LOCALIZED_DEFINITION_BYTES
+        ):
+            fresh_line_snapshot = line_snapshot = numbered
+            route = None
     messages = apply_coding_advice(
         messages,
         advice or fresh_advice,
@@ -775,18 +790,28 @@ def _coding_completion(
             # return a valid structured edit for this goal.
             pass
         else:
-            return completion, candidate, fresh_advice
-    completion = budget.complete(
-        executor.gateway,
-        "coding",
-        messages,
-        exclude=exclude,
-        after_provider=route,
-        max_output_tokens=(
-            6144 if causal_edit or messages[-1]["content"].endswith(DEFINITION_ENDING) else 3072
-        ),
+            return completion, candidate, fresh_advice, None
+    max_tokens = (
+        6144
+        if causal_edit or messages[-1]["content"].endswith(DEFINITION_ENDING)
+        else 3072
     )
-    return completion, None, fresh_advice
+    try:
+        completion = budget.complete(
+            executor.gateway,
+            "coding",
+            messages,
+            exclude=exclude,
+            after_provider=route,
+            max_output_tokens=3072 if fresh_line_snapshot is not None else max_tokens,
+        )
+    except ProviderExhausted:
+        if fresh_line_snapshot is None:
+            raise
+        # Keep the verified localization available to the complete-definition
+        # retry even when the numbered format has no available coding route.
+        completion = None
+    return completion, None, fresh_advice, fresh_line_snapshot
 
 
 def _recovery_digest(task, fixtures, patch):
@@ -2030,7 +2055,9 @@ def solve(executor, task, archive, budget, version):
                 interactive_target = target
                 interactive_symbol = line_retry.snapshot.symbol if line_retry else localized_retry
             try:
-                completion, native_candidate, fresh_advice = future.result()
+                completion, native_candidate, fresh_advice, fresh_line_snapshot = (
+                    future.result()
+                )
             except ProviderExhausted as error:
                 if paired and hedge_pair:
                     continue
@@ -2048,6 +2075,13 @@ def solve(executor, task, archive, budget, version):
                 continue
             except _RequestBudgetExceeded:
                 continue
+            if completion is None:
+                retry_advice[target] = fresh_advice
+                _LOG.info("First numbered stock edit had no available coding route")
+                continue
+            active_line_snapshot = (
+                line_retry.snapshot if line_retry else fresh_line_snapshot
+            )
             fresh_stock = (
                 snapshot is current
                 and continuation is None
@@ -2070,7 +2104,7 @@ def solve(executor, task, archive, budget, version):
                 continue
             if native_candidate is not None and snapshot is not current:
                 continue
-            routes = line_routes if line_retry is not None else last_routes
+            routes = line_routes if active_line_snapshot is not None else last_routes
             routes[target] = completion.route
             editor = RouteEvidence.from_completion(completion)
             try:
@@ -2081,9 +2115,9 @@ def solve(executor, task, archive, budget, version):
                     source = {new_path: test_draft}
                 try:
                     candidate = native_candidate
-                    if candidate is None and line_retry is not None:
+                    if candidate is None and active_line_snapshot is not None:
                         candidate = apply_line_range_edit(
-                            completion.content, source, line_retry.snapshot
+                            completion.content, source, active_line_snapshot
                         )
                     if candidate is None:
                         candidate = (
@@ -2142,6 +2176,8 @@ def solve(executor, task, archive, budget, version):
             except ValueError as error:
                 if fresh_stock:
                     interactive_misses[target] += 1
+                if fresh_line_snapshot is not None and snapshot is current:
+                    retry_advice[target] = fresh_advice
                 if line_followup is not None and snapshot is current:
                     line_retries[target] = line_followup
                 notes[target] = str(error)[:400]

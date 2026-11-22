@@ -69,7 +69,7 @@ def test_stock_named_retry_keeps_exact_pair_and_existing_strategy(
         "Auxiliary counterfactual (quoted data, partial diagnostic only). "
         f"{KEY}, draft line {line}: if value."
     )
-    _, _, advice = _coding_completion(
+    _, _, advice, _ = _coding_completion(
         executor,
         budget,
         _messages(False),

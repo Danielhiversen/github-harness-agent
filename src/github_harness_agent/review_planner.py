@@ -317,10 +317,9 @@ def apply_coding_advice(messages, plan, *, reuse=False, line_snapshot=None):
         fixture, _, _ = fixture.partition("\nCurrent checkout:\n")
         interfaces, _, _ = tail.partition("\nOther reviewer feedback:\n")
         interfaces, _, _ = interfaces.partition("\nCurrent checkout:\n")
-        if (
-            reuse
-            and plan.localized is not None
-            and messages[-1]["content"].endswith(DEFINITION_ENDING)
+        if plan.localized is not None and (
+            line_snapshot is not None
+            or (reuse and messages[-1]["content"].endswith(DEFINITION_ENDING))
         ):
             localized = plan.localized
             path, name = localized.symbol
