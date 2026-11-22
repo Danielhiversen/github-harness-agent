@@ -1120,9 +1120,12 @@ def test_private_operator_regressions_are_repaired_without_trading_passing_cases
 
 
 @pytest.mark.parametrize(
-    "scenario", ("compatible", "identical", "canary", "unrelated", "low_budget")
+    "scenario",
+    ("compatible", "two_sites", "identical", "canary", "unrelated", "low_budget"),
 )
-def test_guarded_stock_reconciliation_checks_every_suite(solver_case, monkeypatch, scenario):
+def test_guarded_stock_reconciliation_checks_every_suite(
+    solver_case, monkeypatch, scenario
+):
     task, _, runner, checkpoints = solver_case
     task = replace(task, require_new_tests=False)
     operator_call = "stock()" if scenario == "identical" else "stock(legacy=True)"
@@ -1137,12 +1140,20 @@ def test_guarded_stock_reconciliation_checks_every_suite(solver_case, monkeypatc
         else ""
     )
     archive = BytesIO()
+    gap = (
+        "    # keep the shared implementation\n" * 10 if scenario == "two_sites" else ""
+    )
+    expected_stock = 5 if scenario == "two_sites" else 4
     with tarfile.open(fileobj=archive, mode="w") as snapshot:
         for path, content in {
-            SOURCE: BASE_SOURCE + "\ndef stock(*, legacy: bool = False):\n    shared = 1\n    return shared - 3\n",
+            SOURCE: BASE_SOURCE
+            + "\ndef stock(*, legacy: bool = False):\n    shared = 1\n"
+            + gap
+            + "    return shared - 3\n",
             "tests/test_existing.py": (
                 "from fixture_calc import stock\n\n"
-                "def test_stock_goal():\n    assert stock() == 4\n" + canary
+                f"def test_stock_goal():\n    assert stock() == {expected_stock}\n"
+                + canary
             ),
         }.items():
             data = content.encode()
@@ -1150,10 +1161,14 @@ def test_guarded_stock_reconciliation_checks_every_suite(solver_case, monkeypatc
             entry.size = len(data)
             snapshot.addfile(entry, BytesIO(data))
     proposal = edit(SOURCE, "    return shared - 3\n", "    return shared + 3\n")
+    if scenario == "two_sites":
+        proposal += edit(SOURCE, "    shared = 1\n", "    shared = 2\n")
     if scenario == "unrelated":
         proposal += SECOND
     gateway = FreeGateway(proposal, "An incomplete edit")
-    executor = PlainExecutor(runner, gateway, Limits(model_requests=2, concurrent_probes=1))
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=2, concurrent_probes=1)
+    )
     budget = _Budget(executor.limits, lambda: False, task)
     if scenario == "low_budget":
         monkeypatch.setattr(
@@ -1169,11 +1184,14 @@ def test_guarded_stock_reconciliation_checks_every_suite(solver_case, monkeypatc
         return failures
 
     monkeypatch.setattr("github_harness_agent.review_solver.evidence", record)
-    if scenario == "compatible":
+    if scenario in {"compatible", "two_sites"}:
         result = solve(executor, task, archive.getvalue(), budget, "fixture-version")
         assert all(check.returncode == 0 for check in result.checks)
         assert b"shared - 3 if legacy else shared + 3" in result.patch
-        assert b"+    shared =" not in result.patch
+        if scenario == "two_sites":
+            assert b"+    shared = 1 if legacy else 2\n" in result.patch
+        else:
+            assert b"+    shared =" not in result.patch
         assert result.route_trace[-1].configured_model == "stand-in/free"
         assert len(gateway.prompts) == 1
         assert guard_failures[-1] == set()
