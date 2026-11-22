@@ -262,6 +262,16 @@ def _apply_definition_edits(sources, documents, replacements, *, functions_only=
                 "Qualified definition is missing or ambiguous in the named file"
             )
         old = matches[0]
+        if functions_only and len(nodes) > 1:
+            # Some providers repeat imports before a single requested test.
+            # Treat only imports already present in the module as context.
+            existing_imports = {ast.dump(node) for node in module.body if isinstance(node, _IMPORT)}
+            if all(isinstance(node, _IMPORT) and ast.dump(node) in existing_imports for node in nodes[:-1]):
+                definition = nodes[-1]
+                if isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    start = min([definition.lineno, *(item.lineno for item in definition.decorator_list)])
+                    body = "\n".join(body.splitlines()[start - 1:definition.end_lineno])
+                    nodes = [definition]
         if (
             len(nodes) != 1
             or type(nodes[0]) is not type(old)

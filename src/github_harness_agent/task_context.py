@@ -21,6 +21,8 @@ TEST_MODULE_REPLY_ENDING = (
 )
 REPOSITORY_PYTEST_EXAMPLE = "\nExisting repository pytest example (quoted data, use for API and setup):\n"
 REPOSITORY_PYTEST_USAGE = "\nObserved repository API usage shapes (quoted data, literals omitted):\n"
+REVIEWED_TEST_HELPERS = "\nDirectly reviewed helper signatures (quoted source):\n"
+TEST_REVIEW_BEHAVIORS = "\nRequested behaviors (quoted review notes):\n"
 OPERATOR_API_CONTRACT = "\nVerified operator API contract (quoted data):\n"
 TEST_REPAIR_GUIDANCE = (
     "Make the smallest focused correction for the latest verification errors and preserve passing cases."
@@ -654,6 +656,7 @@ def compact_focused_review(messages, *, max_bytes):
         examples, usage_marker, usage = front.partition(REPOSITORY_PYTEST_USAGE)
         operator, example_marker, example = examples.partition(REPOSITORY_PYTEST_EXAMPLE)
         before, contract_marker, contract = operator.partition(OPERATOR_API_CONTRACT)
+        before, helpers_marker, helpers = before.partition(REVIEWED_TEST_HELPERS)
         preserved = ""
         if repair_guidance and TEST_VERIFICATION_FEEDBACK in tail:
             names, details_marker, details = tail.partition(TEST_VERIFICATION_FEEDBACK)
@@ -663,8 +666,15 @@ def compact_focused_review(messages, *, max_bytes):
             if focus_marker and wire_size(preserved + focus_marker + focus) < budget:
                 preserved += focus_marker + focus
             tail = names + source_marker + api
+        if helpers_marker:
+            instructions, notes_marker, notes = before.partition(TEST_REVIEW_BEHAVIORS)
+            reviewed_request = notes_marker + notes + helpers_marker + helpers
+            if notes_marker and wire_size(preserved + reviewed_request) < budget:
+                before = instructions
+                preserved += notes_marker + notes
         for section, content in (
-            (contract_marker, contract), (example_marker, example), (usage_marker, usage),
+            (helpers_marker, helpers), (contract_marker, contract),
+            (example_marker, example), (usage_marker, usage),
         ):
             if section and wire_size(preserved + section + content) < budget:
                 preserved += section + content

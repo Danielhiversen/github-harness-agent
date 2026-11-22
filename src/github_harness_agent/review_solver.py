@@ -114,8 +114,10 @@ from .task_context import (
     OPERATOR_API_CONTRACT,
     REPOSITORY_PYTEST_EXAMPLE,
     REPOSITORY_PYTEST_USAGE,
+    REVIEWED_TEST_HELPERS,
     TEST_MODULE_REPLY_ENDING,
     TEST_REPAIR_GUIDANCE,
+    TEST_REVIEW_BEHAVIORS,
     TEST_VERIFICATION_FEEDBACK,
     TEST_VERIFICATION_SOURCE,
     compact_focused_review,
@@ -157,6 +159,12 @@ Use several small blocks if necessary. Use an empty SEARCH only for the indicate
 Prefer small and unique search blocks and preserve unchanged code."""
 _SYSTEM_SUFFIX = """Use public production behavior. Never detect the verifier, hardcode fixture data,
 change checks, or relax the requested behavior."""
+_TEST_HELPER_SYSTEM_SUFFIX = _SYSTEM_SUFFIX.replace(
+    "Use public production behavior.",
+    "Prefer public APIs. For a new regression fixture, you may test an explicitly listed "
+    "directly reviewed helper when it isolates deterministic behavior.",
+    1,
+)
 _SYSTEM = _SYSTEM_PREFIX + _SEARCH_FORMAT + "\n" + _SYSTEM_SUFFIX
 _TEST_MODULE_SYSTEM = (
     _SYSTEM_PREFIX
@@ -196,9 +204,22 @@ _TEST_SECTION = re.compile(r"^_{5,} (.+?) _{5,}$", re.M)
 _PYTEST_SECTION = re.compile(r"^={5,} ([^\n]+?) ={5,}$", re.M)
 _PYTEST_CRASH_LINE = re.compile(r"^\S[^\n]*?\.py:[1-9][0-9]*: .+$")
 _TEST_ERROR_KINDS = re.compile(
-    r"\b(?:AssertionError|AttributeError|FileNotFoundError|ImportError|IndexError|"
-    r"KeyError|ModuleNotFoundError|NameError|RuntimeError|TypeError|ValueError)\b"
+    r"\b(?:AssertionError|AttributeError|FileNotFoundError|ImportError|IndentationError|"
+    r"IndexError|KeyError|ModuleNotFoundError|NameError|RuntimeError|SyntaxError|"
+    r"TypeError|ValueError)\b"
 )
+_PYTEST_GENERIC_HEADING = re.compile(r"ERROR (collecting \S+|at setup of .+)")
+_PYTEST_REPORT_PATH = r"[/\w.-]{1,480}\.py"
+_PYTEST_GENERIC_FRAME = re.compile(rf"^({_PYTEST_REPORT_PATH}):([1-9][0-9]{{0,6}})(?::(?:\s+(.+))?)?$")
+_PYTEST_FILE_FRAME = re.compile(
+    rf'^(?:File "({_PYTEST_REPORT_PATH})"|file ({_PYTEST_REPORT_PATH})), '
+    r"line ([1-9][0-9]{0,6})(?:, in .*)?$"
+)
+_PYTEST_GENERIC_SUMMARY = re.compile(rf"^ERROR ({_PYTEST_REPORT_PATH})(?: - (.+))?$")
+_PYTEST_CAPTURED = re.compile(r"^-{5,} Captured (?:stdout|stderr|log)(?: .+)? -{5,}$")
+_PYTEST_EXCEPTION = re.compile(r"^(?:[A-Za-z_]\w*\.)*([A-Za-z_]\w*(?:Error|Exception)|Failed)(?::|$)")
+_PYTEST_FIXTURE_MISSING = re.compile(r"""^fixture ['"][A-Za-z_]\w{0,120}['"] not found\b""")
+_PYTEST_CLI_ERROR = re.compile(r"^ERROR: (?:file or directory not found|not found|usage):?\s+.+$")
 _DRAFT_EXCEPTION = re.compile(
     r"^(?:E[ \t]+|(?:FAILED|ERROR) \S+ - |\S+\.py:[1-9][0-9]*: )"
     r"([\w.]*(?:Error|Exception):[ \t]*\S[^\n]*)$",
@@ -336,10 +357,54 @@ def _complete_test_module(response, path, limit):
         return None
 
 
+def _retry_test_definition(response, draft, path, limit):
+    """Apply an unlabelled reply only when it identifies a single draft function."""
+    if not isinstance(response, str) or not draft:
+        return None
+    try:
+        if len(response.encode()) > min(limit, 80_000):
+            return None
+        code = response.replace("\r\n", "\n").strip()
+        if fence := _PYTHON_FENCE.fullmatch(code):
+            code = fence["code"]
+        if _MARKER.search(code) or _FENCE_LINE.search(code) or _FILE_HEADER.search(code):
+            return None
+        body = ast.parse(code, filename=path).body
+        if len(body) != 1 or not isinstance(body[0], (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None
+        replacement = body[0]
+        current = ast.parse(draft, filename=path).body
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+
+    matches = [
+        node for node in current
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and node.name == replacement.name
+    ]
+    if len(matches) != 1 or type(matches[0]) is not type(replacement):
+        return None
+
+    symbol = (path, replacement.name)
+    result = apply_definitions(
+        f"REPLACE {path}::{replacement.name}\n{code}",
+        {path: draft}, only=symbol, single_function=True,
+    )
+    try:
+        compile(result[path], path, "exec", dont_inherit=True)
+    except (SyntaxError, ValueError, RecursionError) as error:
+        raise ValueError(f"{path}: invalid Python: {error}") from None
+    return result
+
+
 def _apply_test_reply(response, sources, path, *, allow_module, failed_draft, limit):
     try:
         return apply_blocks(response, sources, path)
     except ValueError:
+        if allow_module and failed_draft:
+            retry = _retry_test_definition(response, sources.get(path), path, limit)
+            if retry is not None:
+                return retry
         if allow_module and (module := _complete_test_module(response, path, limit)):
             return {path: module}
         if allow_module and failed_draft and re.search(r"(?m)^REPLACE ", response or ""):
@@ -406,6 +471,101 @@ def _test_detail(output, node):
             if lines:
                 return excerpt("\n".join(lines), 1600)
     return next((line for line in output.splitlines() if node in line), node)
+
+
+def _pytest_reason_kind(reason):
+    if not reason:
+        return ""
+    if re.match(r"^(?:Failed:\s+)?DID NOT RAISE(?:\s|$)", reason):
+        return "DID NOT RAISE"
+    if _PYTEST_FIXTURE_MISSING.match(reason):
+        return "fixture not found"
+    match = _PYTEST_EXCEPTION.match(reason)
+    if match:
+        kind = match[1]
+        return kind if _TEST_ERROR_KINDS.fullmatch(kind) else "pytest error"
+    return ""
+
+
+def _pytest_report_diagnostic(title, body):
+    heading = title if _PYTEST_GENERIC_HEADING.fullmatch(title) else ""
+    location, reason, kind = "", "", ""
+    for line in body.splitlines():
+        line = line.strip()
+        if _PYTEST_CAPTURED.fullmatch(line):
+            break
+        if frame := _PYTEST_GENERIC_FRAME.fullmatch(line):
+            location = f"{frame[1]}:{frame[2]}"
+            message = frame[3] or ""
+        elif native := _PYTEST_FILE_FRAME.fullmatch(line):
+            location = f"{native[1] or native[2]}:{native[3]}"
+            continue
+        elif line.startswith("E "):
+            message = line[1:].lstrip()
+        else:
+            continue
+        if current := _pytest_reason_kind(message):
+            # Preserve the more specific pytest spelling if the crash row
+            # repeats only the exception class.
+            if not reason or ":" in message:
+                kind, reason = current, message
+    if not kind and heading:
+        kind = "collection error" if heading.startswith("ERROR collecting ") else "setup error"
+    detail = "\n".join(part for part in (excerpt(heading, 150), location, excerpt(reason, 420)) if part)
+    return detail, kind
+
+
+def _generic_verifier_failure(command, returncode, output):
+    """Select report metadata before bounding a non-named verifier failure."""
+    if check_label(command, ()) != "pytest":
+        return excerpt(output, 3000), ""
+    output_text = re.sub(r"\x1b\[[0-9;]*m", "", output)
+    sections = _PYTEST_SECTION.split(output_text)
+    fallback = ("", "")
+    for title, content in zip(sections[1::2], sections[2::2], strict=True):
+        if title in {"ERRORS", "FAILURES"}:
+            reports = _TEST_SECTION.split(content)
+            for heading, body in zip(("", *reports[1::2]), reports[::2], strict=True):
+                detail, kind = _pytest_report_diagnostic(heading, body)
+                if kind and kind not in {"collection error", "setup error"}:
+                    return detail, kind
+                if kind and not fallback[1]:
+                    fallback = detail, kind
+        elif title == "short test summary info":
+            for line in content.splitlines():
+                if summary := _PYTEST_GENERIC_SUMMARY.fullmatch(line):
+                    kind = _pytest_reason_kind(summary[2])
+                    if kind:
+                        return excerpt(line, 700), kind
+                    if not fallback[1]:
+                        fallback = excerpt(line, 700), "collection error"
+    if fallback[1]:
+        return fallback
+    if returncode == 4 and len(sections) == 1:
+        for line in output_text.splitlines():
+            if _PYTEST_CLI_ERROR.fullmatch(line):
+                return excerpt(line, 700), "usage error"
+    return excerpt(output, 3000), ""
+
+
+def _test_diagnostic_label(command, returncode, categories):
+    label = check_label(command, ())
+    if label == "pytest":
+        exit_kind = {
+            1: "failed tests", 2: "interrupted", 3: "internal error",
+            4: "usage error", 5: "no tests collected",
+        }.get(returncode, "execution error")
+    else:
+        label = label if label in {"ruff", "mypy"} else "configured"
+        exit_kind = "execution error" if returncode < 0 or returncode >= 125 else "nonzero exit"
+    return f"{label}/{exit_kind}: {', '.join(sorted(categories)) or 'check failure'}"
+
+
+def _named_test_diagnostic_kind(detail):
+    if _TEST_RESULT.match(detail):
+        first = detail.partition("\n")[0]
+        return _pytest_reason_kind(first.partition(" - ")[2])
+    return _pytest_report_diagnostic("", detail)[1]
 
 
 def _failed_test_feedback(failures, path):
@@ -571,6 +731,7 @@ def evidence(
     unused_import_checks=None,
     on_staged=None,
     private_proposal=False,
+    test_check_labels=None,
 ):
     with executor.verification_runner.workspace(
         archive, budget.remaining, budget.cancelled
@@ -615,15 +776,24 @@ def evidence(
                     option == ("--tb", "line") for option in zip(command, command[1:])
                 )
                 line_details = _line_failure_details(output) if line_traceback else {}
+                categories = set()
+                if not nodes:
+                    detail, kind = _generic_verifier_failure(command, outcome.returncode, output)
+                    if kind:
+                        categories.add(kind)
                 for node in nodes or [
                     f"check {number + 1} (exit {outcome.returncode})"
                 ]:
                     key = (number, node)
                     failures[key] = (
-                        excerpt(output, 3000)
+                        detail
                         if not nodes
                         else (line_details.get(node) or _test_detail(output, node))
                     )
+                    if nodes and test_check_labels is not None and (kind := _named_test_diagnostic_kind(failures[key])):
+                        categories.add(kind)
+                if test_check_labels is not None:
+                    test_check_labels.add(_test_diagnostic_label(command, outcome.returncode, categories))
                 if outcome.returncode >= 125 or outcome.returncode < 0:
                     from .worker import ExecutionError
 
@@ -734,32 +904,44 @@ def _regression_context(fixtures):
     return ", ".join(dict.fromkeys(names)), "\n".join(setup)
 
 
-def _regression_api(path, content, query, limit):
+def _regression_api(path, content, query, limit, *, anchors=()):
     try:
         module = ast.parse(content)
     except SyntaxError:
-        return excerpt(content, limit)
+        return path, ()
     groups = [("", module.body)]
     groups.extend(
         (node.name + ".", node.body)
         for node in module.body
-        if isinstance(node, ast.ClassDef) and not node.name.startswith("_")
+        if isinstance(node, ast.ClassDef) and (anchors or not node.name.startswith("_"))
     )
     signatures = []
+    helpers = []
     for owner, items in groups:
         for node in items:
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or (
-                node.name.startswith("_") and not (owner and node.name == "__init__")
-            ):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
+            private = owner.startswith("_") or (
+                node.name.startswith("_") and not (owner and node.name == "__init__")
+            )
+            if private:
+                if node.name.startswith("__") and (owner or node.name.endswith("__")):
+                    continue
+                first = min([node.lineno, *(decorator.lineno for decorator in node.decorator_list)])
+                if not any(first <= anchor <= node.end_lineno for anchor in anchors):
+                    continue
             prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
             name = owner + node.name
             signature = f"{prefix} {name}({ast.unparse(node.args)})"
             if node.returns is not None:
                 signature += f" -> {ast.unparse(node.returns)}"
-            signatures.append((len(words(signature) & query), signature))
+            if private:
+                helpers.append(signature)
+            else:
+                signatures.append((len(words(signature) & query), signature))
     signatures.sort(key=lambda item: item[0], reverse=True)
-    return path + "\n" + excerpt("\n".join(text for _, text in signatures), limit)
+    public = path + "\n" + excerpt("\n".join(text for _, text in signatures), limit)
+    return public, helpers
 
 
 def _test_authoring_messages(
@@ -775,10 +957,25 @@ def _test_authoring_messages(
     sources = {path: content for path, content in current.items() if path != new_path}
     failure_source = test_failure_focus(sources, note) if repair_failed_tests else ""
     operator_contract = operator_api_contract(fixtures, sources)
-    api = "\n".join(
-        _regression_api(path, content, test_query, 2100 // len(sources))
-        for path, content in sources.items()
-    )
+    reviewed_anchors = {}
+    for path, line, _ in review.feedback:
+        reviewed_anchors.setdefault(path, set()).add(line)
+    api = []
+    reviewed_helpers = []
+    helper_budget = 850
+    for path, content in sources.items():
+        public, helpers = _regression_api(
+            path, content, test_query, 2100 // len(sources), anchors=reviewed_anchors.get(path, ())
+        )
+        api.append(public)
+        for signature in helpers:
+            entry = f"{path}\n{signature}\n"
+            if (size := len(entry.encode())) <= helper_budget:
+                reviewed_helpers.append(entry)
+                helper_budget -= size
+    system = _TEST_MODULE_SYSTEM if allow_test_module else _SYSTEM
+    if reviewed_helpers:
+        system = system.replace(_SYSTEM_SUFFIX, _TEST_HELPER_SYSTEM_SUFFIX, 1)
     draft = current[new_path]
     definition_guidance = (
         f"\nFor a focused repair, prefer one named replacement. Start with REPLACE {new_path}::name "
@@ -805,11 +1002,15 @@ def _test_authoring_messages(
             "Use two or three focused cases when enough, and cover every distinct requested fixture. "
             "Keep the module concise. Combine overlapping examples with shared setup or parameters. "
         )
-        + "Use public APIs and independent fixtures. "
-        "Use the already-passing acceptance suite as behavior and setup context only. "
-        "Avoid copying its cases or reproducing its inventory in the repository tests.\n"
-        "Requested behaviors (quoted review notes):\n"
+        + "Use independent fixtures. "
+        + ("Prefer public APIs. " if reviewed_helpers else "Use public APIs. ")
+        + (
+            "Use the already-passing acceptance suite as behavior and setup context only. "
+            "Avoid copying its cases or reproducing its inventory in the repository tests."
+        )
+        + TEST_REVIEW_BEHAVIORS
         + "\n".join(f"- {excerpt(body, 320)}" for body in behaviors if body)
+        + (REVIEWED_TEST_HELPERS + "".join(reviewed_helpers) if reviewed_helpers else "")
         + (OPERATOR_API_CONTRACT + operator_contract + "\n" if operator_contract else "")
         + (
             REPOSITORY_PYTEST_EXAMPLE + repository_example + "\n"
@@ -824,7 +1025,7 @@ def _test_authoring_messages(
         )
         + (TEST_VERIFICATION_SOURCE + failure_source + "\n" if failure_source else "")
         + "Focused source from verified public APIs:\n"
-        + api
+        + "\n".join(api)
         + "\nFixture for this goal:\n"
         + (f"Unpublished test file {new_path} to revise:\n{draft}\n" if draft else "")
         + "Operator fixture setup excerpt (quoted data):\n"
@@ -843,7 +1044,7 @@ def _test_authoring_messages(
     return [
         {
             "role": "system",
-            "content": (_TEST_MODULE_SYSTEM if allow_test_module else _SYSTEM) + definition_guidance,
+            "content": system + definition_guidance,
         },
         {"role": "user", "content": request},
     ]
@@ -1125,7 +1326,13 @@ def _coding_completion(
                 "role": "system",
                 "content": _SYSTEM_PREFIX
                 + instruction + "\n"
-                + _SYSTEM_SUFFIX,
+                + (
+                    _TEST_HELPER_SYSTEM_SUFFIX
+                    if native_test_path is not None
+                    and _TEST_HELPER_SYSTEM_SUFFIX in focused[0]["content"]
+                    and REVIEWED_TEST_HELPERS in request
+                    else _SYSTEM_SUFFIX
+                ),
             },
             {
                 "role": "user",
@@ -2950,9 +3157,11 @@ def solve(executor, task, archive, budget, version):
     test_rejection = None
     test_case_runs = {}
     focused_generated = focused_pytest(task.checks, (new_path,), verbose=True) if new_path else None
-    test_format_snapshot = None
+    test_checkout_snapshot = None
+    test_checkout_digest = None
+    test_format_revision = None
     test_format_failures = 0
-    test_tool_attempted = False
+    test_tool_attempts = set()
     repository_example = None
     repository_usage = ""
     repository_models = ""
@@ -3436,11 +3645,14 @@ def solve(executor, task, archive, budget, version):
                     allow_test_module = False
                     native_test = False
                     if target == _TEST_GOAL:
-                        if test_format_snapshot is not current:
-                            test_format_snapshot = current
-                            test_format_failures = 0
-                            test_tool_attempted = False
+                        if test_checkout_snapshot is not current:
+                            test_checkout_snapshot = current
+                            test_checkout_digest = hashlib.sha256(patch).digest()
                             test_case_runs = {}
+                        revision = (test_checkout_digest, hashlib.sha256(test_draft.encode()).digest())
+                        if revision != test_format_revision:
+                            test_format_revision = revision
+                            test_format_failures = 0
                         if repository_example is None:
                             reviewed_sources = {path: current[path] for path in paths}
                             repository_example, repository_usage = repository_pytest_context(
@@ -3455,11 +3667,12 @@ def solve(executor, task, archive, budget, version):
                         native_test = (
                             allow_test_module
                             and test_format_failures >= 2
-                            and not test_tool_attempted
+                            and revision not in test_tool_attempts
                             and launch_budget >= 2
                         )
                         if native_test:
-                            test_tool_attempted = True
+                            # Each stored digest pair costs a reserved proposal.
+                            test_tool_attempts.add(revision)
                             _LOG.info("Trying structured pytest module reply after repeated format errors")
                         source = {**current, new_path: test_draft}
                         note = "\n".join(
@@ -3947,6 +4160,7 @@ def solve(executor, task, archive, budget, version):
                 after_runs = {}
                 static_runs = {}
                 unused_import_checks = set()
+                test_check_labels = set()
                 after = evidence(
                     executor,
                     task,
@@ -3957,6 +4171,7 @@ def solve(executor, task, archive, budget, version):
                     pytest_runs=after_runs,
                     static_runs=static_runs,
                     private_proposal=repair is not None and repair.stock_origin,
+                    **({"test_check_labels": test_check_labels} if target == _TEST_GOAL else {}),
                     **(
                         {"unused_import_checks": unused_import_checks}
                         if repair is not None and repair.dependency_seed else {}
@@ -4008,10 +4223,9 @@ def solve(executor, task, archive, budget, version):
                 next_case_runs = after_runs
                 result = None
                 if after:
-                    kinds = {kind for detail in after.values() for kind in _TEST_ERROR_KINDS.findall(detail)}
                     _LOG.info(
-                        "Verifying a new pytest module via %s left %d check diagnostic(s); categories=%s",
-                        completion.route, len(after), ",".join(sorted(kinds)) or "check failure",
+                        "New pytest module verification failed: %s",
+                        "; ".join(sorted(test_check_labels)) or "check failure",
                     )
                     next_diagnostic = _failed_test_feedback(after, new_path)
                 elif not has_runnable_test(new_path, next_draft.encode()):
@@ -4031,16 +4245,29 @@ def solve(executor, task, archive, budget, version):
                         next_case_runs["focused"] = _focused_generated_run(
                             rejection.checks, focused_generated
                         )
-                        _LOG.info("Final verification rejected the new pytest module via %s", completion.route)
                         failures_by_check = {}
                         for index, check in enumerate(rejection.checks):
                             if not check.returncode:
                                 continue
                             nodes = [node for _, node in _TEST_RESULT.findall(check.output)]
+                            categories = set()
                             for node in nodes:
-                                failures_by_check[index, node] = _test_detail(check.output, node)
+                                detail = _test_detail(check.output, node)
+                                failures_by_check[index, node] = detail
+                                if kind := _named_test_diagnostic_kind(detail):
+                                    categories.add(kind)
                             if not nodes:
-                                failures_by_check[index, f"check {index + 1}"] = check.output
+                                detail, kind = _generic_verifier_failure(
+                                    check.command, check.returncode, check.output,
+                                )
+                                failures_by_check[index, f"check {index + 1}"] = detail if kind else check.output
+                                if kind:
+                                    categories.add(kind)
+                            test_check_labels.add(_test_diagnostic_label(check.command, check.returncode, categories))
+                        _LOG.info(
+                            "Final verification rejected the new pytest module: %s",
+                            "; ".join(sorted(test_check_labels)) or "check failure",
+                        )
                         next_diagnostic = (
                             _failed_test_feedback(failures_by_check, new_path) + "\n" + str(rejection)
                         )
@@ -4050,7 +4277,7 @@ def solve(executor, task, archive, budget, version):
                         )
                 lost_test = (
                     _lost_passing_test(test_case_runs, next_case_runs, new_path)
-                    if allow_test_module and test_format_snapshot is current else None
+                    if allow_test_module and test_checkout_snapshot is current else None
                 )
                 if lost_test:
                     notes[target] = (

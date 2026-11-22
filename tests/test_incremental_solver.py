@@ -2,6 +2,7 @@ import json
 import re
 import sys
 import tarfile
+from contextlib import nullcontext
 from pathlib import Path
 from dataclasses import replace
 from io import BytesIO
@@ -35,6 +36,7 @@ from github_harness_agent.review_recovery import ReviewRecovery
 from github_harness_agent.task_context import compact_focused_review, wire_size
 from github_harness_agent.review_solver import (
     _GUIDANCE,
+    _generic_verifier_failure,
     _rejected_attempt,
     _line_failure_details,
     apply_blocks,
@@ -42,6 +44,7 @@ from github_harness_agent.review_solver import (
     patch_for,
     solve,
 )
+from github_harness_agent.task_context import excerpt
 
 
 from github_harness_agent.worker import CommandOutputExceeded
@@ -49,6 +52,71 @@ from github_harness_agent.worker import CommandOutputExceeded
 SOURCE = "fixture_calc.py"
 NEW_TEST = "tests/test_review_regressions.py"
 BASE_SOURCE = "def first():\n    return -1\n\ndef second():\n    return -2\n"
+
+
+@pytest.mark.parametrize("report,expected_category,expected_message,expected_location", (
+    (
+        "===== ERRORS =====\n"
+        "_____ ERROR collecting tests/test_example.py _____\n"
+        "tests/test_example.py:7: in <module>\n"
+        "E   ModuleNotFoundError: No module named 'missing_backend'\n"
+        "----- Captured stdout -----\n"
+        "E   TypeError: printed-not-reported\n",
+        "ModuleNotFoundError", "missing_backend", "tests/test_example.py:7",
+    ),
+    (
+        "===== ERRORS =====\n"
+        "_____ ERROR at setup of test_example _____\n"
+        "file /work/tests/test_example.py, line 11\n"
+        "E   fixture 'unknown_fixture' not found\n",
+        "fixture not found", "unknown_fixture", "/work/tests/test_example.py:11",
+    ),
+    (
+        "===== FAILURES =====\n"
+        "tests/test_example.py:14: Failed: DID NOT RAISE <class 'ValueError'>\n",
+        "DID NOT RAISE", "DID NOT RAISE", "tests/test_example.py:14",
+    ),
+    (
+        "===== short test summary info =====\n"
+        "ERROR tests/test_example.py - SyntaxError: unexpected token\n",
+        "SyntaxError", "unexpected token", "tests/test_example.py",
+    ),
+))
+def test_generic_pytest_failure_selects_structured_details_before_excerpting(
+    report, expected_category, expected_message, expected_location,
+):
+    output = (
+        "early noise\n" * 500 + report
+        + "===== warnings summary =====\n" + "late noise\n" * 500
+    )
+    assert expected_message not in excerpt(output, 3000)
+    detail, kind = _generic_verifier_failure(("uv", "run", "pytest"), 2, output)
+    assert kind == expected_category
+    assert expected_message in detail and expected_location in detail
+    assert not any(marker in detail for marker in ("printed-not-reported", "early noise", "late noise"))
+    command = ("uv", "run", "pytest")
+    executor = SimpleNamespace(
+        verification_runner=SimpleNamespace(workspace=lambda *args: nullcontext(object())),
+        _stage_baseline=lambda *args: None,
+        _command=lambda *args, **kwargs: SimpleNamespace(returncode=2, stdout=output.encode(), stderr=b""),
+    )
+    budget = SimpleNamespace(
+        remaining=None, cancelled=None, claim=lambda *args: None, limits=SimpleNamespace(commands=1),
+    )
+    labels = set()
+    assert evidence(executor, None, None, budget, b"", (command,), test_check_labels=labels) == {
+        (0, "check 1 (exit 2)"): detail,
+    }
+    assert labels == {f"pytest/interrupted: {expected_category}"}
+
+
+@pytest.mark.parametrize("command,output", (
+    (("pytest",), "ordinary output\nE   TypeError: printed\nDID NOT RAISE\n"),
+    (("pytest",), "===== FAILURES =====\n----- Captured log call -----\nE   TypeError: printed\n"),
+    (("ruff", "check"), "===== ERRORS =====\n_____ ERROR collecting tests/test_example.py _____\n"),
+))
+def test_generic_verifier_failure_leaves_unstructured_and_non_pytest_output_alone(command, output):
+    assert _generic_verifier_failure(command, 1, output) == (output, "")
 
 
 def edit(path, old, new):
@@ -3000,6 +3068,58 @@ def test_solver_recovers_malformed_new_test_replies_with_one_scoped_tool(solver_
     assert any(NEW_TEST in check.command for check in result.checks)
     if tool_reply == "failing_test":
         assert "test_results" in gateway.prompts[-1] and "(0, 0)" in gateway.prompts[-1]
+
+
+def test_solver_reserves_one_native_test_reply_per_unpublished_revision(solver_case):
+    task, archive, runner, checkpoints = solver_case
+    fixed = BASE_SOURCE.replace("return -1", "return 1").replace("return -2", "return 2")
+    checkpoint = DraftCheckpoint(
+        "harness2/base",
+        task.base_sha,
+        patch_for({SOURCE: BASE_SOURCE}, {SOURCE: fixed}),
+        guidance=_GUIDANCE,
+        last_editor=("fixture", "fixture/coder"),
+    )
+    task = replace(task, checkpoints={checkpoint.key: checkpoint})
+    first = TEST.replace("(1, 2)", "(0, 0)")
+    second = TEST.replace("(1, 2)", "(1, 0)")
+    calls = []
+    recovery = iter(((first, second), (second, first)))
+
+    class Gateway(FreeGateway):
+        def complete(self, **kwargs):
+            tools = kwargs["tools"]
+            calls.append(bool(tools))
+            if not tools:
+                return super().complete(**kwargs)
+            prompt = kwargs["messages"][-1]["content"]
+            expected, replacement = next(recovery)
+            assert expected in prompt
+            tool, = tools
+            return SimpleNamespace(
+                content="",
+                tool_calls=({
+                    "type": "function",
+                    "function": {
+                        "name": tool["function"]["name"],
+                        "arguments": json.dumps({"code": replacement}),
+                    },
+                },),
+                role="coding", route="tool-free", model="fixture-tool",
+                configured_model="fixture-tool", usage={},
+            )
+
+    gateway = Gateway(first, *(["Malformed edit."] * 6), TEST)
+    executor = PlainExecutor(runner, gateway, Limits(model_requests=12, concurrent_probes=1))
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    result = solve(executor, task, archive, budget, "fixture")
+
+    assert calls == [False, False, False, True, False, False, True, False, False, False]
+    assert first in gateway.prompts[-1]
+    assert b"assert (first(), second()) == (1, 2)" in result.patch
+    assert any(NEW_TEST in check.command and check.returncode == 0 for check in result.checks)
+    assert not checkpoints
 
 
 def test_solver_does_not_keep_a_candidate_rejected_by_final_gate(solver_case):

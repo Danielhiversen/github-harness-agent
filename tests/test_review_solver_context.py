@@ -225,6 +225,49 @@ def test_fresh_test_prompt_distinguishes_requested_fixtures_from_acceptance_inve
     assert all(body in prompt for _, _, body in review.feedback)
 
 
+def test_fresh_test_prompt_includes_only_the_reviewed_private_signature_at_mapped_anchor():
+    path = "src/example/formatting.py"
+    new_path = "tests/test_review_regressions.py"
+    base = (
+        "def _classify(value: int, *, strict: bool = True) -> str:\n"
+        "    result = 'implementation details'\n"
+        "    return result\n\n"
+        "def format_amount(value):\n"
+        "    return _unrelated(value)\n\n"
+        "def __dunder__():\n"
+        "    return 0\n"
+    )
+    verified = "def _unrelated(value, unused=None):\n    return str(value)\n\n" + base
+    review = ReviewRecovery(
+        feedback=(
+            (path, 2, "Cover classification with an offline fixture."),
+            (path, 6, "Keep public formatting behavior."),
+            (path, 9, "Keep the special method behavior."),
+        ),
+        previous_failure="",
+    )
+    mapped = review_solver._draft_review(review, {path: base}, {path: verified})
+    messages = _proposal_messages(
+        (-1, "new regression tests"), {path: verified, new_path: ""}, {}, True,
+        "", mapped, {}, [], new_path, allow_test_module=True,
+    )
+    expanded = [messages[0], {
+        **messages[1],
+        "content": messages[1]["content"].replace(
+            "\nCurrent checkout:\n", "\nCurrent checkout:\n" + "unused checkout data\n" * 500,
+        ),
+    }]
+    compacted = compact_focused_review(expanded, max_bytes=2400)
+
+    for system, user in (messages, compacted):
+        assert "Prefer public APIs" in system["content"]
+        assert f"{path}\ndef _classify(value: int, *, strict: bool=True) -> str" in user["content"]
+        assert all(secret not in user["content"] for secret in (
+            "_unrelated", "__dunder__", "implementation details",
+        ))
+        assert "Cover classification with an offline fixture." in user["content"]
+
+
 @pytest.mark.parametrize("shared", (True, False))
 def test_failed_test_feedback_selects_one_traceback_and_names_other_cases(shared):
     path = "tests/test_review_regressions.py"

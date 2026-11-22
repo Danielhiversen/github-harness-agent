@@ -45,10 +45,78 @@ def test_complete_module_keeps_source_and_applies_byte_limit():
     assert _complete_test_module(f"~~~py\r\n{MODULE}~~~", PATH, 4096) == MODULE
 
 
+def test_named_retry_can_repeat_an_existing_import_as_context():
+    updated = MODULE.replace("sqrt(4) == 2", "sqrt(9) == 3")
+    header = f"REPLACE {PATH}::test_positive\n"
+    options = dict(allow_module=True, failed_draft=True, limit=4096)
+    assert _apply_test_reply(header + updated, {PATH: MODULE}, PATH, **options) == {PATH: updated}
+    with pytest.raises(ValueError):
+        _apply_test_reply(header + "import random\n" + updated, {PATH: MODULE}, PATH, **options)
+
+
 def test_complete_module_accepts_one_fenced_test_with_short_explanation():
     assert _complete_test_module(f"Here is the corrected module.\n\n```python\n{MODULE}```\n\nThe fixture is offline.", PATH, 4096) == MODULE
     assert _complete_test_module(f"```\n{MODULE}```", PATH, 4096) == MODULE
     assert _complete_test_module(f"Replace other.py instead:\n```python\n{MODULE}```", PATH, 4096) is None
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        ("def test_positive():\n    assert sqrt(4) == 2", "def test_positive():\n    assert sqrt(9) == 3"),
+        ("def value():\n    return sqrt(4)", "def value():\n    return sqrt(9)"),
+    ),
+)
+@pytest.mark.parametrize("fenced", (False, True))
+def test_unlabelled_test_retry_preserves_other_definitions_and_imports(old, new, fenced):
+    draft = MODULE + "\ndef value():\n    return sqrt(4)\n\ndef test_other():\n    assert value() > 0\n"
+    reply = f"```python\n{new}\n```" if fenced else new
+
+    assert _apply_test_reply(
+        reply, {PATH: draft}, PATH, allow_module=True, failed_draft=True, limit=4096,
+    ) == {PATH: draft.replace(old, new)}
+
+
+@pytest.mark.parametrize(
+    ("reply", "allow_module", "failed_draft", "limit"),
+    (
+        ("def value():\n    return 2", False, True, 4096),
+        ("def value():\n    return 2", True, False, 4096),
+        ("def value():\n    return 2", True, True, 24),
+        ("# file: src/math_api.py\ndef value():\n    return 2", True, True, 4096),
+        ("def elsewhere():\n    return 2", True, True, 4096),
+        ("def new_value():\n    return 2", True, True, 4096),
+        ("def value():\n    break", True, True, 4096),
+        ("async def value():\n    return 2", True, True, 4096),
+        ("def ambiguous():\n    return 2", True, True, 4096),
+        ("def test_positive():\n    assert sqrt(4) == 2", True, True, 4096),
+    ),
+)
+def test_unlabelled_test_retry_requires_an_authorized_unique_existing_function(
+    reply, allow_module, failed_draft, limit,
+):
+    sources = {
+        PATH: MODULE + "\ndef value():\n    return 1\n\ndef ambiguous():\n    return 1\n"
+        "\ndef ambiguous():\n    return 0\n",
+        "src/math_api.py": "def elsewhere():\n    return 1\n",
+    }
+    original = sources.copy()
+
+    with pytest.raises(ValueError):
+        _apply_test_reply(
+            reply, sources, PATH, allow_module=allow_module, failed_draft=failed_draft, limit=limit,
+        )
+    assert sources == original
+
+
+@pytest.mark.parametrize("failed_draft", (False, True))
+def test_unlabelled_complete_module_still_works_when_not_a_matching_definition(failed_draft):
+    draft = MODULE if failed_draft else ""
+    reply = "def test_fresh():\n    assert abs(-2) == 2\n"
+
+    assert _apply_test_reply(
+        reply, {PATH: draft}, PATH, allow_module=True, failed_draft=failed_draft, limit=4096,
+    ) == {PATH: reply}
 
 
 @pytest.mark.parametrize(
