@@ -46,6 +46,7 @@ from .review_recovery import operator_acceptance_context
 from .review_solver_context import (
     focused_check_excerpt,
     focused_source_excerpt,
+    stock_assertion_evaluated,
     stock_pytest_excerpt,
 )
 from .task_context import MESSAGE_BYTES, compact_focused_review, excerpt, wire_size
@@ -1485,6 +1486,17 @@ def solve(executor, task, archive, budget, version):
             partial = not progressed and assertion_progress(
                 assertions, task.pull_checks, target, failures, after
             )
+            if (
+                snapshot is current
+                and failures.keys() == after.keys() == {target}
+                and stock_fixtures.get((target, failures[target]))
+                and _same_pytest_selection(pytest_runs.get(target[0]), after_runs.get(target[0]))
+                and pytest_runs[target[0]].failed == after_runs[target[0]].failed == {target[1]}
+                and _verified_operator_runs(pytest_runs, after_runs, set(), task.pull_checks, operator_cases)
+            ):
+                partial = stock_assertion_evaluated(archive, target[1], failures[target], after[target])
+                if partial:
+                    _LOG.info("The tracked pytest comparison now evaluates at the previous lookup failure")
             prefix_progress = ""
             if (
                 not introduced

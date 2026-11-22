@@ -655,6 +655,33 @@ def test_stock_pytest_goal_includes_the_tracked_test_without_edit_access(solver_
     assert all(check.returncode == 0 for check in result.checks)
 
 
+def test_review_keeps_an_evaluable_comparison_for_the_next_free_edit(solver_case):
+    task, _, runner, checkpoints = solver_case
+    task = replace(task, require_new_tests=False)
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, content in {
+            SOURCE: BASE_SOURCE + "\ndef result():\n    return {}\n",
+            "tests/test_existing.py": (
+                "from fixture_calc import result\n\n"
+                "def test_contract():\n    assert result()['count'] == 1\n"
+            ),
+        }.items():
+            data = content.encode()
+            item = tarfile.TarInfo(path)
+            item.size = len(data)
+            snapshot.addfile(item, BytesIO(data))
+    gateway = FreeGateway(
+        FIRST + SECOND,
+        edit(SOURCE, "    return {}\n", "    return {'count': 2}\n"),
+        edit(SOURCE, "    return {'count': 2}\n", "    return {'count': 1}\n"),
+    )
+    executor = PlainExecutor(runner, gateway, Limits(model_requests=3, concurrent_probes=1))
+    result = solve(executor, task, archive.getvalue(), _Budget(executor.limits, lambda: False, task), "fixture")
+    assert any(b"return {'count': 2}" in checkpoint.patch for checkpoint in checkpoints)
+    assert all(check.returncode == 0 for check in result.checks)
+
+
 def test_stalled_stock_pytest_uses_advice_and_named_fallback(solver_case):
     task, _, runner, _ = solver_case
     task = replace(task, require_new_tests=False)

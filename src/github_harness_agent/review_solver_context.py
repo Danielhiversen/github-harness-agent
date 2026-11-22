@@ -246,6 +246,45 @@ def _words(text):
     return set(re.findall(r"[A-Za-z][A-Za-z0-9]*", separated.lower()))
 
 
+def stock_assertion_evaluated(archive, node, before, after):
+    """A tracked comparison now evaluates both sides instead of raising during lookup."""
+    selected = node.split("[", 1)[0].removeprefix("/work/").removeprefix("./")
+    match = _STOCK_NODE.fullmatch(selected) if len(selected) <= 512 else None
+    if match is None:
+        return False
+    path = match["path"]
+    location = rf"^(?:/work/|\./)?{re.escape(path)}:([1-9][0-9]{{0,6}}): "
+    old = re.match(location + r"(?:KeyError|IndexError|AttributeError)\b", before)
+    new = re.match(location + r"(?:assert\b|AssertionError\b)", after)
+    evaluated = re.search(r"(?:^E\s+|: )assert\s+[^\n]+", after, re.M)
+    if not old or not new or old[1] != new[1] or evaluated is None:
+        return False
+    try:
+        with tarfile.open(fileobj=BytesIO(archive), mode="r:") as snapshot:
+            tracked = _tracked_python(snapshot, path)
+    except (tarfile.TarError, OSError, EOFError):
+        return False
+    if tracked is None:
+        return False
+    scope = tracked[1]
+    *owners, name = match["name"].split("::")[1:]
+    for owner in owners:
+        classes = [item for item in scope if isinstance(item, ast.ClassDef) and item.name == owner]
+        if len(classes) != 1:
+            return False
+        scope = classes[0].body
+    tests = [item for item in scope if isinstance(item, _FUNCTION) and item.name == name]
+    if len(tests) != 1:
+        return False
+    return any(
+        isinstance(item, ast.Assert)
+        and item.lineno == int(old[1])
+        and isinstance(item.test, ast.Compare)
+        and any(isinstance(expr, (ast.Subscript, ast.Attribute)) for expr in ast.walk(item.test))
+        for item in ast.walk(tests[0])
+    )
+
+
 def _start(node):
     return min(
         [
