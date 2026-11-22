@@ -219,3 +219,40 @@ def test_stock_overview_preserves_call_modes_across_large_operator_cases():
     evidence = _operator_examples({"test_modes.py": fixture}, {"fetch"})
     for index in range(6):
         assert f"test_mode_{index}: service.fetch(mode={index}) -> result == {index}" in evidence
+
+
+def test_private_operator_source_localizes_a_large_selected_method():
+    from github_harness_agent.review_delta_context import private_operator_source
+
+    source = (
+        "class Reader:\n    def fetch(self):\n        value = 0\n"
+        + "        value += 1\n" * 100
+        + "        multiplier = 123\n"
+        + "        value -= 1\n" * 100
+        + "        return value * multiplier\n"
+    )
+    before = {"reader.py": source}
+    after = {"reader.py": source.replace("multiplier = 123", "multiplier = 456")}
+    fixture = {
+        "checks/test_reader.py": (
+            "class TestReader:\n    def test_fetch(self, mode):\n"
+            "        assert Reader().fetch() == mode\n"
+        )
+    }
+    node = "../mounted/checks/test_reader.py::TestReader::test_fetch[mode]"
+
+    excerpt = private_operator_source(before, after, fixture, node)
+
+    assert "reader.py::Reader.fetch" in excerpt
+    assert "# Exact current lines" in excerpt
+    assert "# Exact verified donor lines" in excerpt
+    assert "        multiplier = 456\n" in excerpt
+    assert "        multiplier = 123\n" in excerpt
+    assert len(excerpt) <= 3200
+    other = "def fetch():\n    return 0\n"
+    assert (
+        private_operator_source(
+            {**before, "other.py": other}, {**after, "other.py": other}, fixture, node
+        )
+        == ""
+    )

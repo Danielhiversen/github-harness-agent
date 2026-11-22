@@ -15,6 +15,7 @@ _DELTA_LIMIT = 4600
 _EXAMPLE_LIMIT = 3300
 STOCK_SOURCE_LIMIT = 16 * 1024
 _REGION_LIMIT = 2200
+_PRIVATE_SOURCE_LIMIT = 3200
 
 
 def _parse(source):
@@ -103,15 +104,17 @@ def _changes(before, after):
     return "".join(hunks), regions
 
 
-def _search_source(key, start, lines, regions):
-    if len(key) + 1 + sum(map(len, lines)) <= STOCK_SOURCE_LIMIT:
+def _search_source(
+    key, start, lines, regions, *, limit=STOCK_SOURCE_LIMIT, label="current"
+):
+    if len(key) + 1 + sum(map(len, lines)) <= limit:
         return "".join(lines)
     sections = []
-    remaining = _REGION_LIMIT
+    remaining = min(limit, _REGION_LIMIT)
     if regions and regions[0][0] > 3:
         regions = [(0, 3), *regions]
     for first, end in regions or [(0, 12), (max(12, len(lines) - 10), len(lines))]:
-        heading = f"# Exact current lines starting at {start + first}\n"
+        heading = f"# Exact {label} lines starting at {start + first}\n"
         body = _rows(lines, first, end, min(750, remaining - len(heading) - 1))
         if body:
             sections.append(heading + body)
@@ -126,6 +129,85 @@ def _call_names(tree):
         if isinstance(call, ast.Call)
         and isinstance(call.func, (ast.Attribute, ast.Name))
     }
+
+
+def _selected_operator_calls(fixtures, node_id):
+    path, _, name = node_id.split("[", 1)[0].partition("::")
+    matching = [
+        path_hint
+        for path_hint in fixtures
+        if path == path_hint or path.endswith("/" + path_hint)
+    ]
+    if not name or not matching:
+        return set()
+    module = _parse(fixtures[max(matching, key=len)])
+    if module is None:
+        return set()
+    qualified = name.replace("::", ".")
+    selected = [
+        node
+        for symbol, node in _symbols(module.body)
+        if symbol == qualified and isinstance(node, _FUNCTION)
+    ]
+    if len(selected) != 1:
+        return set()
+    calls = _call_names(selected[0])
+    helpers = [
+        node
+        for node in module.body
+        if isinstance(node, _FUNCTION)
+        and node.name in calls
+        and node is not selected[0]
+    ]
+    aliases = {
+        alias.asname: alias.name
+        for item in module.body
+        if isinstance(item, ast.ImportFrom)
+        for alias in item.names
+        if alias.asname
+    }
+    calls -= {helper.name for helper in helpers}
+    calls.update(callee for helper in helpers[:4] for callee in _call_names(helper))
+    return {aliases.get(callee, callee) for callee in calls}
+
+
+def private_operator_source(verified, tentative, fixtures, node_id):
+    """Show exact source pairs only for changed, unambiguous fixture callees."""
+    calls = _selected_operator_calls(fixtures, node_id)
+    if not calls:
+        return ""
+    previous, current = _definitions(verified), _definitions(tentative)
+    leaves = {
+        key: key.split("::", 1)[1].rsplit(".", 1)[-1]
+        for key in previous.keys() | current.keys()
+    }
+    counts = Counter(leaves.values())
+    symbols = sorted(
+        key
+        for key in previous.keys() & current.keys()
+        if leaves[key] in calls
+        and counts[leaves[key]] == 1
+        and previous[key][1] != current[key][1]
+    )[:2]
+    sections = []
+    for key in symbols:
+        target_label = f"Tentative edit target (exact source): {key}\n"
+        donor_label = f"Previously verified donor (read-only): {key}\n"
+        allowance = (
+            _PRIVATE_SOURCE_LIMIT // len(symbols) - len(target_label + donor_label) - 2
+        ) // 2
+        if allowance < 180:
+            continue
+        before, after = previous[key], current[key]
+        _, current_regions = _changes(before, after)
+        _, donor_regions = _changes(after, before)
+        target = _search_source(key, *after, current_regions, limit=allowance)
+        donor = _search_source(
+            key, *before, donor_regions, limit=allowance, label="verified donor"
+        )
+        if target and donor:
+            sections.append(target_label + target + "\n" + donor_label + donor + "\n")
+    return "".join(sections)
 
 
 def _test_excerpt(lines, node, names):

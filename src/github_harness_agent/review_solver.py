@@ -35,6 +35,7 @@ from .executor import (
 from .providers import ProviderExhausted
 from .review_composition import compose_line_edits, selective_reverts, small_line_edits
 from .review_assertions import assertion_progress, operator_assertions
+from .review_delta_context import private_operator_source
 from .review_prefix_replay import observe_prefix_progress
 from .review_definitions import (
     CAUSAL_EDIT_GUIDANCE,
@@ -551,6 +552,7 @@ def _proposal_messages(
     rejection="",
     stock_fixture=None,
     preserved_stock_fixture="",
+    private_source="",
     mock_detail="",
 ):
     if target == _TEST_GOAL:
@@ -577,13 +579,22 @@ def _proposal_messages(
     )
     path, line, body = notes[0]
     query |= words(body) | fixture_query
-    check_focus = focused_check_excerpt(check_command, diagnostic, current)
+    check_focus = (
+        (
+            "changed definitions invoked by the selected operator case (quoted data)",
+            private_source,
+        )
+        if private_source
+        else focused_check_excerpt(check_command, diagnostic, current)
+    )
     if mock_detail:
         diagnostic += "\n" + mock_detail
     if check_focus:
-        path, focus = check_focus
+        selected_source, focus = check_focus
+        if not private_source:
+            path = selected_source
         lead = (
-            f"Focused source from {path}:\n{focus}\n"
+            f"Focused source from {selected_source}:\n{focus}\n"
             f"Failure details:\n{diagnostic}\nReviewer feedback: {body}\n"
         )
     else:
@@ -1696,8 +1707,20 @@ def solve(executor, task, archive, budget, version):
                         check_command=check_command,
                         stock_fixture=stock_fixture,
                         preserved_stock_fixture=(
-                            stock_fixtures.get((repair.origin, failures.get(repair.origin)), "")
-                            if repair is not None and repair.stock_origin else ""
+                            stock_fixtures.get(
+                                (repair.origin, failures.get(repair.origin)), ""
+                            )
+                            if repair is not None and repair.stock_origin
+                            else ""
+                        ),
+                        private_source=(
+                            private_operator_source(
+                                current, source, fixtures, target[1]
+                            )
+                            if repair is not None
+                            and repair.stock_origin
+                            and target in repair.introduced
+                            else ""
                         ),
                         mock_detail=mock_detail,
                         rejection=(

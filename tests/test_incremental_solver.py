@@ -1709,6 +1709,71 @@ def test_private_static_repair_preserves_stock_and_rechecks_every_gate(
         assert "Private regression repair" not in gateway.prompts[1]
 
 
+def test_private_stock_repair_keeps_selected_verified_donor_visible(solver_case):
+    task, _, runner, _ = solver_case
+    task = replace(task, require_new_tests=False)
+    Path(task.pull_checks[0][-1]).write_text(
+        "from fixture_calc import important as check_value, unrelated\n\n"
+        "def test_selected():\n    assert check_value() == 17\n\n"
+        "def test_other():\n    assert unrelated() > 0\n"
+    )
+    prefix = f'PREFIX = "{"a" * 1600}"\n'
+    suffix = f'SUFFIX = "{"z" * 1600}"\n'
+    source = (
+        prefix + BASE_SOURCE + "\ndef stock():\n    return -3\n"
+        'def important():\n    return int("17")\n'
+        'def unrelated():\n    return int("71")\n' + suffix
+    )
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, content in {
+            SOURCE: source,
+            "tests/test_existing.py": (
+                "from fixture_calc import stock\n\n"
+                "def test_stock():\n    assert stock() == 3\n"
+            ),
+        }.items():
+            body = content.encode()
+            entry = tarfile.TarInfo(path)
+            entry.size = len(body)
+            snapshot.addfile(entry, BytesIO(body))
+    proposal = (
+        edit(SOURCE, prefix, prefix.replace("a" * 1600, "b" * 1600))
+        + edit(SOURCE, "    return -3\n", "    return 3\n")
+        + edit(SOURCE, '    return int("17")\n', "    return 18\n")
+        + edit(SOURCE, '    return int("71")\n', "    return 72\n")
+        + edit(SOURCE, suffix, suffix.replace("z" * 1600, "y" * 1600))
+    )
+    compacted = []
+
+    class Gateway(FreeGateway):
+        def complete(self, *, messages, **kwargs):
+            if self.prompts:
+                compacted.append(compact_focused_review(messages, max_bytes=4096))
+            return super().complete(messages=messages, **kwargs)
+
+    gateway = Gateway(
+        proposal, edit(SOURCE, "    return 18\n", '    return int("17")\n')
+    )
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=2, concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    result = solve(executor, task, archive.getvalue(), budget, "fixture-version")
+
+    assert all(check.returncode == 0 for check in result.checks)
+    private_prompt = gateway.prompts[1]
+    assert "Private regression repair" in private_prompt
+    assert 'return int("17")' in private_prompt
+    assert 'return int("71")' not in private_prompt
+    for prompt in (private_prompt, compacted[0][-1]["content"]):
+        assert f"Tentative edit target (exact source): {SOURCE}::important" in prompt
+        assert f"Previously verified donor (read-only): {SOURCE}::important" in prompt
+        assert "def important():\n    return 18\n" in prompt
+        assert 'def important():\n    return int("17")\n' in prompt
+
+
 def test_private_regression_repair_is_discarded_if_a_concurrent_draft_advances(
     solver_case,
 ):
