@@ -354,19 +354,19 @@ class _Budget:
         options = {"exclude": excluded_models} if excluded_models else {}
         if after_provider:
             options["after_provider"] = after_provider
-        elif self.task.provider_offset:
+        elif self.task.provider_offset and not self.task.review_recovery:
             options["provider_offset"] = self.task.provider_offset
         if max_output_tokens is not None:
             options["max_output_tokens"] = max_output_tokens
 
         def send(payload):
             request_number = self.claim("model request", self.limits.model_requests)
-            if (
-                request_number == 1
-                and self.task.retry_after_provider
-                and not after_provider
-            ):
-                options["after_provider"] = self.task.retry_after_provider
+            request_options = options.copy()
+            if request_number == 1 and not after_provider:
+                if self.task.review_recovery and self.task.provider_offset:
+                    request_options["provider_offset"] = self.task.provider_offset
+                if self.task.retry_after_provider:
+                    request_options["after_provider"] = self.task.retry_after_provider
             remaining = self.remaining()
             return observed_call(
                 self.task,
@@ -377,7 +377,7 @@ class _Budget:
                 timeout=remaining
                 if timeout_cap is None
                 else min(remaining, timeout_cap),
-                **options,
+                **request_options,
             )
 
         with self._lock:

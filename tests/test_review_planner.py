@@ -179,6 +179,7 @@ def test_stock_coding_prompt_keeps_complete_large_selected_method():
     ]
 
     def complete(gateway, role, messages, **options):
+        assert method in messages[-1]["content"]
         return SimpleNamespace(
             content=json.dumps(
                 {
@@ -195,6 +196,8 @@ def test_stock_coding_prompt_keeps_complete_large_selected_method():
         {path: draft},
         "def test_lookup(directory, query):\n    assert directory.resolve(query)\n",
         "lookup failed",
+        "Auxiliary counterfactual (quoted data, partial diagnostic only). "
+        "pkg/directory.py::Directory.resolve, draft line 164: `if query.use_shared_pool`.",
         stock_inputs=({path: baseline}, {}, []),
     )
     coding = apply_coding_advice(messages, plan)[-1]["content"]

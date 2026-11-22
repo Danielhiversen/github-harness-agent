@@ -83,12 +83,12 @@ class FreeGateway:
 
 def test_round_preference_is_used_for_only_the_first_model_request(solver_case):
     task, _, _, _ = solver_case
-    task = replace(task, retry_after_provider="previous-provider")
+    task = replace(task, retry_after_provider="previous-provider", provider_offset=12)
     preferred = []
 
     class Gateway(FreeGateway):
         def complete(self, **kwargs):
-            preferred.append(kwargs.get("after_provider"))
+            preferred.append((kwargs.get("after_provider"), kwargs.pop("provider_offset", 0)))
             return super().complete(**kwargs)
 
     gateway = Gateway("first", "second", "third")
@@ -103,7 +103,7 @@ def test_round_preference_is_used_for_only_the_first_model_request(solver_case):
         max_output_tokens=3072,
         after_provider="chosen-for-goal",
     )
-    assert preferred == ["previous-provider", None, "chosen-for-goal"]
+    assert preferred == [("previous-provider", 12), (None, 0), ("chosen-for-goal", 0)]
 
 
 @pytest.fixture
