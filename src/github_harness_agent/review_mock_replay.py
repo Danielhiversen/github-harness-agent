@@ -20,6 +20,7 @@ _PLANNING_RESERVE = 30
 # Includes startup and staging in a fresh isolated verification workspace.
 _REPLAY_SECONDS = 20
 _DETAIL_BYTES = 900
+_LOOP_OBSERVATION = "Draft loop target "
 _COUNTER_HEADING = "Auxiliary mapping counter changes (quoted advisory data)."
 _OBSERVATION_BOUNDARY = re.compile(
     r"(?m)^(?=Auxiliary (?:counterfactual|mapping counter changes|mock calls|pinned dependencies)\b)"
@@ -64,17 +65,22 @@ def compact_observations(detail, limit):
     result = []
     for report in reports:
         if report.startswith(_COUNTER_HEADING) and len(report.encode()) > allowance:
-            rows = [
-                line
-                for line in report.splitlines()
-                if line.startswith(("Pinned: ", "Draft: "))
-            ]
-            if rows and allowance > len(_COUNTER_HEADING) + len(rows):
-                row_limit = (allowance - len(_COUNTER_HEADING) - len(rows)) // len(rows)
+            lines = report.splitlines()
+            rows = [line for line in lines if line.startswith(("Pinned: ", "Draft: "))]
+            room = allowance - len(_COUNTER_HEADING) - len(rows)
+            if rows and room > 0:
+                reuse = next(
+                    ("\n" + line for line in lines if line.startswith(_LOOP_OBSERVATION)),
+                    "",
+                )
+                if len(reuse) > room - 120:
+                    reuse = ""
+                row_limit = (room - len(reuse)) // len(rows)
                 result.append(
                     _COUNTER_HEADING
                     + "\n"
                     + "\n".join(excerpt(row, row_limit) for row in rows)
+                    + reuse
                 )
                 continue
         result.append(excerpt(report, allowance))
@@ -386,6 +392,55 @@ def _divergent_caller_source(old, new, sources):
     return None
 
 
+def _loop_reuse(before, after, first_difference):
+    if len(before) != 3 or len(after) != 3:
+        return ""
+    old_events, old_bindings = before[1:]
+    new_events, new_bindings = after[1:]
+
+    def symbols(stack):
+        return tuple((path, function) for path, function, _ in stack)
+
+    seen = set()
+    for index, (stack, _, _) in enumerate(new_events):
+        site = tuple(map(tuple, stack))
+        if site in seen:
+            continue
+        seen.add(site)
+        if (binding := new_bindings[index]) is None:
+            continue
+        matches = [
+            event for event in range(index, len(new_events))
+            if new_events[event][0] == stack
+            and new_bindings[event] is not None
+            and new_bindings[event][:-1] == binding[:-1]
+        ]
+        entries = {new_bindings[event][-1] for event in matches}
+        if len(entries) < 2 or matches[-1] < first_difference:
+            continue
+        caller, _, name, ordinal, _ = binding
+        comparable = [
+            older for event, older in zip(old_events, old_bindings, strict=True)
+            if symbols(event[0]) == symbols(stack)
+        ]
+        if not comparable or any(
+            older is None or older[0] != caller or older[2] != name for older in comparable
+        ):
+            continue
+        # Compare reuse counts within each run; the anonymous ordinals do not
+        # identify the same object across independent replay processes.
+        prior_entries = {}
+        for older in comparable:
+            prior_entries.setdefault(tuple(older[:-1]), set()).add(older[-1])
+        if any(len(group) >= len(entries) for group in prior_entries.values()):
+            continue
+        return (
+            f"{_LOOP_OBSERVATION}`{name}`: record #{ordinal} at {len(matches)} mutations "
+            f"(caller line {stack[caller][2]}, object identity only within this evaluation)."
+        )
+    return ""
+
+
 def _counter_difference(baseline, candidate, node, reviewed_sources=None):
     if baseline is None or candidate is None or baseline[0] != candidate[0]:
         return ""
@@ -443,6 +498,8 @@ def _counter_difference(baseline, candidate, node, reviewed_sources=None):
     rows = [
         render(label, events) for label, events in (("Pinned", old), ("Draft", new))
     ]
+    if reuse := _loop_reuse(base_windows[failed], windows[failed], first):
+        rows.append(reuse)
     text = (
         _COUNTER_HEADING + " "
         f"The pinned case passed and the draft failed at {node} line {line} (evaluation {failed + 1}). "

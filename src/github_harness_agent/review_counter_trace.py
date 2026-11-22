@@ -11,7 +11,9 @@ MAX_EVENTS = 8
 MAX_WINDOWS = 4
 MAX_STACK = 3
 MAX_PATH = 120
+_MAX_SAMPLES = 5000
 _NAME = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", re.ASCII)
+_LOOP_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,47}")
 _KEY = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,31}")
 _SENSITIVE = re.compile(
     r"secret|token|passwd|password|credential|api.?key|authorization|cookie|email|phone|identity|account|"
@@ -100,6 +102,29 @@ def _mapping_count(mapping, key):
     return None
 
 
+def _loop_heads(path):
+    try:
+        with Path(path).open("rb") as source:
+            raw = source.read(128 * 1024 + 1)
+        if len(raw) > 128 * 1024:
+            return {}
+        module = ast.parse(raw)
+    except (OSError, SyntaxError, ValueError, RecursionError):
+        return {}
+    heads = {}
+    for loop in ast.walk(module):
+        if (
+            isinstance(loop, ast.For)
+            and isinstance(loop.target, ast.Name)
+            and _LOOP_NAME.fullmatch(name := loop.target.id)
+            and not _SENSITIVE.search(name)
+            and loop.lineno < (start := loop.body[0].lineno)
+        ):
+            # State is attached to the live frame that actually enters this body.
+            heads[start] = (loop.lineno, loop.body[-1].end_lineno, name)
+    return heads
+
+
 class CounterTrace:
     def __init__(self, path, node, reviewed_paths, failure_line=None):
         self.path = path
@@ -108,6 +133,7 @@ class CounterTrace:
         self.paths = {}
         for name in reviewed_paths:
             self.paths[name] = self.paths[str(Path(name).resolve())] = name
+        self.loop_heads = {}
         self.windows = []
         self.actual = None
         self.samples = 0
@@ -115,6 +141,10 @@ class CounterTrace:
 
     def _reset_window(self):
         self.events = []
+        self.observations = []
+        self.bindings = {}
+        self.records = []
+        self.entries = 0
         self.mappings = {}
         self.changed = None
         self.rows = []
@@ -127,7 +157,7 @@ class CounterTrace:
             if self.changed is not None
             else tuple(value for _, value in self.mappings.values())
         )
-        window = (self.digest, self.failed, self.events, counts)
+        window = (self.digest, self.failed, self.events, counts, self.observations)
         self.windows.append(window if self.visited and not self.overflow else None)
         self._reset_window()
 
@@ -155,21 +185,61 @@ class CounterTrace:
                     self.digest = hashlib.sha256(path).hexdigest()
         return self._test_location
 
+    def _observe_binding(self, frame, previous):
+        filename = frame.f_code.co_filename
+        if filename not in self.loop_heads:
+            self.loop_heads[filename] = _loop_heads(filename)
+        start = frame.f_lineno
+        key = id(frame)
+        bindings = self.bindings.get(key, {})
+        for row in tuple(bindings):
+            if not row <= start <= bindings[row][0]:
+                del bindings[row]
+        head = self.loop_heads[filename].get(start)
+        if head is not None and head[0] <= previous < start:
+            _, end, name = head
+            local = frame.f_locals
+            record = local.get(name)
+            if (
+                name in frame.f_code.co_varnames
+                and (type(record) is dict or type(record) is list)
+                and sum(map(len, self.bindings.values())) < MAX_EVENTS
+            ):
+                self.entries += 1
+                bindings[start] = (end, name, record, self.entries)
+        if bindings:
+            self.bindings[key] = bindings
+        else:
+            self.bindings.pop(key, None)
+
+    def _loop_record(self, frame, row):
+        bindings = self.bindings.get(id(frame))
+        if not bindings:
+            return None
+        for start in sorted(bindings, reverse=True):
+            end, name, record, entry = bindings[start]
+            if start <= row <= end and frame.f_locals.get(name) is record:
+                return start, name, record, entry
+        return None
+
     def _locations(self, frame, row):
         locations = []
+        observed = None
         for _ in range(12):
             if frame is None:
                 break
             path = self.paths.get(frame.f_code.co_filename)
             name = frame.f_code.co_qualname.replace(".<locals>.", ".")
             if path and len(name) <= 96 and _NAME.fullmatch(name):
+                if observed is None and (binding := self._loop_record(frame, row)):
+                    observed = (len(locations), *binding)
                 locations.append([path, name, row])
                 if len(locations) == MAX_STACK:
                     break
             frame = frame.f_back
             if frame is not None:
                 row = frame.f_lineno
-        return locations
+        return locations, observed
 
     def _sample(self, frame, row):
         try:
@@ -181,7 +251,7 @@ class CounterTrace:
 
     def _record(self, frame, row):
         self.samples += 1
-        if self.samples > 5000:
+        if self.samples > _MAX_SAMPLES:
             self.overflow = True
             return
         self.visited = True
@@ -204,7 +274,7 @@ class CounterTrace:
                 or NotImplemented in (value, previous[1])
             ):
                 continue
-            locations = self._locations(frame, row)
+            locations, observed = self._locations(frame, row)
             if locations:
                 if len(self.events) == MAX_EVENTS:
                     self.overflow = True
@@ -214,6 +284,19 @@ class CounterTrace:
                     return
                 self.changed = identity
                 self.events.append([locations, previous[1], value])
+                self.observations.append(self._anonymous_binding(observed))
+
+    def _anonymous_binding(self, observed):
+        if observed is None:
+            return None
+        caller, start, variable, record, entry = observed
+        for ordinal, known in enumerate(self.records, 1):
+            if known is record:
+                break
+        else:
+            self.records.append(record)
+            ordinal = len(self.records)
+        return [caller, start, variable, ordinal, entry]
 
     def tracer(self, code):
         if self.assertion is None:
@@ -239,6 +322,10 @@ class CounterTrace:
                     return None
                 if event in {"line", "return"}:
                     self._sample(frame, previous)
+                    if event == "line":
+                        self._observe_binding(frame, previous)
+                    else:
+                        self.bindings.pop(id(frame), None)
                     previous = frame.f_lineno
                 return observe
 
@@ -280,11 +367,12 @@ class CounterTrace:
             if window is None:
                 windows.append(None)
                 continue
-            digest, had_exception, events, counts = window
+            digest, had_exception, events, counts, observed = window
             is_failure = index == failed
             target = self.actual if is_failure else self.assertion[3]
             valid = had_exception == is_failure and counts.count(target) == 1
-            windows.append([digest, events] if valid else None)
+            selected = [digest, events, observed] if any(observed) else [digest, events]
+            windows.append(selected if valid else None)
         if failed is not None and windows[failed] is None:
             return None
         return (
@@ -315,9 +403,9 @@ def valid_report(data, paths, failure_line=None):
 
 
 def _valid_window(window, paths):
-    if type(window) is not list or len(window) != 2:
+    if type(window) is not list or len(window) not in (2, 3):
         return False
-    digest, events = window
+    digest, events = window[:2]
     if (
         type(digest) is not str
         or not re.fullmatch(r"[a-f0-9]{64}", digest)
@@ -350,4 +438,28 @@ def _valid_window(window, paths):
                 or not 1 <= row <= 256 * 1024
             ):
                 return False
-    return True
+    if len(window) == 2:
+        return True
+    observed = window[2]
+    return (
+        type(observed) is list
+        and len(observed) == len(events)
+        and all(
+            binding is None or _valid_binding(binding, event[0])
+            for binding, event in zip(observed, events, strict=True)
+        )
+    )
+
+
+def _valid_binding(binding, stack):
+    if type(binding) is not list or len(binding) != 5:
+        return False
+    frame, start, variable, ordinal, entry = binding
+    return (
+        type(frame) is int and 0 <= frame < len(stack)
+        and type(start) is int and 1 <= start <= stack[frame][2]
+        and type(variable) is str and bool(_LOOP_NAME.fullmatch(variable))
+        and not _SENSITIVE.search(variable)
+        and type(ordinal) is int and 1 <= ordinal <= MAX_EVENTS
+        and type(entry) is int and 1 <= entry <= _MAX_SAMPLES
+    )

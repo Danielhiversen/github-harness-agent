@@ -1,5 +1,6 @@
 from github_harness_agent.review_mock_replay import (
     _counter_difference,
+    compact_observations,
     counter_caller_site,
 )
 from github_harness_agent.review_delta_context import stock_delta_context
@@ -149,3 +150,42 @@ def traverse(mapping, entries):
         )
         assert "Pinned caller source" in detail and "Draft caller source" in detail
         assert "Pinned outer caller source" not in detail
+
+
+def test_counter_trace_accepts_old_events_and_only_bounded_loop_identity_metadata():
+    from github_harness_agent.review_counter_trace import valid_report
+
+    paths = ("module.py",)
+    report = _report(None, [["module.py", "original_route", 7]])
+    assert valid_report(report, paths)
+    window = report[2][0]
+    window.append([[1, 5, "entry", 1, 1]])
+    assert valid_report(report, paths)
+    for malformed in (
+        [3, 5, "entry", 1, 1],
+        [1, 8, "entry", 1, 1],
+        [1, 5, "api_key", 1, 1],
+        [1, 5, "entry", 100, 1],
+        [1, 5, "entry", 1, 0],
+        [1, 5, "entry", 1, 1, {"entry": "sensitive"}],
+    ):
+        window[2] = [malformed]
+        assert not valid_report(report, paths)
+
+
+
+def test_compact_counter_diagnostic_keeps_the_full_loop_identity_observation():
+    reuse = "Draft loop target `" + "entry_" * 7 + "`: record #1 at 2 mutations (object identity only)."
+    report = (
+        "Auxiliary counterfactual " + "first counterfactual information " * 60
+        + "\nAuxiliary mapping counter changes (quoted advisory data). "
+        + "\nPinned: 0 -> 1 after module.py:7 " + "baseline frame " * 40
+        + "\nDraft: 1 -> 2 after module.py:7 " + "draft frame " * 40
+        + "\n" + reuse
+        + "\nAuxiliary mock calls " + "mock information " * 60
+    )
+    compacted = compact_observations(report, 1080)
+    assert len(compacted.encode()) <= 1080
+    assert reuse in compacted
+    assert "Pinned: 0 -> 1 after module.py:7" in compacted
+    assert "Draft: 1 -> 2 after module.py:7" in compacted

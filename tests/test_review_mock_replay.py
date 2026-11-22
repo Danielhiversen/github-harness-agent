@@ -297,3 +297,64 @@ def test_invoke():
         assert "Collector._tick" in detail
     else:
         assert detail == ""
+
+
+@pytest.mark.parametrize(
+    "record_source", ["same dict", "same list", "equal dicts", "rebound", "same course", "one slice"]
+)
+def test_counter_replay_reports_only_observed_loop_record_reuse(tmp_path, record_source):
+    source = """class Collector:
+    def __init__(self):
+        self.summary = {"processed_count": 0}
+
+    def _tick(self):
+        self.summary["processed_count"] += 1
+
+    def process(self, records, fallback):
+        for entry in records:
+            REBIND
+            self._tick()
+        return self.summary
+
+def invoke(records, fallback):
+    return Collector().process(records[:1], fallback)
+"""
+    before = source.replace("REBIND", "entry = fallback" if record_source == "rebound" else "pass")
+    expected = 1
+    after = before.replace("records[:1]", "records")
+    if record_source == "same course":
+        expected = 2
+        before = after
+        after = before.replace("+= 1", "+= 2")
+    elif record_source == "one slice":
+        before = before.replace("            self._tick()", "            for repeat in range(1):\n                self._tick()")
+        after = before.replace("range(1)", "range(2)")
+    item = '["private-input-sentinel"]' if record_source == "same list" else '{"private-input-sentinel": 19}'
+    records = "[item, item]" if record_source in {"same dict", "same list", "same course"} else "[item, item.copy()]"
+    test = f"""from service import invoke
+
+def test_invoke():
+    item = {item}
+    assert invoke({records}, item)["processed_count"] == {expected}
+"""
+    runner = FixtureRunner(tmp_path)
+    executor = PlainExecutor(runner, None, Limits(), verification_runner=runner)
+    task = TaskSnapshot("org/fixture", "1" * 40, "Exercise public processing.", (_COMMAND,))
+    detail = mock_call_diagnostic(
+        executor,
+        task,
+        _archive(before, test),
+        _Budget(executor.limits, lambda: False, task),
+        _COMMAND,
+        _NODE,
+        patch_for({"service.py": before}, {"service.py": after}),
+        reviewed_paths=("service.py",),
+    )
+    assert "mapping counter" in detail
+    assert "private-input-sentinel" not in detail
+    if record_source in {"same dict", "same list"}:
+        assert "loop target `entry`" in detail
+        assert "record #1" in detail and "2 mutations" in detail
+        assert "object identity only" in detail
+    else:
+        assert "loop target" not in detail
