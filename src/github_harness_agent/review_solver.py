@@ -31,6 +31,7 @@ from .executor import (
     _protected,
 )
 from .providers import ProviderExhausted
+from .review_composition import compose_line_edits, small_line_edits
 from .review_assertions import assertion_progress, operator_assertions
 from .review_prefix_replay import observe_prefix_progress
 from .review_definitions import (
@@ -89,6 +90,7 @@ _PYTEST_TOTALS = re.compile(r"(?:\d+ [a-z]+, )*\d+ [a-z]+ in \d+(?:\.\d+)?s(?: \
 _STOCK_REPAIR_CASE_LIMIT = 4
 _GUARD_SECONDS = 90
 _GUARD_MIN_REMAINING = 45
+_COMPOSITION_MIN_REMAINING = 60
 _MODEL_FAILURE_THRESHOLD = 2
 _WORD = re.compile(r"[a-z]{3,}")
 _STOP = set(
@@ -1053,6 +1055,24 @@ def solve(executor, task, archive, budget, version):
         if counts is not None and snapshot is current and editor.configured_model:
             counts[editor.route, editor.configured_model] += 1
 
+    def verify_stock_gain(target, sources, probe_budget):
+        proposal = patch_for(original, sources)
+        if not proposal or len(proposal) > executor.limits.patch_bytes:
+            return None
+        runs = {}
+        checked = evidence(
+            executor, task, archive, probe_budget, proposal, commands, pytest_runs=runs
+        )
+        if (
+            checked.keys() < failures.keys()
+            and _preserved_stock_gain(target, pytest_runs, runs, checked)
+            and _verified_operator_runs(
+                pytest_runs, runs, set(), task.pull_checks, operator_cases
+            )
+        ):
+            return sources, proposal, checked, runs
+        return None
+
     def reconcile_stock_gain(target, proposed_sources):
         if (
             budget.remaining() < _GUARD_MIN_REMAINING
@@ -1067,31 +1087,41 @@ def solve(executor, task, archive, budget, version):
         if path not in paths or _protected(path, task, new_test=False):
             return None
         probe_budget = _GuardBudget(budget)
-        for source in guarded_sources(current[path], proposed_sources[path]):
-            sources = {**current, path: source}
-            guarded_patch = patch_for(original, sources)
-            if not guarded_patch or len(guarded_patch) > executor.limits.patch_bytes:
-                continue
-            runs = {}
-            try:
-                checked = evidence(
-                    executor, task, archive, probe_budget, guarded_patch, commands,
-                    pytest_runs=runs,
-                )
-            except Cancelled:
-                raise
-            except (ExecutionError, ValueError):
-                budget.remaining()
-                return None
-            if (
-                checked.keys() < failures.keys()
-                and _preserved_stock_gain(target, pytest_runs, runs, checked)
-                and _verified_operator_runs(
-                    pytest_runs, runs, set(), task.pull_checks, operator_cases
-                )
-            ):
-                return sources, guarded_patch, checked, runs
+        try:
+            for source in guarded_sources(current[path], proposed_sources[path]):
+                verified = verify_stock_gain(target, {**current, path: source}, probe_budget)
+                if verified is not None:
+                    return verified
+        except Cancelled:
+            raise
+        except (ExecutionError, ValueError):
+            budget.remaining()
         return None
+
+    def compose_stock_gain(target, proposal):
+        nonlocal stock_edits, composition_attempted
+        if (
+            composition_attempted
+            or budget.remaining() < _COMPOSITION_MIN_REMAINING
+            or budget.commands_remaining() < 2 * len(commands) + 1
+        ):
+            return None
+        allowed = {path for path in paths if not _protected(path, task, new_test=False)}
+        edits = small_line_edits(current, proposal, allowed)
+        if not edits:
+            return None
+        previous, stock_edits = stock_edits, edits
+        composed = compose_line_edits(current, previous, edits)
+        if composed is None:
+            return None
+        composition_attempted, stock_edits = True, ()
+        try:
+            return verify_stock_gain(target, composed, _GuardBudget(budget))
+        except Cancelled:
+            raise
+        except (ExecutionError, ValueError):
+            budget.remaining()
+            return None
 
     planning_attempts = {}
     retry_advice = {}
@@ -1102,6 +1132,8 @@ def solve(executor, task, archive, budget, version):
     submitted = 0
     pending = {}
     continuations = {}
+    stock_edits = ()
+    composition_attempted = False
     regression_repair = None
     repair_attempted = set()
     unavailable = {}
@@ -1580,6 +1612,12 @@ def solve(executor, task, archive, budget, version):
                 partial = stock_assertion_evaluated(archive, target[1], failures[target], after[target])
                 if partial:
                     _LOG.info("The tracked pytest comparison now evaluates at the previous lookup failure")
+                elif source is current and repair is None and editor.configured_model:
+                    composed = compose_stock_gain(target, candidate)
+                    if composed is not None:
+                        candidate, proposed, after, after_runs = composed
+                        progressed = True
+                        _LOG.info("Combined independently verified edits for %s", target[1])
             prefix_progress = ""
             if (
                 not introduced
@@ -1644,6 +1682,7 @@ def solve(executor, task, archive, budget, version):
             current, failures, patch, actor = candidate, after, proposed, editor
             pytest_runs = after_runs
             continuations.clear()
+            stock_edits, composition_attempted = (), False
             regression_repair = None
             repair_attempted.clear()
             rejected.clear()

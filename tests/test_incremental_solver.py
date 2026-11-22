@@ -1084,6 +1084,107 @@ def test_guard_uses_a_public_parameter_signature_or_existing_condition(
     assert outcomes == {(1, -1), (-1, 1)}
 
 
+def test_compose_line_edits_requires_exact_base_and_reviewed_paths():
+    from github_harness_agent.review_composition import compose_line_edits, small_line_edits
+
+    base = {SOURCE: "left = 1\nright = 2\n", "tests/test_existing.py": "pass\n"}
+    allowed = {SOURCE}
+    first = small_line_edits(base, {**base, SOURCE: "left = 3\nright = 2\n"}, allowed)
+    second = small_line_edits(base, {**base, SOURCE: "left = 1\nright = 4\n"}, allowed)
+    touching = small_line_edits(
+        base, {**base, SOURCE: "left = 1\ncenter = 0\nright = 2\n"}, allowed
+    )
+
+    assert compose_line_edits(base, first, second) == {
+        **base, SOURCE: "left = 3\nright = 4\n"
+    }
+    assert compose_line_edits(base, first, touching) is None
+    assert compose_line_edits({**base, SOURCE: "left = 8\nright = 2\n"}, first, second) is None
+    assert small_line_edits(base, {**base, "tests/test_existing.py": "raise RuntimeError\n"}, allowed) == ()
+
+
+@pytest.mark.parametrize("scenario", ("disjoint", "conflict", "canary"))
+def test_solver_combines_only_verified_disjoint_stock_edits(solver_case, monkeypatch, scenario):
+    task, _, runner, checkpoints = solver_case
+    task = replace(task, require_new_tests=False)
+    operator = Path(task.pull_checks[0][-1])
+    operator.write_text(
+        "from fixture_calc import first, second\n\n"
+        "def test_first():\n    assert first() == -1\n\n"
+        "def test_second():\n    assert second() == -2\n"
+    )
+    canary = (
+        "\ndef test_independent_modes():\n    assert (left(), right()) != (12, 22)\n"
+        if scenario == "canary"
+        else ""
+    )
+    sources = {
+        SOURCE: BASE_SOURCE + "\ndef left():\n    return 11\n\ndef right():\n    return 21\n",
+        "tests/test_existing.py": (
+            "from fixture_calc import left, right\n\n"
+            "def test_stock_goal():\n    assert left() + right() == 34\n" + canary
+        ),
+    }
+    if scenario == "disjoint":
+        prior_source = "# Accepted configuration\n" + sources[SOURCE]
+        accepted = DraftCheckpoint(
+            "harness2/base",
+            task.base_sha,
+            patch_for({SOURCE: sources[SOURCE]}, {SOURCE: prior_source}),
+            guidance=_GUIDANCE,
+        )
+        task = replace(task, checkpoints={accepted.key: accepted})
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, source in sources.items():
+            data = source.encode()
+            entry = tarfile.TarInfo(path)
+            entry.size = len(data)
+            snapshot.addfile(entry, BytesIO(data))
+
+    class Gateway(FreeGateway):
+        def complete(self, **kwargs):
+            completion = super().complete(**kwargs)
+            completion.configured_model = f"stand-in/free-{len(self.prompts)}"
+            return completion
+
+    left = edit(SOURCE, "    return 11\n", "    return 12\n")
+    right = (
+        edit(SOURCE, "    return 11\n", "    return 14\n")
+        if scenario == "conflict"
+        else edit(SOURCE, "    return 21\n", "    return 22\n")
+    )
+    gateway = Gateway(left, right)
+    executor = PlainExecutor(runner, gateway, Limits(model_requests=2, concurrent_probes=1))
+    budget = _Budget(executor.limits, lambda: False, task)
+    composed_failures = []
+
+    def record(*args, **kwargs):
+        failures = evidence(*args, **kwargs)
+        if b"+    return 12\n" in args[4] and b"+    return 22\n" in args[4]:
+            composed_failures.append({node for _, node in failures})
+        return failures
+
+    monkeypatch.setattr("github_harness_agent.review_solver.evidence", record)
+    if scenario == "disjoint":
+        result = solve(executor, task, archive.getvalue(), budget, "fixture-version")
+        assert (b"+    return 12\n" in result.patch and b"+    return 22\n" in result.patch)
+        assert b"+# Accepted configuration\n" in result.patch
+        assert all(check.returncode == 0 for check in result.checks)
+        assert [item.configured_model for item in result.route_trace] == [
+            "stand-in/free-1", "stand-in/free-2"
+        ]
+        assert composed_failures == [set()]
+    else:
+        with pytest.raises(AttemptRejected):
+            solve(executor, task, archive.getvalue(), budget, "fixture-version")
+        assert composed_failures == (
+            [{"tests/test_existing.py::test_independent_modes"}] if scenario == "canary" else []
+        )
+    assert len(gateway.prompts) == 2
+    assert not checkpoints
+
+
 @pytest.mark.parametrize("followup", ("repair", "lose_stock", "operator_remains", "partial_stock"))
 def test_private_repair_reconciles_a_stock_gain_without_storing_regressions(solver_case, followup):
     task, _, runner, checkpoints = solver_case
