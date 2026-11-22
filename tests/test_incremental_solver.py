@@ -526,6 +526,142 @@ def test_rejection_preserves_both_ends_of_long_diagnostics():
     assert len(evidence) < 2000
 
 
+@pytest.mark.parametrize(
+    "followup", ("repair", "assertion", "stagnant", "tradeoff", "repeat")
+)
+def test_private_operator_regressions_are_repaired_without_trading_passing_cases(
+    solver_case, followup
+):
+    task, archive, runner, checkpoints = solver_case
+    fixture = Path(task.pull_checks[0][-1])
+    fixture.write_text(
+        "import fixture_calc as calc\n\n"
+        "def test_first():\n    assert calc.first() == 1\n\n"
+        "def test_guard_one():\n"
+        + ("    assert calc.second() < 0\n" if followup == "assertion" else "")
+        + "    assert calc.second() == -2\n\n"
+        "def test_guard_two():\n    assert not getattr(calc, 'regression_flag', False)\n"
+    )
+    task = replace(
+        task, pull_checks=((*task.pull_checks[0][:-1], "--tb=line", str(fixture)),)
+    )
+    flag = edit(SOURCE, "def first():\n", "regression_flag = True\n\ndef first():\n")
+    revert_second = edit(SOURCE, "    return 2\n", "    return -2\n")
+    remove_flag = edit(SOURCE, "regression_flag = True\n\n", "")
+    if followup == "repair":
+        repairs = (revert_second, remove_flag)
+    elif followup == "assertion":
+        repairs = (
+            edit(SOURCE, "    return 2\n", "    return -3\n"),
+            edit(SOURCE, "    return -3\n", "    return -2\n") + remove_flag,
+        )
+    elif followup in {"stagnant", "repeat"}:
+        repairs = (
+            edit(SOURCE, "regression_flag = True\n", "regression_flag = bool(1)\n"),
+            FIRST,
+        )
+        if followup == "repeat":
+            repairs = (repairs[0], FIRST + SECOND + flag, FIRST)
+    else:
+        repairs = (
+            revert_second + edit(SOURCE, "    return 1\n", "    return -1\n"),
+            FIRST,
+        )
+    gateway = FreeGateway(
+        FIRST + SECOND + flag,
+        *repairs,
+        edit(NEW_TEST, "", TEST.replace("(1, 2)", "(1, -2)")),
+    )
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=len(repairs) + 2, concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    result = solve(executor, task, archive, budget, "fixture-version")
+
+    targets = [prompt.splitlines()[0].rsplit("::", 1)[-1] for prompt in gateway.prompts]
+    assert targets[:3] == [
+        "test_first",
+        "test_guard_one",
+        {"repair": "test_guard_two", "assertion": "test_guard_one"}.get(
+            followup, "test_first"
+        ),
+    ]
+    if followup == "repeat":
+        assert targets[3] == "test_first"
+    assert "assert calc.second() == -2" in gateway.prompts[1]
+    assert "+regression_flag = True" in gateway.prompts[1]
+    assert "def test_guard_one():" in gateway.prompts[1]
+    assert len(checkpoints) == 1
+    for patch in [result.patch, checkpoints[0].patch]:
+        assert b"regression_flag" not in patch
+        assert b"+    return 2\n" not in patch
+        assert b"+    return 1\n" in patch
+    assert all(check.returncode == 0 for check in result.checks)
+
+
+def test_private_regression_repair_is_discarded_if_a_concurrent_draft_advances(
+    solver_case,
+):
+    task, archive, runner, checkpoints = solver_case
+    fixture = Path(task.pull_checks[0][-1])
+    fixture.write_text(
+        fixture.read_text() + "\ndef test_guard():\n"
+        "    import fixture_calc\n"
+        "    assert not getattr(fixture_calc, 'regression_flag', False)\n"
+    )
+    repair_started = Event()
+    second_saved = Event()
+    first_started = Event()
+    flag = edit(SOURCE, "def first():\n", "regression_flag = True\n\ndef first():\n")
+
+    def save(checkpoint):
+        checkpoints.append(checkpoint)
+        if b"+    return 2\n" in checkpoint.patch:
+            second_saved.set()
+
+    class Gateway:
+        def complete(self, *, role, messages, **request):
+            goal = messages[-1]["content"].splitlines()[0]
+            if "test_guard" in goal:
+                repair_started.set()
+                assert second_saved.wait(30)
+                proposal = (
+                    edit(SOURCE, "regression_flag = True\n", "stale_repair = True\n")
+                    + SECOND
+                )
+            elif "test_second" in goal:
+                assert repair_started.wait(30)
+                proposal = SECOND
+            elif "test_first" in goal:
+                proposal = FIRST if first_started.is_set() else FIRST + flag
+                first_started.set()
+            else:
+                proposal = edit(NEW_TEST, "", TEST)
+            return SimpleNamespace(
+                role=role,
+                route="stand-in-free",
+                model="fixture-coder",
+                configured_model="stand-in/free",
+                content=proposal,
+                usage={},
+            )
+
+    task = replace(task, save_checkpoint=save)
+    executor = PlainExecutor(
+        runner, Gateway(), Limits(model_requests=5, concurrent_probes=2)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    result = solve(executor, task, archive, budget, "fixture-version")
+
+    assert repair_started.is_set()
+    assert b"+    return 2\n" in checkpoints[0].patch
+    assert b"+    return 1\n" not in checkpoints[0].patch
+    assert all(b"stale_repair" not in draft.patch for draft in checkpoints)
+    assert b"stale_repair" not in result.patch
+
+
 @pytest.mark.parametrize("branch_between", (False, True))
 def test_solver_checkpoints_later_straight_line_assertion_only(
     solver_case, branch_between

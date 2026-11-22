@@ -7,7 +7,7 @@ import json
 import logging
 import re
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from . import review_recovery
 from .check_artifacts import check_label
@@ -663,6 +663,47 @@ def _rejected_attempt(source, candidate, target, before, after):
     )
 
 
+@dataclass(frozen=True)
+class _RegressionRepair:
+    origin: tuple[int, str]
+    sources: dict[str, str]
+    failures: dict[tuple[int, str], str]
+    gained: set[tuple[int, str]]
+    introduced: set[tuple[int, str]]
+    attempts: int = 0
+
+
+def _named_operator_cases(keys, commands):
+    # A missing node is meaningful only when pytest ran the complete check.
+    incomplete = {
+        "-x",
+        "--exitfirst",
+        "--lf",
+        "--last-failed",
+        "--sw",
+        "--stepwise",
+        "--maxfail",
+    }
+    return all(
+        "::" in node
+        and check_label(commands[number], ()) == "pytest"
+        and not any(arg.split("=", 1)[0] in incomplete for arg in commands[number])
+        for number, node in keys
+    )
+
+
+def _private_repair_context(current, repair):
+    gained = ", ".join(excerpt(node, 160) for _, node in sorted(repair.gained)[:4])
+    return (
+        "Private regression repair. Fix the selected newly failing case. "
+        "Preserve all previously passing cases and the improvement in: "
+        + gained
+        + ". Edit the current tentative source. Use this diff only as evidence.\n"
+        + "Unpublished changes relative to the accepted checkout (quoted data):\n"
+        + excerpt(patch_for(current, repair.sources).decode("utf-8"), 1050)
+    )
+
+
 def solve(executor, task, archive, budget, version):
     review = task.review_recovery
     if not (
@@ -814,6 +855,8 @@ def solve(executor, task, archive, budget, version):
     submitted = 0
     pending = {}
     continuations = {}
+    regression_repair = None
+    repair_attempted = set()
     unavailable = {}
     test_draft = current.get(new_path, "")
     test_diagnostic = ""
@@ -840,12 +883,28 @@ def solve(executor, task, archive, budget, version):
             if not remaining and not ready:
                 return None
             limit = executor.limits.concurrent_probes if operator else 1
-            active = {target for target, _, _, _, _ in pending.values()}
+            active = {request[0] for request in pending.values()}
+            private = regression_repair or next(
+                (
+                    request[-1]
+                    for request in pending.values()
+                    if request[1] is current and request[-1] is not None
+                ),
+                None,
+            )
+            repair_target = (
+                min(regression_repair.introduced) if regression_repair else None
+            )
             available = sorted(
                 (
                     key
                     for key in remaining
-                    if key not in active and key not in unavailable
+                    if key not in active
+                    and key not in unavailable
+                    and (
+                        private is None
+                        or (key != private.origin and key not in private.gained)
+                    )
                 ),
                 # A failing parameter identifies a concrete input in a family of cases.
                 key=lambda key: (
@@ -855,6 +914,8 @@ def solve(executor, task, archive, budget, version):
                     key,
                 ),
             )
+            if repair_target is not None:
+                available.insert(0, repair_target)
             launch_budget = min(
                 max_proposals - submitted, budget.model_requests_remaining()
             )
@@ -865,6 +926,7 @@ def solve(executor, task, archive, budget, version):
                         break
                     attempts[target] = attempts.get(target, 0) + 1
                     continuation = continuations.pop(target, None)
+                    repair = regression_repair if target == repair_target else None
                     if continuation is None:
                         source, diagnostics = current, failures
                         note = notes.get(target, review.previous_failure)
@@ -875,6 +937,10 @@ def solve(executor, task, archive, budget, version):
                             "This checkout includes one unpublished proposal. The same "
                             "assertion still fails. Continue from these edits once."
                         )
+                    if repair is not None:
+                        regression_repair = None
+                        source, diagnostics = repair.sources, repair.failures
+                        note = ""
                     if target == _TEST_GOAL:
                         source = {**current, new_path: test_draft}
                         note = "\n".join(
@@ -910,11 +976,15 @@ def solve(executor, task, archive, budget, version):
                         fixtures,
                         interfaces,
                         new_path,
-                        continuing=continuation is not None,
+                        continuing=continuation is not None or repair is not None,
                         named_definitions=named_definitions,
                         check_command=check_command,
                         rejection=(
-                            rejected.get(target, "") if continuation is None else ""
+                            _private_repair_context(current, repair)
+                            if repair is not None
+                            else rejected.get(target, "")
+                            if continuation is None
+                            else ""
                         ),
                     )
                     planner_input = None
@@ -945,6 +1015,7 @@ def solve(executor, task, archive, budget, version):
                         continuation,
                         named_definitions,
                         planner_input is not None,
+                        repair,
                     )
                     cost = 2 if native or planner_input is not None else 1
                     submitted += cost
@@ -962,15 +1033,18 @@ def solve(executor, task, archive, budget, version):
             if not done:
                 continue
             future = next(future for future in pending if future in done)
-            target, snapshot, continuation, named_definitions, advised = pending.pop(
-                future
+            target, snapshot, continuation, named_definitions, advised, repair = (
+                pending.pop(future)
             )
-            if (continuation is not None or advised) and snapshot is not current:
+            if (
+                continuation is not None or advised or repair is not None
+            ) and snapshot is not current:
                 continue
             try:
                 completion, native_candidate = future.result()
             except ProviderExhausted as error:
-                unavailable[target] = error
+                if repair is None:
+                    unavailable[target] = error
                 continue
             except _RequestBudgetExceeded:
                 continue
@@ -985,6 +1059,8 @@ def solve(executor, task, archive, budget, version):
             editor = RouteEvidence.from_completion(completion)
             try:
                 source = current if continuation is None else continuation[0]
+                if repair is not None:
+                    source = repair.sources
                 if target == _TEST_GOAL:
                     source = {new_path: test_draft}
                 try:
@@ -1065,6 +1141,59 @@ def solve(executor, task, archive, budget, version):
                 item for item in failures if item[0] < len(task.pull_checks)
             }
             new_operator = {item for item in after if item[0] < len(task.pull_checks)}
+            introduced = new_operator - old_operator
+            gained = old_operator - new_operator
+            if repair is not None:
+                improved = (
+                    not (repair.gained & new_operator)
+                    and introduced <= repair.introduced
+                    and _named_operator_cases(old_operator | new_operator, commands)
+                    and (
+                        introduced < repair.introduced
+                        or (
+                            repair.attempts == 0
+                            and assertion_progress(
+                                assertions,
+                                task.pull_checks,
+                                target,
+                                repair.failures,
+                                after,
+                            )
+                        )
+                    )
+                )
+                if not improved or introduced:
+                    if improved and repair.attempts == 0:
+                        regression_repair = replace(
+                            repair,
+                            sources=candidate,
+                            failures=after,
+                            gained=gained,
+                            introduced=introduced,
+                            attempts=1,
+                        )
+                    else:
+                        rejected[repair.origin] = _rejected_attempt(
+                            current, candidate, repair.origin, failures, after
+                        )
+                    continue
+            elif (
+                introduced
+                and gained
+                and snapshot is current
+                and target not in repair_attempted
+                and regression_repair is None
+                and not any(
+                    request[1] is current and request[-1] is not None
+                    for request in pending.values()
+                )
+                and _named_operator_cases(old_operator | new_operator, commands)
+            ):
+                repair_attempted.add(target)
+                regression_repair = _RegressionRepair(
+                    target, candidate, after, gained, introduced
+                )
+                continue
             progressed = new_operator < old_operator or (
                 new_operator == old_operator and after.keys() < failures.keys()
             )
@@ -1072,15 +1201,33 @@ def solve(executor, task, archive, budget, version):
                 assertions, task.pull_checks, target, failures, after
             )
             prefix_progress = ""
-            if not (progressed or partial) and snapshot is current and no_progress.get(target):
+            if (
+                not introduced
+                and not (progressed or partial)
+                and snapshot is current
+                and no_progress.get(target)
+            ):
                 prefix_progress = observe_prefix_progress(
-                    executor, task, archive, budget, assertions, fixtures, target,
-                    failures, after, patch, proposed,
+                    executor,
+                    task,
+                    archive,
+                    budget,
+                    assertions,
+                    fixtures,
+                    target,
+                    failures,
+                    after,
+                    patch,
+                    proposed,
                 )
             stale_regression = (
                 snapshot is not current and not after.keys() <= failures.keys()
             )
-            if stale_regression or not (progressed or partial or prefix_progress):
+            if (
+                introduced
+                or stale_regression
+                or not (progressed or partial or prefix_progress)
+            ):
                 if snapshot is current and target in old_operator and "::" in target[1]:
                     count_recovery(no_progress, target)
                 if (
@@ -1105,6 +1252,8 @@ def solve(executor, task, archive, budget, version):
                 continue
             current, failures, patch, actor = candidate, after, proposed, editor
             continuations.clear()
+            regression_repair = None
+            repair_attempted.clear()
             rejected.clear()
             last_routes.pop(target, None)
             notes.pop(target, None)
