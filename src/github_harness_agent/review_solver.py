@@ -19,9 +19,11 @@ from .check_diagnostics import (
     ordinary_unused_import_failure,
 )
 from .checkpoint import (
+    PRIVATE_PATCH_BYTES,
     RECOVERY_GOAL_LIMIT,
     RECOVERY_MODE_THRESHOLD,
     DraftCheckpoint,
+    PrivateRecovery,
     SolverRecovery,
 )
 from .executor import (
@@ -319,6 +321,7 @@ def evidence(
     pytest_runs=None,
     static_runs=None,
     unused_import_checks=None,
+    on_staged=None,
 ):
     with executor.verification_runner.workspace(
         archive, budget.remaining, budget.cancelled
@@ -327,6 +330,8 @@ def evidence(
         if patch:
             executor._git(ws, budget, "apply", "--index", data=patch)
             executor._check_patch_paths(ws, task, budget, tree)
+        if on_staged is not None:
+            on_staged(ws, tree)
         failures = {}
         for number, command in enumerate(commands):
             budget.claim("command", budget.limits.commands)
@@ -1257,7 +1262,9 @@ def solve(executor, task, archive, budget, version):
     retained_failures = failures
     retained_identity = _recovery_digest(task, fixtures, patch)
     retained_recovery = task.solver_recovery
+    alternate = None
     if retained_recovery and retained_recovery.identity == retained_identity:
+        alternate = retained_recovery.alternate
         goals = {goal: (bad, stalled) for goal, bad, stalled in retained_recovery.goals}
         for target in failures:
             bad, stalled = goals.get(_goal_digest(target), (0, 0))
@@ -1277,8 +1284,8 @@ def solve(executor, task, archive, budget, version):
         ]
         goals.sort(key=lambda goal: (-max(goal[1:]), goal[0]))
         state = (
-            SolverRecovery(retained_identity, tuple(goals[:RECOVERY_GOAL_LIMIT]))
-            if goals
+            SolverRecovery(retained_identity, tuple(goals[:RECOVERY_GOAL_LIMIT]), alternate)
+            if goals or alternate is not None
             else None
         )
         if state != retained_recovery:
@@ -1357,6 +1364,167 @@ def solve(executor, task, archive, budget, version):
             run.passed + len(run.failed),
             failed=failed,
         )
+
+    def private_identity():
+        return _goal_digest(
+            (retained_identity, review.feedback, task.protected_paths, task.test_update)
+        )
+
+    def restore_private_progress():
+        nonlocal alternate
+        if alternate is None or task.save_solver_recovery is None:
+            return None
+        if (
+            not budget.model_requests_remaining()
+            or budget.commands_remaining() < 2 * len(commands) + 3
+            or budget.remaining() < 90
+        ):
+            return None
+        saved, alternate = alternate, None
+        if (
+            saved.identity != private_identity()
+            or len(failures) != 1
+            or not patch
+            or len(saved.patch) > executor.limits.patch_bytes
+            or len(saved.preceding_cases)
+            > (
+                _DEPENDENCY_SEED_CASE_LIMIT
+                if saved.dependency_seed
+                else _STOCK_REPAIR_CASE_LIMIT
+            )
+        ):
+            return None
+        target = next(iter(failures))
+        baseline_run = pytest_runs.get(target[0])
+        if (
+            saved.origin != _goal_digest(target)
+            or not _named_operator_cases({target}, commands)
+            or baseline_run is None
+            or baseline_run.failed != {target[1]}
+        ):
+            return None
+        fixture = stock_pytest_excerpt(
+            archive, commands[target[0]], target[1], failures[target]
+        )
+        if not fixture:
+            return None
+        stock_fixtures[target, failures[target]] = fixture
+        allowed = {path for path in paths if not _protected(path, task, new_test=False)}
+        sources = original.copy()
+        probe = _GuardBudget(budget, wall_seconds=180, reserve=60)
+
+        def capture(ws, tree):
+            scope = {path: original[path] for path in allowed}
+            updates = executor._capture_scoped_sources(
+                ws, probe, tree, scope, text_only=True
+            )
+            sources.update(updates)
+            if not updates or patch_for(original, sources) != saved.patch:
+                raise ValueError("Invalid private review patch")
+
+        runs, static_runs = {}, {}
+        unused_import_checks = set()
+        try:
+            checked = evidence(
+                executor,
+                task,
+                archive,
+                probe,
+                saved.patch,
+                commands,
+                pytest_runs=runs,
+                static_runs=static_runs,
+                unused_import_checks=unused_import_checks
+                if saved.dependency_seed
+                else None,
+                on_staged=capture,
+            )
+            operator = {key for key in checked if key[0] < len(task.pull_checks)}
+            static = _localized_static_failures(
+                checked.keys() - operator, static_runs, sources, allowed
+            )
+            if (
+                {_goal_digest(key) for key in operator} != set(saved.cases)
+                or static is None
+                or {_goal_digest(key): count for key, count in static.items()}
+                != dict(saved.static)
+                or not qualified_stock_gain(
+                    target,
+                    checked,
+                    runs,
+                    operator,
+                    static,
+                    dependency_seed=saved.dependency_seed,
+                )
+                or identify_stock_collection(target, patch, probe, failed=True)
+                != saved.collection
+                or identify_stock_collection(target, saved.patch, probe)
+                != saved.collection
+            ):
+                return None
+        except Cancelled:
+            raise
+        except LimitExceeded:
+            budget.remaining()
+            alternate = saved
+            return None
+        except (ExecutionError, ValueError):
+            budget.remaining()
+            return None
+        alternate = saved
+        _LOG.info(
+            "Resumed independently verified private stock progress with %d review cases",
+            len(operator),
+        )
+        return _RegressionRepair(
+            target,
+            sources,
+            checked,
+            set(),
+            operator,
+            stock_origin=True,
+            static_failures=static,
+            stock_collection_id=saved.collection,
+            dependency_seed=saved.dependency_seed,
+            unused_import_checks=frozenset(unused_import_checks),
+        )
+
+    def save_private_progress(repair, successor, proposed, editor):
+        nonlocal alternate
+        if (
+            task.save_solver_recovery is None
+            or not repair.stock_collection_id
+            or not (editor.role == "coding" and editor.configured_model)
+            or not successor.introduced
+            or not successor.introduced < repair.introduced
+            or not 0 < len(proposed) <= PRIVATE_PATCH_BYTES
+            or len(repair.introduced) > RECOVERY_GOAL_LIMIT
+            or any(count > 2048 for count in successor.static_failures.values())
+            or any(
+                source != original.get(path)
+                for path, source in successor.sources.items()
+                if path not in paths or _protected(path, task, new_test=False)
+            )
+        ):
+            return
+        state = PrivateRecovery(
+            private_identity(),
+            _goal_digest(repair.origin),
+            repair.stock_collection_id,
+            proposed,
+            tuple(sorted(map(_goal_digest, repair.introduced))),
+            tuple(sorted(map(_goal_digest, successor.introduced))),
+            tuple(
+                sorted(
+                    (_goal_digest(key), count)
+                    for key, count in successor.static_failures.items()
+                )
+            ),
+            dependency_seed=repair.dependency_seed,
+        )
+        budget.remaining()
+        alternate = state
+        retain_recovery(durable=True)
 
     def probe_pinned_restore(target, advice):
         allowed = {
@@ -1761,9 +1929,9 @@ def solve(executor, task, archive, budget, version):
     stock_edits = ()
     composition_attempted = False
     hunk_isolation_attempted = False
-    regression_repair = None
+    regression_repair = restore_private_progress()
     repair_attempted = set()
-    pinned_restore_attempted = False
+    pinned_restore_attempted = regression_repair is not None
     pinned_restore_advice = {}
     unavailable = {}
     test_draft = current.get(new_path, "")
@@ -1773,6 +1941,7 @@ def solve(executor, task, archive, budget, version):
     def start_new_draft(target):
         nonlocal interactive_target, interactive_symbol, hedge_used
         nonlocal stock_edits, composition_attempted, regression_repair
+        nonlocal alternate
         interactive_target = interactive_symbol = None
         interactive_misses.clear()
         unlocalized_plans.clear()
@@ -1780,6 +1949,7 @@ def solve(executor, task, archive, budget, version):
         continuations.clear()
         stock_edits, composition_attempted = (), False
         regression_repair = None
+        alternate = None
         pinned_restore_advice.clear()
         repair_attempted.clear()
         unavailable.clear()
@@ -2621,6 +2791,8 @@ def solve(executor, task, archive, budget, version):
                             static_failures=pending_static,
                             unused_import_checks=frozenset(unused_import_checks),
                         )
+                        if snapshot is current and source is repair.sources:
+                            save_private_progress(repair, regression_repair, proposed, editor)
                     else:
                         rejected[repair.origin] = _rejected_attempt(
                             current, candidate, repair.origin, failures, after

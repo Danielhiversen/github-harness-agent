@@ -1,6 +1,6 @@
 import pytest
 
-from github_harness_agent.checkpoint import DraftCheckpoint, SolverRecovery
+from github_harness_agent.checkpoint import DraftCheckpoint, PrivateRecovery, SolverRecovery
 from github_harness_agent.controller import (
     _retire_drafts,
     draft_scope,
@@ -47,6 +47,38 @@ def test_retiring_recovery_only_envelope_does_not_signal_a_saved_draft():
     data = {"draft_checkpoints": {"drafts": {}, "solver_recovery": recovery.to_data()}}
     assert not _retire_drafts(data)
     assert not data
+
+
+def test_invalid_private_alternate_keeps_independent_recovery_counters():
+    primary = SolverRecovery("a" * 64, (("b" * 64, 0, 2),))
+    alternate = PrivateRecovery(
+        "c" * 64, "d" * 64, "e" * 64, b"patch", ("1" * 64, "2" * 64), ("2" * 64,)
+    )
+    value = SolverRecovery(primary.identity, primary.goals, alternate).to_data()
+    assert SolverRecovery.from_data(value).alternate == alternate
+    assert (
+        SolverRecovery.from_data(
+            SolverRecovery(primary.identity, (), alternate).to_data()
+        ).alternate
+        == alternate
+    )
+
+    for key, invalid in (
+        ("cases", ["3" * 64]),
+        ("patch_b64", "===?"),
+        ("patch_b64", "A" * (350_000)),
+        ("static", [["f" * 64, True]]),
+    ):
+        corrupted = {**value, "alternate": {**value["alternate"], key: invalid}}
+        assert SolverRecovery.from_data(corrupted) == primary
+
+    drafts = {"primary": {"patch": "verified primary"}}
+    data = {"draft_checkpoints": {"drafts": drafts, "solver_recovery": value}}
+    assert _retire_drafts(data)
+    assert data["retired_draft_checkpoints"] == {
+        "drafts": drafts,
+        "solver_recovery": primary.to_data(),
+    }
 
 
 @pytest.mark.parametrize("conflict", [False, True])

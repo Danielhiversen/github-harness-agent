@@ -224,11 +224,26 @@ def restore_solver_recovery(envelope, scope, head, parent):
         return None
 
 
+def _retired_draft_envelope(envelope):
+    recovery = envelope.get("solver_recovery")
+    if not isinstance(recovery, dict) or "alternate" not in recovery:
+        return envelope
+    retired = dict(envelope)
+    retired.pop("solver_recovery")
+    if recovery.get("goals"):
+        retired["solver_recovery"] = {
+            key: value for key, value in recovery.items() if key != "alternate"
+        }
+    return retired
+
+
 def _retire_drafts(data):
     envelope = data.pop("draft_checkpoints", None)
     # Legacy checkpoints may have an empty drafts mapping and still fence a review.
-    if envelope is not None and (envelope.get("drafts") or "solver_recovery" not in envelope):
-        data["retired_draft_checkpoints"] = envelope
+    if envelope is not None and (
+        envelope.get("drafts") or "solver_recovery" not in envelope
+    ):
+        data["retired_draft_checkpoints"] = _retired_draft_envelope(envelope)
         return True
     return False
 
@@ -633,8 +648,8 @@ class Controller:
                             api, path, repo, origin, parent, scope, existing
                         )
                     except RebaseConflict as error:
-                        data["retired_draft_checkpoints"] = data.pop(
-                            "draft_checkpoints"
+                        data["retired_draft_checkpoints"] = _retired_draft_envelope(
+                            data.pop("draft_checkpoints")
                         )
                         raise RebaseConflict(
                             f"{error}. The previous draft was retired. Use resume to start from the current checkout."
@@ -756,8 +771,8 @@ class Controller:
                             and publisher.branch_head(repo, branch) != origin
                         ):
                             if checkpoints:
-                                data["retired_draft_checkpoints"] = data.pop(
-                                    "draft_checkpoints"
+                                data["retired_draft_checkpoints"] = _retired_draft_envelope(
+                                    data.pop("draft_checkpoints")
                                 )
                                 data["stage"] = "watch"
                                 raise RebaseConflict(

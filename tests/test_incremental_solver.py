@@ -3283,17 +3283,29 @@ def test_scoped_rollout_paces_exact_edit_then_restores_verification(
         assert not counts
 
 
-@pytest.mark.parametrize("different_selection", [False, True])
+@pytest.mark.parametrize("scenario", ("same", "changed_selection", "resume"))
 def test_pinned_stock_counterfactual_only_feeds_verified_private_repair(
-    solver_case, monkeypatch, different_selection
+    solver_case, monkeypatch, scenario
 ):
     from github_harness_agent import review_solver
+    from github_harness_agent.worker import Cancelled
 
     task, _, runner, checkpoints = solver_case
+    different_selection = scenario == "changed_selection"
+    resume = scenario == "resume"
+    states = []
+    lease_ended = Event()
+
+    def save_recovery(state, durable):
+        states.append((state, durable))
+        if resume and durable and state and state.alternate:
+            lease_ended.set()
+
     task = replace(
         task,
         checks=((sys.executable, "-m", "pytest", "-q", "tests"),),
         require_new_tests=False,
+        save_solver_recovery=save_recovery,
     )
     acceptance = Path(task.pull_checks[0][-1])
     with acceptance.open("a") as stream:
@@ -3301,14 +3313,20 @@ def test_pinned_stock_counterfactual_only_feeds_verified_private_repair(
             "\nfrom fixture_calc import stock_value\n"
             "\ndef test_review_value():\n    assert stock_value(review=True) == 8\n"
         )
+        if resume:
+            stream.write(
+                "\ndef test_review_z_extra():\n    assert stock_value(review='extra') == 80\n"
+            )
+    stock_return = "    return floor(3.5)\n" if resume else "    return 3\n"
     method = (
         "\ndef stock_value(*, review=False):\n"
-        "    if review:\n"
+        + ("    if review == 'extra':\n        return 70\n" if resume else "")
+        + "    if review:\n"
         "        return 7\n"
         + "    # preserve the existing definition and its lengthy comments\n" * 110
-        + "    return 3\n"
+        + stock_return
     )
-    original = BASE_SOURCE + method
+    original = ("from math import floor\n\n" if resume else "") + BASE_SOURCE + method
     test = (
         "from fixture_calc import stock_value\n"
         "import pytest\n\n"
@@ -3359,12 +3377,16 @@ def test_pinned_stock_counterfactual_only_feeds_verified_private_repair(
 
     monkeypatch.setattr(review_solver, "stock_collection", collect)
     prompts = []
+    extra = edit(SOURCE, "        return 70\n", "        return 80\n") if resume else ""
+    remove_import = edit(SOURCE, "from math import floor\n\n", "") if resume else ""
     early_edits = iter(
         (
             FIRST
             + SECOND
             + edit(SOURCE, "        return 7\n", "        return 8\n")
-            + edit(SOURCE, "    return 3\n", "    return -3\n"),
+            + extra
+            + remove_import
+            + edit(SOURCE, stock_return, "    return -3\n"),
             edit(
                 SOURCE,
                 "def stock_value(*, review=False):\n",
@@ -3391,7 +3413,7 @@ def test_pinned_stock_counterfactual_only_feeds_verified_private_repair(
                 )
             elif "Private regression repair." in prompt:
                 assert checkpoints and b"+    return -3\n" in checkpoints[-1].patch
-                assert "    return 3" in prompt
+                assert stock_return.strip() in prompt
                 content = edit(SOURCE, "        return 7\n", "        return 8\n")
             elif "Advisory strategy" in prompt:
                 content = "unusable format"
@@ -3416,7 +3438,63 @@ def test_pinned_stock_counterfactual_only_feeds_verified_private_repair(
     executor = PlainExecutor(
         runner, Gateway(), Limits(model_requests=10, concurrent_probes=1)
     )
-    budget = _Budget(executor.limits, lambda: False, task)
+    budget = _Budget(executor.limits, lease_ended.is_set, task)
+    if resume:
+        with pytest.raises(Cancelled):
+            solve(executor, task, archive.getvalue(), budget, "fixture")
+        saved = [
+            state for state, durable in states if durable and state and state.alternate
+        ]
+        assert len(saved) == 1
+        assert len(checkpoints) == 1
+        assert b"+    return 3\n" not in checkpoints[-1].patch
+        assert len(saved[0].alternate.cases) == 1
+        assert len(saved[0].alternate.preceding_cases) == 2
+        assert saved[0].alternate.dependency_seed
+        assert b"+        return 8\n" in saved[0].alternate.patch
+        resumed = replace(
+            task,
+            checkpoints={checkpoints[-1].key: checkpoints[-1]},
+            solver_recovery=SolverRecovery.from_data(saved[0].to_data()),
+        )
+        gateway = FreeGateway(extra)
+        executor = PlainExecutor(
+            runner, gateway, Limits(model_requests=1, concurrent_probes=1)
+        )
+        fresh = _Budget(executor.limits, lambda: False, resumed)
+        result = solve(executor, resumed, archive.getvalue(), fresh, "fixture")
+        assert "Private regression repair." in gateway.prompts[0]
+        assert "test_review_z_extra" in gateway.prompts[0].splitlines()[0]
+        assert all(check.returncode == 0 for check in result.checks)
+        assert b"+        return 80\n" in result.patch
+        assert len(probes) == 6 and all(probe == probes[0] for probe in probes)
+        assert states[-1][0] is None or states[-1][0].alternate is None
+
+        alternate = saved[0].alternate
+        wrong_case = next(iter(set(alternate.preceding_cases) - set(alternate.cases)))
+        for changed in (
+            replace(alternate, identity="f" * 64),
+            replace(alternate, cases=(wrong_case,)),
+            replace(alternate, collection="f" * 64),
+        ):
+            stale = replace(
+                resumed, solver_recovery=replace(saved[0], alternate=changed)
+            )
+            gateway = FreeGateway("incomplete edit")
+            executor = PlainExecutor(
+                runner, gateway, Limits(model_requests=1, concurrent_probes=1)
+            )
+            with pytest.raises(AttemptRejected):
+                solve(
+                    executor,
+                    stale,
+                    archive.getvalue(),
+                    _Budget(executor.limits, lambda: False, stale),
+                    "fixture",
+                )
+            assert "Private regression repair." not in gateway.prompts[0]
+            assert not any(state and state.alternate for state, _ in states[-1:])
+        return
     result = solve(executor, task, archive.getvalue(), budget, "fixture")
     assert all(check.returncode == 0 for check in result.checks)
     private = [prompt for prompt in prompts if "Private regression repair." in prompt]
