@@ -125,14 +125,17 @@ def prepare_line_range_edit(sources, symbol):
 def line_range_prompt(snapshot):
     """Render the editor contract and exact line numbering for this snapshot."""
     path, qualified = snapshot.symbol
+    first = snapshot.first_body_line
+    indent = re.match(r"[ \t]*", snapshot.lines[first - 1])[0]
+    example_line = json.dumps(indent + "pass")
     numbered = "\n".join(
         f"{row} | {line}" for row, line in enumerate(snapshot.lines, 1)
     )
     return (
         f"Edit only {path}::{qualified} using numbered lines from this exact current definition.\n"
-        "Return only one JSON object in this format.\n"
+        "Use this JSON format. Supply the changed lines with their indentation.\n"
         f'{{"snapshot":"{snapshot.digest}","edits":['
-        f'{{"start":{snapshot.first_body_line},"end":{snapshot.first_body_line},"lines":["replacement line"]}}'
+        f'{{"start":{first},"end":{first},"lines":[{example_line}]}}'
         "]}\n"
         f"Use one to {_MAX_EDITS} non-overlapping, inclusive ranges within lines "
         f"{snapshot.first_body_line} through {len(snapshot.lines)}. Numbers refer to the unedited definition. "
@@ -173,15 +176,17 @@ def _edits(response, snapshot, indent):
             type(start) is not int
             or type(end) is not int
             or not snapshot.first_body_line <= start <= end <= len(snapshot.lines)
-            or type(lines) is not list
-            or any(
-                type(line) is not str
-                or _INVALID_LINE.search(line)
-                or (line.strip() and not line.startswith(indent))
-                for line in lines
-            )
         ):
-            raise ValueError("Invalid body line range or replacement text")
+            raise ValueError(
+                f"Use numbered definition rows {snapshot.first_body_line} through "
+                f"{len(snapshot.lines)} for start and end. The numbers are relative to this definition."
+            )
+        if type(lines) is not list or any(
+            type(line) is not str or _INVALID_LINE.search(line) for line in lines
+        ):
+            raise ValueError("Use a lines array with one string per source line and no line breaks")
+        if any(line.strip() and not line.startswith(indent) for line in lines):
+            raise ValueError("Preserve the body indentation shown after the numbering on each nonblank line")
         edits.append((start, end, lines))
     edits.sort(key=lambda edit: edit[0])
     if any(previous[1] >= current[0] for previous, current in zip(edits, edits[1:])):

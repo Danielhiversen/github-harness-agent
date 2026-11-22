@@ -52,6 +52,12 @@ def test_method_relative_ranges_update_only_localized_body():
     assert "5 |         # preserve this comment" in prompt
     assert "6 |         result = sum(values)" in prompt
     assert "unrelated" not in prompt
+    example = json.loads(
+        next(row for row in prompt.splitlines() if row.startswith('{"snapshot"'))
+    )
+    assert example["edits"] == [
+        _edit(snapshot.first_body_line, snapshot.first_body_line, "        pass")
+    ]
 
     response = _reply(
         snapshot,
@@ -84,6 +90,20 @@ def test_rejects_malformed_or_out_of_scope_ranges(edits):
     snapshot = _prepare()
     with pytest.raises(ValueError):
         apply_line_range_edit(_reply(snapshot, *edits), {PATH: SOURCE}, snapshot)
+
+
+@pytest.mark.parametrize(
+    ("edit", "message"),
+    [
+        (_edit(400, 400, "        return 0"), "numbered definition rows 6 through 7"),
+        (_edit(7, 7, "return 0"), "body indentation"),
+        (_edit(7, 7, "        return 0\n"), "one string per source line"),
+    ],
+)
+def test_invalid_range_feedback_identifies_the_specific_format_error(edit, message):
+    snapshot = _prepare()
+    with pytest.raises(ValueError, match=message):
+        apply_line_range_edit(_reply(snapshot, edit), {PATH: SOURCE}, snapshot)
 
 
 def test_rejects_changed_snapshot_and_ambiguous_payloads():
