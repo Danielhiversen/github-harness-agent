@@ -2469,6 +2469,8 @@ def test_localized_named_failure_tries_numbered_ranges_as_an_independent_remedy(
     [
         (False, "localized"),
         (True, "localized"),
+        (False, "outage"),
+        (False, "outage_regression"),
         (False, "unlocalized"),
         (False, "long_evidence"),
         (False, "one_attempt"),
@@ -2480,11 +2482,13 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
     solver_case, monkeypatch, interactive_tests, scenario
 ):
     from github_harness_agent import review_solver
+    from github_harness_agent.providers import ProviderExhausted
 
     task, _, runner, checkpoints = solver_case
     recovery = []
-    localized = scenario in {"localized", "long_evidence"}
     long_evidence = scenario == "long_evidence"
+    outage = scenario in {"outage", "outage_regression"}
+    localized = scenario == "localized" or long_evidence or outage
     acceptance = Path(task.pull_checks[0][-1])
     with acceptance.open("a") as file:
         file.write("\nfrom fixture_calc import stock_result\n"
@@ -2557,6 +2561,15 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
     phases = []
     tool_turns = []
     regression = "from fixture_calc import stock_result\n\ndef test_repair():\n    assert stock_result() == 3\n"
+    rejected_checks = []
+    if scenario == "outage_regression":
+        def record(*args, **kwargs):
+            result = evidence(*args, **kwargs)
+            if b"+        return 8\n" in args[4]:
+                rejected_checks.append(result)
+            return result
+
+        monkeypatch.setattr(review_solver, "evidence", record)
 
     focused_command = None
 
@@ -2567,7 +2580,7 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
         nonlocal focused_command
         if request.url.path == "/api/tags":
             return httpx.Response(200, json=local_inventory())
-        assert scenario in {"localized", "unlocalized", "long_evidence"}
+        assert scenario in {"localized", "unlocalized", "long_evidence"} or outage
         payload = json.loads(request.content)
         calls = ()
         tools, messages = payload["tools"], payload["messages"]
@@ -2606,7 +2619,11 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
             assert "outside the scoped review" in outputs[0]
             assert "return 1" in outputs[1] and "return 2" in outputs[1]
             assert "return -3" in outputs[1]
-            calls = (call("edit_file", {"path": SOURCE, "old_text": "    return -3\n", "new_text": "    return 3\n"}),)
+            if scenario == "outage_regression":
+                old, new = "        return 7\n    return -3\n", "        return 8\n    return 3\n"
+            else:
+                old, new = "    return -3\n", "    return 3\n"
+            calls = (call("edit_file", {"path": SOURCE, "old_text": old, "new_text": new}),)
             if interactive_tests:
                 calls += (call("edit_file", {"path": NEW_TEST, "new_text": regression}),)
         elif len(tool_turns) == 3:
@@ -2624,13 +2641,18 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
             prompt = messages[-1]["content"]
             calls = ()
             if tools:
+                if scenario == "outage_regression" and {tool["function"]["name"] for tool in tools} == {"replace_python_definition"}:
+                    raise ProviderExhausted(None, {"fixture": "native tool unavailable"})
+                if outage and len(tool_turns) == 3:
+                    phases.append("provider outage")
+                    raise ProviderExhausted(None, {"fixture": "temporary outage"})
                 return wire.complete(role=role, messages=messages, tools=tools, timeout=timeout, **kwargs)
             if role == "planning":
                 phases.append("planning")
                 content = json.dumps({"strategy": "Trace the public inputs.", "symbols": [f"{SOURCE}::stock_result" if localized else "unknown.py::not_reviewed"]})
             elif prompt.startswith("Selected failure: new regression tests"):
                 phases.append("author")
-                if scenario in {"localized", "unlocalized", "long_evidence"}:
+                if scenario in {"localized", "unlocalized", "long_evidence", "outage"}:
                     assert len(checkpoints) == 1
                     assert b"+    return 3\n" not in checkpoints[0].patch
                 content = edit(NEW_TEST, "", regression)
@@ -2640,6 +2662,10 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
             elif scenario == "reserved" and phases[-1:] == ["guided search"]:
                 phases.append("text")
                 content = fix
+            elif scenario == "outage_regression" and "provider outage" in phases:
+                phases.append("text")
+                assert "return -3" in prompt and "return 8" not in prompt
+                content = "An incomplete edit"
             elif prompt.endswith("Respond with complete named Python definitions only."):
                 phases.append("named")
                 content = "invalid named edit"
@@ -2661,6 +2687,14 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
         verification_runner=FixtureRunner(verifier_root),
     )
     budget = _Budget(executor.limits, lambda: False, task)
+    if scenario == "outage_regression":
+        with pytest.raises(ReviewRoundExhausted):
+            solve(executor, task, archive.getvalue(), budget, "fixture")
+        assert len(rejected_checks) == 1
+        assert {name.rsplit("::", 1)[-1] for _, name in rejected_checks[0]} == {"test_stock_baseline"}
+        assert all(b"+        return 8\n" not in checkpoint.patch for checkpoint in checkpoints)
+        assert "provider outage" in phases and "author" not in phases
+        return
     result = solve(executor, task, archive.getvalue(), budget, "fixture")
 
     expected = ["text"] * (2 if scenario == "wrong_snapshot" else 3)
@@ -2668,7 +2702,10 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
         expected += ["planning", "guided search"]
         if localized:
             expected += ["named", "numbered"]
-        expected += ["text"] if scenario == "reserved" else ["interactive"] * 4
+        if outage:
+            expected += ["interactive"] * 3 + ["provider outage"]
+        else:
+            expected += ["text"] if scenario == "reserved" else ["interactive"] * 4
         assert any(durable for _, durable in recovery)
     else:
         assert not any(durable for _, durable in recovery)
@@ -2685,13 +2722,18 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
     assert all(check.returncode == 0 for check in result.checks)
 
 
-def test_scoped_rollout_rejects_unreviewed_files_written_through_run(solver_case):
+@pytest.mark.parametrize("outage", (False, True))
+def test_scoped_rollout_rejects_unreviewed_files_written_through_run(solver_case, outage):
+    from github_harness_agent.providers import ProviderExhausted
+
     task, archive, runner, _ = solver_case
     task = replace(task, save_checkpoint=None, review_recovery=None, require_new_tests=False)
 
     class Gateway:
         def complete(self, *, role, messages, **request):
             finished = any(message["role"] == "tool" for message in messages)
+            if finished and outage:
+                raise ProviderExhausted(None)
             commands = () if finished else ({
                 "id": "run",
                 "type": "function",
@@ -2702,6 +2744,12 @@ def test_scoped_rollout_rejects_unreviewed_files_written_through_run(solver_case
                     }),
                 },
             },)
+            if outage:
+                commands = ({"id": "edit", "type": "function", "function": {
+                    "name": "edit_file", "arguments": json.dumps({
+                        "path": SOURCE, "old_text": "    return -1\n", "new_text": "    return 1\n",
+                    }),
+                }}, *commands)
             return SimpleNamespace(
                 role=role, route="fixture", model="fixture", configured_model="fixture",
                 content="done" if finished else None, tool_calls=commands, usage={},
@@ -2713,3 +2761,96 @@ def test_scoped_rollout_rejects_unreviewed_files_written_through_run(solver_case
     with pytest.raises(AttemptRejected, match="Interactive edits exceeded the scoped review paths"):
         executor._rollout(task, archive, budget, "Test scoped tool calls.", "coding", clarification=False, scoped_sources=scope)
     assert scope == {SOURCE: BASE_SOURCE}
+
+
+@pytest.mark.parametrize(
+    "scenario", ("attributed", "no_edit", "cancelled", "expired", "unattributed")
+)
+def test_scoped_outage_requires_live_budget_and_attributable_source(
+    solver_case, scenario
+):
+    from github_harness_agent.providers import ProviderExhausted
+    from github_harness_agent.worker import Cancelled, LimitExceeded
+
+    task, archive, runner, _ = solver_case
+    task = replace(
+        task, save_checkpoint=None, review_recovery=None, require_new_tests=False
+    )
+    cancellation = Event()
+    turns = []
+
+    class Gateway:
+        def complete(self, *, role, **request):
+            turns.append(role)
+            if len(turns) == 3:
+                if scenario == "cancelled":
+                    cancellation.set()
+                if scenario == "expired":
+                    budget.deadline = 0
+                raise ProviderExhausted(None)
+            if len(turns) == 1 and scenario != "no_edit":
+                name, params = (
+                    "edit_file",
+                    {
+                        "path": SOURCE,
+                        "old_text": "    return -1\n",
+                        "new_text": "    return 1\n",
+                    },
+                )
+                model = "editor"
+            else:
+                argv = ["cat", SOURCE]
+                if scenario == "unattributed":
+                    argv = [
+                        sys.executable,
+                        "-c",
+                        f"from pathlib import Path; p = Path({SOURCE!r}); p.write_text(p.read_text() + '# shell-only edit\\n')",
+                    ]
+                name, params = "run", {"argv": argv}
+                model = "observer"
+            call = {
+                "id": str(len(turns)),
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(params)},
+            }
+            return SimpleNamespace(
+                role=role,
+                route=model,
+                model=model,
+                configured_model=model,
+                content=None,
+                tool_calls=(call,),
+                usage={},
+            )
+
+    executor = PlainExecutor(runner, Gateway(), Limits(model_requests=3))
+    budget = _Budget(executor.limits, cancellation.is_set, task)
+    scope = {SOURCE: BASE_SOURCE}
+    if scenario == "attributed":
+        patch, _, actor = executor._rollout(
+            task,
+            archive,
+            budget,
+            "Scoped tool calls.",
+            "coding",
+            clarification=False,
+            scoped_sources=scope,
+        )
+        assert b"+    return 1\n" in patch
+        assert "    return 1\n" in scope[SOURCE]
+        assert actor.configured_model == "editor"
+    else:
+        expected = {"cancelled": Cancelled, "expired": LimitExceeded}.get(
+            scenario, ProviderExhausted
+        )
+        with pytest.raises(expected):
+            executor._rollout(
+                task,
+                archive,
+                budget,
+                "Scoped tool calls.",
+                "coding",
+                clarification=False,
+                scoped_sources=scope,
+            )
+        assert scope == {SOURCE: BASE_SOURCE}

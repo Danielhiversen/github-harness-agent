@@ -1078,6 +1078,8 @@ class PlainExecutor:
             focused_test_requested = False
             focus_next_turn = False
             text_batch_applied = False
+            scoped_edits = {}
+            scoped_outage = None
 
             def valid_recovery_test(path, content):
                 return (
@@ -1145,7 +1147,11 @@ class PlainExecutor:
                     if not recovery_turn:
                         if text_batch_applied:
                             break
-                        raise
+                        if not scoped_edits:
+                            raise
+                        budget.remaining()
+                        scoped_outage = error
+                        break
                     native_error = error
                     completion = None
                 turns += 1
@@ -1299,13 +1305,14 @@ class PlainExecutor:
                         if is_edit:
                             action = "edit_file"
                             data = edit_payload(tool, self.limits.patch_bytes)
+                            if scoped_sources is not None or focused_test_turn:
+                                edit = json.loads(data)
                             if (
                                 scoped_sources is not None
-                                and json.loads(data)["path"] not in scoped_sources
+                                and edit["path"] not in scoped_sources
                             ):
                                 raise InvalidEdit("That file is outside the scoped review.")
                             if focused_test_turn:
-                                edit = json.loads(data)
                                 path = edit["path"]
                                 if (
                                     edit.get("old_text") is not None
@@ -1387,6 +1394,27 @@ class PlainExecutor:
                         )
                     if text_recovery and touched and returncode == 0:
                         successful_text_edits += 1
+                    if (
+                        scoped_sources is not None
+                        and is_edit
+                        and touched
+                        and returncode == 0
+                    ):
+                        path = edit["path"]
+                        if not _protected(path, task, new_test=False):
+                            earlier = scoped_edits.pop(path, None)
+                            expected = earlier[0] if earlier else scoped_sources[path]
+                            old = edit.get("old_text")
+                            if old and last.configured_model:
+                                first = expected.find(old)
+                                if first >= 0 and expected.find(old, first + 1) < 0:
+                                    scoped_edits[path] = (
+                                        expected[:first]
+                                        + edit["new_text"]
+                                        + expected[first + len(old) :],
+                                        turns,
+                                        last,
+                                    )
                     if touched:
                         actor = last
                         ran_command = True
@@ -1561,7 +1589,30 @@ class PlainExecutor:
                 if patch and not clarification:
                     self._check_patch_paths(workspace, task, budget, baseline)
                 if scoped_sources is not None:
-                    self._capture_scoped_sources(workspace, budget, initial_tree, scoped_sources)
+                    updated = self._capture_scoped_sources(
+                        workspace, budget, initial_tree, scoped_sources
+                    )
+                    if scoped_outage is not None:
+                        production = {
+                            path: content
+                            for path, content in updated.items()
+                            if not _protected(path, task, new_test=False)
+                        }
+                        if not production or any(
+                            path not in scoped_edits or scoped_edits[path][0] != content
+                            for path, content in production.items()
+                        ):
+                            raise scoped_outage
+                        _, _, actor = max(
+                            (scoped_edits[path] for path in production),
+                            key=lambda entry: entry[1],
+                        )
+                        budget.remaining()
+                        logging.getLogger(__name__).info(
+                            "Harvesting %d attributed scoped source edit(s) after provider exhaustion",
+                            len(production),
+                        )
+                    scoped_sources.update(updated)
             except (CommandOutputExceeded, _CandidateOutputError) as error:
                 budget.reject(error, actor or last)
         return patch, "\n".join(trajectory)[-32768:], actor or last
@@ -1590,7 +1641,7 @@ class PlainExecutor:
             if blob.returncode or b"\x00" in blob.stdout:
                 raise _CandidateOutputError("Interactive review requires readable source files")
             updated[path] = blob.stdout.decode("utf-8")
-        sources.update(updated)
+        return updated
 
     @staticmethod
     def _check_clarification(content):
