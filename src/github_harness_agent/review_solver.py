@@ -9,6 +9,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import replace
 
 from . import review_recovery
+from .check_artifacts import check_label
 from .checkpoint import DraftCheckpoint
 from .executor import (
     AttemptRejected,
@@ -27,7 +28,7 @@ from .review_prefix_replay import observe_prefix_progress
 from .review_definitions import DEFINITION_ENDING, DEFINITION_FORMAT, apply_definitions
 from .review_planner import plan_coding_messages
 from .review_recovery import operator_acceptance_context
-from .review_solver_context import focused_source_excerpt
+from .review_solver_context import focused_check_excerpt, focused_source_excerpt
 from .task_context import excerpt
 from .test_updates import has_runnable_test
 
@@ -145,9 +146,16 @@ def _test_detail(output, node):
     sections = _TEST_SECTION.split(output)
     for title, body in zip(sections[1::2], sections[2::2], strict=True):
         if heading.fullmatch(title):
-            lines = [
-                line for line in body.splitlines() if line.startswith(("E ", "> "))
-            ]
+            frame_lines = []
+            lines = []
+            for line in body.splitlines():
+                if line.startswith("-----"):
+                    break
+                if _PYTEST_CRASH_LINE.fullmatch(line.lstrip()):
+                    frame_lines.append(line)
+                elif line.startswith(("E ", "> ")):
+                    lines.append(line)
+            lines = [*frame_lines[:4], *lines]
             if lines:
                 return "\n".join(lines)[:1600]
     return next((line for line in output.splitlines() if node in line), node)
@@ -432,6 +440,7 @@ def _proposal_messages(
     *,
     continuing=False,
     named_definitions=False,
+    check_command=(),
 ):
     if target == _TEST_GOAL:
         return _test_authoring_messages(
@@ -453,9 +462,22 @@ def _proposal_messages(
     )
     path, line, body = notes[0]
     query |= words(body) | fixture_query
-    focus = focused_source_excerpt(
-        current[path], target[1], review_note=body, anchor=line, max_chars=4800
-    )
+    check_focus = focused_check_excerpt(check_command, diagnostic, current)
+    if check_focus:
+        path, focus = check_focus
+        lead = (
+            f"Focused source from {path}:\n{focus}\n"
+            f"Failure details:\n{diagnostic}\nReviewer feedback: {body}\n"
+        )
+    else:
+        focus = focused_source_excerpt(
+            current[path], target[1], review_note=body, anchor=line, max_chars=4800
+        )
+        lead = (
+            f"Reviewer feedback: {body}\n"
+            f"Focused source from {path}:\n{focus}\n"
+            f"Failure details:\n{diagnostic}\n"
+        )
     source = "\n".join(
         f"FILE {name}\n"
         + (
@@ -472,9 +494,7 @@ def _proposal_messages(
     goal = (
         f"Selected failure: {target[1]}\n"
         f"Editable checkout paths (use these exact names): {', '.join(editable)}\n"
-        f"Reviewer feedback: {body}\n"
-        f"Focused source from {path}:\n{focus}\n"
-        f"Failure details:\n{diagnostic}\n"
+        + lead
     )
     fixture = _fixture_excerpt(fixtures, target[1])
     request = (
@@ -718,8 +738,12 @@ def solve(executor, task, archive, budget, version):
                             for item in (test_diagnostic, notes.get(target))
                             if item
                         )
+                    check_command = commands[target[0]] if target in diagnostics else ()
                     named_definitions = (
-                        target in failures and malformed.get(target, 0) >= 2
+                        target in failures
+                        and malformed.get(target, 0) >= 2
+                        # Import blocks cannot be replaced by naming a definition.
+                        and (not check_command or check_label(check_command, ()) != "ruff")
                     )
                     messages = _proposal_messages(
                         target,
@@ -733,6 +757,7 @@ def solve(executor, task, archive, budget, version):
                         new_path,
                         continuing=continuation is not None,
                         named_definitions=named_definitions,
+                        check_command=check_command,
                     )
                     planner_input = None
                     if (

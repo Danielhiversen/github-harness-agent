@@ -2,10 +2,93 @@
 
 import ast
 import re
+from pathlib import PurePosixPath
+
+from .check_diagnostics import check_locations
 
 _FUNCTION = (ast.FunctionDef, ast.AsyncFunctionDef)
 _IMPORT = (ast.Import, ast.ImportFrom)
 _ASSIGNMENT = (ast.Assign, ast.AnnAssign)
+
+
+def _diagnostic_window(lines, imports, row, limit):
+    start, stop = max(1, row - 4), min(len(lines), row + 4)
+    for index, (first, last) in enumerate(imports):
+        if not first <= row <= last:
+            continue
+        # Import sorting can cover several statements, including multiline imports.
+        for prev_first, prev_last in reversed(imports[:index]):
+            if any(
+                text.strip() and not text.lstrip().startswith("#")
+                for text in lines[prev_last : first - 1]
+            ):
+                break
+            first = prev_first
+        for next_first, next_last in imports[index + 1 :]:
+            if any(
+                text.strip() and not text.lstrip().startswith("#")
+                for text in lines[last : next_first - 1]
+            ):
+                break
+            last = next_last
+        start = min(start, first)
+        stop = max(stop, last)
+        break
+    start, stop = max(start, row - 40), min(stop, row + 40)
+    while start <= row <= stop:
+        text = f"# Lines {start}-{stop} (diagnostic at line {row})\n" + "".join(
+            lines[start - 1 : stop]
+        )
+        if len(text) <= limit:
+            return text, start, stop
+        if row - start >= stop - row:
+            start += 1
+        else:
+            stop -= 1
+    return "", row, row
+
+
+def focused_check_excerpt(command, diagnostic, sources, *, max_chars=2800):
+    locations = []
+    focus_path = None
+    for raw_path, row in check_locations(command, diagnostic):
+        path = PurePosixPath(raw_path)
+        if path.is_absolute():
+            if not path.is_relative_to("/work"):
+                continue
+            path = path.relative_to("/work")
+        name = str(path)
+        if not sources.get(name) or (focus_path and name != focus_path):
+            continue
+        focus_path = name
+        if row not in locations:
+            locations.append(row)
+        if len(locations) == 3:
+            break
+    if not focus_path:
+        return None
+    source = sources[focus_path]
+    lines = source.splitlines(keepends=True)
+    locations = [row for row in locations if row <= len(lines)]
+    try:
+        imports = sorted(
+            (node.lineno, node.end_lineno)
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, _IMPORT)
+        )
+    except (SyntaxError, ValueError, RecursionError):
+        imports = []
+    chunks = []
+    stop = start = 0
+    for row in locations:
+        if start <= row <= stop:
+            continue
+        chunk, start, stop = _diagnostic_window(
+            lines, imports, row, max_chars - sum(map(len, chunks))
+        )
+        if chunk:
+            chunks.append(chunk)
+    return (focus_path, "".join(chunks)) if chunks else None
 
 
 def _words(text):

@@ -16,6 +16,10 @@ _MYPY = re.compile(
     rf"^(.{{1,512}}?):({_POSITION})(?::({_POSITION}))?: (?:error|warning): "
     r".* +\[([a-z][a-z0-9-]{0,47})\]\s*$"
 )
+_MYPY_LOCATION = re.compile(
+    rf"^(.{{1,512}}?):({_POSITION})(?::{_POSITION})?: (?:error|warning): "
+)
+_PYTEST_LOCATION = re.compile(rf"^(.{{1,512}}?\.py):({_POSITION}):\s")
 _SAFE_PATH = re.compile(r"[A-Za-z0-9_. -]+(?:/[A-Za-z0-9_. -]+)*")
 _ANSI_COLOR = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -40,10 +44,10 @@ def _ruff_matches(output):
     for line in output.splitlines():
         if match := _RUFF_SHORT.match(line):
             path, row, column, code = match.groups()
-            yield _format_identifier(code, path, row, column)
+            yield code, path, row, column
             rule = None
         elif rule and (match := _RUFF_ARROW.match(line)):
-            yield _format_identifier(rule, *match.groups())
+            yield rule, *match.groups()
             rule = None
         elif line and not line[0].isspace():
             match = _RUFF_HEADER.match(line)
@@ -72,7 +76,7 @@ def check_details(command, output):
             for path, row, column, code in (match.groups(),)
         )
     else:
-        matches = _ruff_matches(output)
+        matches = (_format_identifier(*match) for match in _ruff_matches(output))
     identifiers = []
     for item in matches:
         if item and item not in identifiers:
@@ -84,6 +88,19 @@ def check_details(command, output):
         if identifiers
         else f"Check tool: {tool}."
     )
+
+
+def check_locations(command, output):
+    """Read line locations only from the recognized verifier's diagnostic format."""
+    tool = check_label(tuple(command), ()) if command else None
+    output = _ANSI_COLOR.sub("", output)
+    if tool == "ruff":
+        yield from ((path, int(row)) for _, path, row, _ in _ruff_matches(output))
+    elif tool in {"mypy", "pytest"}:
+        pattern = _MYPY_LOCATION if tool == "mypy" else _PYTEST_LOCATION
+        for line in output.splitlines():
+            if match := pattern.match(line.lstrip()):
+                yield match[1], int(match[2])
 
 
 def check_failure_summary(task, checks, *, baseline_failed=False):

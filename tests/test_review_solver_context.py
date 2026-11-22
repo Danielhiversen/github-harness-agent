@@ -1,4 +1,10 @@
-from github_harness_agent.review_solver_context import focused_source_excerpt
+import pytest
+
+from github_harness_agent.review_solver_context import (
+    focused_check_excerpt,
+    focused_source_excerpt,
+)
+from github_harness_agent.task_context import compact_focused_review
 from github_harness_agent.review_solver import _proposal_messages
 from github_harness_agent.review_recovery import ReviewRecovery
 
@@ -149,3 +155,54 @@ def normalize(values):
     assert "Editable checkout paths" in prompt
     assert "Reviewer feedback: Normalize the numeric category" in prompt
     assert "Focused source from module.py:\n# Line 4\ndef normalize" in prompt
+
+
+@pytest.mark.parametrize(
+    ("command", "diagnostic"),
+    [
+        (("ruff", "check", "."), "I001 [*] Imports unsorted\n --> core.py:1:1\n"),
+        (("ruff", "check", "."), "core.py:2:1: F401 Unused import\n"),
+        (("mypy", "."), "core.py:7: error: Unexpected type [assignment]\n"),
+        (("pytest",), "/work/core.py:7: AssertionError: Unexpected value\n"),
+    ],
+)
+def test_check_location_precedes_historical_review_in_compact_prompt(
+    command, diagnostic
+):
+    core = (
+        "import zlib\nimport array\n\nfrom pathlib import (\n    Path,\n)\n"
+        "VALUE = 32\n\n" + "x = 1\n" * 1600
+    )
+    target = (0, "check 1 (exit 1)")
+    review = ReviewRecovery((("reviewed.py", 2, "Update the original feature"),), "")
+    messages = _proposal_messages(
+        target,
+        {"core.py": core, "reviewed.py": "def previous():\n    pass\n"},
+        {target: diagnostic},
+        False,
+        "",
+        review,
+        {},
+        (),
+        "",
+        check_command=command,
+    )
+    compact = compact_focused_review(messages, max_bytes=4900)
+    prompt = compact[-1]["content"]
+    assert prompt.index("Focused source from core.py:") < prompt.index(
+        "Reviewer feedback:"
+    )
+    assert "from pathlib import (\n    Path,\n)" in prompt
+    if command[0] == "ruff":
+        assert "import zlib\nimport array" in prompt
+    assert "Current checkout:" not in prompt
+
+
+def test_check_focus_rejects_unrecognized_tools_and_external_paths():
+    sources = {"core.py": "import array\n"}
+    assert focused_check_excerpt(
+        ("custom-check",), "core.py:1:1: F401 Unused import", sources
+    ) is None
+    assert focused_check_excerpt(
+        ("pytest",), "/operator/core.py:1: AssertionError", sources
+    ) is None

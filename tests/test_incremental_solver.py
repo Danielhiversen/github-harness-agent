@@ -150,6 +150,29 @@ def test_line_traceback_does_not_guess_when_a_location_is_missing():
     assert _line_failure_details(output) == {}
 
 
+def test_ruff_goal_keeps_search_replace_after_malformed_proposals(solver_case, monkeypatch):
+    task, archive, runner, _ = solver_case
+    task = replace(task, checks=(("ruff", "check", "."),))
+    gateway = FreeGateway("prose", "still prose", "more prose")
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=3, concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+    monkeypatch.setattr(
+        "github_harness_agent.review_solver.evidence",
+        lambda *args: {(1, "check 2 (exit 1)"): f"{SOURCE}:1:1: I001 Imports unsorted"},
+    )
+
+    with pytest.raises(AttemptRejected):
+        solve(executor, task, archive, budget, "fixture-version")
+
+    assert len(gateway.prompts) == 3
+    assert all(
+        prompt.endswith("Respond with exact SEARCH/REPLACE blocks only.")
+        for prompt in gateway.prompts
+    )
+
+
 def test_assertion_progress_rejects_regressions_and_untrusted_locations():
     fixture_path = "/operator/test_sample.py"
     assertions = operator_assertions(
