@@ -86,7 +86,7 @@ _PYTEST_SECTION = re.compile(r"^={5,} ([^\n]+?) ={5,}$", re.M)
 _PYTEST_CRASH_LINE = re.compile(r"^\S[^\n]*?\.py:[1-9][0-9]*: .+$")
 _PYTEST_TOTALS = re.compile(r"(?:\d+ [a-z]+, )*\d+ [a-z]+ in \d+(?:\.\d+)?s(?: \([\d:]+\))?")
 _STOCK_REPAIR_CASE_LIMIT = 4
-_GUARD_SECONDS = 20
+_GUARD_SECONDS = 90
 _GUARD_MIN_REMAINING = 45
 _MODEL_FAILURE_THRESHOLD = 2
 _WORD = re.compile(r"[a-z]{3,}")
@@ -869,7 +869,8 @@ class _GuardBudget:
         self.budget = budget
         self.cancelled = budget.cancelled
         self.limits = budget.limits
-        self.deadline = time.monotonic() + _GUARD_SECONDS
+        # Leave room for the normal private repair if neither guarded edit verifies.
+        self.deadline = time.monotonic() + min(_GUARD_SECONDS, max(0, budget.remaining() - 25))
 
     def remaining(self):
         remaining = min(self.budget.remaining(), self.deadline - time.monotonic())
