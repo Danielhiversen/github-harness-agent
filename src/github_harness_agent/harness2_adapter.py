@@ -70,10 +70,10 @@ def verify_review_repair(executor, task, archive, budget):
     solved = solve(executor, task, archive, budget, HARNESS2_REVISION)
     if solved is not None:
         return solved
-    if task.review_recovery and task.review_recovery.test_only:
-        raise ExecutionError("Could not establish a scoped standalone pytest module for this review")
     guidance = _base_guidance(task)
     prompt = f"{SYSTEM_PROMPT}\n\n{guidance}"
+    if task.review_recovery and task.review_recovery.test_only:
+        prompt += "\n\nAdd only new test files. Keep production code and existing tests unchanged."
     if task.inline_review_threads > 1:
         prompt += (
             "\n\nHandle one review concern at a time. Read the review index and, for the "

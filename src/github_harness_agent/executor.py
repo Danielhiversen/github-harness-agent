@@ -167,6 +167,10 @@ class _ProtectedPatchError(_CandidateOutputError):
     )
 
 
+class _TestOnlyPatchError(_ProtectedPatchError):
+    repair_feedback = "Restore production code and existing tests. Add only new test files."
+
+
 class _VerificationRejected(ExecutionError):
     """A trusted check ran and rejected the candidate."""
 
@@ -1797,7 +1801,9 @@ class PlainExecutor:
             pass
         raise _CandidateOutputError("Model provided an invalid run tool call")
 
-    def _check_patch_paths(self, workspace, task, budget, baseline, *, index=None):
+    def _check_patch_paths(
+        self, workspace, task, budget, baseline, *, index=None, new_tests_only=False
+    ):
         result = self._git(
             workspace,
             budget,
@@ -1828,6 +1834,8 @@ class PlainExecutor:
                 and mode == b"100644"
                 and _test_module(PurePosixPath(path).name)
             )
+            if new_tests_only and not new_test:
+                raise _TestOnlyPatchError(f"Test-only review patch changes an out-of-scope path: {path}")
             amended_test = (
                 status == b"M"
                 and fields[0] == b":100644"
@@ -1913,7 +1921,8 @@ class PlainExecutor:
                 )
                 self._git(workspace, budget, "apply", "--index", "--binary", data=patch)
                 new_tests, amended_test = self._check_patch_paths(
-                    workspace, task, budget, baseline_tree
+                    workspace, task, budget, baseline_tree,
+                    new_tests_only=bool(task.review_recovery and task.review_recovery.test_only),
                 )
             except (_CandidateOutputError, CommandOutputExceeded) as error:
                 budget.reject(error, actor)

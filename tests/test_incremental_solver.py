@@ -3155,15 +3155,18 @@ def test_solver_restores_independently_verified_test_seed(solver_case, scenario)
     assert all(check.returncode == 0 for check in result.checks)
 
 
-@pytest.mark.parametrize("scenario", ("success", "baseline_failure", "no_collection"))
-def test_single_test_only_review_adds_an_independent_module(solver_case, scenario):
+@pytest.mark.parametrize(
+    "scenario", ("success", "baseline_failure", "no_collection", "ordinary", "protected_anchor")
+)
+def test_single_test_only_review_adds_an_independent_module(solver_case, monkeypatch, scenario):
     task, _, runner, checkpoints = solver_case
     task = replace(
         task,
         inline_review_threads=1,
         review_recovery=plan_recovery(
             [{
-                "path": SOURCE, "line": 2, "thread": "review", "reply_to": 1,
+                "path": "tests/test_existing.py" if scenario == "protected_anchor" else SOURCE,
+                "line": 2, "thread": "review", "reply_to": 1,
                 "body": (
                     "Please add an offline pytest regression for the reviewed behavior. "
                     "A test-only change in a new test module is sufficient."
@@ -3173,6 +3176,8 @@ def test_single_test_only_review_adds_an_independent_module(solver_case, scenari
             "",
         ),
     )
+    if scenario in {"ordinary", "protected_anchor"}:
+        task = replace(task, pull_checks=())
     archive = BytesIO()
     fixed = BASE_SOURCE.replace("return -1", "return 1").replace("return -2", "return 2")
     existing_test = "def test_prior_coverage():\n    assert True\n"
@@ -3195,6 +3200,24 @@ def test_single_test_only_review_adds_an_independent_module(solver_case, scenari
     gateway = FreeGateway(*proposals)
     executor = PlainExecutor(runner, gateway, Limits(model_requests=len(proposals)))
     budget = _Budget(executor.limits, lambda: False, task)
+    if scenario == "protected_anchor":
+        rollouts = []
+
+        def rollout(task, archive, budget, prompt, role, *, checkpoint_key, **kwargs):
+            rollouts.append(checkpoint_key)
+            before = {SOURCE: fixed, next_path: ""}
+            production = fixed + "\nunused_constant = 3\n" if len(rollouts) == 1 else fixed
+            after = {SOURCE: production, next_path: TEST}
+            assert "Add only new test files." in prompt
+            return patch_for(before, after), "", None
+
+        monkeypatch.setattr(executor, "_rollout", rollout)
+        result = verify_review_repair(executor, task, archive.getvalue(), budget)
+        assert rollouts == ["harness2/base", "harness2/repair"]
+        assert SOURCE.encode() not in result.patch
+        assert f"+++ b/{next_path}".encode() in result.patch
+        assert any(next_path in check.command for check in result.checks)
+        return
     if scenario == "baseline_failure":
         with pytest.raises(ExecutionError, match="unchanged baseline"):
             verify_review_repair(executor, task, archive.getvalue(), budget)

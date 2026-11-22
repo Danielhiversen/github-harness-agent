@@ -1996,8 +1996,7 @@ def solve(executor, task, archive, budget, version):
     review = task.review_recovery
     if not (
         review
-        and task.pull_checks
-        and (task.inline_review_threads >= 2 or review.test_only)
+        and (review.test_only or (task.pull_checks and task.inline_review_threads >= 2))
         and task.save_checkpoint
     ):
         return None
@@ -2018,9 +2017,9 @@ def solve(executor, task, archive, budget, version):
                 ws, budget, argv, cap=cap, checked=False
             ),
         )
-        if not context:
+        if not context and not review.test_only:
             return None
-        fixtures = json.loads(context.split("\n", 1)[1])
+        fixtures = json.loads(context.split("\n", 1)[1]) if context else {}
         original = {
             path: executor._read_recovery_source(ws, budget, task, tree, path)
             for path in paths
