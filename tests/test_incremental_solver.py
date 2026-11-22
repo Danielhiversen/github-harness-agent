@@ -1196,19 +1196,34 @@ def test_solver_combines_only_verified_disjoint_stock_edits(solver_case, monkeyp
     assert not checkpoints
 
 
-@pytest.mark.parametrize("followup", ("repair", "lose_stock", "operator_remains", "partial_stock"))
+@pytest.mark.parametrize(
+    "followup", (
+        "repair", "lose_stock", "operator_remains", "partial_stock",
+        "malformed", "no_improvement", "retry_limit", "four_cases",
+    )
+)
 def test_private_repair_reconciles_a_stock_gain_without_storing_regressions(solver_case, followup):
     task, _, runner, checkpoints = solver_case
     task = replace(task, require_new_tests=False)
+    extra_operator = (
+        "from fixture_calc import third, ultimate\n\n"
+        "def test_third():\n    assert third() == -5\n\n"
+        "def test_ultimate():\n    assert ultimate() == -6\n"
+        if followup == "four_cases"
+        else ""
+    )
     Path(task.pull_checks[0][-1]).write_text(
         "from fixture_calc import first, second\n\n"
         "def test_first():\n    assert first() == -1\n\n"
-        "def test_second():\n    assert second() == -2\n"
+        "def test_second():\n    assert second() == -2\n\n" + extra_operator
     )
     archive = BytesIO()
     with tarfile.open(fileobj=archive, mode="w") as snapshot:
         for path, content in {
-            SOURCE: BASE_SOURCE + "\ndef stock():\n    return -3\n\ndef stock_guard():\n    return 0\n",
+            SOURCE: (
+                BASE_SOURCE + "\ndef stock():\n    return -3\n\ndef stock_guard():\n    return 0\n"
+                + "\ndef third():\n    return -5\n\ndef ultimate():\n    return -6\n"
+            ),
             "tests/test_existing.py": (
                 "from fixture_calc import stock, stock_guard\n\n"
                 "def test_stock_goal():\n    assert stock() == 3\n\n"
@@ -1225,25 +1240,57 @@ def test_private_repair_reconciles_a_stock_gain_without_storing_regressions(solv
     restore_first = edit(SOURCE, "    return 1\n", "    return -1\n")
     restore_second = edit(SOURCE, "    return 2\n", "    return -2\n")
     initial = stock_fix + FIRST + SECOND
+    if followup == "four_cases":
+        initial += edit(SOURCE, "    return -5\n", "    return 5\n")
+        initial += edit(SOURCE, "    return -6\n", "    return 6\n")
     followups = {
         "repair": (restore_first, restore_second),
         "lose_stock": (restore_first + restore_second + break_stock_guard,),
         "operator_remains": (restore_first, edit(SOURCE, "    return 2\n", "    return 4\n")),
         "partial_stock": ("An incomplete edit",),
+        "malformed": (
+            "An incomplete edit",
+            f"REPLACE {SOURCE}::first\ndef first():\n    return -1\n",
+            restore_second,
+        ),
+        "no_improvement": (
+            edit(SOURCE, "    return 1\n", "    return 4\n"),
+            restore_first,
+            restore_second,
+        ),
+        "retry_limit": ("An incomplete edit",) * 4,
+        "four_cases": (
+            restore_first,
+            restore_second,
+            edit(SOURCE, "    return 5\n", "    return -5\n"),
+            edit(SOURCE, "    return 6\n", "    return -6\n"),
+        ),
     }[followup]
     if followup == "partial_stock":
         initial += break_stock_guard
-    gateway = FreeGateway(initial, *followups)
+    after_provider = []
+
+    class Gateway(FreeGateway):
+        def complete(self, **kwargs):
+            after_provider.append(kwargs.get("after_provider"))
+            result = super().complete(**kwargs)
+            result.route = f"provider-{len(self.prompts)}"
+            return result
+
+    gateway = Gateway(initial, *followups)
     executor = PlainExecutor(
         runner, gateway, Limits(model_requests=len(followups) + 1, concurrent_probes=1)
     )
     budget = _Budget(executor.limits, lambda: False, task)
 
-    if followup == "repair":
+    if followup in {"repair", "malformed", "no_improvement", "four_cases"}:
         result = solve(executor, task, archive.getvalue(), budget, "fixture-version")
         assert b"+    return 3\n" in result.patch
         assert b"+    return 1\n" not in result.patch
         assert b"+    return 2\n" not in result.patch
+        assert b"+    return 4\n" not in result.patch
+        assert b"+    return 5\n" not in result.patch
+        assert b"+    return 6\n" not in result.patch
         assert all(check.returncode == 0 for check in result.checks)
     else:
         with pytest.raises(AttemptRejected):
@@ -1251,15 +1298,29 @@ def test_private_repair_reconciles_a_stock_gain_without_storing_regressions(solv
 
     assert not checkpoints
     assert "test_stock_goal" in gateway.prompts[0].splitlines()[0]
-    if followup == "partial_stock":
-        assert "test_stock_goal" in gateway.prompts[1].splitlines()[0]
-        assert "Private regression repair" not in gateway.prompts[1]
+    if followup in {"partial_stock", "retry_limit"}:
+        assert "test_stock_goal" in gateway.prompts[-1].splitlines()[0]
+        assert "Private regression repair" not in gateway.prompts[-1]
+        if followup == "retry_limit":
+            assert sum("Private regression repair" in prompt for prompt in gateway.prompts) == 3
     else:
-        for prompt, case in zip(gateway.prompts[1:], ("test_first", "test_second")):
+        cases = {
+            "malformed": ("test_first", "test_first", "test_second"),
+            "no_improvement": ("test_first", "test_first", "test_second"),
+            "four_cases": ("test_first", "test_second", "test_third", "test_ultimate"),
+        }.get(followup, ("test_first", "test_second"))
+        for prompt, case in zip(gateway.prompts[1:], cases, strict=False):
             assert case in prompt.splitlines()[0]
             assert "Private regression repair" in prompt
             assert "test_stock_goal" in prompt
             assert "assert stock() == 3" in prompt
+    if followup == "malformed":
+        assert after_provider[2] == "provider-2"
+        assert "No complete edit blocks" in gateway.prompts[2]
+        assert gateway.prompts[2].endswith("Respond with complete named Python definitions only.")
+    if followup == "no_improvement":
+        assert after_provider[2] == "provider-2"
+        assert "The selected case still fails" in gateway.prompts[2]
     assert len(gateway.prompts) == len(followups) + 1
 
 

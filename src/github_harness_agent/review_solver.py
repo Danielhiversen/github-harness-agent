@@ -88,6 +88,7 @@ _PYTEST_SECTION = re.compile(r"^={5,} ([^\n]+?) ={5,}$", re.M)
 _PYTEST_CRASH_LINE = re.compile(r"^\S[^\n]*?\.py:[1-9][0-9]*: .+$")
 _PYTEST_TOTALS = re.compile(r"(?:\d+ [a-z]+, )*\d+ [a-z]+ in \d+(?:\.\d+)?s(?: \([\d:]+\))?")
 _STOCK_REPAIR_CASE_LIMIT = 4
+_STOCK_REPAIR_RETRIES = 2
 _GUARD_SECONDS = 90
 _GUARD_MIN_REMAINING = 45
 _COMPOSITION_MIN_REMAINING = 60
@@ -775,6 +776,17 @@ class _RegressionRepair:
     introduced: set[tuple[int, str]]
     attempts: int = 0
     stock_origin: bool = False
+    retries: int = 0
+    retry_note: str = ""
+    retry_named: bool = False
+
+
+def _retry_stock_repair(repair, note, named_definitions):
+    if repair.retries >= _STOCK_REPAIR_RETRIES:
+        return None
+    return replace(
+        repair, retries=repair.retries + 1, retry_note=note, retry_named=named_definitions
+    )
 
 
 def _named_operator_cases(keys, commands):
@@ -1231,7 +1243,7 @@ def solve(executor, task, archive, budget, version):
                     if repair is not None:
                         regression_repair = None
                         source, diagnostics = repair.sources, repair.failures
-                        note = ""
+                        note = repair.retry_note
                         _LOG.info("Verifying a private repair of %d newly failing review case(s)", len(repair.introduced))
                     if target == _TEST_GOAL:
                         source = {**current, new_path: test_draft}
@@ -1273,11 +1285,14 @@ def solve(executor, task, archive, budget, version):
                             or check_label(check_command, ()) != "ruff"
                         )
                     )
+                    if repair is not None and repair.stock_origin:
+                        named_definitions = repair.retry_named
                     native = (
                         named_definitions
                         and target in native_ready
                         and target not in native_attempted
                         and launch_budget >= 2
+                        and not (repair is not None and repair.stock_origin)
                     )
                     if native:
                         native_attempted.add(target)
@@ -1481,6 +1496,12 @@ def solve(executor, task, archive, budget, version):
                 )
             except ValueError as error:
                 notes[target] = str(error)[:400]
+                if repair is not None and repair.stock_origin:
+                    regression_repair = _retry_stock_repair(
+                        repair,
+                        notes[target] + ". Use the unchanged stock-passing draft and follow the requested edit format.",
+                        not named_definitions,
+                    )
                 _LOG.info(
                     "Review edit could not be applied for %s: %s",
                     target[1],
@@ -1535,6 +1556,7 @@ def solve(executor, task, archive, budget, version):
                 and stock_fixtures.get((target, failures.get(target)))
                 and _named_operator_cases({target}, commands)
                 and _preserved_stock_gain(target, pytest_runs, after_runs, after)
+                and (after.keys() - new_operator) < failures.keys()
                 and _verified_operator_runs(
                     pytest_runs, after_runs, new_operator, task.pull_checks, operator_cases
                 )
@@ -1559,23 +1581,35 @@ def solve(executor, task, archive, budget, version):
                     )
                 )
                 if repair.stock_origin:
-                    improved = (
-                        improved
-                        and _preserved_stock_gain(repair.origin, pytest_runs, after_runs, after)
+                    verified = (
+                        _preserved_stock_gain(repair.origin, pytest_runs, after_runs, after)
                         and _verified_operator_runs(
                             pytest_runs, after_runs, new_operator, task.pull_checks, operator_cases
                         )
-                        and (introduced or after.keys() < failures.keys())
+                        and (after.keys() - new_operator) <= (repair.failures.keys() - repair.introduced)
                     )
+                    improved = verified and introduced < repair.introduced
+                    if verified and introduced == repair.introduced:
+                        regression_repair = _retry_stock_repair(
+                            repair,
+                            "The selected case still fails on the proposed edit. Try a different fix against the unchanged stock-passing draft. "
+                            + excerpt(after[target], 240),
+                            named_definitions,
+                        )
+                        if regression_repair is not None:
+                            continue
                 if not improved or introduced:
-                    if improved and repair.attempts == 0:
+                    if improved and (repair.stock_origin or repair.attempts == 0):
                         regression_repair = replace(
                             repair,
                             sources=candidate,
                             failures=after,
                             gained=gained,
                             introduced=introduced,
-                            attempts=1,
+                            attempts=repair.attempts + 1,
+                            retries=0,
+                            retry_note="",
+                            retry_named=False,
                         )
                     else:
                         rejected[repair.origin] = _rejected_attempt(
