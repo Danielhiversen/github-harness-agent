@@ -980,7 +980,7 @@ class PlainExecutor:
                 if source:
                     instructions += "\n\n" + source
             acceptance_source = ""
-            if task.pull_checks:
+            if task.pull_checks and scoped_sources is None:
                 try:
                     acceptance_source = operator_acceptance_context(
                         task.pull_checks,

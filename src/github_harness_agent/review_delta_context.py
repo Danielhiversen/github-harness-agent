@@ -254,7 +254,7 @@ def _test_excerpt(lines, node, names):
     return "".join(groups)
 
 
-def _operator_examples(fixtures, names):
+def _operator_examples(fixtures, names, *, first_limit=None):
     candidates = []
     contracts = []
     for path, source in fixtures.items():
@@ -302,11 +302,35 @@ def _operator_examples(fixtures, names):
     selected = []
     # Keep the archive order for equally relevant examples.
     for _, example in sorted(candidates, key=lambda item: item[0], reverse=True):
+        if first_limit is not None:
+            if len(example.encode()) <= first_limit:
+                return example
+            continue
         if len(example) <= remaining:
             selected.append(example)
             remaining -= len(example)
+    if first_limit is not None:
+        return ""
     overview = excerpt("\n".join(contracts), 2300) if contracts else ""
     return (overview + "\n\n" if overview else "") + "".join(selected)
+
+
+def interactive_stock_focus(original, current, stock_fixture, fixtures):
+    """Find a shared public call and one operator example for a scoped tool session."""
+    before, after = _definitions(original), _definitions(current)
+    called = set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", stock_fixture))
+    matching = {
+        key: name for key in after
+        if (name := key.split("::", 1)[1].rsplit(".", 1)[-1]) in called
+    }
+    changed = [
+        key for key in matching
+        if key in before and before[key][1] != after[key][1]
+    ]
+    hint = changed if changed else matching
+    symbol = tuple(next(iter(hint)).split("::", 1)) if len(hint) == 1 else None
+    example = _operator_examples(fixtures, set(matching.values()), first_limit=900)
+    return symbol, example
 
 
 def stock_delta_context(original, current, stock_fixture, fixtures, notes):

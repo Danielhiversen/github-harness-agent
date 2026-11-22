@@ -34,6 +34,7 @@ from .executor import (
 )
 from .providers import ProviderExhausted
 from .review_composition import compose_line_edits, selective_reverts, small_line_edits
+from .review_delta_context import interactive_stock_focus
 from .review_assertions import assertion_progress, operator_assertions
 from .review_delta_context import private_operator_source
 from .review_prefix_replay import observe_prefix_progress
@@ -68,7 +69,7 @@ from .review_solver_context import (
     stock_pytest_excerpt,
 )
 from .task_context import MESSAGE_BYTES, compact_focused_review, excerpt, wire_size
-from .test_updates import has_runnable_test
+from .test_updates import focused_pytest, has_runnable_test
 from .worker import Cancelled, ExecutionError, LimitExceeded
 
 _LOG = logging.getLogger(__name__)
@@ -113,6 +114,7 @@ _STOCK_HEDGE_DELAY = 60
 _INTERACTIVE_MAX_TURNS = 12
 _INTERACTIVE_MAX_TOOLS = 24
 _INTERACTIVE_RESERVE_SECONDS = 60
+_INTERACTIVE_INSTRUCTIONS_BYTES = 4100
 _GUARD_SECONDS = 90
 _GUARD_MIN_REMAINING = 45
 _COMPOSITION_MIN_REMAINING = 60
@@ -1240,33 +1242,59 @@ def solve(executor, task, archive, budget, version):
             _CHECKPOINT, task.base_sha, patch, guidance=_GUIDANCE,
             last_editor=(actor.route, actor.configured_model) if actor and actor.configured_model else None,
         )
-        definition = prepare_line_range_edit(current, symbol)
-        focus = ""
-        if definition and sum(map(len, definition.lines)) <= 10000:
-            focus = (
-                "\nLocalized method in the current draft, ready for an exact edit:\n"
-                + "::".join(definition.symbol) + "\n" + "\n".join(definition.lines)
-            )
+        command = commands[target[0]]
+        stock_fixture = stock_pytest_excerpt(archive, command, target[1], "")
+        inferred_symbol, example = interactive_stock_focus(
+            original, current, stock_fixture, fixtures
+        )
+        symbol = symbol or inferred_symbol
+        focused = focused_pytest((command,), (target[1],))
+        command_label, argv = ("Focused", focused) if focused else ("Configured", command)
+        instructions = (
+            "The saved draft passes the operator review checks. Use the workspace tools to "
+            "reproduce the tracked test, try a focused fix, and preserve all passing behavior."
+            f"\nTracked pytest node: {target[1]}"
+            f"\n{command_label} pytest argv: {json.dumps(argv)}"
+            f"\nEdit only these paths: {json.dumps(sorted(reviewed))}"
+        )
+        if example:
+            instructions += "\nPassing operator suite example (quoted):\n" + example
+        sections = [
+            ("\nTracked test and fixture setup (quoted):\n", stock_fixture),
+        ]
+        if symbol is not None:
+            definition = prepare_line_range_edit(current, symbol)
+            sections.append(("\nLocalized method in the current draft (quoted):\n", "::".join(symbol)))
+            if definition is not None:
+                sections.append(("\n", "\n".join(definition.lines)))
+        sections += [
+            ("\nLast failure (quoted):\n", excerpt(failures[target], 650)),
+            ("\nExecution observations (quoted):\n", excerpt(mock_diagnostics.get(target, ""), 650)),
+            ("\nOriginal review (quoted):\n", excerpt(task.instructions, 650)),
+        ]
+        # Leave room for checkpoint and operator-command annotations and complete
+        # tool results even on the smallest supported local model prompt.
+        for heading, section in sections:
+            if not section:
+                continue
+            prompt = {"role": "user", "content": instructions + heading}
+            room = _INTERACTIVE_INSTRUCTIONS_BYTES - wire_size([prompt])
+            if room < 160:
+                break
+            bounded = excerpt(section, room)
+            while wire_size([{**prompt, "content": instructions + heading + bounded}]) > _INTERACTIVE_INSTRUCTIONS_BYTES:
+                room //= 2
+                bounded = excerpt(section, room)
+            instructions += heading + bounded
         initial_tools = probe.tools_left
         interactive_task = replace(
             task,
-            instructions=(
-                task.instructions
-                + "\n\nThe saved draft passes the operator review checks. Use the workspace tools to inspect the draft, "
-                "test a focused fix, and preserve all passing behavior. Edit only these paths: "
-                + json.dumps(sorted(reviewed))
-                + "\nTracked pytest node: " + target[1]
-                + "\nConfigured pytest command: " + json.dumps(commands[target[0]])
-                + "\nLast failure (quoted data):\n" + excerpt(failures[target], 1800)
-                + "\nObserved execution differences from offline replays (quoted data):\n"
-                + excerpt(mock_diagnostics.get(target, ""), 2600) + focus
-                + "\nApply a focused trial and run the tracked test early. Use the remaining turns "
-                "to revise it against the observed failure and independent review checks."
-            ),
+            instructions=instructions,
             checkpoints={_CHECKPOINT: draft},
             save_checkpoint=None,
             save_solver_recovery=None,
             review_recovery=None,
+            repair_failure=(),
             context=None,
             test_update=None,
         )
@@ -1393,6 +1421,8 @@ def solve(executor, task, archive, budget, version):
     submitted = 0
     pending = {}
     interactive_target = interactive_symbol = None
+    interactive_misses = Counter()
+    unlocalized_plans = set()
     interactive_attempted = False
     stock_hedge = None
     hedge_used = False
@@ -1467,6 +1497,18 @@ def solve(executor, task, archive, budget, version):
             launch_budget = min(
                 max_proposals - submitted, budget.model_requests_remaining()
             )
+            if interactive_target is None and len(failures) == 1:
+                sole_target = next(iter(failures))
+                # Let the ranked planner try a verified plateau first. If it
+                # cannot localize it, the isolated tools may inspect the files.
+                if (
+                    interactive_misses[sole_target] >= RECOVERY_MODE_THRESHOLD
+                    and (
+                        sole_target in unlocalized_plans
+                        or no_progress.get(sole_target, 0) < RECOVERY_MODE_THRESHOLD
+                    )
+                ):
+                    interactive_target, interactive_symbol = sole_target, None
             if (
                 interactive_target is not None
                 and not interactive_attempted
@@ -1761,6 +1803,7 @@ def solve(executor, task, archive, budget, version):
                     route = (
                         line_routes.get(target) if line_retry else last_routes.get(target)
                     )
+                    advice_source = "planning" if planner_input is not None else "guided" if advice is not None else None
                     launched_at = time.monotonic()
                     future = pool.submit(
                         _coding_completion,
@@ -1779,7 +1822,7 @@ def solve(executor, task, archive, budget, version):
                         current,
                         continuation,
                         named_definitions,
-                        planner_input is not None or advice is not None,
+                        advice_source,
                         (rotation_key, bool(exclude)),
                         localized_retry,
                         line_retry,
@@ -1860,6 +1903,21 @@ def solve(executor, task, archive, budget, version):
                 continue
             except _RequestBudgetExceeded:
                 continue
+            fresh_stock = (
+                snapshot is current
+                and continuation is None
+                and repair is None
+                and failures.keys() == {target}
+                and stock_fixtures.get((target, failures[target]))
+                and completion.configured_model
+            )
+            if (
+                fresh_stock
+                and advised == "planning"
+                and localized_retry_symbol(fresh_advice) is None
+            ):
+                unlocalized_plans.add(target)
+                interactive_misses[target] += 1
             if native_candidate is not None:
                 submitted -= 1  # The reserved text fallback was unused.
             unavailable.clear()
@@ -1937,6 +1995,8 @@ def solve(executor, task, archive, budget, version):
                     static_runs=static_runs,
                 )
             except ValueError as error:
+                if fresh_stock:
+                    interactive_misses[target] += 1
                 if line_followup is not None and snapshot is current:
                     line_retries[target] = line_followup
                 notes[target] = str(error)[:400]
@@ -2232,6 +2292,8 @@ def solve(executor, task, archive, budget, version):
                 or not (progressed or partial or prefix_progress)
             ):
                 count_model_failure(rotation_key, snapshot, editor)
+                if fresh_stock:
+                    interactive_misses[target] += 1
                 if snapshot is current and (
                     (target in old_operator and "::" in target[1])
                     or (
@@ -2275,7 +2337,9 @@ def solve(executor, task, archive, budget, version):
                 if not sibling.cancel() and not sibling.done():
                     retired = sibling
             current, failures, patch, actor = candidate, after, proposed, editor
-            interactive_target = None
+            interactive_target = interactive_symbol = None
+            interactive_misses.clear()
+            unlocalized_plans.clear()
             hedge_used = False
             pytest_runs = after_runs
             continuations.clear()

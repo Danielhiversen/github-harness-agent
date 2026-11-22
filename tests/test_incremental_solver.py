@@ -11,10 +11,13 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from test_executor import FixtureRunner, FixtureWorkspace
-from test_providers import KILO, OLLAMA, OPENROUTER, OPENROUTER_SIBLING, deployment, routed
+from test_providers import (
+    KILO, LOCAL_MODEL, OLLAMA, OPENROUTER, OPENROUTER_SIBLING,
+    deployment, local_inventory, mock_async_local, pinned_local, routed,
+)
 
 from github_harness_agent import review_recovery
-from github_harness_agent.checkpoint import DraftCheckpoint
+from github_harness_agent.checkpoint import DraftCheckpoint, SolverRecovery
 from github_harness_agent.executor import (
     AttemptRejected,
     Limits,
@@ -2405,23 +2408,58 @@ def test_localized_named_failure_tries_numbered_ranges_as_an_independent_remedy(
     )
 
 
-@pytest.mark.parametrize("interactive_tests", (False, True))
+@pytest.mark.parametrize(
+    ("interactive_tests", "scenario"),
+    [
+        (False, "localized"),
+        (True, "localized"),
+        (False, "unlocalized"),
+        (False, "one_attempt"),
+        (False, "wrong_snapshot"),
+        (False, "reserved"),
+    ],
+)
 def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
-    solver_case, monkeypatch, interactive_tests
+    solver_case, monkeypatch, interactive_tests, scenario
 ):
     from github_harness_agent import review_solver
 
     task, _, runner, checkpoints = solver_case
     recovery = []
+    localized = scenario == "localized"
+    acceptance = Path(task.pull_checks[0][-1])
+    with acceptance.open("a") as file:
+        file.write("\nfrom fixture_calc import stock_result\n"
+                   "\ndef test_stock_baseline():\n    assert stock_result(baseline=True) == 7\n")
+    task = replace(task, instructions=task.instructions + "\n" + "Original review background. " * 600)
     task = replace(task, save_solver_recovery=lambda state, durable: recovery.append((state, durable)))
     if interactive_tests:
         task = replace(task, checks=((sys.executable, "-m", "pytest", "-q", "tests"),))
+    initial_source = BASE_SOURCE + (
+        "\ndef stock_result(*, baseline=False):\n"
+        "    if baseline:\n        return 7\n"
+        "    return -3\n"
+    )
+    if scenario == "wrong_snapshot":
+        target = (1, "tests/test_existing.py::test_stock_result")
+        saved_source = initial_source.replace("return -1", "return 1").replace("return -2", "return 2")
+        checkpoint = DraftCheckpoint(
+            review_solver._CHECKPOINT, task.base_sha,
+            patch_for({SOURCE: initial_source}, {SOURCE: saved_source}), guidance=_GUIDANCE,
+        )
+        task = replace(
+            task, checkpoints={checkpoint.key: checkpoint},
+            solver_recovery=SolverRecovery("0" * 64, ((review_solver._goal_digest(target), 2, 2),)),
+        )
     archive = BytesIO()
     with tarfile.open(fileobj=archive, mode="w") as snapshot:
         for path, content in {
-            SOURCE: BASE_SOURCE + "\ndef stock_result():\n    return -3\n",
+            SOURCE: initial_source,
+            "tests/conftest.py": (
+                "import pytest\n\n@pytest.fixture\ndef tracked_stock_seed():\n    return int('03')\n"
+            ),
             "tests/test_existing.py": (
-                "from fixture_calc import stock_result\n\ndef test_stock_result():\n    assert stock_result() == 3\n"
+                "from fixture_calc import stock_result\n\ndef test_stock_result(tracked_stock_seed):\n    assert stock_result() == tracked_stock_seed\n"
             ),
         }.items():
             data = content.encode()
@@ -2433,61 +2471,91 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
         review_solver, "stock_guard_diagnostic",
         lambda *args: "Auxiliary counterfactual (quoted data, partial diagnostic only). fixture_calc.py::stock_result, draft line 8: causal evidence.",
     )
+    early_success = scenario in {"one_attempt", "wrong_snapshot"}
+    fix = edit(SOURCE, "    return -3\n", "    return 3\n")
     text_edits = iter((
-        FIRST + SECOND,
+        *((FIRST + SECOND,) if scenario != "wrong_snapshot" else ()),
         edit(SOURCE, "    return -3\n", "    return -4\n"),
-        edit(SOURCE, "    return -3\n", "    return -5\n"),
+        fix if early_success else edit(SOURCE, "    return -3\n", "    return -5\n"),
     ))
     phases = []
     tool_turns = []
     regression = "from fixture_calc import stock_result\n\ndef test_repair():\n    assert stock_result() == 3\n"
 
+    focused_command = None
+
     def call(name, arguments):
         return {"id": name + arguments.get("path", ""), "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}
+
+    async def mock_wire(request):
+        nonlocal focused_command
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json=local_inventory())
+        assert scenario in {"localized", "unlocalized"}
+        payload = json.loads(request.content)
+        calls = ()
+        tools, messages = payload["tools"], payload["messages"]
+        tool_turns.append(payload["max_tokens"])
+        phases.append("interactive")
+        outputs = [message["content"] for message in messages if message["role"] == "tool"]
+        if not outputs:
+            task_prompt = "\n".join(str(m.get("content") or "") for m in messages)
+            assert "def test_stock_result(tracked_stock_seed):\n    assert stock_result() == tracked_stock_seed" in task_prompt
+            assert "def tracked_stock_seed():\n    return int('03')" in task_prompt
+            assert "def test_stock_baseline():\n    assert stock_result(baseline=True) == 7" in task_prompt
+            command_text = re.search(r"(?m)^Focused pytest argv: (.+)$", task_prompt)
+            assert command_text
+            focused_command = json.loads(command_text[1])
+            assert focused_command[-1] == "tests/test_existing.py::test_stock_result"
+            assert "Localized method in the current draft" in task_prompt
+            assert "def stock_result(*, baseline=False):\n    if baseline:\n        return 7\n    return -3" in task_prompt
+            assert {tool["function"]["name"] for tool in tools} >= {"run", "edit_file"}, phases
+            calls = (
+                call("edit_file", {"path": "outside.py", "new_text": "bad = True\n"}),
+                call("run", {"argv": ["cat", SOURCE]}),
+            )
+        elif len(tool_turns) == 2:
+            assert "outside the scoped review" in outputs[0]
+            assert "return 1" in outputs[1] and "return 2" in outputs[1]
+            assert "return -3" in outputs[1]
+            calls = (call("edit_file", {"path": SOURCE, "old_text": "    return -3\n", "new_text": "    return 3\n"}),)
+            if interactive_tests:
+                calls += (call("edit_file", {"path": NEW_TEST, "new_text": regression}),)
+        elif len(tool_turns) == 3:
+            calls = (call("run", {"argv": focused_command}),)
+        else:
+            assert "1 passed" in outputs[-1]
+        message = {"tool_calls": calls} if calls else {"content": "done"}
+        return httpx.Response(200, json={"model": LOCAL_MODEL, "choices": [{"message": message}]})
+
+    mock_async_local(monkeypatch, mock_wire)
+    wire = routed([pinned_local(local_input_bytes=8192)], lambda _: pytest.fail('non-local wire'))
 
     class Gateway:
         def complete(self, *, role, messages, tools, timeout, **kwargs):
             prompt = messages[-1]["content"]
             calls = ()
             if tools:
-                tool_turns.append(timeout)
-                phases.append("interactive")
-                outputs = [message["content"] for message in messages if message["role"] == "tool"]
-                if not outputs:
-                    task_prompt = "\n".join(str(m.get("content") or "") for m in messages)
-                    assert "Localized method in the current draft" in task_prompt
-                    assert "def stock_result():\n    return -3" in task_prompt
-                    assert {tool["function"]["name"] for tool in tools} >= {"run", "edit_file"}, phases
-                    calls = (
-                        call("edit_file", {"path": "outside.py", "new_text": "bad = True\n"}),
-                        call("run", {"argv": ["cat", SOURCE]}),
-                    )
-                elif len(tool_turns) == 2:
-                    assert "outside the scoped review" in outputs[0]
-                    assert "return 1" in outputs[1] and "return 2" in outputs[1]
-                    assert "return -3" in outputs[1]
-                    calls = (call("edit_file", {"path": SOURCE, "old_text": "    return -3\n", "new_text": "    return 3\n"}),)
-                    if interactive_tests:
-                        calls += (call("edit_file", {"path": NEW_TEST, "new_text": regression}),)
-                elif len(tool_turns) == 3:
-                    calls = (call("run", {"argv": list(task.checks[0])}),)
-                else:
-                    assert ("2 passed" if interactive_tests else "1 passed") in outputs[-1]
-                content = "done" if not calls else None
-            elif role == "planning":
+                return wire.complete(role=role, messages=messages, tools=tools, timeout=timeout, **kwargs)
+            if role == "planning":
                 phases.append("planning")
-                content = json.dumps({"strategy": "Trace the public inputs.", "symbols": [f"{SOURCE}::stock_result"]})
+                content = json.dumps({"strategy": "Trace the public inputs.", "symbols": [f"{SOURCE}::stock_result" if localized else "unknown.py::not_reviewed"]})
             elif prompt.startswith("Selected failure: new regression tests"):
                 phases.append("author")
-                assert len(checkpoints) == 1 and b"+    return 3\n" not in checkpoints[0].patch
+                if scenario in {"localized", "unlocalized"}:
+                    assert len(checkpoints) == 1
+                    assert b"+    return 3\n" not in checkpoints[0].patch
                 content = edit(NEW_TEST, "", regression)
             elif "single line-range JSON object" in prompt:
                 phases.append("numbered")
                 content = "invalid line range"
+            elif scenario == "reserved" and phases[-1:] == ["guided search"]:
+                phases.append("text")
+                content = fix
             elif prompt.endswith("Respond with complete named Python definitions only."):
                 phases.append("named")
                 content = "invalid named edit"
-            elif "Trace the public inputs." in prompt:
+            elif "Trace the public inputs." in prompt or (not localized and phases[-1:] == ["planning"]):
                 phases.append("guided search")
                 content = "invalid search edit"
             else:
@@ -2501,18 +2569,29 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
     verifier_root = runner.path / "verification"
     verifier_root.mkdir()
     executor = PlainExecutor(
-        runner, Gateway(), Limits(model_requests=14, concurrent_probes=1),
+        runner, Gateway(), Limits(model_requests=7 if scenario == "reserved" else 14, concurrent_probes=1),
         verification_runner=FixtureRunner(verifier_root),
     )
-    result = solve(executor, task, archive.getvalue(), _Budget(executor.limits, lambda: False, task), "fixture")
+    budget = _Budget(executor.limits, lambda: False, task)
+    result = solve(executor, task, archive.getvalue(), budget, "fixture")
 
-    expected = ["text"] * 3 + ["planning", "guided search", "named", "numbered"] + ["interactive"] * 4
+    expected = ["text"] * (2 if scenario == "wrong_snapshot" else 3)
+    if not early_success:
+        expected += ["planning", "guided search"]
+        if localized:
+            expected += ["named", "numbered"]
+        expected += ["text"] if scenario == "reserved" else ["interactive"] * 4
+        assert any(durable for _, durable in recovery)
+    else:
+        assert not any(durable for _, durable in recovery)
     if not interactive_tests:
         expected.append("author")
     assert phases == expected
-    assert len(checkpoints) == 1 and b"+    return 3\n" not in checkpoints[0].patch
-    assert any(durable for _, durable in recovery)
-    assert all(0 < timeout <= 120 for timeout in tool_turns)
+    if scenario == "reserved":
+        assert budget.model_requests_remaining() == 0
+    if scenario != "wrong_snapshot":
+        assert b"+    return 3\n" not in checkpoints[0].patch
+    assert all(0 < tokens <= 3072 for tokens in tool_turns)
     assert b"+    return 3\n" in result.patch and NEW_TEST.encode() in result.patch
     assert b"outside.py" not in result.patch
     assert all(check.returncode == 0 for check in result.checks)

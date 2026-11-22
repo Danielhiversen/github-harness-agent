@@ -112,7 +112,7 @@ def requests_new_tests(body: str) -> bool:
     return False
 
 
-def focused_pytest(checks, selectors, report):
+def focused_pytest(checks, selectors, report=None):
     """Reuse the configured pytest launcher with an explicit node selection."""
     for command in checks:
         launcher = 0
@@ -138,7 +138,8 @@ def focused_pytest(checks, selectors, report):
             prefix = command[: launcher + 3]
         else:
             continue
-        return (*prefix, "-o", "addopts=", f"--junitxml={report}", "--", *selectors)
+        artifacts = (f"--junitxml={report}",) if report is not None else ()
+        return (*prefix, "-o", "addopts=", *artifacts, "--", *selectors)
     return None
 
 
