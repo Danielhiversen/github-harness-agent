@@ -627,6 +627,61 @@ def test_stalled_stock_pytest_uses_advice_and_named_fallback(solver_case):
     assert b"tests/test_existing.py" not in result.patch
 
 
+def test_planned_retry_shares_pinned_mock_call_difference(solver_case):
+    task, _, runner, checkpoints = solver_case
+    task = replace(task, require_new_tests=False)
+    stock = "\ndef stock_publish(callback):\n    callback(1)\n"
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, text in {
+            SOURCE: BASE_SOURCE + stock,
+            "tests/test_existing.py": (
+                "from fixture_calc import stock_publish\n"
+                "from unittest.mock import Mock\n\n"
+                "def test_publish():\n"
+                "    callback = Mock()\n"
+                "    stock_publish(callback)\n"
+                "    callback.assert_called_once_with(1)\n"
+            ),
+        }.items():
+            data = text.encode()
+            entry = tarfile.TarInfo(path)
+            entry.size = len(data)
+            snapshot.addfile(entry, BytesIO(data))
+    proposed = iter((
+        FIRST + SECOND + edit(SOURCE, "    callback(1)\n", "    callback(2)\n"),
+        edit(SOURCE, "    callback(2)\n", "    callback(3)\n"),
+        edit(SOURCE, "    callback(2)\n", "    callback(4)\n"),
+        edit(SOURCE, "    callback(2)\n", "    callback(5)\n"),
+        edit(SOURCE, "    callback(2)\n", "    callback(1)\n"),
+    ))
+    prompts = []
+
+    class Gateway:
+        def complete(self, *, role, messages, **request):
+            prompts.append((role, messages[-1]["content"]))
+            content = (
+                '{"strategy":"Preserve the original callback value.",'
+                '"symbols":["fixture_calc.py::stock_publish"]}'
+                if role == "planning" else next(proposed)
+            )
+            return SimpleNamespace(
+                role=role, route="stand-in-free", model="fixture-coder",
+                configured_model="stand-in/free", content=content, usage={},
+            )
+
+    executor = PlainExecutor(runner, Gateway(), Limits(model_requests=6, concurrent_probes=1))
+    budget = _Budget(executor.limits, lambda: False, task)
+    result = solve(executor, task, archive.getvalue(), budget, "fixture-version")
+
+    expected = 'callback on base [["",[1],{}]]\ncallback on current [["",[2],{}]]'
+    assert [role for role, _ in prompts] == ["coding"] * 3 + ["planning", "coding", "coding"]
+    assert all(expected not in prompt for _, prompt in prompts[:3])
+    assert all(expected in prompt for _, prompt in prompts[3:])
+    assert all(b"Auxiliary mock calls" not in draft.patch for draft in checkpoints)
+    assert all(check.returncode == 0 for check in result.checks)
+
+
 def test_rejected_edit_evidence_reaches_coder_and_planner_without_persistence(
     solver_case,
 ):

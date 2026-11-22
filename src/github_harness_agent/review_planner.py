@@ -107,7 +107,9 @@ def _prompt_sections(messages):
     return None
 
 
-def request_coding_advice(executor, budget, messages, sources, fixture, diagnostic):
+def request_coding_advice(
+    executor, budget, messages, sources, fixture, diagnostic, mock_detail=""
+):
     sections = _prompt_sections(messages)
     if sections is None:
         return None
@@ -119,6 +121,7 @@ def request_coding_advice(executor, budget, messages, sources, fixture, diagnost
         lead
         + "\nVerification diagnostic (quoted):\n"
         + excerpt(diagnostic, 1400)
+        + ("\n" + mock_detail if mock_detail else "")
         + "\nSelected fixture (quoted):\n"
         + excerpt(fixture, 2600)
         + "\nRelevant current implementation (quoted):\n"

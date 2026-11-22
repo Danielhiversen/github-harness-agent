@@ -38,6 +38,7 @@ from .review_definitions import (
     apply_definitions,
     apply_native_definition,
 )
+from .review_mock_replay import mock_call_diagnostic
 from .review_planner import apply_coding_advice, request_coding_advice
 from .review_recovery import operator_acceptance_context
 from .review_solver_context import (
@@ -460,6 +461,7 @@ def _proposal_messages(
     check_command=(),
     rejection="",
     stock_fixture=None,
+    mock_detail="",
 ):
     if target == _TEST_GOAL:
         return _test_authoring_messages(
@@ -486,6 +488,8 @@ def _proposal_messages(
     path, line, body = notes[0]
     query |= words(body) | fixture_query
     check_focus = focused_check_excerpt(check_command, diagnostic, current)
+    if mock_detail:
+        diagnostic += "\n" + mock_detail
     if check_focus:
         path, focus = check_focus
         lead = (
@@ -884,6 +888,7 @@ def solve(executor, task, archive, budget, version):
     planning_attempts = {}
     retry_advice = {}
     stock_fixtures = {}
+    mock_diagnostics = {}
     max_proposals = min(36, budget.model_requests_remaining())
     editor = actor
     submitted = 0
@@ -1028,6 +1033,24 @@ def solve(executor, task, archive, budget, version):
                     )
                     if native:
                         native_attempted.add(target)
+                    plan_count, last_planned = planning_attempts.get(target, (0, -3))
+                    plan = (
+                        can_plan
+                        and not native
+                        and advice is None
+                        and repair is None
+                        and plan_count < 2
+                        and attempts[target] - last_planned >= 3
+                        and no_progress.get(target, 0) >= RECOVERY_MODE_THRESHOLD
+                        and continuation is None
+                        and launch_budget >= 2
+                        and budget.remaining() > 30
+                    )
+                    if plan and stock_fixture and patch and target not in mock_diagnostics:
+                        mock_diagnostics[target] = mock_call_diagnostic(
+                            executor, task, archive, budget, check_command, target[1], patch
+                        )
+                    mock_detail = mock_diagnostics.get(target, "")
                     messages = _proposal_messages(
                         target,
                         source,
@@ -1042,6 +1065,7 @@ def solve(executor, task, archive, budget, version):
                         named_definitions=named_definitions,
                         check_command=check_command,
                         stock_fixture=stock_fixture,
+                        mock_detail=mock_detail,
                         rejection=(
                             _private_repair_context(current, repair)
                             if repair is not None
@@ -1051,23 +1075,11 @@ def solve(executor, task, archive, budget, version):
                         ),
                     )
                     planner_input = None
-                    plan_count, last_planned = planning_attempts.get(target, (0, -3))
-                    if (
-                        can_plan
-                        and not native
-                        and advice is None
-                        and repair is None
-                        and plan_count < 2
-                        and attempts[target] - last_planned >= 3
-                        and no_progress.get(target, 0) >= RECOVERY_MODE_THRESHOLD
-                        and continuation is None
-                        and launch_budget >= 2
-                        and budget.remaining() > 30
-                    ):
+                    if plan:
                         fixture = stock_fixture or _fixture_excerpt(
                             fixtures, target[1], selected_first=True
                         )
-                        planner_input = source, fixture, diagnostics[target]
+                        planner_input = source, fixture, diagnostics[target], mock_detail
                         planning_attempts[target] = plan_count + 1, attempts[target]
                     future = pool.submit(
                         _coding_completion,
@@ -1341,6 +1353,7 @@ def solve(executor, task, archive, budget, version):
             rejected.clear()
             planning_attempts.clear()
             retry_advice.clear()
+            mock_diagnostics.clear()
             last_routes.pop(target, None)
             notes.pop(target, None)
             if prefix_progress:
