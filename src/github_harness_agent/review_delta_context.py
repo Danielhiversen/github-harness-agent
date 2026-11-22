@@ -13,6 +13,7 @@ from .task_context import excerpt
 _FUNCTION = (ast.FunctionDef, ast.AsyncFunctionDef)
 _DELTA_LIMIT = 4600
 _EXAMPLE_LIMIT = 3300
+STOCK_SOURCE_LIMIT = 16 * 1024
 _REGION_LIMIT = 2200
 
 
@@ -102,8 +103,8 @@ def _changes(before, after):
     return "".join(hunks), regions
 
 
-def _search_source(start, lines, regions):
-    if sum(map(len, lines)) <= _REGION_LIMIT:
+def _search_source(key, start, lines, regions):
+    if len(key) + 1 + sum(map(len, lines)) <= STOCK_SOURCE_LIMIT:
         return "".join(lines)
     sections = []
     remaining = _REGION_LIMIT
@@ -235,7 +236,7 @@ def stock_delta_context(original, current, stock_fixture, fixtures, notes):
                 changes.append(section)
                 remaining -= len(section)
         if key in draft:
-            inventory[key] = _search_source(*after, regions)
+            inventory[key] = _search_source(key, *after, regions)
     examples = _operator_examples(fixtures, names | changed_names)
     note_limit = 3300 // max(1, len(notes))
     constraints = "\nReview notes (quoted):\n" + "\n".join(

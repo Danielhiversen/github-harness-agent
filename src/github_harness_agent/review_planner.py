@@ -8,7 +8,11 @@ from collections import Counter
 
 from .providers import ProviderExhausted
 from .review_definitions import _symbols
-from .review_delta_context import resolve_symbol, stock_delta_context
+from .review_delta_context import (
+    STOCK_SOURCE_LIMIT,
+    resolve_symbol,
+    stock_delta_context,
+)
 from .task_context import excerpt
 
 _LOG = logging.getLogger(__name__)
@@ -66,7 +70,7 @@ def _inventory(sources, query):
     return selected
 
 
-def _advice(content, inventory):
+def _advice(content, inventory, *, source_limit=_SOURCE_LIMIT):
     if not isinstance(content, str) or len(content) > 4200:
         return None
     content = content.strip()
@@ -89,7 +93,7 @@ def _advice(content, inventory):
     ):
         return None
     snippets = []
-    remaining = _SOURCE_LIMIT
+    remaining = source_limit
     for key in dict.fromkeys(resolve_symbol(label, inventory) for label in symbols):
         if key is None:
             continue
@@ -180,7 +184,11 @@ def request_coding_advice(
         )
     except ProviderExhausted:
         return None
-    plan = _advice(completion.content, inventory)
+    plan = _advice(
+        completion.content,
+        inventory,
+        source_limit=STOCK_SOURCE_LIMIT if is_stock else _SOURCE_LIMIT,
+    )
     if plan is None:
         _LOG.info(
             "Free planning response contained no usable strategy and source selection"

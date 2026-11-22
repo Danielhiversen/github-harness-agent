@@ -149,3 +149,54 @@ def test_verified(queue):
     assert "        return self.new_lookup(key)" in coding
     assert "old_lookup" not in coding
     assert coding.endswith("Respond with exact SEARCH/REPLACE blocks only.")
+
+
+def test_stock_coding_prompt_keeps_complete_large_selected_method():
+    path = "pkg/directory.py"
+    setup = "".join(f"        values.append({i})\n" for i in range(160))
+    finish = "".join(f"        values.extend([{i}])\n" for i in range(160, 320))
+    method = (
+        "    def resolve(self, query):\n"
+        "        values = []\n"
+        + setup
+        + "        if query.use_shared_pool:\n"
+        "            values = self.lookup_shared(query)\n"
+        + finish
+        + "        return values\n"
+    )
+    assert 8000 <= len(method) <= 12000
+    draft = "class Directory:\n" + method
+    baseline = "class Directory:\n    def resolve(self, query):\n        return []\n"
+    messages = [
+        {"role": "system", "content": "Use exact SEARCH/REPLACE."},
+        {
+            "role": "user",
+            "content": "Selected failure: test_lookup\n"
+            "Focused source from pkg/directory.py:\n# abandoned focus\n"
+            "Failure details:\nlookup failed\n"
+            "Fixture for this goal:\nread-only test\nCurrent checkout:\n",
+        },
+    ]
+
+    def complete(gateway, role, messages, **options):
+        return SimpleNamespace(
+            content=json.dumps(
+                {
+                    "strategy": "Preserve the intended pool selection.",
+                    "symbols": ["pkg.directory.Directory.resolve"],
+                }
+            )
+        )
+
+    plan = request_coding_advice(
+        SimpleNamespace(gateway=object()),
+        SimpleNamespace(complete=complete),
+        messages,
+        {path: draft},
+        "def test_lookup(directory, query):\n    assert directory.resolve(query)\n",
+        "lookup failed",
+        stock_inputs=({path: baseline}, {}, []),
+    )
+    coding = apply_coding_advice(messages, plan)[-1]["content"]
+    assert method in coding
+    assert coding.endswith("Respond with exact SEARCH/REPLACE blocks only.")
