@@ -1712,6 +1712,62 @@ def test_private_static_repair_preserves_stock_and_rechecks_every_gate(
         assert "Private regression repair" not in gateway.prompts[1]
 
 
+@pytest.mark.parametrize("scenario", ("count", "later", "loop"))
+def test_solver_checkpoints_verified_tracked_assertion_progress(solver_case, scenario):
+    task, _, runner, checkpoints = solver_case
+    task = replace(task, require_new_tests=False)
+    Path(task.pull_checks[0][-1]).write_text(
+        "from fixture_calc import first, second\n\n"
+        "def test_first():\n    assert first() == -1\n\n"
+        "def test_second():\n    assert second() == -2\n"
+    )
+    source = (
+        BASE_SOURCE
+        + "\ndef stock_value():\n    return 5\n\ndef stock_other():\n    return 6\n"
+    )
+    fixture = "from fixture_calc import stock_value, stock_other\n\ndef test_stock():\n"
+    if scenario == "count":
+        fixture += "    assert stock_value() == 1\n"
+        first_edit = edit(SOURCE, "    return 5\n", "    return 3\n")
+        second_edit = edit(SOURCE, "    return 3\n", "    return 1\n")
+    else:
+        lines = "    assert stock_value() == 1\n    assert stock_other() == 1\n"
+        fixture += (
+            "    for _ in (None,):\n"
+            + "".join("    " + line for line in lines.splitlines(keepends=True))
+            if scenario == "loop"
+            else lines
+        )
+        first_edit = edit(SOURCE, "    return 5\n", "    return 1\n")
+        second_edit = edit(SOURCE, "    return 6\n", "    return 1\n")
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, content in {
+            SOURCE: source,
+            "tests/test_existing.py": fixture,
+        }.items():
+            body = content.encode()
+            entry = tarfile.TarInfo(path)
+            entry.size = len(body)
+            snapshot.addfile(entry, BytesIO(body))
+    gateway = FreeGateway(first_edit, second_edit)
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=2, concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    result = solve(executor, task, archive.getvalue(), budget, "fixture-version")
+
+    assert all(check.returncode == 0 for check in result.checks)
+    assert len(checkpoints) == 1
+    assert len(gateway.prompts) == 2
+    assert checkpoints[0].progress == (
+        "The tracked pytest integer comparison moved closer to its expected value."
+        if scenario == "count"
+        else "The tracked pytest case reached a later assertion in the same straight-line suite.",
+    )
+
+
 def test_private_stock_repair_keeps_selected_verified_donor_visible(solver_case):
     task, _, runner, _ = solver_case
     task = replace(task, require_new_tests=False)

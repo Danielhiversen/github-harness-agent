@@ -7,6 +7,7 @@ from io import BytesIO
 from pathlib import PurePosixPath
 
 from .check_diagnostics import check_locations
+from .review_assertions import _STRAIGHT_LINE
 
 _FUNCTION = (ast.FunctionDef, ast.AsyncFunctionDef)
 _IMPORT = (ast.Import, ast.ImportFrom)
@@ -16,6 +17,10 @@ _CONTROL = (*_LOOP, ast.If, ast.With, ast.AsyncWith, ast.Try, ast.TryStar, ast.M
 _STOCK_NODE = re.compile(
     r"(?P<path>(?:[\w-][\w.-]*/)*[\w-][\w.-]*\.py)"
     r"(?P<name>(?:::[A-Za-z_]\w*)*::test\w*)"
+)
+_INTEGER_COMPARISON = re.compile(r"(-?[1-9][0-9]{0,17}|0) +== +([1-9][0-9]{0,17}|0)")
+_LOOKUP_PROGRESS = (
+    "The tracked pytest comparison now evaluates at the previous lookup failure."
 )
 
 
@@ -260,52 +265,165 @@ def _stock_frame(match, detail):
     return None
 
 
+def _stock_node_match(node):
+    selected = node.split("[", 1)[0].removeprefix("/work/").removeprefix("./")
+    return _STOCK_NODE.fullmatch(selected) if len(selected) <= 512 else None
+
+
 def stock_failure_site(node, detail):
     """Describe a traceback in the selected test without logging assertion data."""
-    selected = node.split("[", 1)[0].removeprefix("/work/").removeprefix("./")
-    match = _STOCK_NODE.fullmatch(selected) if len(selected) <= 512 else None
+    match = _stock_node_match(node)
     frame = _stock_frame(match, detail) if match else None
     return f"line {frame[0]} ({frame[1]})" if frame else ""
 
 
-def stock_assertion_evaluated(archive, node, before, after):
-    """A tracked comparison now evaluates both sides instead of raising during lookup."""
-    selected = node.split("[", 1)[0].removeprefix("/work/").removeprefix("./")
-    match = _STOCK_NODE.fullmatch(selected) if len(selected) <= 512 else None
-    if match is None:
-        return False
-    path = match["path"]
-    old, new = _stock_frame(match, before), _stock_frame(match, after)
-    evaluated = re.search(r"(?:^E\s+|: )assert\s+[^\n]+", after, re.M)
-    if (
-        old is None or old[1] not in {"KeyError", "IndexError", "AttributeError"}
-        or new != (old[0], "AssertionError") or evaluated is None
-    ):
-        return False
+def _tracked_stock_test(archive, match):
     try:
         with tarfile.open(fileobj=BytesIO(archive), mode="r:") as snapshot:
-            tracked = _tracked_python(snapshot, path)
+            tracked = _tracked_python(snapshot, match["path"])
     except (tarfile.TarError, OSError, EOFError):
-        return False
+        return None
     if tracked is None:
-        return False
+        return None
     scope = tracked[1]
     *owners, name = match["name"].split("::")[1:]
     for owner in owners:
-        classes = [item for item in scope if isinstance(item, ast.ClassDef) and item.name == owner]
+        classes = [
+            item
+            for item in scope
+            if isinstance(item, ast.ClassDef) and item.name == owner
+        ]
         if len(classes) != 1:
-            return False
+            return None
         scope = classes[0].body
-    tests = [item for item in scope if isinstance(item, _FUNCTION) and item.name == name]
-    if len(tests) != 1:
+    tests = [
+        item for item in scope if isinstance(item, _FUNCTION) and item.name == name
+    ]
+    return tests[0] if len(tests) == 1 else None
+
+
+def _rewritten_assertion(detail):
+    """Read one pytest-rewritten expression, from line or structured traceback output."""
+    lines = detail.splitlines()
+    expressions = set(re.findall(r"^E[ \t]+assert[ \t]+([^\n]+)$", detail, re.M))
+    if lines and (first := re.match(r"^.+\.py:[0-9]+: assert[ \t]+(.+)$", lines[0])):
+        expressions.add(first[1])
+    return expressions.pop() if len(expressions) == 1 else None
+
+
+def _straight_line_suites(body):
+    yield body
+    for statement in body:
+        if isinstance(statement, ast.If):
+            yield from _straight_line_suites(statement.body)
+            yield from _straight_line_suites(statement.orelse)
+        elif (
+            isinstance(statement, ast.For)
+            and isinstance(statement.iter, (ast.Tuple, ast.List))
+            and len(statement.iter.elts) == 1
+            and not isinstance(statement.iter.elts[0], ast.Starred)
+        ):
+            # Both failures must come from the same iteration. Dynamic and
+            # multi-item loops can hide the old failure behind an earlier iteration.
+            yield from _straight_line_suites(statement.body)
+
+
+def _integer_approach(assertion, before, after):
+    comparison = assertion.test
+    if not (
+        isinstance(comparison, ast.Compare)
+        and len(comparison.ops) == 1
+        and isinstance(comparison.ops[0], ast.Eq)
+        and not isinstance(comparison.left, ast.Constant)
+        and isinstance(expected := comparison.comparators[0], ast.Constant)
+        and type(expected.value) is int
+        and expected.value >= 0
+    ):
         return False
-    return any(
-        isinstance(item, ast.Assert)
-        and item.lineno == old[0]
-        and isinstance(item.test, ast.Compare)
-        and any(isinstance(expr, (ast.Subscript, ast.Attribute)) for expr in ast.walk(item.test))
-        for item in ast.walk(tests[0])
+    old, new = (
+        _INTEGER_COMPARISON.fullmatch(before),
+        _INTEGER_COMPARISON.fullmatch(after),
     )
+    if (
+        old is None
+        or new is None
+        or int(old[2]) != expected.value
+        or int(new[2]) != expected.value
+    ):
+        return False
+    low, high = sorted((int(old[1]), expected.value))
+    return low < int(new[1]) < high
+
+
+def stock_assertion_progress(archive, node, before, after, *, changed_paths=()):
+    """Report bounded progress on an unchanged, archive-backed pytest assertion."""
+    match = _stock_node_match(node)
+    if match is None or match["path"] in changed_paths:
+        return ""
+    old, new = _stock_frame(match, before), _stock_frame(match, after)
+    if old is None or new is None or new[1] != "AssertionError":
+        return ""
+    lookup = old[1] in {"KeyError", "IndexError", "AttributeError"} and old[0] == new[0]
+    old_expression, new_expression = (
+        _rewritten_assertion(before),
+        _rewritten_assertion(after),
+    )
+    if not new_expression or (
+        not lookup
+        and (old[1] != "AssertionError" or not old_expression or old[0] > new[0])
+    ):
+        return ""
+    test = _tracked_stock_test(archive, match)
+    if test is None:
+        return ""
+    if lookup:
+        if any(
+            isinstance(item, ast.Assert)
+            and item.lineno == old[0]
+            and isinstance(item.test, ast.Compare)
+            and any(
+                isinstance(expr, (ast.Subscript, ast.Attribute))
+                for expr in ast.walk(item.test)
+            )
+            for item in ast.walk(test)
+        ):
+            return _LOOKUP_PROGRESS
+        return ""
+
+    sites = {}
+    for suite in _straight_line_suites(test.body):
+        for index, statement in enumerate(suite):
+            if isinstance(statement, ast.Assert) and statement.lineno in (
+                old[0],
+                new[0],
+            ):
+                sites.setdefault(statement.lineno, []).append((suite, index))
+    previous, current = sites.get(old[0], []), sites.get(new[0], [])
+    if len(previous) != 1 or len(current) != 1:
+        return ""
+    old_suite, start = previous[0]
+    new_suite, stop = current[0]
+    if old[0] == new[0] and _integer_approach(
+        old_suite[start], old_expression, new_expression
+    ):
+        return (
+            "The tracked pytest integer comparison moved closer to its expected value."
+        )
+    if (
+        old_suite is new_suite
+        and start < stop
+        and all(
+            isinstance(statement, _STRAIGHT_LINE)
+            for statement in old_suite[start + 1 : stop]
+        )
+    ):
+        return "The tracked pytest case reached a later assertion in the same straight-line suite."
+    return ""
+
+
+def stock_assertion_evaluated(archive, node, before, after):
+    """A tracked comparison now evaluates both sides instead of raising during lookup."""
+    return stock_assertion_progress(archive, node, before, after) == _LOOKUP_PROGRESS
 
 
 def _start(node):

@@ -388,3 +388,125 @@ def test_short_pytest_frame_localizes_only_the_selected_test_and_evaluated_asser
     assert not stock_failure_site(node, lookup.replace("in test_count", "in helper"))
     assert not stock_failure_site(node, lookup.replace("E   ", "src/helper.py:4: in helper\nE   "))
     assert not stock_assertion_evaluated(archive.getvalue(), node, lookup, evaluated.replace(":3:", ":4:"))
+
+
+def _tracked_assertion_archive(source):
+    archive = BytesIO()
+    content = source.encode()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        member = tarfile.TarInfo("tests/test_counts.py")
+        member.size = len(content)
+        snapshot.addfile(member, BytesIO(content))
+    return archive.getvalue()
+
+
+@pytest.mark.parametrize(
+    "old, new, expected",
+    (
+        ("5 == 1", "3 == 1", True),
+        ("-4 == 1", "-2 == 1", True),
+        ("5 == 1", "5 == 1", False),
+        ("3 == 1", "5 == 1", False),
+        ("5 == 1", "0 == 1", False),
+        ("5 == 1", "3 == 2", False),
+        ("5 == 1", "True == 1", False),
+        ("5 == 1", "3.0 == 1", False),
+        ("5 == 1", "'3' == 1", False),
+        ("5 == 1", "03 == 1", False),
+        ("5 == 1", "3 == 1 or False", False),
+        ("5 == 1", "3 == 1\nE    assert 2 == 1", False),
+    ),
+)
+def test_stock_integer_progress_requires_a_strict_same_side_literal(old, new, expected):
+    from github_harness_agent.review_solver_context import stock_assertion_progress
+
+    archive = _tracked_assertion_archive(
+        "def test_count():\n    assert read_count() == 1\n"
+    )
+    node = "tests/test_counts.py::test_count"
+    before = f"tests/test_counts.py:2: assert {old}"
+    after = f"/work/tests/test_counts.py:2: in test_count\nE   assert {new}"
+    assert bool(stock_assertion_progress(archive, node, before, after)) is expected
+    assert not stock_assertion_progress(
+        archive, node, before, after, changed_paths={"tests/test_counts.py"}
+    )
+
+
+@pytest.mark.parametrize(
+    "expression",
+    (
+        "read_count() == True",
+        "read_count() == expected",
+        "read_count() == 1 == 1",
+        "5 == 1",
+    ),
+)
+def test_stock_integer_progress_requires_an_immutable_literal_comparison(expression):
+    from github_harness_agent.review_solver_context import stock_assertion_progress
+
+    archive = _tracked_assertion_archive(
+        f"def test_count():\n    assert {expression}\n"
+    )
+    assert not stock_assertion_progress(
+        archive,
+        "tests/test_counts.py::test_count",
+        "tests/test_counts.py:2: assert 5 == 1",
+        "tests/test_counts.py:2: assert 3 == 1",
+    )
+
+
+@pytest.mark.parametrize(
+    "body, old, new, expected",
+    (
+        ("    assert first()\n    assert second()\n", 2, 3, True),
+        ("    assert first()\n    assert second()\n", 3, 2, False),
+        ("    assert first()\n    if enabled:\n        assert second()\n", 2, 4, False),
+        (
+            "    assert first()\n    if enabled:\n        pass\n    assert second()\n",
+            2,
+            5,
+            False,
+        ),
+        (
+            "    if enabled:\n        assert first()\n        assert second()\n",
+            3,
+            4,
+            True,
+        ),
+        (
+            "    for item in (0,):\n        assert first()\n        assert second()\n",
+            3,
+            4,
+            True,
+        ),
+        (
+            "    for item in (0, 1):\n        assert first()\n        assert second()\n",
+            3,
+            4,
+            False,
+        ),
+        (
+            "    for item in items:\n        assert first()\n        assert second()\n",
+            3,
+            4,
+            False,
+        ),
+        ("    assert first(); assert hidden()\n    assert second()\n", 2, 3, False),
+    ),
+)
+def test_stock_later_assertion_progress_requires_unambiguous_straight_line_suite(
+    body, old, new, expected
+):
+    from github_harness_agent.review_solver_context import stock_assertion_progress
+
+    archive = _tracked_assertion_archive("def test_count():\n" + body)
+    before = f"tests/test_counts.py:{old}: assert False"
+    after = f"tests/test_counts.py:{new}: assert False"
+    assert (
+        bool(
+            stock_assertion_progress(
+                archive, "tests/test_counts.py::test_count", before, after
+            )
+        )
+        is expected
+    )

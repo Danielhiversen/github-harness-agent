@@ -64,7 +64,7 @@ from .review_recovery import operator_acceptance_context
 from .review_solver_context import (
     focused_check_excerpt,
     focused_source_excerpt,
-    stock_assertion_evaluated,
+    stock_assertion_progress,
     stock_failure_site,
     stock_pytest_excerpt,
 )
@@ -2240,22 +2240,48 @@ def solve(executor, task, archive, budget, version):
             partial = not progressed and assertion_progress(
                 assertions, task.pull_checks, target, failures, after
             )
+            stock_progress = ""
             isolated_stock_failure = (
                 snapshot is current
                 and failures.keys() == after.keys() == {target}
                 and stock_fixtures.get((target, failures[target]))
-                and _same_pytest_selection(pytest_runs.get(target[0]), after_runs.get(target[0]))
-                and pytest_runs[target[0]].failed == after_runs[target[0]].failed == {target[1]}
-                and _verified_operator_runs(pytest_runs, after_runs, set(), task.pull_checks, operator_cases)
+                and _same_pytest_selection(
+                    pytest_runs.get(target[0]), after_runs.get(target[0])
+                )
+                and pytest_runs[target[0]].failed
+                == after_runs[target[0]].failed
+                == {target[1]}
+                and _verified_operator_runs(
+                    pytest_runs, after_runs, set(), task.pull_checks, operator_cases
+                )
             )
             if isolated_stock_failure:
                 previous_site = stock_failure_site(target[1], failures[target])
                 next_site = stock_failure_site(target[1], after[target])
                 if previous_site and next_site:
-                    _LOG.info("Tracked pytest verification for %s: %s -> %s", target[1], previous_site, next_site)
-                partial = stock_assertion_evaluated(archive, target[1], failures[target], after[target])
+                    _LOG.info(
+                        "Tracked pytest verification for %s: %s -> %s",
+                        target[1],
+                        previous_site,
+                        next_site,
+                    )
+                if _named_operator_cases({target}, commands):
+                    changed_paths = {
+                        path
+                        for path in current.keys() | candidate.keys()
+                        if current.get(path) != original.get(path)
+                        or candidate.get(path) != original.get(path)
+                    }
+                    stock_progress = stock_assertion_progress(
+                        archive,
+                        target[1],
+                        failures[target],
+                        after[target],
+                        changed_paths=changed_paths,
+                    )
+                partial = bool(stock_progress)
                 if partial:
-                    _LOG.info("The tracked pytest comparison now evaluates at the previous lookup failure")
+                    _LOG.info("%s", stock_progress)
                 elif source is current and repair is None and editor.configured_model:
                     composed = compose_stock_gain(target, candidate)
                     if composed is not None:
@@ -2380,14 +2406,20 @@ def solve(executor, task, archive, budget, version):
             retained_failures = failures
             retained_identity = _recovery_digest(task, fixtures, patch)
             retain_recovery()
+            progress_note = prefix_progress or stock_progress
             task.save_checkpoint(
                 DraftCheckpoint(
                     _CHECKPOINT,
                     task.base_sha,
                     patch,
-                    (prefix_progress,) if prefix_progress else (
-                        ("An operator case reached a later assertion and still failed.",)
-                        if partial else ()
+                    (progress_note,)
+                    if progress_note
+                    else (
+                        (
+                            "An operator case reached a later assertion and still failed.",
+                        )
+                        if partial
+                        else ()
                     ),
                     _GUIDANCE,
                     (editor.route, editor.configured_model),
