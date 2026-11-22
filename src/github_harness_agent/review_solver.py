@@ -16,16 +16,19 @@ from . import review_recovery
 from .check_artifacts import check_label
 from .check_diagnostics import (
     check_details,
+    check_failure_summary,
     check_locations,
     ordinary_static_locations,
     ordinary_unused_import_failure,
     static_error_message,
 )
 from .checkpoint import (
+    GENERATED_TEST_NAME,
     PRIVATE_PATCH_BYTES,
     RECOVERY_GOAL_LIMIT,
     RECOVERY_MODE_THRESHOLD,
     DraftCheckpoint,
+    GeneratedTestSeed,
     PrivateRecovery,
     SolverRecovery,
 )
@@ -33,6 +36,7 @@ from .executor import (
     SYSTEM_PROMPT,
     AttemptRejected,
     CandidateEvidence,
+    CheckEvidence,
     RefinementEvidence,
     RouteEvidence,
     _CandidateOutputError,
@@ -714,6 +718,47 @@ def _focused_generated_run(checks, command):
     return None
 
 
+def _project_generated_seed(path, source, run):
+    if not run or not run.named_cases or not run.failed or not run.passed or run.deselected:
+        return None
+    prefix = path + "::"
+    names = {node.removeprefix(prefix) for node in run.named_cases}
+    if any(not node.startswith(prefix) for node in run.named_cases) or not all(
+        GENERATED_TEST_NAME.fullmatch(name) for name in names
+    ):
+        return None
+    tree = ast.parse(source)
+    definitions = [
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("test_")
+    ]
+    if len(definitions) != len(names) or {node.name for node in definitions} != names:
+        return None
+    omitted = {node.removeprefix(prefix) for node in run.failed}
+    removed = [node for node in definitions if node.name in omitted]
+    lines = source.split("\n")
+    for node in reversed(removed):
+        first = min([node.lineno, *(decorator.lineno for decorator in node.decorator_list)])
+        del lines[first - 1 : node.end_lineno]
+    reduced = "\n".join(lines)
+    tree.body = [node for node in tree.body if node not in removed]
+    if ast.dump(tree) != ast.dump(ast.parse(reduced)):
+        return None
+    return GeneratedTestSeed.from_data({
+        "source": reduced,
+        "passing": sorted(names - omitted),
+        "omitted": sorted(omitted),
+    })
+
+
+def _covers_generated_seed(run, path, names):
+    if not run or not run.named_cases or run.deselected:
+        return False
+    passing = run.named_cases - run.failed
+    return all(f"{path}::{name}" in passing for name in names)
+
+
 class _PrivateCheckOutputExceeded(CommandOutputExceeded):
     """A configured check exceeded its output limit on a private proposal."""
 
@@ -732,6 +777,7 @@ def evidence(
     on_staged=None,
     private_proposal=False,
     test_check_labels=None,
+    check_results=None,
 ):
     with executor.verification_runner.workspace(
         archive, budget.remaining, budget.cancelled
@@ -761,8 +807,11 @@ def evidence(
                 ) from None
             if pytest_runs is not None and check_label(command, ()) == "pytest":
                 pytest_runs[number] = _complete_pytest_run(outcome)
-            if outcome.returncode:
+            if check_results is not None or outcome.returncode:
                 output = _combined(outcome)
+                if check_results is not None:
+                    check_results.append(CheckEvidence(command, outcome.returncode, output))
+            if outcome.returncode:
                 if static_runs is not None and outcome.returncode == 1:
                     locations = ordinary_static_locations(command, output)
                     if locations:
@@ -1878,8 +1927,11 @@ def solve(executor, task, archive, budget, version):
     retained_identity = _recovery_digest(task, fixtures, patch)
     retained_recovery = task.solver_recovery
     alternate = None
+    test_seed = None
     if retained_recovery and retained_recovery.identity == retained_identity:
         alternate = retained_recovery.alternate
+        if task.require_new_tests and not failures and not current[new_path]:
+            test_seed = retained_recovery.test_seed
         goals = {goal: (bad, stalled) for goal, bad, stalled in retained_recovery.goals}
         for target in failures:
             bad, stalled = goals.get(_goal_digest(target), (0, 0))
@@ -1899,8 +1951,8 @@ def solve(executor, task, archive, budget, version):
         ]
         goals.sort(key=lambda goal: (-max(goal[1:]), goal[0]))
         state = (
-            SolverRecovery(retained_identity, tuple(goals[:RECOVERY_GOAL_LIMIT]), alternate)
-            if goals or alternate is not None
+            SolverRecovery(retained_identity, tuple(goals[:RECOVERY_GOAL_LIMIT]), alternate, test_seed)
+            if goals or alternate is not None or test_seed is not None
             else None
         )
         if state != retained_recovery:
@@ -3152,24 +3204,74 @@ def solve(executor, task, archive, budget, version):
     round_limit_snapshot = None
     round_limit_advice = {}
     unavailable = {}
-    test_draft = current.get(new_path, "")
-    test_diagnostic = ""
+    test_draft = test_seed.source if test_seed else current.get(new_path, "")
+    test_diagnostic = (
+        "This independently verified partial draft is authoring context. Preserve its "
+        "passing cases and submit a complete module restoring these omitted coverage cases: "
+        + ", ".join(test_seed.omitted)
+        if test_seed else ""
+    )
     test_rejection = None
     test_case_runs = {}
     focused_generated = focused_pytest(task.checks, (new_path,), verbose=True) if new_path else None
     test_checkout_snapshot = None
     test_checkout_digest = None
+    if test_seed:
+        test_case_runs["focused"] = _PytestRun(
+            len(test_seed.passing), frozenset(), 0,
+            frozenset(f"{new_path}::{name}" for name in test_seed.passing),
+        )
+        test_checkout_snapshot = current
+        test_checkout_digest = hashlib.sha256(patch).digest()
     test_format_revision = None
     test_format_failures = 0
     test_tool_attempts = set()
     repository_example = None
     repository_usage = ""
     repository_models = ""
+    attempted_seed_cases = set()
+
+    def retain_test_seed(candidate, runs):
+        nonlocal test_seed
+        if (
+            task.save_solver_recovery is None
+            or executor.runner is executor.verification_runner
+            or _recovery_digest(task, fixtures, patch) != retained_identity
+            or any(candidate[path] != current[path] for path in paths)
+        ):
+            return
+        try:
+            seed = _project_generated_seed(new_path, candidate[new_path], runs.get("focused"))
+        except (ValueError, SyntaxError, RecursionError):
+            return
+        if seed is None or seed.passing in attempted_seed_cases:
+            return
+        all_names = set(seed.passing + seed.omitted)
+        if test_seed and not (
+            set(test_seed.passing) < set(seed.passing)
+            and set(test_seed.passing + test_seed.omitted) <= all_names
+        ):
+            return
+        attempted_seed_cases.add(seed.passing)
+        projection = patch_for(original, {**current, new_path: seed.source})
+        try:
+            verified = executor._verify(task, archive, budget, projection)
+        except Cancelled:
+            raise
+        except ExecutionError:
+            budget.remaining()
+            return
+        run = _focused_generated_run(verified.checks, focused_generated)
+        if not _covers_generated_seed(run, new_path, seed.passing) or run.passed != len(seed.passing):
+            return
+        test_seed = seed
+        retain_recovery(durable=True)
+        _LOG.info("Saved independently verified authoring context for %d generated test cases", run.passed)
 
     def start_new_draft(target):
         nonlocal interactive_target, interactive_symbol, hedge_used
         nonlocal stock_edits, composition_attempted, regression_repair
-        nonlocal alternate
+        nonlocal alternate, test_seed
         interactive_target = interactive_symbol = None
         interactive_misses.clear()
         unlocalized_plans.clear()
@@ -3178,6 +3280,8 @@ def solve(executor, task, archive, budget, version):
         stock_edits, composition_attempted = (), False
         regression_repair = None
         alternate = None
+        test_seed = None
+        attempted_seed_cases.clear()
         pinned_restore_advice.clear()
         repair_attempted.clear()
         unavailable.clear()
@@ -3279,6 +3383,9 @@ def solve(executor, task, archive, budget, version):
                 if verified is not None:
                     current, patch, failures, pytest_runs = verified
                     start_new_draft(target)
+                    save_verified_progress(
+                        patch, "Round-limit change passed all configured checks. New tests are pending.", actor
+                    )
                     _LOG.info("A private round-limit trial passed all configured checks")
                     continue
                 if advisory:
@@ -4146,6 +4253,10 @@ def solve(executor, task, archive, budget, version):
                     raise
                 if target == _TEST_GOAL:
                     candidate = {**current, **candidate}
+                    if test_seed is not None and any(
+                        candidate[path] != current[path] for path in paths
+                    ):
+                        raise ValueError("Keep the verified production edits and revise only the test module.")
                 if (
                     failures
                     and needs_tests
@@ -4161,22 +4272,53 @@ def solve(executor, task, archive, budget, version):
                 static_runs = {}
                 unused_import_checks = set()
                 test_check_labels = set()
-                after = evidence(
-                    executor,
-                    task,
-                    archive,
-                    budget,
-                    proposed,
-                    commands,
-                    pytest_runs=after_runs,
-                    static_runs=static_runs,
-                    private_proposal=repair is not None and repair.stock_origin,
-                    **({"test_check_labels": test_check_labels} if target == _TEST_GOAL else {}),
-                    **(
-                        {"unused_import_checks": unused_import_checks}
-                        if repair is not None and repair.dependency_seed else {}
-                    ),
-                )
+                focused_rejection = None
+                after = {}
+                remaining_commands = commands
+                if (
+                    target == _TEST_GOAL and focused_generated is not None
+                    and all(candidate[path] == current[path] for path in paths)
+                    and has_runnable_test(new_path, candidate[new_path].encode())
+                ):
+                    fast_runs, fast_checks = {}, []
+                    after = evidence(
+                        executor, task, archive, budget, proposed, (focused_generated,),
+                        pytest_runs=fast_runs, test_check_labels=test_check_labels,
+                        check_results=fast_checks,
+                    )
+                    fast_run = after_runs["focused"] = fast_runs.get(0)
+                    if fast_run and fast_run.named_cases is not None:
+                        _LOG.info(
+                            "Focused generated pytest cases: %d passed, %d failed",
+                            fast_run.passed, len(fast_run.failed),
+                        )
+                    remaining_commands = tuple(
+                        command for command in commands if command != focused_generated
+                    )
+                    if after:
+                        error = _VerificationRejected(check_failure_summary(task, fast_checks))
+                        error.checks = tuple(fast_checks)
+                        try:
+                            budget.reject(error, editor)
+                        except AttemptRejected as rejection:
+                            focused_rejection = rejection
+                if not after:
+                    after = evidence(
+                        executor,
+                        task,
+                        archive,
+                        budget,
+                        proposed,
+                        remaining_commands,
+                        pytest_runs=after_runs,
+                        static_runs=static_runs,
+                        private_proposal=repair is not None and repair.stock_origin,
+                        **({"test_check_labels": test_check_labels} if target == _TEST_GOAL else {}),
+                        **(
+                            {"unused_import_checks": unused_import_checks}
+                            if repair is not None and repair.dependency_seed else {}
+                        ),
+                    )
             except _PrivateCheckOutputExceeded as error:
                 budget.remaining()
                 regression_repair = _retry_stock_repair(
@@ -4219,7 +4361,7 @@ def solve(executor, task, archive, budget, version):
                 continue
             if target == _TEST_GOAL:
                 next_draft = candidate[new_path]
-                next_rejection = None
+                next_rejection = focused_rejection
                 next_case_runs = after_runs
                 result = None
                 if after:
@@ -4242,9 +4384,8 @@ def solve(executor, task, archive, budget, version):
                         if not isinstance(rejection, _VerificationRejected):
                             raise
                         next_rejection = error
-                        next_case_runs["focused"] = _focused_generated_run(
-                            rejection.checks, focused_generated
-                        )
+                        if run := _focused_generated_run(rejection.checks, focused_generated):
+                            next_case_runs["focused"] = run
                         failures_by_check = {}
                         for index, check in enumerate(rejection.checks):
                             if not check.returncode:
@@ -4287,7 +4428,21 @@ def solve(executor, task, archive, budget, version):
                     _LOG.info("Retained the prior unpublished draft after losing a verified passing pytest case")
                     continue
                 if result is not None:
+                    if test_seed is not None and (
+                        next_draft == test_seed.source
+                        or not _covers_generated_seed(
+                            next_case_runs.get("focused"), new_path,
+                            test_seed.passing + test_seed.omitted,
+                        )
+                    ):
+                        notes[target] = (
+                            "Expand the test module and preserve these verified passing and "
+                            "omitted cases: " + ", ".join(test_seed.passing + test_seed.omitted)
+                        )
+                        continue
                     return result
+                if allow_test_module and snapshot is current:
+                    retain_test_seed(candidate, next_case_runs)
                 test_draft = next_draft
                 test_rejection = next_rejection
                 test_diagnostic = next_diagnostic

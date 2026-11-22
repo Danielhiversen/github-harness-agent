@@ -3020,6 +3020,83 @@ def test_solver_preserves_verified_passing_cases_in_unpublished_draft(solver_cas
     assert not checkpoints
 
 
+@pytest.mark.parametrize("scenario", ("resume", "different_scope", "projection_fails"))
+def test_solver_restores_independently_verified_test_seed(solver_case, scenario):
+    task, archive, runner, checkpoints = solver_case
+    fixed = BASE_SOURCE.replace("return -1", "return 1").replace("return -2", "return 2")
+    checkpoint = DraftCheckpoint(
+        "harness2/base",
+        task.base_sha,
+        patch_for({SOURCE: BASE_SOURCE}, {SOURCE: fixed}),
+        guidance=_GUIDANCE,
+        last_editor=("fixture", "fixture/coder"),
+    )
+    saved = []
+    task = replace(
+        task,
+        checkpoints={checkpoint.key: checkpoint},
+        save_solver_recovery=lambda state, durable: saved.append((state, durable)),
+    )
+    if scenario == "resume":
+        task = replace(task, checks=((sys.executable, "-m", "pytest", "-q", "tests"),))
+    if scenario == "projection_fails":
+        require_both = (
+            "from pathlib import Path\n"
+            f"p = Path({NEW_TEST!r})\n"
+            "if p.exists() and 'def test_results(' not in p.read_text():\n"
+            "    raise SystemExit('the full test module must contain test_results')\n"
+        )
+        task = replace(task, checks=(*task.checks, (sys.executable, "-c", require_both)))
+    keep = "\n\ndef test_keep():\n    assert second() == 2\n"
+    full = TEST + keep
+    rejected = full.replace("(1, 2)", "(0, 0)")
+    verification = runner.path / "independent"
+    verification.mkdir()
+    independent = FixtureRunner(verification)
+
+    def run(task, proposals):
+        gateway = FreeGateway(*proposals)
+        executor = PlainExecutor(
+            runner, gateway, Limits(model_requests=len(proposals)),
+            verification_runner=independent,
+        )
+        return solve(
+            executor, task, archive, _Budget(executor.limits, lambda: False, task), "fixture-version"
+        ), gateway
+
+    with pytest.raises(AttemptRejected, match="test_results"):
+        run(task, (rejected,))
+    if scenario == "projection_fails":
+        assert not saved
+        return
+    [(state, durable)] = saved
+    assert durable
+    seed = state.test_seed
+    assert seed.passing == ("test_keep",)
+    assert seed.omitted == ("test_results",)
+    assert "def test_keep" in seed.source
+    assert "def test_results" not in seed.source
+    assert not checkpoints
+
+    restored = SolverRecovery.from_data(state.to_data())
+    resumed = replace(task, solver_recovery=restored)
+    if scenario == "different_scope":
+        result, gateway = run(replace(resumed, checkpoint_scope="another-review"), (full,))
+        assert "test_keep" not in gateway.prompts[0]
+    else:
+        # An edited passing subset still lacks the omitted coverage.
+        subset_only = seed.source.replace("second() == 2", "2 == second()")
+        result, gateway = run(resumed, (subset_only, full))
+        assert len(gateway.prompts) == 2
+        assert "def test_keep" in gateway.prompts[0]
+        assert "test_results" in gateway.prompts[0]
+        assert "Correct the first result." in gateway.prompts[0]
+        assert "Correct the second result." in gateway.prompts[0]
+    assert b"def test_results()" in result.patch
+    assert b"def test_keep()" in result.patch
+    assert all(check.returncode == 0 for check in result.checks)
+
+
 @pytest.mark.parametrize(
     "tool_reply", ("valid", "extra", "duplicate", "unavailable", "empty", "failing_test"),
 )

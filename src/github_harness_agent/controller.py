@@ -226,13 +226,14 @@ def restore_solver_recovery(envelope, scope, head, parent):
 
 def _retired_draft_envelope(envelope):
     recovery = envelope.get("solver_recovery")
-    if not isinstance(recovery, dict) or "alternate" not in recovery:
+    private = {"alternate", "test_seed"}
+    if not isinstance(recovery, dict) or private.isdisjoint(recovery):
         return envelope
     retired = dict(envelope)
     retired.pop("solver_recovery")
     if recovery.get("goals"):
         retired["solver_recovery"] = {
-            key: value for key, value in recovery.items() if key != "alternate"
+            key: value for key, value in recovery.items() if key not in private
         }
     return retired
 

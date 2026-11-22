@@ -7,6 +7,8 @@ from dataclasses import dataclass
 RECOVERY_MODE_THRESHOLD = 2
 RECOVERY_GOAL_LIMIT = 24
 PRIVATE_PATCH_BYTES = 256 * 1024
+GENERATED_TEST_SEED_BYTES = 4096
+GENERATED_TEST_NAME = re.compile(r"test_[A-Za-z0-9_]{1,95}")
 
 
 @dataclass(frozen=True)
@@ -92,15 +94,58 @@ class PrivateRecovery:
 
 
 @dataclass(frozen=True)
+class GeneratedTestSeed:
+    """An independently verified incomplete test module for authoring prompts."""
+
+    source: str
+    passing: tuple[str, ...]
+    omitted: tuple[str, ...]
+
+    def to_data(self):
+        return {
+            "source": self.source,
+            "passing": list(self.passing),
+            "omitted": list(self.omitted),
+        }
+
+    @classmethod
+    def from_data(cls, data):
+        if not isinstance(data, dict):
+            raise ValueError("Invalid generated test seed")
+        source, passing, omitted = (
+            data.get(key) for key in ("source", "passing", "omitted")
+        )
+        if (
+            not isinstance(source, str)
+            or not 0 < len(source) <= GENERATED_TEST_SEED_BYTES
+            or len(source.encode("utf-8")) > GENERATED_TEST_SEED_BYTES
+            or not all(isinstance(names, list) and names for names in (passing, omitted))
+            or len(passing) + len(omitted) > RECOVERY_GOAL_LIMIT
+        ):
+            raise ValueError("Invalid generated test seed")
+        names = passing + omitted
+        if (
+            not all(isinstance(name, str) and GENERATED_TEST_NAME.fullmatch(name) for name in names)
+            or len(set(names)) != len(names)
+            or sum(map(len, names)) > 1200
+        ):
+            raise ValueError("Invalid generated test seed")
+        return cls(source, tuple(passing), tuple(omitted))
+
+
+@dataclass(frozen=True)
 class SolverRecovery:
     identity: str
     goals: tuple[tuple[str, int, int], ...]
     alternate: PrivateRecovery | None = None
+    test_seed: GeneratedTestSeed | None = None
 
     def to_data(self):
         data = {"identity": self.identity, "goals": [list(goal) for goal in self.goals]}
         if self.alternate is not None:
             data["alternate"] = self.alternate.to_data()
+        if self.test_seed is not None:
+            data["test_seed"] = self.test_seed.to_data()
         return data
 
     @classmethod
@@ -112,12 +157,16 @@ class SolverRecovery:
             alternate = PrivateRecovery.from_data(value.get("alternate"))
         except ValueError:
             alternate = None
+        try:
+            test_seed = GeneratedTestSeed.from_data(value.get("test_seed"))
+        except ValueError:
+            test_seed = None
         if (
             not isinstance(identity, str)
             or not re.fullmatch(r"[a-f0-9]{64}", identity)
             or not isinstance(goals, list)
             or len(goals) > RECOVERY_GOAL_LIMIT
-            or not (goals or alternate is not None)
+            or not (goals or alternate is not None or test_seed is not None)
         ):
             raise ValueError("Invalid solver recovery state")
         records = {}
@@ -141,6 +190,7 @@ class SolverRecovery:
             identity,
             tuple((key, *counts) for key, counts in records.items()),
             alternate,
+            test_seed,
         )
 
 
