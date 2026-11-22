@@ -33,6 +33,7 @@ from .review_definitions import CAUSAL_EDIT_GUIDANCE, DEFINITION_ENDING, LOCALIZ
 from .task_context import (
     MESSAGE_BYTES,
     compact_focused_review,
+    is_localized_review,
     compact_messages,
     wire_size,
 )
@@ -943,6 +944,13 @@ class ProviderRouter:
                         or route_messages
                     )
                     max_tokens = min(max_tokens, 2600)
+                if (
+                    groq_edit
+                    and is_localized_review(messages)
+                    and wire_size(route_messages) > _FOCUSED_RETRY_INPUT_BYTES
+                ):
+                    failures[route.alias] = "localized definition exceeds focused input limit"
+                    continue
                 payload = builder(route, route_messages, tools, max_tokens)
                 if role == "planning" and "chat_template_kwargs" in payload:
                     payload["chat_template_kwargs"].update(enable_thinking=True, medium_effort=True)

@@ -9,6 +9,7 @@ from typing import Any
 
 from .github import GitHubError, validate_repository
 from .review_definitions import DEFINITION_ENDING
+from .review_line_ranges import LINE_RANGE_ENDING
 
 MESSAGE_BYTES = 57344
 RETRY_MESSAGE_BYTES = 24576
@@ -465,12 +466,113 @@ def _whole_line_prefix(text, max_wire):
     return "".join(chunks)
 
 
+_LOCALIZED_BASELINE = (
+    "\nComplete pinned baseline definition (quoted read-only behavioral reference):\n"
+)
+_LOCALIZED_BASELINE_EXCERPT = (
+    "\nPinned baseline excerpt (quoted read-only behavioral reference):\n"
+)
+_LOCALIZED_FIXTURE = "\nFixture for this goal (quoted, read-only):\n"
+_LOCALIZED_FOCUS = "\nFocused source from "
+_LOCALIZED_FAILURE = "\nFailure details:\n"
+_LOCALIZED_CHECKOUT = "\nCurrent checkout:\n"
+_LOCALIZED_STRATEGY = "\nAdvisory strategy (quoted data; verify against the code): "
+_LOCALIZED_IMPORTS = "\nImported API declarations:\n"
+_LOCALIZED_NOTES = "\nReview notes (quoted):\n"
+_LOCALIZED_PASSING = "\nOperator pytest examples (quoted, read-only):\n"
+
+
+def is_localized_review(messages):
+    if [item.get("role") for item in messages] != ["system", "user"]:
+        return False
+    text = messages[1].get("content")
+    return (
+        isinstance(text, str)
+        and text.startswith("Selected failure: ")
+        and text.endswith((DEFINITION_ENDING, LINE_RANGE_ENDING))
+        and (_LOCALIZED_BASELINE in text or _LOCALIZED_BASELINE_EXCERPT in text)
+        and text.partition(_LOCALIZED_FOCUS)[2]
+        .partition("\n")[0]
+        .endswith((" (exact current definition):", " (numbered current definition)"))
+    )
+
+
+def _compact_localized_review(messages, max_bytes):
+    system, request = messages
+    text = request["content"]
+    header, _, source = text.partition(_LOCALIZED_FOCUS)
+    if (
+        source.count(_LOCALIZED_BASELINE) + source.count(_LOCALIZED_BASELINE_EXCERPT)
+        != 1
+    ):
+        return None
+    baseline_marker = (
+        _LOCALIZED_BASELINE_EXCERPT
+        if _LOCALIZED_BASELINE_EXCERPT in source
+        else _LOCALIZED_BASELINE
+    )
+    current, found_base, reference = source.partition(baseline_marker)
+    baseline, found_failure, detail = reference.partition(_LOCALIZED_FAILURE)
+    failure, found_fixture, fixture = detail.partition(_LOCALIZED_FIXTURE)
+    if not all((found_base, found_failure, found_fixture, current.strip())):
+        return None
+    checkout, found_checkout, footer = fixture.partition(_LOCALIZED_CHECKOUT)
+    if not found_checkout:
+        return None
+    fixture, _, context = checkout.partition(_LOCALIZED_IMPORTS)
+    imports, notes_marker, context = context.partition(_LOCALIZED_NOTES)
+    notes, passing_marker, passing = context.partition(_LOCALIZED_PASSING)
+    header, strategy_marker, strategy = header.partition(_LOCALIZED_STRATEGY)
+    # Keep a recognizable layout so budget-level compaction can be followed
+    # by a smaller provider-specific compaction without losing the method.
+    layout = (
+        (strategy_marker, strategy, 8),
+        (_LOCALIZED_BASELINE_EXCERPT, baseline, 10),
+        (_LOCALIZED_FAILURE, failure, 20),
+        (_LOCALIZED_FIXTURE, fixture, 25),
+        (_LOCALIZED_IMPORTS, imports, 2),
+        (_LOCALIZED_NOTES, notes if notes_marker else "", 10),
+        (_LOCALIZED_PASSING, passing if passing_marker else "", 25),
+    )
+
+    def payload(excerpts):
+        advisory, *evidence = excerpts
+        return [
+            system,
+            {
+                **request,
+                "content": (
+                    header
+                    + advisory
+                    + _LOCALIZED_FOCUS
+                    + current
+                    + "".join(evidence)
+                    + _LOCALIZED_CHECKOUT
+                    + footer
+                ),
+            },
+        ]
+
+    markers = [heading for heading, _, _ in layout]
+    spare = max_bytes - wire_size(payload(markers))
+    if spare < 0:
+        return None
+    excerpts = [
+        heading + _bounded_content(body, spare * share // 100)
+        for heading, body, share in layout
+    ]
+    compact = payload(excerpts)
+    return compact if wire_size(compact) <= max_bytes else None
+
+
 def compact_focused_review(messages, *, max_bytes):
     """Retain the active review goal and focused source while dropping bulk context."""
     if [item.get("role") for item in messages] != ["system", "user"] or wire_size(
         messages
     ) <= max_bytes:
         return None
+    if is_localized_review(messages):
+        return _compact_localized_review(messages, max_bytes)
     system, request = messages
     text = request.get("content")
     if not isinstance(text, str) or not text.startswith("Selected failure: "):
@@ -522,6 +624,8 @@ def compact_messages(
     """Keep a bounded prompt and a suffix of complete, unchanged tool turns."""
     if wire_size(messages) <= max_bytes:
         return list(messages)
+    if is_localized_review(messages):
+        return _compact_localized_review(messages, max_bytes) or list(messages)
 
     prefix = []
     index = 0

@@ -1408,3 +1408,95 @@ def test_pinned_local_compaction_keeps_reviewed_source_anchors(monkeypatch):
     mock_async_local(monkeypatch, local)
     route = ProviderRouter(load_manifest(), [pinned_local(local_input_bytes=12288)])
     assert route.complete(role="plain", messages=messages).route == "ollama-local"
+
+
+@pytest.mark.parametrize("named", [False, True])
+@pytest.mark.parametrize("backend", ["groq", "ollama"])
+@pytest.mark.parametrize("fits", [False, True])
+def test_gateway_compacts_localized_review_without_cutting_editable_method(
+    monkeypatch, named, backend, fits
+):
+    from github_harness_agent.review_definitions import DEFINITION_ENDING
+    from github_harness_agent.review_line_ranges import (
+        LINE_RANGE_ENDING,
+        line_range_prompt,
+        prepare_line_range_edit,
+    )
+    from github_harness_agent.task_context import compact_messages, wire_size
+
+    path = "module.py"
+    count = 160 if fits else 345
+    body = (
+        "def edit(items):\n"
+        + "".join(
+            f"    values_{index} = sum(items) + {index}\n" for index in range(count)
+        )
+        + f"    return values_{count - 1}\n"
+    )
+    snapshot = prepare_line_range_edit({path: body}, (path, "edit"))
+    current = (
+        f"{path}::edit (exact current definition):\n" + body
+        if named
+        else f"{path}::edit (numbered current definition)\n"
+        + line_range_prompt(snapshot)
+    )
+    ending = DEFINITION_ENDING if named else LINE_RANGE_ENDING
+    system = {"role": "system", "content": "Apply exactly the requested edit format."}
+    prompt = (
+        "Selected failure: tests/test_demo.py::test_missing\n"
+        'Advisory strategy (quoted data; verify against the code): "Compare dispatch."\n'
+        "Focused source from "
+        + current
+        + "\nComplete pinned baseline definition (quoted read-only behavioral reference):\n"
+        + body.replace("values_", "pinned_values_")
+        + "\nFailure details:\nKeyError during selected lookup\n"
+        "\nFixture for this goal (quoted, read-only):\ndef test_missing():\n    assert edit([1]) == 2\n"
+        "\nImported API declarations:\n"
+        "\nReview notes (quoted):\nMaintain public validation.\n"
+        "\nOperator pytest examples (quoted, read-only):\n"
+        "test_existing: edit([2, 3]) -> result == 6\n"
+        "test_priority: edit([5, 6]) -> result == 12\n"
+        "\nCurrent checkout:\nPreserve both cases.\n" + ending
+    )
+    messages = [system, {"role": "user", "content": prompt}]
+    calls = []
+
+    def handle(request):
+        if request.method == "GET":
+            return httpx.Response(200, json=local_inventory())
+        calls.append(json.loads(request.content))
+        return httpx.Response(200, json=openai_response())
+
+    if backend == "groq":
+        router = routed(deployment(GROQ), handle)
+    else:
+
+        async def local_handle(request):
+            return handle(request)
+
+        mock_async_local(monkeypatch, local_handle)
+        router = routed([pinned_local(local_input_bytes=12 * 1024)], handle)
+    assert wire_size(messages) > 12 * 1024
+    if not fits:
+        with pytest.raises(ProviderExhausted):
+            router.complete(role="coding", messages=messages, max_output_tokens=3072)
+        assert calls == []
+        return
+    intermediate = compact_messages(messages, max_bytes=14 * 1024, role="coding")
+    assert wire_size(intermediate) <= 14 * 1024
+    assert current in intermediate[1]["content"]
+    router.complete(role="coding", messages=intermediate, max_output_tokens=3072)
+    assert len(calls) == 1
+    sent = calls[0]["messages"]
+    assert wire_size(sent) <= 12 * 1024
+    assert sent[0] == system
+    text = sent[1]["content"]
+    assert current in text
+    assert text.startswith("Selected failure: tests/test_demo.py::test_missing")
+    assert text.endswith(ending)
+    assert "KeyError during selected lookup" in text
+    assert "assert edit([1]) == 2" in text
+    assert "test_existing: edit([2, 3]) -> result == 6" in text
+    assert "test_priority: edit([5, 6]) -> result == 12" in text
+    assert "Compare dispatch" in text
+    assert body.replace("values_", "pinned_values_") not in text
