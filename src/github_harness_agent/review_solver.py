@@ -31,11 +31,17 @@ from .executor import (
 from .providers import ProviderExhausted
 from .review_assertions import assertion_progress, operator_assertions
 from .review_prefix_replay import observe_prefix_progress
-from .review_definitions import DEFINITION_ENDING, DEFINITION_FORMAT, apply_definitions
+from .review_definitions import (
+    DEFINITION_ENDING,
+    DEFINITION_FORMAT,
+    NATIVE_DEFINITION_TOOL,
+    apply_definitions,
+    apply_native_definition,
+)
 from .review_planner import plan_coding_messages
 from .review_recovery import operator_acceptance_context
 from .review_solver_context import focused_check_excerpt, focused_source_excerpt
-from .task_context import excerpt
+from .task_context import compact_focused_review, excerpt
 from .test_updates import has_runnable_test
 
 _LOG = logging.getLogger(__name__)
@@ -563,16 +569,51 @@ def _finish_review(executor, task, archive, budget, patch, actor, version):
     )
 
 
-def _coding_completion(executor, budget, messages, route, planner_input):
+def _coding_completion(
+    executor, budget, messages, route, planner_input, native_source=None
+):
+    if native_source is not None:
+        focused = compact_focused_review(messages, max_bytes=12 * 1024) or messages
+        request = focused[-1]["content"].removesuffix(DEFINITION_ENDING)
+        native_messages = [
+            {
+                "role": "system",
+                "content": _SYSTEM_PREFIX
+                + "Call replace_python_definition exactly once with one complete existing function or method.\n"
+                + _SYSTEM_SUFFIX,
+            },
+            {
+                "role": "user",
+                "content": request + "Use the native definition replacement tool only.",
+            },
+        ]
+        try:
+            completion = budget.complete(
+                executor.gateway,
+                "coding",
+                native_messages,
+                (NATIVE_DEFINITION_TOOL,),
+                after_provider=route,
+                max_output_tokens=2048,
+                retry_oversize=False,
+            )
+            candidate = apply_native_definition(completion.tool_calls, native_source)
+        except (ProviderExhausted, ValueError):
+            # The reserved text request is still usable with providers that cannot
+            # return a valid structured edit for this goal.
+            pass
+        else:
+            return completion, candidate
     if planner_input is not None:
         messages = plan_coding_messages(executor, budget, messages, *planner_input)
-    return budget.complete(
+    completion = budget.complete(
         executor.gateway,
         "coding",
         messages,
         after_provider=route,
         max_output_tokens=3072,
     )
+    return completion, None
 
 
 def _recovery_digest(task, fixtures, patch):
@@ -724,6 +765,8 @@ def solve(executor, task, archive, budget, version):
     last_routes = {}
     attempts = {}
     malformed = {}
+    native_ready = set()
+    native_attempted = set()
     no_progress = {}
     retained_failures = failures
     retained_identity = _recovery_digest(task, fixtures, patch)
@@ -844,8 +887,19 @@ def solve(executor, task, archive, budget, version):
                         target in failures
                         and malformed.get(target, 0) >= RECOVERY_MODE_THRESHOLD
                         # Import blocks cannot be replaced by naming a definition.
-                        and (not check_command or check_label(check_command, ()) != "ruff")
+                        and (
+                            not check_command
+                            or check_label(check_command, ()) != "ruff"
+                        )
                     )
+                    native = (
+                        named_definitions
+                        and target in native_ready
+                        and target not in native_attempted
+                        and launch_budget >= 2
+                    )
+                    if native:
+                        native_attempted.add(target)
                     messages = _proposal_messages(
                         target,
                         source,
@@ -866,6 +920,7 @@ def solve(executor, task, archive, budget, version):
                     planner_input = None
                     if (
                         target in operator
+                        and not native
                         and target not in planned
                         and no_progress.get(target, 0) >= RECOVERY_MODE_THRESHOLD
                         and continuation is None
@@ -882,6 +937,7 @@ def solve(executor, task, archive, budget, version):
                         messages,
                         last_routes.get(target),
                         planner_input,
+                        source if native else None,
                     )
                     pending[future] = (
                         target,
@@ -890,7 +946,7 @@ def solve(executor, task, archive, budget, version):
                         named_definitions,
                         planner_input is not None,
                     )
-                    cost = 2 if planner_input is not None else 1
+                    cost = 2 if native or planner_input is not None else 1
                     submitted += cost
                     launch_budget -= cost
             if not pending:
@@ -912,14 +968,18 @@ def solve(executor, task, archive, budget, version):
             if (continuation is not None or advised) and snapshot is not current:
                 continue
             try:
-                completion = future.result()
+                completion, native_candidate = future.result()
             except ProviderExhausted as error:
                 unavailable[target] = error
                 continue
             except _RequestBudgetExceeded:
                 continue
+            if native_candidate is not None:
+                submitted -= 1  # The reserved text fallback was unused.
             unavailable.clear()
             if ready:
+                continue
+            if native_candidate is not None and snapshot is not current:
                 continue
             last_routes[target] = completion.route
             editor = RouteEvidence.from_completion(completion)
@@ -928,14 +988,21 @@ def solve(executor, task, archive, budget, version):
                 if target == _TEST_GOAL:
                     source = {new_path: test_draft}
                 try:
-                    candidate = (
-                        apply_definitions(completion.content, source)
-                        if named_definitions
-                        else apply_blocks(completion.content, source, new_path)
-                    )
+                    candidate = native_candidate
+                    if candidate is None:
+                        candidate = (
+                            apply_definitions(completion.content, source)
+                            if named_definitions
+                            else apply_blocks(completion.content, source, new_path)
+                        )
                 except ValueError:
-                    if target in failures and check_label(commands[target[0]], ()) != "ruff":
+                    if (
+                        target in failures
+                        and check_label(commands[target[0]], ()) != "ruff"
+                    ):
                         count_recovery(malformed, target)
+                        if named_definitions:
+                            native_ready.add(target)
                     raise
                 if target == _TEST_GOAL:
                     candidate = {**current, **candidate}
@@ -1044,6 +1111,7 @@ def solve(executor, task, archive, budget, version):
             if prefix_progress:
                 notes[target] = prefix_progress
             malformed.pop(target, None)
+            native_ready.discard(target)
             no_progress.pop(target, None)
             if not failures and (
                 not task.require_new_tests
@@ -1060,6 +1128,7 @@ def solve(executor, task, archive, budget, version):
             budget.remaining()
             # A new durable draft retires the earlier draft's recovery metadata.
             malformed.clear()
+            native_ready.clear()
             no_progress.clear()
             retained_failures = failures
             retained_identity = _recovery_digest(task, fixtures, patch)

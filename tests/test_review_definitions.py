@@ -1,6 +1,11 @@
+import json
+
 import pytest
 
-from github_harness_agent.review_definitions import apply_definitions
+from github_harness_agent.review_definitions import (
+    apply_definitions,
+    apply_native_definition,
+)
 from github_harness_agent.task_context import compact_focused_review
 
 
@@ -27,6 +32,33 @@ import json
     assert result["module.py"] == original["module.py"].replace(
         "\n\nclass", "\nimport json\n\nclass"
     ).replace("return raw", "return json.loads(raw)")
+
+
+@pytest.mark.parametrize(
+    "invalid", ["multiple", "duplicate", "extra", "wrong_definition"]
+)
+def test_native_replacement_rejects_ambiguous_or_unscoped_arguments(invalid):
+    code = {"module.py": "def decode(raw):\n    return raw\n"}
+    args = {
+        "path": "module.py",
+        "symbol": "decode",
+        "definition": "def decode(raw): return raw.strip()",
+    }
+    if invalid == "extra":
+        args["command"] = "anything"
+    if invalid == "wrong_definition":
+        args["definition"] = "def other(raw): return raw.strip()"
+    serialized = json.dumps(args)
+    if invalid == "duplicate":
+        serialized = serialized[:-1] + ', "path": "module.py"}'
+    call = {
+        "type": "function",
+        "function": {"name": "replace_python_definition", "arguments": serialized},
+    }
+    calls = (call, call) if invalid == "multiple" else (call,)
+    with pytest.raises(ValueError):
+        apply_native_definition(calls, code)
+    assert code["module.py"] == "def decode(raw):\n    return raw\n"
 
 
 def test_bare_fenced_definition_is_bound_to_one_existing_owner():

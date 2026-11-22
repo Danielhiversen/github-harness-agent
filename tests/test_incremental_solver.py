@@ -1,3 +1,4 @@
+import json
 import sys
 import tarfile
 from pathlib import Path
@@ -555,6 +556,91 @@ def test_solver_checkpoints_later_straight_line_assertion_only(
         assert len(checkpoints) == 1
         assert b"+    return 1\n" in checkpoints[0].patch
         assert b"+    return 2\n" not in checkpoints[0].patch
+
+
+@pytest.mark.parametrize("native_failure", [None, "exhausted", "out_of_scope"])
+def test_solver_tries_one_native_edit_then_keeps_text_fallback(
+    solver_case, native_failure
+):
+    from github_harness_agent.providers import ProviderExhausted
+
+    task, archive, runner, _ = solver_case
+    Path(task.pull_checks[0][-1]).write_text(
+        "from fixture_calc import first\n\ndef test_one():\n    assert first() == 1\n"
+    )
+    task = replace(task, require_new_tests=False)
+    calls = []
+    replacement = "def first():\n    return 1\n"
+
+    class Gateway(FreeGateway):
+        def complete(
+            self,
+            *,
+            role,
+            messages,
+            tools,
+            timeout,
+            after_provider=None,
+            max_output_tokens=None,
+        ):
+            calls.append(bool(tools))
+            if not tools:
+                return super().complete(
+                    role=role,
+                    messages=messages,
+                    tools=tools,
+                    timeout=timeout,
+                    after_provider=after_provider,
+                    max_output_tokens=max_output_tokens,
+                )
+            assert max_output_tokens == 2048
+            assert len(tools) == 1
+            function = tools[0]["function"]["name"]
+            assert function == "replace_python_definition"
+            if native_failure == "exhausted":
+                raise ProviderExhausted(None, {"fixture": "tool unavailable"})
+            payload = {
+                "path": "outside.py" if native_failure else SOURCE,
+                "symbol": "first",
+                "definition": replacement,
+            }
+            return SimpleNamespace(
+                content=None,
+                role=role,
+                route="native-free",
+                model="fixture-native",
+                configured_model="stand-in/native",
+                usage={},
+                tool_calls=(
+                    {
+                        "type": "function",
+                        "id": "call-1",
+                        "function": {
+                            "name": function,
+                            "arguments": json.dumps(payload),
+                        },
+                    },
+                ),
+            )
+
+    gateway = Gateway(
+        "prose",
+        "still prose",
+        "invalid named reply",
+        f"REPLACE {SOURCE}::first\n{replacement}",
+    )
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=5, concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+    result = solve(executor, task, archive, budget, "fixture-version")
+
+    assert b"+    return 1\n" in result.patch
+    assert all(check.returncode == 0 for check in result.checks)
+    assert calls == [False, False, False, True] + ([False] if native_failure else [])
+    assert result.route_trace[-1].route == (
+        "stand-in-free" if native_failure else "native-free"
+    )
 
 
 def test_solver_offers_named_definitions_only_after_repeated_malformed_edits(

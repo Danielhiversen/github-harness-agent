@@ -1,6 +1,7 @@
 """Apply bounded, atomic replacements of named existing Python definitions."""
 
 import ast
+import json
 import re
 import textwrap
 from collections import defaultdict
@@ -13,6 +14,33 @@ Then include the complete replacement definition, optionally in a Python code fe
 For a module-level symbol, use relative/path.py::function. Keep the same name and kind.
 Optionally add imports separately with IMPORTS relative/path.py and raw import statements.
 Both methods and functions may be unindented. Keep unrelated code and preserve behavior."""
+
+NATIVE_DEFINITION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "replace_python_definition",
+        "description": "Replace one existing Python function or method by exact path and qualified name.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Exact editable relative Python path.",
+                },
+                "symbol": {
+                    "type": "string",
+                    "description": "Existing function name or Class.method.",
+                },
+                "definition": {
+                    "type": "string",
+                    "description": "Complete replacement Python definition.",
+                },
+            },
+            "required": ["path", "symbol", "definition"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 _DEF = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 _IMPORT = (ast.Import, ast.ImportFrom)
@@ -118,15 +146,7 @@ def _import_index(module):
     return index
 
 
-def apply_definitions(response, sources):
-    """Return a fresh source mapping or reject the proposal without partial edits."""
-    if (
-        not isinstance(response, str)
-        or not response.strip()
-        or len(response.encode()) > 80_000
-    ):
-        raise ValueError("Definition response is empty or exceeds the edit limit")
-    text = _unfence(response.replace("\r\n", "\n"))
+def _documents(sources):
     documents = {}
     for path, source in sources.items():
         parts = PurePosixPath(path)
@@ -139,10 +159,74 @@ def apply_definitions(response, sources):
             module = _parse(source, path)
             if module.body:
                 documents[path] = module
+    return documents
 
+
+def apply_definitions(response, sources):
+    """Return a fresh source mapping or reject the proposal without partial edits."""
+    if (
+        not isinstance(response, str)
+        or not response.strip()
+        or len(response.encode()) > 80_000
+    ):
+        raise ValueError("Definition response is empty or exceeds the edit limit")
+    text = _unfence(response.replace("\r\n", "\n"))
+    documents = _documents(sources)
+    return _apply_definition_edits(sources, documents, _edits(text, documents))
+
+
+def _unique_object(pairs):
+    value = dict(pairs)
+    if len(value) != len(pairs):
+        raise ValueError("Duplicate native edit argument")
+    return value
+
+
+def apply_native_definition(calls, sources):
+    """Validate a single native function call against the supplied source snapshot."""
+    try:
+        if len(calls) != 1:
+            raise ValueError
+        function = calls[0]["function"]
+        if (
+            calls[0]["type"] != "function"
+            or function["name"] != "replace_python_definition"
+        ):
+            raise ValueError
+        arguments = function["arguments"]
+        if not isinstance(arguments, str) or len(arguments.encode()) > 16_384:
+            raise ValueError
+        edit = json.loads(arguments, object_pairs_hook=_unique_object)
+        if type(edit) is not dict or edit.keys() != {"path", "symbol", "definition"}:
+            raise ValueError
+        if not all(isinstance(value, str) for value in edit.values()):
+            raise ValueError
+        path, symbol, body = (edit[key] for key in ("path", "symbol", "definition"))
+        if (
+            not _HEADER.fullmatch(f"REPLACE {path}::{symbol}")
+            or len(body.encode()) > 10_240
+        ):
+            raise ValueError
+    except (IndexError, KeyError, TypeError, ValueError, RecursionError):
+        raise ValueError("Expected one valid native definition replacement") from None
+
+    body = _unfence(body.replace("\r\n", "\n"))
+    documents = _documents(sources)
+    current = documents.get(path)
+    if current is None or not any(
+        name == symbol and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for name, node in _symbols(current.body)
+    ):
+        raise ValueError(
+            "Native edit must name an existing function in the editable source list"
+        )
+    return _apply_definition_edits(sources, documents, ((path, symbol, body),))
+
+
+def _apply_definition_edits(sources, documents, replacements):
     edits = defaultdict(list)
     added_imports = defaultdict(dict)
-    for path, name, body in _edits(text, documents):
+    for path, name, body in replacements:
         if path not in documents:
             raise ValueError("File is outside the editable Python source list")
         module = documents[path]
