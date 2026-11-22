@@ -7,8 +7,10 @@ from io import BytesIO
 from threading import Event
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from test_executor import FixtureRunner
+from test_providers import KILO, OLLAMA, OPENROUTER, OPENROUTER_SIBLING, deployment, routed
 
 from github_harness_agent import review_recovery
 from github_harness_agent.checkpoint import DraftCheckpoint
@@ -57,6 +59,7 @@ class FreeGateway:
         messages,
         tools,
         timeout,
+        exclude=(),
         after_provider=None,
         max_output_tokens=None,
     ):
@@ -206,6 +209,93 @@ def test_ruff_goal_keeps_search_replace_after_malformed_proposals(
         prompt.endswith("Respond with exact SEARCH/REPLACE blocks only.")
         for prompt in gateway.prompts
     )
+
+
+def _proposal_router(models, proposals, attempts):
+    config = deployment(*models)
+    for priority, route in enumerate(reversed(config), start=1):
+        route["quality_priority"] = priority
+        if route["model"] == OPENROUTER_SIBLING:
+            route["url"] = "https://openrouter-free.example.invalid"
+
+    def upstream(request):
+        model = json.loads(request.content)["model"]
+        assert model != OLLAMA.split("/", 1)[1], "Durable exclusion was ignored"
+        attempts.append(model)
+        return httpx.Response(
+            200,
+            json={
+                "model": "provider-reported-model",
+                "choices": [{"message": {"content": next(proposals)}}],
+            },
+        )
+
+    return routed(config, upstream)
+
+
+def test_solver_rotates_exact_models_until_verified_progress(solver_case, monkeypatch):
+    task, archive, runner, checkpoints = solver_case
+    task = replace(
+        task,
+        checks=(("ruff", "check", "."), ("ruff", "check", "--select", "F401", ".")),
+        excluded_models=(tuple(OLLAMA.split("/", 1)),),
+    )
+    lint = {(1, "check 2 (exit 1)"): "Imports unsorted"}
+
+    def verify(executor, task, archive, budget, patch, commands, *, pytest_runs=None):
+        if b"+    return 1\n" in patch:
+            return lint
+        return {**lint, (2, "check 3 (exit 1)"): "Unused import"}
+
+    monkeypatch.setattr("github_harness_agent.review_solver.evidence", verify)
+    attempts = []
+    stalled = edit(SOURCE, "    return -1\n", "    return -3\n")
+    gateway = _proposal_router(
+        (OLLAMA, OPENROUTER, OPENROUTER_SIBLING, KILO),
+        iter((
+            "malformed", "malformed", stalled, "malformed", stalled,
+            "malformed", "malformed", "malformed", FIRST, "malformed",
+        )),
+        attempts,
+    )
+    executor = PlainExecutor(runner, gateway, Limits(model_requests=10, concurrent_probes=1))
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    with pytest.raises(ReviewRoundExhausted):
+        solve(executor, task, archive, budget, "fixture-version")
+
+    assert attempts == [
+        model.split("/", 1)[1]
+        for model in (
+            OPENROUTER, OPENROUTER, KILO, KILO, OPENROUTER, OPENROUTER,
+            KILO, KILO, OPENROUTER_SIBLING, OPENROUTER,
+        )
+    ]
+    assert len(checkpoints) == 1
+    assert checkpoints[0].last_editor == tuple(OPENROUTER_SIBLING.split("/", 1))
+
+
+def test_solver_reenables_sole_model_once_when_rotation_exhausts(solver_case, monkeypatch):
+    task, archive, runner, _ = solver_case
+    task = replace(
+        task,
+        checks=(("ruff", "check", "."),),
+        excluded_models=(tuple(OLLAMA.split("/", 1)),),
+    )
+    monkeypatch.setattr(
+        "github_harness_agent.review_solver.evidence",
+        lambda *args, pytest_runs=None: {(1, "check 2 (exit 1)"): "Imports unsorted"},
+    )
+    attempts = []
+    gateway = _proposal_router((OLLAMA, OPENROUTER), iter(["malformed"] * 7), attempts)
+    executor = PlainExecutor(runner, gateway, Limits(model_requests=7, concurrent_probes=1))
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    with pytest.raises(AttemptRejected):
+        solve(executor, task, archive, budget, "fixture-version")
+
+    assert attempts == [OPENROUTER.split("/", 1)[1]] * 6
+    assert budget.model_requests_remaining() == 0
 
 
 def test_assertion_progress_rejects_regressions_and_untrusted_locations():

@@ -343,15 +343,15 @@ class _Budget:
         messages,
         tools=(),
         *,
+        exclude=(),
         after_provider=None,
         retry_oversize=True,
         review_windows=False,
         max_output_tokens=None,
         timeout_cap=None,
     ):
-        options = (
-            {"exclude": self.task.excluded_models} if self.task.excluded_models else {}
-        )
+        excluded_models = tuple(dict.fromkeys((*self.task.excluded_models, *exclude)))
+        options = {"exclude": excluded_models} if excluded_models else {}
         if after_provider:
             options["after_provider"] = after_provider
         elif self.task.provider_offset:

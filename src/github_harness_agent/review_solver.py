@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import re
+from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 
@@ -81,6 +82,7 @@ _PYTEST_SECTION = re.compile(r"^={5,} ([^\n]+?) ={5,}$", re.M)
 _PYTEST_CRASH_LINE = re.compile(r"^\S[^\n]*?\.py:[1-9][0-9]*: .+$")
 _PYTEST_TOTALS = re.compile(r"(?:\d+ [a-z]+, )*\d+ [a-z]+ in \d+(?:\.\d+)?s(?: \([\d:]+\))?")
 _STOCK_REPAIR_CASE_LIMIT = 4
+_MODEL_FAILURE_THRESHOLD = 2
 _WORD = re.compile(r"[a-z]{3,}")
 _STOP = set(
     "self test check review request fixture calls builder return catalog assert tests with this from that they when have with which should".split()
@@ -638,7 +640,15 @@ def _finish_review(executor, task, archive, budget, patch, actor, version):
 
 
 def _coding_completion(
-    executor, budget, messages, route, planner_input, native_source=None, advice=None
+    executor,
+    budget,
+    messages,
+    route,
+    planner_input,
+    native_source=None,
+    advice=None,
+    *,
+    exclude=(),
 ):
     fresh_advice = None
     if planner_input is not None:
@@ -684,6 +694,7 @@ def _coding_completion(
         executor.gateway,
         "coding",
         messages,
+        exclude=exclude,
         after_provider=route,
         max_output_tokens=(
             6144 if messages[-1]["content"].endswith(DEFINITION_ENDING) else 3072
@@ -962,6 +973,8 @@ def solve(executor, task, archive, budget, version):
     notes = {}
     rejected = {}
     last_routes = {}
+    # None marks a goal and text format whose alternate routes were exhausted.
+    model_failures = {}
     attempts = {}
     malformed = {}
     native_ready = set()
@@ -1006,6 +1019,11 @@ def solve(executor, task, archive, budget, version):
             # Persist mode changes before the worker can lose its lease. Shorter
             # attempts and verified checkpoint writes coalesce other updates.
             retain_recovery(durable=True)
+
+    def count_model_failure(rotation_key, snapshot, editor):
+        counts = model_failures.get(rotation_key)
+        if counts is not None and snapshot is current and editor.configured_model:
+            counts[editor.route, editor.configured_model] += 1
 
     planning_attempts = {}
     retry_advice = {}
@@ -1203,6 +1221,23 @@ def solve(executor, task, archive, budget, version):
                         )
                         planner_input = source, fixture, diagnostics[target], mock_detail
                         planning_attempts[target] = plan_count + 1, attempts[target]
+                    rotation_key = None
+                    exclude = ()
+                    if (
+                        target != _TEST_GOAL
+                        and continuation is None
+                        and repair is None
+                        and planner_input is None
+                        and advice is None
+                        and not native
+                    ):
+                        rotation_key = (target, named_definitions)
+                        counts = model_failures.setdefault(rotation_key, Counter())
+                        if counts is not None:
+                            exclude = tuple(
+                                model for model, count in counts.items()
+                                if count >= _MODEL_FAILURE_THRESHOLD
+                            )
                     future = pool.submit(
                         _coding_completion,
                         executor,
@@ -1212,6 +1247,7 @@ def solve(executor, task, archive, budget, version):
                         planner_input,
                         source if native else None,
                         advice,
+                        exclude=exclude,
                     )
                     pending[future] = (
                         target,
@@ -1219,6 +1255,7 @@ def solve(executor, task, archive, budget, version):
                         continuation,
                         named_definitions,
                         planner_input is not None or advice is not None,
+                        (rotation_key, bool(exclude)),
                         repair,
                     )
                     cost = 2 if native or planner_input is not None else 1
@@ -1237,9 +1274,15 @@ def solve(executor, task, archive, budget, version):
             if not done:
                 continue
             future = next(future for future in pending if future in done)
-            target, snapshot, continuation, named_definitions, advised, repair = (
-                pending.pop(future)
-            )
+            (
+                target,
+                snapshot,
+                continuation,
+                named_definitions,
+                advised,
+                (rotation_key, rotated),
+                repair,
+            ) = pending.pop(future)
             if (
                 continuation is not None or advised or repair is not None
             ) and snapshot is not current:
@@ -1247,7 +1290,12 @@ def solve(executor, task, archive, budget, version):
             try:
                 completion, native_candidate, fresh_advice = future.result()
             except ProviderExhausted as error:
-                if repair is None:
+                if rotated:
+                    if snapshot is current:
+                        # Reopen this goal's model choices for the rest of this draft.
+                        # The next proposal uses the normal request budget and task exclusions.
+                        model_failures[rotation_key] = None
+                elif repair is None:
                     unavailable[target] = error
                 continue
             except _RequestBudgetExceeded:
@@ -1276,6 +1324,7 @@ def solve(executor, task, archive, budget, version):
                             else apply_blocks(completion.content, source, new_path)
                         )
                 except ValueError:
+                    count_model_failure(rotation_key, snapshot, editor)
                     if fresh_advice is not None:
                         retry_advice[target] = fresh_advice
                     if (
@@ -1460,6 +1509,7 @@ def solve(executor, task, archive, budget, version):
                 or stale_regression
                 or not (progressed or partial or prefix_progress)
             ):
+                count_model_failure(rotation_key, snapshot, editor)
                 if snapshot is current and (
                     (target in old_operator and "::" in target[1])
                     or (
@@ -1498,6 +1548,7 @@ def solve(executor, task, archive, budget, version):
             repair_attempted.clear()
             rejected.clear()
             planning_attempts.clear()
+            model_failures.clear()
             retry_advice.clear()
             mock_diagnostics.clear()
             last_routes.pop(target, None)
