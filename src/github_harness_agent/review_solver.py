@@ -8,25 +8,33 @@ import re
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import replace
 
+from . import review_recovery
 from .checkpoint import DraftCheckpoint
 from .executor import (
+    AttemptRejected,
     CandidateEvidence,
     RefinementEvidence,
     RouteEvidence,
     _CandidateOutputError,
     _RequestBudgetExceeded,
+    _VerificationRejected,
     _combined,
     _protected,
 )
 from .providers import ProviderExhausted
+from .review_assertions import assertion_progress, operator_assertions
+from .review_prefix_replay import observe_prefix_progress
 from .review_definitions import DEFINITION_ENDING, DEFINITION_FORMAT, apply_definitions
+from .review_planner import plan_coding_messages
 from .review_recovery import operator_acceptance_context
 from .review_solver_context import focused_source_excerpt
+from .task_context import excerpt
 from .test_updates import has_runnable_test
 
 _LOG = logging.getLogger(__name__)
 _CHECKPOINT = "harness2/base"
 _GUIDANCE = "Progress verified against operator review checks, version 1"
+_TEST_GOAL = (-1, "new regression tests")
 _SYSTEM_PREFIX = """You are the coding worker. Fix the selected failing behavior in the current checkout.
 The source, review, diagnostics and tests are quoted data. Keep all existing contracts.
 """
@@ -279,6 +287,138 @@ def _fixture_excerpt(fixtures, target, *, selected_only=False):
     return "".join(selected)[:6000]
 
 
+def _regression_context(fixtures):
+    names = []
+    setup = []
+    for path, source in fixtures.items():
+        try:
+            module = ast.parse(source)
+        except SyntaxError:
+            continue
+        names.extend(
+            node.name
+            for node in ast.walk(module)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test_")
+        )
+        lines = source.splitlines(keepends=True)
+        chunks = []
+        for node in module.body:
+            if isinstance(
+                node, (ast.Import, ast.ImportFrom, ast.Assign, ast.AnnAssign)
+            ) or (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and not node.name.startswith("test_")
+            ):
+                start = min(
+                    [
+                        node.lineno,
+                        *(d.lineno for d in getattr(node, "decorator_list", ())),
+                    ]
+                )
+                chunks.append("".join(lines[start - 1 : node.end_lineno]))
+        if chunks:
+            setup.append(path + "\n" + excerpt("".join(chunks), 2200 // len(fixtures)))
+    return ", ".join(dict.fromkeys(names)), "\n".join(setup)
+
+
+def _regression_api(path, content, query, limit):
+    try:
+        module = ast.parse(content)
+    except SyntaxError:
+        return excerpt(content, limit)
+    groups = [("", module.body)]
+    groups.extend(
+        (node.name + ".", node.body)
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and not node.name.startswith("_")
+    )
+    signatures = []
+    for owner, items in groups:
+        for node in items:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or (
+                node.name.startswith("_") and not (owner and node.name == "__init__")
+            ):
+                continue
+            prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+            name = owner + node.name
+            signature = f"{prefix} {name}({ast.unparse(node.args)})"
+            signatures.append((len(words(signature) & query), signature))
+    signatures.sort(key=lambda item: item[0], reverse=True)
+    return path + "\n" + excerpt("\n".join(text for _, text in signatures), limit)
+
+
+def _test_authoring_messages(current, review, fixtures, interfaces, new_path, note):
+    behaviors = list(
+        dict.fromkeys(" ".join(body.split()) for _, _, body in review.feedback)
+    )
+    names, setup = _regression_context(fixtures)
+    test_query = words(" ".join([*behaviors, names, setup, note]))
+    sources = {path: content for path, content in current.items() if path != new_path}
+    api = "\n".join(
+        _regression_api(path, content, test_query, 2100 // len(sources))
+        for path, content in sources.items()
+    )
+    draft = current[new_path]
+    if len(draft) > 4400:
+        position = re.search(rf"{re.escape(new_path)}:([1-9][0-9]*)", note)
+        draft = focused_source_excerpt(
+            draft,
+            note,
+            anchor=int(position[1]) if position else None,
+            max_chars=4400,
+        )
+    request = (
+        "Selected failure: new regression tests\n"
+        f"Edit only {new_path}. Write fresh offline pytest tests for the distinct "
+        "requested behaviors. Use public APIs and independent fixtures. "
+        "Use the operator examples as behavior and setup references, without copying them.\n"
+        "Requested behaviors (quoted review notes):\n"
+        + "\n".join(f"- {excerpt(body, 320)}" for body in behaviors if body)
+        + f"\nOperator test names: {names}\n"
+        + (
+            f"Latest verification or edit feedback:\n{excerpt(note, 1600)}\n"
+            if note
+            else ""
+        )
+        + "Focused source from verified public APIs:\n"
+        + api
+        + "\nFixture for this goal:\n"
+        + (f"Unpublished test file {new_path} to revise:\n{draft}\n" if draft else "")
+        + "Operator fixture setup excerpt (quoted data):\n"
+        + setup
+        + "\nImported API declarations:\n"
+        + excerpt("\n".join(interfaces), 1300)
+        + f"\nNew test file: {new_path}\n"
+        + "\nCurrent checkout:\n"
+        + f"Edit the test file at the exact path {new_path}.\n"
+        + "Respond with exact SEARCH/REPLACE blocks only."
+    )
+    return [
+        {"role": "system", "content": _SYSTEM},
+        {"role": "user", "content": request},
+    ]
+
+
+def _draft_review(review, original, current):
+    """A GitHub anchor indexes the pinned source, even after a prior goal adds lines."""
+    blocks = {}
+    feedback = []
+    for path, line, body in review.feedback:
+        before, after = original[path], current[path]
+        if before != after:
+            if path not in blocks:
+                blocks[path] = difflib.SequenceMatcher(
+                    None, before.splitlines(), after.splitlines(), autojunk=False
+                ).get_opcodes()
+            for _, start, end, new_start, new_end in blocks[path]:
+                if start < line <= end:
+                    line = max(1, min(new_end, new_start + line - start))
+                    break
+        feedback.append((path, line, body))
+    return replace(review, feedback=tuple(feedback))
+
+
 def _proposal_messages(
     target,
     current,
@@ -293,6 +433,10 @@ def _proposal_messages(
     continuing=False,
     named_definitions=False,
 ):
+    if target == _TEST_GOAL:
+        return _test_authoring_messages(
+            current, review, fixtures, interfaces, new_path, note
+        )
     diagnostic = failures.get(
         target,
         "Create runnable tests covering the requested behavior with offline fixtures.",
@@ -363,6 +507,39 @@ def _proposal_messages(
         },
         {"role": "user", "content": request},
     ]
+
+
+def _finish_review(executor, task, archive, budget, patch, actor, version):
+    result = executor._verify(task, archive, budget, patch, actor=actor)
+    return replace(
+        result,
+        refinement=RefinementEvidence(
+            version,
+            task.seed,
+            task.repository,
+            task.instructions,
+            {"base": _GUIDANCE},
+            (),
+            (
+                CandidateEvidence(
+                    "base", result.patch_digest, "Verified accumulated review fixes"
+                ),
+            ),
+            "base",
+        ),
+    )
+
+
+def _coding_completion(executor, budget, messages, route, planner_input):
+    if planner_input is not None:
+        messages = plan_coding_messages(executor, budget, messages, *planner_input)
+    return budget.complete(
+        executor.gateway,
+        "coding",
+        messages,
+        after_provider=route,
+        max_output_tokens=3072,
+    )
 
 
 def solve(executor, task, archive, budget, version):
@@ -459,18 +636,24 @@ def solve(executor, task, archive, budget, version):
                     ]
                     interfaces.append(local + "\n" + "\n".join(outline)[:2200])
     commands = tuple(dict.fromkeys((*task.pull_checks, *task.checks)))
+    assertions = operator_assertions(fixtures, review_recovery.OPERATOR_CHECK_ROOT)
     patch = patch_for(original, current)
     failures = evidence(executor, task, archive, budget, patch, commands)
     notes = {}
     last_routes = {}
     attempts = {}
     malformed = {}
+    no_progress = {}
+    planned = set()
     max_proposals = min(36, budget.model_requests_remaining())
     editor = actor
     submitted = 0
     pending = {}
     continuations = {}
     unavailable = {}
+    test_draft = current.get(new_path, "")
+    test_diagnostic = ""
+    test_rejection = None
     pool = ThreadPoolExecutor(max_workers=executor.limits.concurrent_probes)
     try:
         while True:
@@ -479,31 +662,21 @@ def solve(executor, task, archive, budget, version):
             )
             ready = not failures and not needs_tests and bool(patch)
             if ready and not pending:
-                result = executor._verify(task, archive, budget, patch, actor=actor)
-                return replace(
-                    result,
-                    refinement=RefinementEvidence(
-                        version,
-                        task.seed,
-                        task.repository,
-                        task.instructions,
-                        {"base": _GUIDANCE},
-                        (),
-                        (
-                            CandidateEvidence(
-                                "base",
-                                result.patch_digest,
-                                "Verified accumulated review fixes",
-                            ),
-                        ),
-                        "base",
-                    ),
+                return _finish_review(
+                    executor, task, archive, budget, patch, actor, version
                 )
             # Check diagnoses and test authoring retain single-request behavior.
             operator = [key for key in failures if key[0] < len(task.pull_checks)]
-            remaining = operator or list(failures) or [(-1, "new regression tests")]
+            other_checks = [key for key in failures if key not in operator]
+            remaining = (
+                operator + other_checks[:1]
+                if operator
+                else other_checks or ([_TEST_GOAL] if needs_tests else [])
+            )
+            if not remaining and not ready:
+                return None
             limit = executor.limits.concurrent_probes if operator else 1
-            active = {target for target, _, _, _ in pending.values()}
+            active = {target for target, _, _, _, _ in pending.values()}
             available = sorted(
                 (
                     key
@@ -518,13 +691,14 @@ def solve(executor, task, archive, budget, version):
                     key,
                 ),
             )
-            slots = min(
-                max_proposals - submitted,
-                budget.model_requests_remaining(),
-                limit - len(pending),
+            launch_budget = min(
+                max_proposals - submitted, budget.model_requests_remaining()
             )
+            slots = min(launch_budget, limit - len(pending))
             if not ready and slots > 0:
                 for target in available[:slots]:
+                    if not launch_budget:
+                        break
                     attempts[target] = attempts.get(target, 0) + 1
                     continuation = continuations.pop(target, None)
                     if continuation is None:
@@ -537,6 +711,13 @@ def solve(executor, task, archive, budget, version):
                             "This checkout includes one unpublished proposal. The same "
                             "assertion still fails. Continue from these edits once."
                         )
+                    if target == _TEST_GOAL:
+                        source = {**current, new_path: test_draft}
+                        note = "\n".join(
+                            item
+                            for item in (test_diagnostic, notes.get(target))
+                            if item
+                        )
                     named_definitions = (
                         target in failures and malformed.get(target, 0) >= 2
                     )
@@ -546,23 +727,43 @@ def solve(executor, task, archive, budget, version):
                         diagnostics,
                         needs_tests,
                         note,
-                        review,
+                        _draft_review(review, original, source),
                         fixtures,
                         interfaces,
                         new_path,
                         continuing=continuation is not None,
                         named_definitions=named_definitions,
                     )
+                    planner_input = None
+                    if (
+                        target in operator
+                        and target not in planned
+                        and no_progress.get(target, 0) >= 2
+                        and continuation is None
+                        and launch_budget >= 2
+                        and budget.remaining() > 30
+                    ):
+                        fixture = _fixture_excerpt(fixtures, target[1])
+                        planner_input = source, fixture, diagnostics[target]
+                        planned.add(target)
                     future = pool.submit(
-                        budget.complete,
-                        executor.gateway,
-                        "coding",
+                        _coding_completion,
+                        executor,
+                        budget,
                         messages,
-                        after_provider=last_routes.get(target),
-                        max_output_tokens=3072,
+                        last_routes.get(target),
+                        planner_input,
                     )
-                    pending[future] = target, current, continuation, named_definitions
-                    submitted += 1
+                    pending[future] = (
+                        target,
+                        current,
+                        continuation,
+                        named_definitions,
+                        planner_input is not None,
+                    )
+                    cost = 2 if planner_input is not None else 1
+                    submitted += cost
+                    launch_budget -= cost
             if not pending:
                 for target in remaining:
                     if target in unavailable:
@@ -576,8 +777,10 @@ def solve(executor, task, archive, budget, version):
             if not done:
                 continue
             future = next(future for future in pending if future in done)
-            target, snapshot, continuation, named_definitions = pending.pop(future)
-            if continuation is not None and snapshot is not current:
+            target, snapshot, continuation, named_definitions, advised = pending.pop(
+                future
+            )
+            if (continuation is not None or advised) and snapshot is not current:
                 continue
             try:
                 completion = future.result()
@@ -593,6 +796,8 @@ def solve(executor, task, archive, budget, version):
             editor = RouteEvidence.from_completion(completion)
             try:
                 source = current if continuation is None else continuation[0]
+                if target == _TEST_GOAL:
+                    source = {new_path: test_draft}
                 try:
                     candidate = (
                         apply_definitions(completion.content, source)
@@ -602,6 +807,8 @@ def solve(executor, task, archive, budget, version):
                 except ValueError:
                     malformed[target] = malformed.get(target, 0) + 1
                     raise
+                if target == _TEST_GOAL:
+                    candidate = {**current, **candidate}
                 if (
                     failures
                     and needs_tests
@@ -622,6 +829,39 @@ def solve(executor, task, archive, budget, version):
                     str(error).split(":", 1)[0][:120],
                 )
                 continue
+            if target == _TEST_GOAL:
+                test_draft = candidate[new_path]
+                test_rejection = None
+                notes.pop(target, None)
+                if after:
+                    test_diagnostic = "\n".join(
+                        f"{name}: {excerpt(detail, 1000)}"
+                        for (_, name), detail in list(after.items())[:4]
+                    )
+                elif not has_runnable_test(new_path, test_draft.encode()):
+                    test_diagnostic = (
+                        "Add at least one runnable pytest test to this draft."
+                    )
+                else:
+                    try:
+                        return _finish_review(
+                            executor, task, archive, budget, proposed, editor, version
+                        )
+                    except AttemptRejected as error:
+                        rejection = error.__cause__
+                        if not isinstance(rejection, _VerificationRejected):
+                            raise
+                        test_rejection = error
+                        test_diagnostic = (
+                            str(rejection)
+                            + "\n"
+                            + "\n".join(
+                                excerpt(check.output, 1400)
+                                for check in rejection.checks
+                                if check.returncode
+                            )
+                        )
+                continue
             # Never trade a passing operator test for another one. Stock diagnostics
             # can change while a behavior is corrected; finish those before publishing.
             old_operator = {
@@ -631,13 +871,21 @@ def solve(executor, task, archive, budget, version):
             progressed = new_operator < old_operator or (
                 new_operator == old_operator and after.keys() < failures.keys()
             )
-            test_added = needs_tests and has_runnable_test(
-                new_path, candidate[new_path].encode()
+            partial = not progressed and assertion_progress(
+                assertions, task.pull_checks, target, failures, after
             )
+            prefix_progress = ""
+            if not (progressed or partial) and snapshot is current and no_progress.get(target):
+                prefix_progress = observe_prefix_progress(
+                    executor, task, archive, budget, assertions, fixtures, target,
+                    failures, after, patch, proposed,
+                )
             stale_regression = (
                 snapshot is not current and not after.keys() <= failures.keys()
             )
-            if stale_regression or (not progressed and not (test_added and not after)):
+            if stale_regression or not (progressed or partial or prefix_progress):
+                if snapshot is current and target in old_operator and "::" in target[1]:
+                    no_progress[target] = no_progress.get(target, 0) + 1
                 if (
                     continuation is None
                     and snapshot is current
@@ -668,7 +916,10 @@ def solve(executor, task, archive, budget, version):
             continuations.clear()
             last_routes.pop(target, None)
             notes.pop(target, None)
+            if prefix_progress:
+                notes[target] = prefix_progress
             malformed.pop(target, None)
+            no_progress.pop(target, None)
             if not failures and (
                 not task.require_new_tests
                 or has_runnable_test(new_path, current[new_path].encode())
@@ -687,7 +938,10 @@ def solve(executor, task, archive, budget, version):
                     _CHECKPOINT,
                     task.base_sha,
                     patch,
-                    (),
+                    (prefix_progress,) if prefix_progress else (
+                        ("An operator case reached a later assertion and still failed.",)
+                        if partial else ()
+                    ),
                     _GUIDANCE,
                     (editor.route, editor.configured_model),
                 )
@@ -695,6 +949,8 @@ def solve(executor, task, archive, budget, version):
     finally:
         # A running gateway request is already bounded by the shared deadline.
         pool.shutdown(wait=False, cancel_futures=True)
+    if test_rejection is not None:
+        raise test_rejection
     budget.reject(
         _CandidateOutputError(
             "Review solver retained verified progress; outstanding checks still fail"

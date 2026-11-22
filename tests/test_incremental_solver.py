@@ -18,7 +18,12 @@ from github_harness_agent.executor import (
     TaskSnapshot,
     _Budget,
 )
+from github_harness_agent.review_assertions import (
+    assertion_progress,
+    operator_assertions,
+)
 from github_harness_agent.review_recovery import ReviewRecovery
+from github_harness_agent.task_context import compact_focused_review
 from github_harness_agent.review_solver import (
     _GUIDANCE,
     _line_failure_details,
@@ -145,6 +150,32 @@ def test_line_traceback_does_not_guess_when_a_location_is_missing():
     assert _line_failure_details(output) == {}
 
 
+def test_assertion_progress_rejects_regressions_and_untrusted_locations():
+    fixture_path = "/operator/test_sample.py"
+    assertions = operator_assertions(
+        {
+            "test_sample.py": "def test_results():\n    assert first()\n    assert second()\n"
+        },
+        "/operator",
+    )
+    test = (0, "../operator/test_sample.py::test_results")
+    before = {test: f"{fixture_path}:2: assert False"}
+    after = {test: f"{fixture_path}:3: assert False"}
+    commands = (("pytest", "--tb=line", fixture_path),)
+    assert assertion_progress(assertions, commands, test, before, after)
+    assert not assertion_progress(assertions, commands, test, after, before)
+    assert not assertion_progress(
+        assertions, commands, test, before, {**after, (1, "Stock lint"): "Failed"}
+    )
+    assert not assertion_progress(
+        assertions,
+        commands,
+        test,
+        before,
+        {test: "/checkout/test_sample.py:3: assert False"},
+    )
+
+
 def test_apply_blocks_is_atomic_when_a_later_search_is_ambiguous():
     source = {SOURCE: "first = 0\nsecond = 0\nsecond = 0\n", NEW_TEST: ""}
     original = source.copy()
@@ -203,6 +234,112 @@ def test_solver_continues_a_compound_assertion_before_checkpointing(solver_case)
     assert NEW_TEST.encode() in result.patch
 
 
+@pytest.mark.parametrize(
+    "planner_reply",
+    (
+        '{"strategy": "Preserve both results and correct the second return value.", "symbols": ["fixture_calc.py::second"]}',
+        '{"strategy": "Read elsewhere", "symbols": ["unrelated.py::missing"]}',
+    ),
+)
+def test_stalled_implementation_uses_bounded_advice_then_normal_verification(
+    solver_case, planner_reply
+):
+    task, archive, runner, checkpoints = solver_case
+    Path(task.pull_checks[0][-1]).write_text(TEST)
+    prompts = []
+    coding = iter(
+        (
+            FIRST,
+            edit(SOURCE, "    return 1\n", "    return 4\n"),
+            FIRST + SECOND,
+            edit(NEW_TEST, "", TEST),
+        )
+    )
+
+    class Gateway:
+        def complete(self, *, role, messages, timeout, **request):
+            prompt = messages[-1]["content"]
+            prompts.append((role, prompt))
+            if role == "planning":
+                assert timeout <= 25
+                assert request["max_output_tokens"] <= 512
+                assert "fixture_calc.py::second" in prompt
+                assert "def test_results():" in prompt
+                assert "def second():" not in prompt
+                content = planner_reply
+            else:
+                content = next(coding)
+            return SimpleNamespace(
+                role=role,
+                route="stand-in-free",
+                model="fixture-coder",
+                configured_model="stand-in/free",
+                content=content,
+                usage={},
+            )
+
+    executor = PlainExecutor(
+        runner, Gateway(), Limits(model_requests=5, concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    result = solve(executor, task, archive, budget, "fixture-version")
+
+    assert [role for role, _ in prompts] == [
+        "coding",
+        "coding",
+        "planning",
+        "coding",
+        "coding",
+    ]
+    coding_prompt = prompts[3][1]
+    if "unrelated.py" not in planner_reply:
+        assert (
+            "Preserve both results and correct the second return value."
+            in coding_prompt
+        )
+        assert (
+            "fixture_calc.py::second\ndef second():\n    return -2\n" in coding_prompt
+        )
+    else:
+        assert "Read elsewhere" not in coding_prompt
+    assert all(b"+    return 4\n" not in draft.patch for draft in checkpoints)
+    assert all(check.returncode == 0 for check in result.checks)
+    assert budget.model_requests_remaining() == 0
+
+
+@pytest.mark.parametrize("branch_between", (False, True))
+def test_solver_checkpoints_later_straight_line_assertion_only(
+    solver_case, branch_between
+):
+    task, archive, runner, checkpoints = solver_case
+    fixture = Path(task.pull_checks[0][-1])
+    fixture.write_text(
+        "from fixture_calc import first, second\n\n"
+        "def test_results():\n"
+        "    assert first() == 1\n"
+        + ("    if first() != 1:\n        return\n" if branch_between else "")
+        + "    assert second() == 2\n"
+    )
+    operator = (*task.pull_checks[0][:-1], "--tb=line", str(fixture))
+    task = replace(task, pull_checks=(operator,))
+    gateway = FreeGateway(FIRST)
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=1, concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    with pytest.raises(AttemptRejected, match="outstanding checks still fail"):
+        solve(executor, task, archive, budget, "fixture-version")
+
+    if branch_between:
+        assert not checkpoints
+    else:
+        assert len(checkpoints) == 1
+        assert b"+    return 1\n" in checkpoints[0].patch
+        assert b"+    return 2\n" not in checkpoints[0].patch
+
+
 def test_solver_offers_named_definitions_only_after_repeated_malformed_edits(
     solver_case,
 ):
@@ -226,6 +363,34 @@ def test_solver_offers_named_definitions_only_after_repeated_malformed_edits(
     ] == [False, False, True, False]
     assert b"+    return 1\n" in result.patch
     assert b"+    return 2\n" in result.patch
+    assert NEW_TEST.encode() in result.patch
+
+
+def test_solver_retains_a_reached_and_passing_compound_prefix_after_stagnation(
+    solver_case,
+):
+    task, archive, runner, checkpoints = solver_case
+    (check,) = task.pull_checks
+    Path(check[-1]).write_text(
+        "from fixture_calc import first, second\n\n"
+        "def test_compound():\n"
+        "    assert first() == 1 and second() == 2, 'compound predicate'\n"
+    )
+    task = replace(task, pull_checks=((*check[:-1], "--tb=line", check[-1]),))
+    continuation = edit(SOURCE, "    return -2\n", "    return 0\n")
+    finish = edit(SOURCE, "    return 0\n", "    return 2\n")
+    gateway = FreeGateway(FIRST, continuation, finish, edit(NEW_TEST, "", TEST))
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=4, concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    result = solve(executor, task, archive, budget, "fixture-version")
+
+    assert b"+    return 1\n" in checkpoints[0].patch
+    assert b"+    return 0\n" in checkpoints[0].patch
+    assert "first() == 1: passed" in checkpoints[0].progress[0]
+    assert "second() == 2: failed" in gateway.prompts[2]
     assert NEW_TEST.encode() in result.patch
 
 
@@ -391,6 +556,68 @@ def test_solver_verifies_another_goal_while_a_provider_is_still_working(
     assert [route.route for route in result.route_trace] == expected_routes
     assert result.usage == {"requests": len(expected_routes)}
     assert budget.model_requests_remaining() == 0
+
+
+@pytest.mark.parametrize("late_failure", ("stock", "focused", "setup-only"))
+def test_solver_repairs_an_unpublished_regression_test_in_place(
+    solver_case, late_failure
+):
+    task, archive, runner, checkpoints = solver_case
+    bad_return = "(0, 0)" if late_failure == "focused" else "(1, 2)  # rejected-style"
+    if late_failure == "stock":
+        lint = (
+            "from pathlib import Path\n"
+            "p = Path('tests/test_review_regressions.py')\n"
+            "if p.exists() and 'rejected-style' in p.read_text():\n"
+            "    raise SystemExit('tests/test_review_regressions.py:4: invalid style')\n"
+        )
+        task = replace(task, checks=(*task.checks, (sys.executable, "-c", lint)))
+    if late_failure == "setup-only":
+        bad_test = TEST.split("\n\n", 1)[0] + "\n"
+        repair = edit(NEW_TEST, bad_test, TEST)
+        expected_diagnostic = "Add at least one runnable pytest test"
+    else:
+        bad_test = TEST.replace("(1, 2)", bad_return)
+        repair = edit(
+            NEW_TEST,
+            f"    assert (first(), second()) == {bad_return}\n",
+            "    assert (first(), second()) == (1, 2)\n",
+        )
+        expected_diagnostic = (
+            "invalid style" if late_failure == "stock" else "test_results"
+        )
+    gateway = FreeGateway(FIRST, SECOND, edit(NEW_TEST, "", bad_test), repair)
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=4, concurrent_probes=1)
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    result = solve(executor, task, archive, budget, "fixture-version")
+
+    repair_prompt = gateway.prompts[3]
+    assert bad_test in repair_prompt
+    assert expected_diagnostic in repair_prompt
+    assert all(NEW_TEST.encode() not in checkpoint.patch for checkpoint in checkpoints)
+    assert NEW_TEST.encode() in result.patch
+    assert all(check.returncode == 0 for check in result.checks)
+
+    request = gateway.prompts[2].replace(
+        "\nCurrent checkout:\n", "\nCurrent checkout:\n" + ("unused context\n" * 2000)
+    )
+    compact = compact_focused_review(
+        [
+            {"role": "system", "content": "Review guidance"},
+            {"role": "user", "content": request},
+        ],
+        max_bytes=12 * 1024,
+    )[-1]["content"]
+    assert "Correct the first result." in compact
+    assert "Correct the second result." in compact
+    assert "test_first" in compact
+    assert "test_second" in compact
+    assert "from fixture_calc import first, second" in compact
+    assert "def first()" in compact
+    assert "fresh offline" in compact
 
 
 def test_solver_does_not_keep_a_candidate_rejected_by_final_gate(solver_case):

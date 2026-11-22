@@ -312,6 +312,10 @@ class _Budget:
         with self._lock:
             return self.limits.model_requests - self._calls["model request"]
 
+    def commands_remaining(self):
+        with self._lock:
+            return self.limits.commands - self._calls["command"]
+
     def complete(
         self,
         gateway,
@@ -323,6 +327,7 @@ class _Budget:
         retry_oversize=True,
         review_windows=False,
         max_output_tokens=None,
+        timeout_cap=None,
     ):
         options = (
             {"exclude": self.task.excluded_models} if self.task.excluded_models else {}
@@ -336,13 +341,16 @@ class _Budget:
 
         def send(payload):
             self.claim("model request", self.limits.model_requests)
+            remaining = self.remaining()
             return observed_call(
                 self.task,
                 gateway,
                 role=role,
                 messages=payload,
                 tools=tools,
-                timeout=self.remaining(),
+                timeout=remaining
+                if timeout_cap is None
+                else min(remaining, timeout_cap),
                 **options,
             )
 
