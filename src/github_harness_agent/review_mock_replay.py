@@ -76,12 +76,17 @@ def compact_observations(detail, limit):
                 if len(reuse) > room - 120:
                     reuse = ""
                 row_limit = (room - len(reuse)) // len(rows)
-                result.append(
-                    _COUNTER_HEADING
-                    + "\n"
-                    + "\n".join(excerpt(row, row_limit) for row in rows)
-                    + reuse
-                )
+                if reuse and row_limit >= 3:
+                    # With an identity note, keep the leading transition and
+                    # closest caller instead of spending half the row on its tail.
+                    rows = [
+                        row if len(row.encode()) <= row_limit else
+                        row.encode()[: row_limit - 3].decode(errors="ignore").rstrip() + "..."
+                        for row in rows
+                    ]
+                else:
+                    rows = [excerpt(row, row_limit) for row in rows]
+                result.append(_COUNTER_HEADING + "\n" + "\n".join(rows) + reuse)
                 continue
         result.append(excerpt(report, allowance))
     return "\n".join(result)
@@ -393,9 +398,10 @@ def _divergent_caller_source(old, new, sources):
 
 
 def _loop_reuse(before, after, first_difference):
-    if len(before) != 3 or len(after) != 3:
+    if len(after) != 3:
         return ""
-    old_events, old_bindings = before[1:]
+    old_events = before[1]
+    old_bindings = before[2] if len(before) == 3 else None
     new_events, new_bindings = after[1:]
 
     def symbols(stack):
@@ -419,6 +425,19 @@ def _loop_reuse(before, after, first_difference):
         if len(entries) < 2 or matches[-1] < first_difference:
             continue
         caller, _, name, ordinal, _ = binding
+        # Each distinct observed entry accounts for at least one mutation at
+        # this draft site. A complete pinned window with fewer observed
+        # mutations in total needs no comparable object binding.
+        pinned_total = len(old_events)
+        if pinned_total < len(entries) and len(new_events) < review_counter_trace.MAX_EVENTS:
+            unit = "mutation" if pinned_total == 1 else "mutations"
+            return (
+                f"{_LOOP_OBSERVATION}`{name}`: record #{ordinal} at {len(matches)} mutations "
+                f"across {len(entries)} loop entries (object identity only). "
+                f"Pinned: {pinned_total} observed {unit}."
+            )
+        if old_bindings is None:
+            continue
         comparable = [
             older for event, older in zip(old_events, old_bindings, strict=True)
             if symbols(event[0]) == symbols(stack)

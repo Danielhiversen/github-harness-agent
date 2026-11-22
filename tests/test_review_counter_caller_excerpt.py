@@ -175,7 +175,10 @@ def test_counter_trace_accepts_old_events_and_only_bounded_loop_identity_metadat
 
 
 def test_compact_counter_diagnostic_keeps_the_full_loop_identity_observation():
-    reuse = "Draft loop target `" + "entry_" * 7 + "`: record #1 at 2 mutations (object identity only)."
+    reuse = (
+        "Draft loop target `" + "entry_" * 7
+        + "`: record #1, 3 mutations over 3 loop entries (object identity only). Pinned: 1 observed mutation."
+    )
     report = (
         "Auxiliary counterfactual " + "first counterfactual information " * 60
         + "\nAuxiliary mapping counter changes (quoted advisory data). "
@@ -189,3 +192,34 @@ def test_compact_counter_diagnostic_keeps_the_full_loop_identity_observation():
     assert reuse in compacted
     assert "Pinned: 0 -> 1 after module.py:7" in compacted
     assert "Draft: 1 -> 2 after module.py:7" in compacted
+
+
+
+def test_counter_reuse_can_compare_a_complete_pinned_count_without_loop_bindings():
+    from github_harness_agent.review_counter_trace import MAX_EVENTS
+
+    def events(count):
+        stack = [["module.py", "increment", 2], ["module.py", "original_route", 7]]
+        return [[stack, index, index + 1] for index in range(count)]
+
+    def bindings(count, same_identity=True):
+        return [[1, 5, "row", 1 if same_identity else index, index] for index in range(1, count + 1)]
+
+    def detail(pinned, draft, *, lost_window=False):
+        preceding = [None] if lost_window else []
+        return _counter_difference(
+            [8, None, [*preceding, pinned]], [8, len(preceding), [*preceding, draft]],
+            "tests/test_demo.py::test_count",
+        )
+
+    pinned = ["a" * 64, events(1)]
+    draft = ["a" * 64, events(3), bindings(3)]
+    observed = detail(pinned, draft)
+    assert "3 loop entries" in observed and "Pinned: 1 observed mutation" in observed
+    equal_count = events(3)
+    equal_count[-1][-1] = 10
+    assert "loop target" not in detail(["a" * 64, equal_count], draft)
+    assert "loop target" not in detail(pinned, ["a" * 64, events(3), bindings(3, False)])
+    assert "loop target" not in detail(pinned, ["a" * 64, events(MAX_EVENTS), bindings(MAX_EVENTS)])
+    assert not detail(pinned, draft, lost_window=True)
+    assert not detail(pinned, ["b" * 64, events(3), bindings(3)])

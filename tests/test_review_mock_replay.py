@@ -300,7 +300,7 @@ def test_invoke():
 
 
 @pytest.mark.parametrize(
-    "record_source", ["same dict", "same list", "equal dicts", "rebound", "same course", "one slice"]
+    "record_source", ["same dict", "same list", "equal dicts", "rebound", "same course", "one slice", "no pinned binding"]
 )
 def test_counter_replay_reports_only_observed_loop_record_reuse(tmp_path, record_source):
     source = """class Collector:
@@ -329,8 +329,10 @@ def invoke(records, fallback):
     elif record_source == "one slice":
         before = before.replace("            self._tick()", "            for repeat in range(1):\n                self._tick()")
         after = before.replace("range(1)", "range(2)")
+    elif record_source == "no pinned binding":
+        before = before.replace("        for entry in records:\n            pass\n            self._tick()", "        self._tick()")
     item = '["private-input-sentinel"]' if record_source == "same list" else '{"private-input-sentinel": 19}'
-    records = "[item, item]" if record_source in {"same dict", "same list", "same course"} else "[item, item.copy()]"
+    records = "[item, item]" if record_source in {"same dict", "same list", "same course", "no pinned binding"} else "[item, item.copy()]"
     test = f"""from service import invoke
 
 def test_invoke():
@@ -352,9 +354,12 @@ def test_invoke():
     )
     assert "mapping counter" in detail
     assert "private-input-sentinel" not in detail
-    if record_source in {"same dict", "same list"}:
+    if record_source in {"same dict", "same list", "no pinned binding"}:
         assert "loop target `entry`" in detail
         assert "record #1" in detail and "2 mutations" in detail
         assert "object identity only" in detail
+        if record_source == "no pinned binding":
+            assert "2 loop entries" in detail
+            assert "Pinned: 1 observed mutation" in detail
     else:
         assert "loop target" not in detail
