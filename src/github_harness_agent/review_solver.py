@@ -63,6 +63,7 @@ from .review_definitions import (
 from .review_guard_probe import stock_guard_diagnostic
 from .review_guard_order import swap_traced_filters
 from .review_parameter_use import lost_iteration_argument
+from .review_semantic_key import guard_traced_counter_once
 from .review_guards import guarded_sources
 from .review_mock_replay import (
     compact_observations,
@@ -2032,6 +2033,46 @@ def solve(executor, task, archive, budget, version):
             budget.remaining()
         return None
 
+    def try_semantic_record_key(target, trace, focused_failure, *, mixed=False):
+        nonlocal current, patch, failures, pytest_runs
+        signal = counter_loop_reuse(trace)
+        if (
+            signal is None
+            or not focused_failure
+            or budget.remaining() < 200
+            or budget.commands_remaining() < 3 * len(commands) + 6
+            or not stock_missing_count_after_reorder(
+                archive, target[1], failures[target], focused_failure, signal.assertion_line
+            )
+        ):
+            return False
+        allowed = {path for path in paths if not _protected(path, task, new_test=False)}
+        sources = guard_traced_counter_once(current, signal, allowed)
+        if sources is None:
+            return False
+        _LOG.info("Checking the existing record key against repeated diagnostic events")
+        proposal = patch_for(original, sources)
+        if not 0 < len(proposal) <= executor.limits.patch_bytes:
+            return False
+        probe = _GuardBudget(budget, wall_seconds=180, reserve=60)
+        try:
+            passed, _ = focused_guard_trial(target, proposal, probe)
+            if not passed:
+                return False
+            verify = verify_mixed_stock_gain if mixed else verify_stock_gain
+            verified = verify(target, sources, probe)
+        except Cancelled:
+            raise
+        except (ExecutionError, ValueError):
+            budget.remaining()
+            return False
+        if verified is None:
+            return False
+        current, patch, failures, pytest_runs = verified
+        start_new_draft(target)
+        _LOG.info("Record-key trial passed the repository checks with %d review case(s) remaining", len(failures))
+        return True
+
     def try_guard_precision(target, trace, focused_failure, *, verify=None):
         nonlocal current, failures, patch, pytest_runs, actor, editor
         nonlocal precision_attempted, submitted
@@ -2544,6 +2585,11 @@ def solve(executor, task, archive, budget, version):
                     )
                     continue
                 if failed_trial and (
+                    try_semantic_record_key(stock, *failed_trial, mixed=True)
+                    or try_guard_precision(stock, *failed_trial, verify=verify_mixed_stock_gain)
+                ):
+                    continue
+                if failed_trial and (
                     site := stock_failure_site(stock[1], failed_trial[1])
                 ):
                     notes[stock] = (
@@ -2624,9 +2670,9 @@ def solve(executor, task, archive, budget, version):
                                     "An adjacent stock filter reorder passed all configured checks"
                                 )
                                 continue
-                            if try_guard_precision(
+                            if try_semantic_record_key(
                                 eager_target, eager_trace, focused_failure
-                            ):
+                            ) or try_guard_precision(eager_target, eager_trace, focused_failure):
                                 continue
                             launch_budget = min(
                                 max_proposals - submitted,

@@ -258,7 +258,11 @@ def test_solver_rotates_exact_models_until_verified_progress(solver_case, monkey
     )
     lint = {(1, "check 2 (exit 1)"): "Imports unsorted"}
 
-    def verify(executor, task, archive, budget, patch, commands, *, pytest_runs=None, static_runs=None):
+    def verify(
+        executor, task, archive, budget, patch, commands, *,
+        pytest_runs=None, static_runs=None, private_proposal=False,
+    ):
+        assert not private_proposal
         if b"+    return 1\n" in patch:
             return lint
         return {**lint, (2, "check 3 (exit 1)"): "Unused import"}

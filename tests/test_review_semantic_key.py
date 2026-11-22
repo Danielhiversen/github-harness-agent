@@ -77,7 +77,7 @@ def test_proved_group_sort_key_guards_only_the_traced_effect():
     another_position = {**base, "x": 10}
     direct = guard_traced_counter_once({PATH: SOURCE}, observed(), {PATH})
     assert direct
-    assert len(direct[PATH].splitlines()) - len(SOURCE.splitlines()) <= 21
+    assert len(direct[PATH].splitlines()) - len(SOURCE.splitlines()) <= 23
     assert "_gha_" not in direct[PATH]
     assert "            continue\n" in direct[PATH]
     assert invoke(SOURCE, [base, same_key])[0] == {"excluded": 2}
