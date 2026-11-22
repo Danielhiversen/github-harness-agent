@@ -240,3 +240,65 @@ def test_round_guard_uses_literal_loop_target_values_from_operator_fixture():
         )
         is None
     )
+
+
+def aliased_queue():
+    return indirect_queue().replace(
+        "            if deferred.get(label):\n"
+        "                item = deferred[label].popleft()\n"
+        "            elif roots[label]:\n"
+        "                item = roots[label].popleft()",
+        "            pending = deferred.get(label, deque())\n"
+        "            seeded = roots[label]\n"
+        "            if pending:\n"
+        "                item = pending.popleft()\n"
+        "            elif seeded:\n"
+        "                item = seeded.popleft()",
+    )
+
+
+def test_round_guard_resolves_aliases_to_the_proved_queue_mapping():
+    source = aliased_queue().replace(
+        "                for group in sorted(groups.keys()):",
+        "                ordered = sorted(groups.keys(), key=lambda key: (len(key), key))\n"
+        "                for group in ordered:",
+    )
+    candidate = prepare(current=source)
+    assert candidate is not None
+    assert run(candidate.sources[PATH], 1) == run(PINNED, 1)
+    assert run(candidate.sources[PATH], 2) == run(PINNED, 2)
+
+
+@pytest.mark.parametrize(
+    "case", ["foreign default", "reassigned alias", "foreign insert"]
+)
+def test_round_guard_declines_unproven_lookups_and_alias_writes(case):
+    source = aliased_queue()
+    if case == "foreign default":
+        source = source.replace(
+            "deferred.get(label, deque())", "deferred.get(label, deque([Work(9)]))"
+        )
+    elif case == "reassigned alias":
+        source = source.replace(
+            "            if pending:",
+            "            pending = deque([Work(9)])\n            if pending:",
+        )
+    elif case == "foreign insert":
+        source = source.replace(
+            "            if pending:",
+            "            pending.append(Work(9))\n            if pending:",
+        )
+    assert prepare(current=source) is None
+
+
+@pytest.mark.parametrize(
+    "change", ["ordered = []", "ordered.append('foreign')", "consume(ordered)"]
+)
+def test_round_guard_declines_mutated_or_escaped_sorted_result(change):
+    source = aliased_queue().replace(
+        "                for group in sorted(groups.keys()):",
+        "                ordered = sorted(groups.keys())\n"
+        f"                {change}\n"
+        "                for group in ordered:",
+    )
+    assert prepare(current=source) is None

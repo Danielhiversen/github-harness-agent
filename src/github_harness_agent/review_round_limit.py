@@ -505,6 +505,62 @@ def _pins(pinned, round_loop, factory, roots):
             yield seeds[0]
 
 
+def _lookup_origin(value):
+    if isinstance(value, ast.Subscript) and isinstance(value.value, ast.Name):
+        return value.value.id
+    if (
+        _member(value, "get")
+        and isinstance(value.func.value, ast.Name)
+        and len(value.args) == 2
+        and not value.keywords
+        and _empty_queue(value.args[1])
+    ):
+        return value.func.value.id
+    return None
+
+
+def _pop_sources(current, pops, statements):
+    aliases, worklists = {}, set()
+    for pop in pops:
+        receiver = pop.func.value
+        name = _base(receiver)
+        if isinstance(receiver, ast.Name):
+            writes = [
+                (statement, target, value)
+                for statement in statements
+                if (pair := _assignment(statement))[1] is not None
+                and _name(target := pair[0], name)
+                for value in (pair[1],)
+            ]
+            if (
+                len(writes) == 1
+                and (origin := _lookup_origin(writes[0][2])) is not None
+            ):
+                definition, target, _ = writes[0]
+                if (
+                    origin == name
+                    or definition.lineno >= pop.lineno
+                    or any(
+                        _name(node, name)
+                        and isinstance(node.ctx, (ast.Store, ast.Del))
+                        and node is not target
+                        for node in _walk(current.body)
+                    )
+                    or any(
+                        isinstance(node, (ast.Global, ast.Nonlocal))
+                        and name in node.names
+                        for node in _walk(current.body)
+                    )
+                ):
+                    return None
+                aliases[name] = origin
+                name = origin
+        worklists.add(name)
+    if aliases.keys() & worklists:
+        return None
+    return worklists, aliases
+
+
 def _queue_roots(current, item, call, roots):
     body = [node for node in _walk(current.body) if isinstance(node, ast.stmt)]
     assignments = [
@@ -523,7 +579,10 @@ def _queue_roots(current, item, call, roots):
         for pop in assignments
     ):
         return None
-    containers = {_base(pop.func.value) for pop in assignments}
+    origins = _pop_sources(current, assignments, body)
+    if origins is None:
+        return None
+    containers, aliases = origins
     seeded = {
         name: roots[_wrapper(value)]
         for statement in body
@@ -557,7 +616,7 @@ def _queue_roots(current, item, call, roots):
     ]
     if len(local_writes) != len(containers):
         return None
-    return next(iter(seeded.values())), containers
+    return next(iter(seeded.values())), containers, aliases
 
 
 def _guarded_expansion(current, selected):
@@ -580,6 +639,35 @@ def _destination(operation):
     return _base(value)
 
 
+def _ordered_groups(current, branch, group):
+    ordered = group.iter
+    if isinstance(ordered, ast.Name):
+        name = ordered.id
+        definitions = [
+            (target, value)
+            for statement in branch
+            if isinstance(statement, ast.stmt)
+            and statement.lineno < group.lineno
+            and (pair := _assignment(statement))[1] is not None
+            and _name(target := pair[0], name)
+            for value in (pair[1],)
+        ]
+        if len(definitions) != 1:
+            return None
+        target, value = definitions[0]
+        # The sorted result must be a private local used only as this iterable.
+        if any(
+            _name(node, name) and node not in (target, ordered)
+            for node in _walk(current.body)
+        ) or any(
+            isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names
+            for node in _walk(current.body)
+        ):
+            return None
+        ordered = value
+    return ordered if _call(ordered, "sorted") and len(ordered.args) == 1 else None
+
+
 def _staged_batches(current, block, grouped_pushes, containers):
     accepted, guards = set(), set()
     in_branch = list(_walk(block.body))
@@ -599,8 +687,8 @@ def _staged_batches(current, block, grouped_pushes, containers):
         for group in in_branch:
             if not isinstance(group, ast.For) or not isinstance(group.target, ast.Name):
                 continue
-            ordered = group.iter
-            if not _call(ordered, "sorted") or len(ordered.args) != 1:
+            ordered = _ordered_groups(current, in_branch, group)
+            if ordered is None:
                 continue
             items = ordered.args[0]
             if not (
@@ -651,7 +739,13 @@ def _staged_batches(current, block, grouped_pushes, containers):
     return accepted, guards
 
 
-def _queues_children(current, block, selected, child_list, containers):
+def _queues_children(current, block, selected, child_list, containers, aliases=None):
+    aliases = aliases or {}
+
+    def destination(operation):
+        name = _destination(operation)
+        return aliases.get(name, name)
+
     individual, pushes = set(), set()
     for node in _walk(block.body):
         if (
@@ -667,30 +761,30 @@ def _queues_children(current, block, selected, child_list, containers):
                 and len(operation.args) == 1
                 and not operation.keywords
                 and _name(operation.args[0], node.target.id)
-                and _destination(operation)
+                and destination(operation)
             )
         if (
             _member(node, "extend", "extendleft")
             and len(node.args) == 1
             and not node.keywords
             and _name(_wrapper(node.args[0]), child_list)
-            and _destination(node) in containers
+            and destination(node) in containers
             and node.lineno > selected.lineno
         ):
             pushes.add(node)
     staged, stages = _staged_batches(current, block, individual, containers)
     pushes.update(staged)
     pushes.update(
-        node for node in individual if _destination(node) in containers | stages
+        node for node in individual if destination(node) in containers | stages
     )
-    if not any(_destination(node) in containers for node in pushes):
+    if not any(destination(node) in containers for node in pushes):
         return False
-    mapped = containers | stages
+    mapped = containers | stages | aliases.keys()
     for node in _walk(current.body):
         if _member(
             node, "append", "appendleft", "extend", "extendleft", "insert", "update"
         ):
-            if _destination(node) in mapped and node not in pushes:
+            if destination(node) in mapped and node not in pushes:
                 return False
         if _member(node, "setdefault") and _base(node.func.value) in mapped:
             if len(node.args) != 2 or node.keywords or not _empty_queue(node.args[1]):
@@ -804,7 +898,9 @@ def prepare_round_limit_guard(original, current, allowed, *, owner, operator_fix
                 if len(legacy) != 1 or queue is None or legacy[0][0] != queue[0][0]:
                     continue
                 block, child_list = expansion[0]
-                if not _queues_children(working, block, call, child_list, queue[1]):
+                if not _queues_children(
+                    working, block, call, child_list, queue[1], queue[2]
+                ):
                     continue
                 snippets = (
                     f"pinned round loop: {_quote(before, round_loop.iter)}",
