@@ -960,6 +960,7 @@ def solve(executor, task, archive, budget, version):
                                 and continuation is None
                                 and repair is None
                                 and no_progress.get(target, 0) >= RECOVERY_MODE_THRESHOLD
+                                and attempts[target] >= 6
                                 and attempts[target] % 3 == 0
                             )
                         )
