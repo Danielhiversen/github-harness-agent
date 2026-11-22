@@ -1193,6 +1193,7 @@ def solve(executor, task, archive, budget, version):
                         regression_repair = None
                         source, diagnostics = repair.sources, repair.failures
                         note = ""
+                        _LOG.info("Verifying a private repair of %d newly failing review case(s)", len(repair.introduced))
                     if target == _TEST_GOAL:
                         source = {**current, new_path: test_draft}
                         note = "\n".join(
@@ -1268,6 +1269,7 @@ def solve(executor, task, archive, budget, version):
                     mock_detail = mock_diagnostics.get(target, "")
                     if continuation is not None and mock_detail:
                         mock_detail = "Observations from the saved draft before the unpublished edit:\n" + mock_detail
+                        _LOG.info("Continuing an unpublished edit for tracked pytest case %s", target[1])
                     if stock_fixture and (plan or advice is not None):
                         named_definitions = False
                     messages = _proposal_messages(
