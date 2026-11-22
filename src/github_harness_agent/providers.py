@@ -810,9 +810,21 @@ class ProviderRouter:
             _tool_route_affinity(role, messages),
         )
         if after_provider:
+            # Give each ready alternate account one turn before normal fallback.
             # Several public aliases can share a credential and its quota.
-            previous = {r.quota_key for r in self.routes if r.alias == after_provider}
-            routes.sort(key=lambda r: r.quota_key in previous)
+            seen_accounts = {
+                route.quota_key for route in self.routes if route.alias == after_provider
+            }
+            first_turns = []
+            remaining = []
+            for route in routes:
+                key = (route.alias, route.model)
+                if route.quota_key in seen_accounts or key in deferred:
+                    remaining.append(route)
+                else:
+                    first_turns.append(route)
+                    seen_accounts.add(route.quota_key)
+            routes = first_turns + remaining
         pending = {(route.alias, route.model): route for route in routes}
         single_account = len({route.quota_key for route in routes}) == 1
         failed_accounts = set()

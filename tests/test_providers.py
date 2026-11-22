@@ -1110,6 +1110,28 @@ def test_resumed_editor_account_tried_last_and_remains_eligible():
     assert attempts == ["kilo-free", "ollama-local", "openrouter-free"]
 
 
+def test_resumed_editor_returns_to_top_model_before_alternate_siblings():
+    models = (KILO, OPENROUTER, OPENROUTER_SIBLING, OLLAMA)
+    config = deployment(*models)
+    config[2]["url"] = config[1]["url"]
+    for priority, route in enumerate(reversed(config), start=1):
+        route["quality_priority"] = priority
+    previous, alternate, sibling, local = (model.split("/", 1)[1] for model in models)
+    attempts = []
+
+    def upstream(request):
+        model = json.loads(request.content)["model"]
+        attempts.append(model)
+        status = 200 if model in {previous, sibling} else 404
+        return httpx.Response(status, json=openai_response())
+
+    router = routed(config, upstream)
+    result = router.complete(role="coding", messages=[], after_provider="kilo-free")
+
+    assert result.route == "kilo-free"
+    assert attempts == [alternate, local, previous]
+
+
 LOCAL_ALIAS = "ollama-local/harness-review-coder:30b"
 LOCAL_MODEL = "harness-review-coder:30b"
 LOCAL_URL = "http://127.0.0.1:11434/v1"
