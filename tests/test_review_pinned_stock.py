@@ -180,3 +180,33 @@ def test_pinned_restore_never_selects_arbitrarily_from_more_than_two_imports():
     assert "from adapters import decode" not in restored
     assert "from io import StringIO" not in restored
     assert "More than two absent import bindings" in summary
+
+
+def test_pinned_seed_marks_verified_dependency_edits_only():
+    from github_harness_agent.review_planner import pinned_stock_restore_seed
+
+    path = "feature.py"
+    original = {path: _PINNED_DEPENDENCIES}
+    with_dependencies = {path: _DRAFT_DEPENDENCIES}
+    primary_only = {
+        path: _PINNED_DEPENDENCIES.replace(
+            "return decode(self.prepare(StringIO(value)))", "return self.prepare(value)"
+        )
+    }
+    for draft, has_dependency_edits in (
+        (with_dependencies, True),
+        (primary_only, False),
+    ):
+        row = next(
+            i
+            for i, line in enumerate(draft[path].splitlines(), 1)
+            if "def calculate(" in line
+        )
+        localized = _localized_definition(
+            original, draft, f"{path}::Example.calculate", row
+        )
+        advice = _StockAdvice("repair", "", "", localized, "")
+        seed = pinned_stock_restore_seed(
+            advice, original, draft, {path}, minimum_bytes=1
+        )
+        assert seed.has_dependency_edits is has_dependency_edits

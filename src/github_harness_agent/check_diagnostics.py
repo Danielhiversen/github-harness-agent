@@ -125,6 +125,17 @@ def ordinary_static_locations(command, output):
     return ()
 
 
+def ordinary_unused_import_failure(command, output):
+    """Recognize a complete Ruff report containing only unused imports."""
+    if check_label(command, ()) != "ruff" or not ordinary_static_locations(
+        command, output
+    ):
+        return False
+    return all(
+        code == "F401" for code, *_ in _ruff_matches(_ANSI_COLOR.sub("", output))
+    )
+
+
 def check_failure_summary(task, checks, *, baseline_failed=False):
     failures = []
     for index, failed in enumerate(checks):

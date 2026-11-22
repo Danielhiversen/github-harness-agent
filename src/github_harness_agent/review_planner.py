@@ -67,33 +67,40 @@ def localized_retry_symbol(advice):
     return None
 
 
-def prepare_pinned_stock_restore(advice, original, sources, allowed, *, minimum_bytes):
+@dataclass(frozen=True)
+class _PinnedStockRestore:
+    sources: dict[str, str]
+    advisory: str
+    has_dependency_edits: bool
+
+
+def pinned_stock_restore_seed(advice, original, sources, allowed, *, minimum_bytes):
     """Build a speculative exact restore and describe its static dependencies."""
     symbol = localized_retry_symbol(advice)
     if symbol is None:
-        return None, ""
+        return None
     path, qualified = symbol
     if path not in allowed or path not in original or path not in sources:
-        return None, ""
+        return None
     located = advice.localized
     if (
         located.baseline == located.current
         or len(located.current.encode()) < minimum_bytes
         or hashlib.sha256(sources[path].encode()).hexdigest() != located.source_digest
     ):
-        return None, ""
+        return None
     try:
         before = _scope(original[path], qualified)
         after = _scope(sources[path], qualified)
         if before is None or after is None or type(before.node) is not type(after.node):
-            return None, ""
+            return None
         if (
             "".join(before.rows[before.start : before.node.end_lineno])
             != located.baseline
             or "".join(after.rows[after.start : after.node.end_lineno])
             != located.current
         ):
-            return None, ""
+            return None
         primary = (after.start, after.node.end_lineno, located.baseline)
         extras, facts = pinned_restore_dependencies(before, after, qualified)
         summary = (
@@ -110,6 +117,7 @@ def prepare_pinned_stock_restore(advice, original, sources, allowed, *, minimum_
         try:
             compile(restored, path, "exec")
         except (ValueError, SyntaxError, RecursionError):
+            extras = ()
             restored = (
                 "".join(after.rows[: after.start])
                 + located.baseline
@@ -117,8 +125,16 @@ def prepare_pinned_stock_restore(advice, original, sources, allowed, *, minimum_
             )
             compile(restored, path, "exec")
     except (ValueError, SyntaxError, RecursionError):
-        return None, ""
-    return {**sources, path: restored}, summary
+        return None
+    return _PinnedStockRestore({**sources, path: restored}, summary, bool(extras))
+
+
+def prepare_pinned_stock_restore(advice, original, sources, allowed, *, minimum_bytes):
+    """Return the speculative source and its advisory for offline inspection."""
+    seed = pinned_stock_restore_seed(
+        advice, original, sources, allowed, minimum_bytes=minimum_bytes
+    )
+    return (seed.sources, seed.advisory) if seed is not None else (None, "")
 
 
 def restore_pinned_stock_definition(

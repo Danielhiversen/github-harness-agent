@@ -13,7 +13,11 @@ from dataclasses import dataclass, field, replace
 
 from . import review_recovery
 from .check_artifacts import check_label
-from .check_diagnostics import check_locations, ordinary_static_locations
+from .check_diagnostics import (
+    check_locations,
+    ordinary_static_locations,
+    ordinary_unused_import_failure,
+)
 from .checkpoint import (
     RECOVERY_GOAL_LIMIT,
     RECOVERY_MODE_THRESHOLD,
@@ -68,7 +72,7 @@ from .review_planner import (
     apply_coding_advice,
     localized_retry_symbol,
     request_coding_advice,
-    prepare_pinned_stock_restore,
+    pinned_stock_restore_seed,
 )
 from .review_recovery import operator_acceptance_context
 from .review_solver_context import (
@@ -120,6 +124,8 @@ _PYTEST_SECTION = re.compile(r"^={5,} ([^\n]+?) ={5,}$", re.M)
 _PYTEST_CRASH_LINE = re.compile(r"^\S[^\n]*?\.py:[1-9][0-9]*: .+$")
 _PYTEST_TOTALS = re.compile(r"(?:\d+ [a-z]+, )*\d+ [a-z]+ in \d+(?:\.\d+)?s(?: \([\d:]+\))?")
 _STOCK_REPAIR_CASE_LIMIT = 4
+_DEPENDENCY_SEED_CASE_LIMIT = 6
+_DEPENDENCY_SEED_PROBE_SECONDS = 120
 _STOCK_REPAIR_STATIC_LIMIT = 2
 _STOCK_REPAIR_RETRIES = 2
 _STOCK_HEDGE_DELAY = 60
@@ -312,6 +318,7 @@ def evidence(
     *,
     pytest_runs=None,
     static_runs=None,
+    unused_import_checks=None,
 ):
     with executor.verification_runner.workspace(
         archive, budget.remaining, budget.cancelled
@@ -332,6 +339,10 @@ def evidence(
                     locations = ordinary_static_locations(command, output)
                     if locations:
                         static_runs[number] = locations
+                        if unused_import_checks is not None and ordinary_unused_import_failure(
+                            command, output
+                        ):
+                            unused_import_checks.add(number)
                 nodes = [node for _, node in _TEST_RESULT.findall(output)]
                 line_traceback = "--tb=line" in command or any(
                     option == ("--tb", "line") for option in zip(command, command[1:])
@@ -900,11 +911,16 @@ class _RegressionRepair:
     retry_named: bool = False
     static_failures: dict[tuple[int, str], int] = field(default_factory=dict)
     stock_collection_id: str | None = None
+    dependency_seed: bool = False
+    unused_import_checks: frozenset[int] = frozenset()
 
     def next_target(self, commands):
-        if self.static_failures:
+        static = self.static_failures
+        if self.dependency_seed and self.introduced:
+            static = {key for key in static if key[0] not in self.unused_import_checks}
+        if static:
             return min(
-                self.static_failures,
+                static,
                 key=lambda key: (check_label(commands[key[0]], ()) != "mypy", key),
             )
         return min(self.introduced)
@@ -1033,6 +1049,25 @@ def _verified_operator_runs(before, after, failures, operator_commands, names):
     return reported == failures
 
 
+def _qualified_stock_operator_cases(
+    before, after, failures, commands, names, *, dependency_seed=False
+):
+    size = len(failures)
+    limit = _DEPENDENCY_SEED_CASE_LIMIT if dependency_seed else _STOCK_REPAIR_CASE_LIMIT
+    if size > limit or not _verified_operator_runs(
+        before, after, failures, commands, names
+    ):
+        return False
+    if not dependency_seed:
+        return True
+    passed = sum(
+        after[number].passed
+        for number, command in enumerate(commands)
+        if check_label(command, ()) == "pytest"
+    )
+    return passed >= size
+
+
 class _GuardBudget:
     """Charge the normal command budget while capping optional verification time."""
 
@@ -1053,6 +1088,14 @@ class _GuardBudget:
     def claim(self, kind, limit):
         self.remaining()
         return self.budget.claim(kind, limit)
+
+
+def _pinned_restore_budget(budget, *, dependency_seed):
+    return _GuardBudget(
+        budget,
+        wall_seconds=_DEPENDENCY_SEED_PROBE_SECONDS if dependency_seed else None,
+        reserve=60,
+    )
 
 
 class _InteractiveBudget(_GuardBudget):
@@ -1285,19 +1328,19 @@ def solve(executor, task, archive, budget, version):
         )
 
     def qualified_stock_gain(
-        target, checked, runs, operator_failures, static_failures
+        target, checked, runs, operator_failures, static_failures, *, dependency_seed=False
     ):
         return (
-            len(operator_failures) <= _STOCK_REPAIR_CASE_LIMIT
-            and stock_fixtures.get((target, failures.get(target)))
+            stock_fixtures.get((target, failures.get(target)))
             and _named_operator_cases({target}, commands)
             and _preserved_stock_gain(target, pytest_runs, runs, checked)
             and (
                 static_failures
                 or (operator_failures and (checked.keys() - operator_failures) < failures.keys())
             )
-            and _verified_operator_runs(
-                pytest_runs, runs, operator_failures, task.pull_checks, operator_cases
+            and _qualified_stock_operator_cases(
+                pytest_runs, runs, operator_failures, task.pull_checks, operator_cases,
+                dependency_seed=dependency_seed,
             )
         )
 
@@ -1322,20 +1365,24 @@ def solve(executor, task, archive, budget, version):
         test_path = target[1].partition("::")[0].removeprefix("/work/").removeprefix("./")
         if (task.test_update or "").partition("::")[0] == test_path or test_path in allowed:
             return None, ""
-        sources, advisory = prepare_pinned_stock_restore(
+        seed = pinned_stock_restore_seed(
             advice, original, current, allowed, minimum_bytes=_LONG_LOCALIZED_DEFINITION_BYTES
         )
-        if sources is None:
-            return None, advisory
+        if seed is None:
+            return None, ""
+        sources, advisory = seed.sources, seed.advisory
+        dependency_seed = seed.has_dependency_edits
         restored_patch = patch_for(original, sources)
         if not restored_patch or len(restored_patch) > executor.limits.patch_bytes:
             return None, advisory
-        probe_budget = _GuardBudget(budget, reserve=60)
+        probe_budget = _pinned_restore_budget(budget, dependency_seed=dependency_seed)
         runs, static_runs = {}, {}
+        unused_import_checks = set()
         try:
             checked = evidence(
                 executor, task, archive, probe_budget, restored_patch, commands,
                 pytest_runs=runs, static_runs=static_runs,
+                **({"unused_import_checks": unused_import_checks} if dependency_seed else {}),
             )
             operator_failures = {key for key in checked if key[0] < len(task.pull_checks)}
             static_failures = _localized_static_failures(
@@ -1345,7 +1392,8 @@ def solve(executor, task, archive, budget, version):
                 not checked
                 or static_failures is None
                 or not qualified_stock_gain(
-                    target, checked, runs, operator_failures, static_failures
+                    target, checked, runs, operator_failures, static_failures,
+                    dependency_seed=dependency_seed,
                 )
             ):
                 return None, advisory
@@ -1368,6 +1416,8 @@ def solve(executor, task, archive, budget, version):
             stock_origin=True,
             static_failures=static_failures,
             stock_collection_id=selection,
+            dependency_seed=dependency_seed,
+            unused_import_checks=frozenset(unused_import_checks),
         ), ""
 
     def verify_stock_candidate(target, sources, probe_budget, *, accept_partial=False):
@@ -2373,6 +2423,7 @@ def solve(executor, task, archive, budget, version):
                     raise ValueError("Patch exceeds the configured byte limit")
                 after_runs = {}
                 static_runs = {}
+                unused_import_checks = set()
                 after = evidence(
                     executor,
                     task,
@@ -2382,6 +2433,10 @@ def solve(executor, task, archive, budget, version):
                     commands,
                     pytest_runs=after_runs,
                     static_runs=static_runs,
+                    **(
+                        {"unused_import_checks": unused_import_checks}
+                        if repair is not None and repair.dependency_seed else {}
+                    ),
                 )
             except ValueError as error:
                 if fresh_stock:
@@ -2564,6 +2619,7 @@ def solve(executor, task, archive, budget, version):
                             retry_note="",
                             retry_named=False,
                             static_failures=pending_static,
+                            unused_import_checks=frozenset(unused_import_checks),
                         )
                     else:
                         rejected[repair.origin] = _rejected_attempt(
