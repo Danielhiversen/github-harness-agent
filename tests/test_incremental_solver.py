@@ -31,7 +31,7 @@ from github_harness_agent.review_assertions import (
     operator_assertions,
 )
 from github_harness_agent.review_recovery import ReviewRecovery
-from github_harness_agent.task_context import compact_focused_review
+from github_harness_agent.task_context import compact_focused_review, wire_size
 from github_harness_agent.review_solver import (
     _GUIDANCE,
     _rejected_attempt,
@@ -2470,6 +2470,7 @@ def test_localized_named_failure_tries_numbered_ranges_as_an_independent_remedy(
         (False, "localized"),
         (True, "localized"),
         (False, "unlocalized"),
+        (False, "long_evidence"),
         (False, "one_attempt"),
         (False, "wrong_snapshot"),
         (False, "reserved"),
@@ -2482,7 +2483,8 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
 
     task, _, runner, checkpoints = solver_case
     recovery = []
-    localized = scenario == "localized"
+    localized = scenario in {"localized", "long_evidence"}
+    long_evidence = scenario == "long_evidence"
     acceptance = Path(task.pull_checks[0][-1])
     with acceptance.open("a") as file:
         file.write("\nfrom fixture_calc import stock_result\n"
@@ -2496,6 +2498,15 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
         "    if baseline:\n        return 7\n"
         "    return -3\n"
     )
+    test_body = "from fixture_calc import stock_result\n\ndef test_stock_result(tracked_stock_seed):\n"
+    fixture_body = "import pytest\n\n@pytest.fixture\ndef tracked_stock_seed():\n"
+    if long_evidence:
+        initial_source += "".join(f"    unused_value_{row} = {row}\n" for row in range(150))
+        test_body += "".join(f"    checked_input_{row} = {row}\n" for row in range(160))
+        fixture_body += "".join(f"    fixture_input_{row} = {row}\n" for row in range(55))
+    assertion_line = len(test_body.splitlines()) + 1
+    test_body += "    assert stock_result() == tracked_stock_seed\n"
+    fixture_body += "    return int('03')\n"
     if scenario == "wrong_snapshot":
         target = (1, "tests/test_existing.py::test_stock_result")
         saved_source = initial_source.replace("return -1", "return 1").replace("return -2", "return 2")
@@ -2511,18 +2522,27 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
     with tarfile.open(fileobj=archive, mode="w") as snapshot:
         for path, content in {
             SOURCE: initial_source,
-            "tests/conftest.py": (
-                "import pytest\n\n@pytest.fixture\ndef tracked_stock_seed():\n    return int('03')\n"
-            ),
-            "tests/test_existing.py": (
-                "from fixture_calc import stock_result\n\ndef test_stock_result(tracked_stock_seed):\n    assert stock_result() == tracked_stock_seed\n"
-            ),
+            "tests/conftest.py": fixture_body,
+            "tests/test_existing.py": test_body,
         }.items():
             data = content.encode()
             entry = tarfile.TarInfo(path)
             entry.size = len(data)
             snapshot.addfile(entry, BytesIO(data))
-    monkeypatch.setattr(review_solver, "mock_call_diagnostic", lambda *args, **kwargs: "")
+    traces = ""
+    if long_evidence:
+        traces = (
+            "Auxiliary mapping counter changes (quoted advisory data). "
+            "The pinned case passed and the draft failed at its numeric assertion. "
+            "Locations show where the probe observed each change, with reviewed callers.\n"
+            f"Pinned: 0 -> 7 after {SOURCE}:8 stock_result; " + "more pinned context " * 15 + "\n"
+            f"Draft: 0 -> -3 after {SOURCE}:10 stock_result; " + "more draft context " * 15 + "\n"
+            "Auxiliary mock calls (quoted advisory data)\n"
+            "The pinned base passed and the current draft failed. "
+            "Each call is [method, arguments, keyword arguments].\n"
+            "lookup on base [1]\nlookup on current [3]"
+        )
+    monkeypatch.setattr(review_solver, "mock_call_diagnostic", lambda *args, **kwargs: traces)
     monkeypatch.setattr(
         review_solver, "stock_guard_diagnostic",
         lambda *args: "Auxiliary counterfactual (quoted data, partial diagnostic only). fixture_calc.py::stock_result, draft line 8: causal evidence.",
@@ -2547,28 +2567,40 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
         nonlocal focused_command
         if request.url.path == "/api/tags":
             return httpx.Response(200, json=local_inventory())
-        assert scenario in {"localized", "unlocalized"}
+        assert scenario in {"localized", "unlocalized", "long_evidence"}
         payload = json.loads(request.content)
         calls = ()
         tools, messages = payload["tools"], payload["messages"]
         tool_turns.append(payload["max_tokens"])
         phases.append("interactive")
         outputs = [message["content"] for message in messages if message["role"] == "tool"]
+        task_prompt = next(m["content"] for m in messages if m["role"] == "user")
+        if long_evidence:
+            assert wire_size(messages) <= 8192
+            assert f"tests/test_existing.py:{assertion_line}" in task_prompt
+            assert f"(diagnostic at line {assertion_line})" in task_prompt
+            assert "assert stock_result() == tracked_stock_seed" in task_prompt
+            assert "assert -3 == 3" in task_prompt
+            assert "Auxiliary counterfactual" in task_prompt
+            assert f"Pinned: 0 -> 7 after {SOURCE}:8" in task_prompt
+            assert f"Draft: 0 -> -3 after {SOURCE}:10" in task_prompt
+            assert "lookup on current [3]" in task_prompt
         if not outputs:
-            task_prompt = "\n".join(str(m.get("content") or "") for m in messages)
-            assert "def test_stock_result(tracked_stock_seed):\n    assert stock_result() == tracked_stock_seed" in task_prompt
-            assert "def tracked_stock_seed():\n    return int('03')" in task_prompt
+            if not long_evidence:
+                assert "def test_stock_result(tracked_stock_seed):\n    assert stock_result() == tracked_stock_seed" in task_prompt
+                assert "def tracked_stock_seed():\n    return int('03')" in task_prompt
             assert "def test_stock_baseline():\n    assert stock_result(baseline=True) == 7" in task_prompt
             command_text = re.search(r"(?m)^Focused pytest argv: (.+)$", task_prompt)
             assert command_text
             focused_command = json.loads(command_text[1])
             assert focused_command[-1] == "tests/test_existing.py::test_stock_result"
             assert "Localized method in the current draft" in task_prompt
-            assert "def stock_result(*, baseline=False):\n    if baseline:\n        return 7\n    return -3" in task_prompt
+            if not long_evidence:
+                assert "def stock_result(*, baseline=False):\n    if baseline:\n        return 7\n    return -3" in task_prompt
             assert {tool["function"]["name"] for tool in tools} >= {"run", "edit_file"}, phases
             calls = (
                 call("edit_file", {"path": "outside.py", "new_text": "bad = True\n"}),
-                call("run", {"argv": ["cat", SOURCE]}),
+                call("run", {"argv": ["sed", "-n", "1,10p", SOURCE]}),
             )
         elif len(tool_turns) == 2:
             assert "outside the scoped review" in outputs[0]
@@ -2598,7 +2630,7 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
                 content = json.dumps({"strategy": "Trace the public inputs.", "symbols": [f"{SOURCE}::stock_result" if localized else "unknown.py::not_reviewed"]})
             elif prompt.startswith("Selected failure: new regression tests"):
                 phases.append("author")
-                if scenario in {"localized", "unlocalized"}:
+                if scenario in {"localized", "unlocalized", "long_evidence"}:
                     assert len(checkpoints) == 1
                     assert b"+    return 3\n" not in checkpoints[0].patch
                 content = edit(NEW_TEST, "", regression)

@@ -10,12 +10,42 @@ from types import SimpleNamespace
 from . import review_counter_trace, review_mock_probe
 from .review_prefix_replay import _interpreter
 from .review_solver_context import _STOCK_NODE, _tracked_stock_test
+from .task_context import excerpt
 from .worker import Cancelled, ExecutionError, LimitExceeded
 
 _PLANNING_RESERVE = 30
 # Includes startup and staging in a fresh isolated verification workspace.
 _REPLAY_SECONDS = 20
 _DETAIL_BYTES = 900
+_COUNTER_HEADING = "Auxiliary mapping counter changes (quoted advisory data)."
+_OBSERVATION_BOUNDARY = re.compile(
+    r"(?m)^(?=Auxiliary (?:counterfactual|mapping counter changes|mock calls)\b)"
+)
+
+
+def compact_observations(detail, limit):
+    """Budget for each replay report, including both sides of a counter comparison."""
+    if len(detail.encode()) <= limit:
+        return detail
+    reports = [part.strip() for part in _OBSERVATION_BOUNDARY.split(detail) if part.strip()]
+    if not reports:
+        return ""
+    allowance = max(0, (limit - len(reports) + 1) // len(reports))
+    result = []
+    for report in reports:
+        if report.startswith(_COUNTER_HEADING) and len(report.encode()) > allowance:
+            rows = [
+                line for line in report.splitlines()
+                if line.startswith(("Pinned: ", "Draft: "))
+            ]
+            if rows and allowance > len(_COUNTER_HEADING) + len(rows):
+                row_limit = (allowance - len(_COUNTER_HEADING) - len(rows)) // len(rows)
+                result.append(
+                    _COUNTER_HEADING + "\n" + "\n".join(excerpt(row, row_limit) for row in rows)
+                )
+                continue
+        result.append(excerpt(report, allowance))
+    return "\n".join(result)
 
 
 def _readout(
@@ -219,7 +249,7 @@ def _counter_difference(baseline, candidate, node):
         render(label, events) for label, events in (("Pinned", old), ("Draft", new))
     ]
     return (
-        "Auxiliary mapping counter changes (quoted advisory data). "
+        _COUNTER_HEADING + " "
         f"The pinned case passed and the draft failed at {node} line {line} (evaluation {failed + 1}). "
         "Locations show where the probe observed each change, with reviewed callers.\n"
         + "\n".join(rows)

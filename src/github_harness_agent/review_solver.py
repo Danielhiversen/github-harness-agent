@@ -49,7 +49,7 @@ from .review_definitions import (
 )
 from .review_guard_probe import stock_guard_diagnostic
 from .review_guards import guarded_sources
-from .review_mock_replay import mock_call_diagnostic
+from .review_mock_replay import compact_observations, mock_call_diagnostic
 from .review_line_ranges import (
     LineRangeSnapshot,
     apply_line_range_edit,
@@ -1244,35 +1244,41 @@ def solve(executor, task, archive, budget, version):
             last_editor=(actor.route, actor.configured_model) if actor and actor.configured_model else None,
         )
         command = commands[target[0]]
+        diagnostic = failures[target]
         stock_fixture = stock_pytest_excerpt(archive, command, target[1], "")
+        window = (
+            stock_pytest_excerpt(
+                archive, command, target[1], diagnostic, failure_window_only=True,
+            )
+            if wire_size(stock_fixture) > 1400 else ""
+        )
         inferred_symbol, example = interactive_stock_focus(
-            original, current, stock_fixture, fixtures
+            original, current, stock_fixture + window, fixtures
         )
         symbol = symbol or inferred_symbol
         focused = focused_pytest((command,), (target[1],))
         command_label, argv = ("Focused", focused) if focused else ("Configured", command)
         instructions = (
             "The saved draft passes the operator review checks. Use the workspace tools to "
-            "reproduce the tracked test, try a focused fix, and preserve all passing behavior."
+            "reproduce the tracked test, try a focused fix, and preserve all passing behavior. "
+            "Use run to read the complete files when needed."
             f"\nTracked pytest node: {target[1]}"
             f"\n{command_label} pytest argv: {json.dumps(argv)}"
             f"\nEdit only these paths: {json.dumps(sorted(reviewed))}"
         )
         if example:
             instructions += "\nPassing operator suite example (quoted):\n" + example
+        stock_heading = "\nTracked test and fixture setup (quoted):\n"
         sections = [
-            ("\nTracked test and fixture setup (quoted):\n", stock_fixture),
+            ("\nLast failure (quoted):\n", excerpt(diagnostic, 650)),
+            ("\nExecution observations (quoted):\n", compact_observations(mock_diagnostics.get(target, ""), 1080)),
         ]
         if symbol is not None:
-            definition = prepare_line_range_edit(current, symbol)
             sections.append(("\nLocalized method in the current draft (quoted):\n", "::".join(symbol)))
-            if definition is not None:
-                sections.append(("\n", "\n".join(definition.lines)))
-        sections += [
-            ("\nLast failure (quoted):\n", excerpt(failures[target], 650)),
-            ("\nExecution observations (quoted):\n", excerpt(mock_diagnostics.get(target, ""), 650)),
-            ("\nOriginal review (quoted):\n", excerpt(task.instructions, 650)),
-        ]
+        sections.append((stock_heading, stock_fixture))
+        if symbol is not None and (definition := prepare_line_range_edit(current, symbol)):
+            sections.append(("\nCurrent method source (quoted):\n", "\n".join(definition.lines)))
+        sections.append(("\nOriginal review (quoted):\n", excerpt(task.instructions, 650)))
         # Leave room for checkpoint and operator-command annotations and complete
         # tool results even on the smallest supported local model prompt.
         for heading, section in sections:
@@ -1282,6 +1288,8 @@ def solve(executor, task, archive, budget, version):
             room = _INTERACTIVE_INSTRUCTIONS_BYTES - wire_size([prompt])
             if room < 160:
                 break
+            if heading == stock_heading and window and wire_size(section) - 2 > room:
+                section = window + "Use run to read the complete tracked test and fixture setup.\n"
             bounded = excerpt(section, room)
             while wire_size([{**prompt, "content": instructions + heading + bounded}]) > _INTERACTIVE_INSTRUCTIONS_BYTES:
                 room //= 2

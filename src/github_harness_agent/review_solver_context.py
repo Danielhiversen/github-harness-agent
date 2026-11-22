@@ -160,7 +160,7 @@ def _fixture_arguments(node):
     return dependencies
 
 
-def stock_pytest_excerpt(archive, command, node, diagnostic):
+def stock_pytest_excerpt(archive, command, node, diagnostic, *, failure_window_only=False):
     """Read a pytest node and local fixture declarations from the pinned Git archive."""
     target = node.split("[", 1)[0].removeprefix("/work/").removeprefix("./")
     match = _STOCK_NODE.fullmatch(target) if len(target) <= 512 else None
@@ -218,10 +218,16 @@ def stock_pytest_excerpt(archive, command, node, diagnostic):
     )
     if row is not None:
         window, _, _ = _diagnostic_window(
-            lines, (), row, 1000, bounds=(test.lineno, test.end_lineno)
+            lines, (), row, 650 if failure_window_only else 1000,
+            bounds=(test.lineno, test.end_lineno),
         )
         if window:
-            chunks.append(f"# {path}\n{window}\n")
+            chunk = f"# {path}\n{window}\n"
+            if failure_window_only:
+                return chunk
+            chunks.append(chunk)
+    if failure_window_only:
+        return ""
     chunks.append(definition(path, lines, test, 2700))
     visible = {}
     wanted = _fixture_arguments(test)
