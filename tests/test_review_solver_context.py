@@ -272,6 +272,59 @@ def test_calculation(uncertain):
     assert "do not show" not in str(shapes) and "42" not in str(shapes)
 
 
+def test_operator_test_context_quotes_only_verified_call_shapes_and_mapping_keys():
+    path = "src/example/formatter.py"
+    sources = {path: """
+class Formatter:
+    def calculate(self, value, *, precision) -> dict[str, int]: ...
+    def unknown(self) -> object: ...
+"""}
+    fixtures = {"operator/test_contract.py": """
+from example.formatter import Formatter as Service
+from other import Unrelated
+def make_service(secret):
+    return Service(secret)
+def make_unrelated(secret):
+    return Unrelated(secret)
+def test_operator_only():
+    direct = make_service('operator fixture value').calculate('secret', precision=7)
+    assert direct['public_total'] == 987654 and direct['_private'] == 6
+    assert direct['12.3,45.6'] in 'hidden expected contents'
+    with mock_context():
+        client = make_service(123)
+        observed = client.calculate(812, precision=8)
+    assert observed['observation_count'] == 654321
+    unknown = make_service(1).unknown()
+    assert unknown['do_not_show'] == 8
+    unrelated = make_unrelated(2).calculate(8, unproved=5)
+    assert unrelated['also_hidden'] == 53
+"""}
+    contract = review_solver_context.operator_api_contract(fixtures, sources)
+    assert set(contract.splitlines()) == {
+        "Formatter.calculate(..., precision=...)",
+        "result['public_total']",
+        "result['observation_count']",
+    }
+    review = ReviewRecovery(feedback=((path, 3, "cover calculated totals"),), previous_failure="")
+    new_path = "tests/test_review_regressions.py"
+    for repairing in (False, True):
+        messages = _proposal_messages(
+            (-1, "new regression tests"), {**sources, new_path: ""}, {}, True,
+            "Verifier expects a mapping" if repairing else "", review, fixtures, [], new_path,
+            allow_test_module=True, repair_failed_tests=repairing,
+        )
+        compacted = compact_focused_review(messages, max_bytes=2300)
+        for prompt in (messages[-1]["content"], compacted[-1]["content"]):
+            assert "Verified operator API contract (quoted data)" in prompt
+            assert contract in prompt
+            assert "987654" not in prompt and "654321" not in prompt
+            assert "hidden expected contents" not in prompt
+            assert prompt.endswith(TEST_MODULE_REPLY_ENDING)
+        if repairing:
+            prompt = compacted[-1]["content"]
+            assert prompt.index("Verifier expects a mapping") < prompt.index(contract)
+
+
 def test_review_imported_models_use_pinned_package_source_including_relative_imports():
     archive = BytesIO()
     contents = (

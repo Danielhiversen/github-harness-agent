@@ -21,6 +21,7 @@ TEST_MODULE_REPLY_ENDING = (
 )
 REPOSITORY_PYTEST_EXAMPLE = "\nExisting repository pytest example (quoted data, use for API and setup):\n"
 REPOSITORY_PYTEST_USAGE = "\nObserved repository API usage shapes (quoted data, literals omitted):\n"
+OPERATOR_API_CONTRACT = "\nVerified operator API contract (quoted data):\n"
 TEST_REPAIR_GUIDANCE = (
     "Make the smallest focused correction for the latest verification errors and preserve passing cases."
 )
@@ -650,14 +651,17 @@ def compact_focused_review(messages, *, max_bytes):
     else:
         front, names_marker, tail = lead.partition("\nOperator test names:")
         examples, usage_marker, usage = front.partition(REPOSITORY_PYTEST_USAGE)
-        before, example_marker, example = examples.partition(REPOSITORY_PYTEST_EXAMPLE)
+        operator, example_marker, example = examples.partition(REPOSITORY_PYTEST_EXAMPLE)
+        before, contract_marker, contract = operator.partition(OPERATOR_API_CONTRACT)
         preserved = ""
         if repair_guidance and TEST_VERIFICATION_FEEDBACK in tail:
             names, details_marker, details = tail.partition(TEST_VERIFICATION_FEEDBACK)
             diagnostic, source_marker, api = details.partition("\nFocused source from ")
             preserved = _bounded_content(details_marker + diagnostic, min(1100, budget // 3))
             tail = names + source_marker + api
-        for section, content in ((example_marker, example), (usage_marker, usage)):
+        for section, content in (
+            (contract_marker, contract), (example_marker, example), (usage_marker, usage),
+        ):
             if section and wire_size(preserved + section + content) < budget:
                 preserved += section + content
         if preserved and names_marker:

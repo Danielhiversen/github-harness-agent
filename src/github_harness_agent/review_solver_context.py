@@ -204,6 +204,7 @@ def _source_root(path):
 class _ReturnedValue:
     methods: dict[str, bool | tuple[bool, ...]]
     mapping: bool | tuple[bool, ...] = False
+    class_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -211,6 +212,7 @@ class _UsageOrigin:
     rows: tuple[str, ...]
     methods: dict[str, bool | tuple[bool, ...]]
     mapping: bool = False
+    class_name: str = ""
 
 
 def _mapping_result(annotation):
@@ -247,7 +249,10 @@ def _reviewed_calls(declarations):
             if len(returns) == 1 and isinstance(returns[0], ast.Call):
                 result = _dotted_name(returns[0].func)
         functions[node.name] = _ReturnedValue(classes.get(result, {}), _mapping_result(node.returns))
-    return {**{name: _ReturnedValue(methods) for name, methods in classes.items()}, **functions}
+    return {
+        **{name: _ReturnedValue(methods, class_name=name) for name, methods in classes.items()},
+        **functions,
+    }
 
 
 def _shape_operand(node):
@@ -280,7 +285,7 @@ def _rebound_names(node):
             yield item.rest
 
 
-def _usage_shapes(node, reviewed_calls):
+def _usage_shapes(node, reviewed_calls, *, contract_only=False):
     """Read calls and public attributes from straight-line code and context bodies."""
     bound = _fixture_arguments(node)
     bound.update(arg.arg for arg in (node.args.vararg, node.args.kwarg) if arg is not None)
@@ -289,10 +294,10 @@ def _usage_shapes(node, reviewed_calls):
         for name in item.names
     )
     local_names = set(_rebound_names(node)) | bound
-    yield from _usage_block(node.body, reviewed_calls, local_names, {}, bound)
+    yield from _usage_block(node.body, reviewed_calls, local_names, {}, bound, contract_only)
 
 
-def _usage_block(statements, reviewed_calls, local_names, origins, bound):
+def _usage_block(statements, reviewed_calls, local_names, origins, bound, contract_only):
     for statement in statements:
         rebound = Counter(_rebound_names(statement))
         if isinstance(statement, (ast.With, ast.AsyncWith)):
@@ -300,6 +305,7 @@ def _usage_block(statements, reviewed_calls, local_names, origins, bound):
             nested_origins = {name: origin for name, origin in origins.items() if name not in context_names}
             yield from _usage_block(
                 statement.body, reviewed_calls, local_names, nested_origins, bound | context_names,
+                contract_only,
             )
             # A suppressing exit can leave a previous value in place. A fresh name with a
             # single proven mapping assignment either has that value or cannot be read.
@@ -325,22 +331,37 @@ def _usage_block(statements, reviewed_calls, local_names, origins, bound):
         if isinstance(expression, ast.Call):
             called = _dotted_name(expression.func)
             receiver, _, method = called.rpartition(".")
+            origin = origins.get(receiver)
+            if (
+                contract_only and isinstance(expression.func, ast.Attribute)
+                and isinstance(expression.func.value, ast.Call)
+            ):
+                factory = _dotted_name(expression.func.value.func)
+                if factory.split(".", 1)[0] not in local_names:
+                    origin = reviewed_calls.get(factory)
+                method = expression.func.attr
             if called in reviewed_calls and called.split(".", 1)[0] not in local_names:
                 returned = reviewed_calls[called]
-            elif receiver in origins and method in origins[receiver].methods:
-                returned = _ReturnedValue({}, origins[receiver].methods[method])
+                if contract_only:
+                    called = ""
+            elif origin and method in origin.methods:
+                mapping = origin.methods[method]
+                returned = _ReturnedValue({}, mapping)
+                if contract_only:
+                    returns_mapping = mapping is True or (isinstance(mapping, tuple) and any(mapping))
+                    called = f"{origin.class_name}.{method}" if origin.class_name and returns_mapping else ""
             else:
                 called = ""
             if called:
-                args = [_shape_operand(arg) for arg in expression.args]
+                args = ["..." if contract_only else _shape_operand(arg) for arg in expression.args]
                 args.extend(
-                    f"{arg.arg}={_shape_operand(arg.value)}" if arg.arg else "**..."
+                    f"{arg.arg}={'...' if contract_only else _shape_operand(arg.value)}" if arg.arg else "**..."
                     for arg in expression.keywords
                 )
                 invocation = f"{called}({', '.join(args)})"
-                if awaited:
+                if awaited and not contract_only:
                     invocation = "await " + invocation
-                if names:
+                if names and not contract_only:
                     invocation = f"{', '.join(names)} = {invocation}"
                 if len(invocation.encode()) <= 210:
                     setup = origins[receiver].rows if receiver in origins else ()
@@ -357,9 +378,10 @@ def _usage_block(statements, reviewed_calls, local_names, origins, bound):
                     and isinstance(key := item.slice.value, str)
                     and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", key)
                 ):
-                    lookup = f"{item.value.id}[{key!r}]"
+                    receiver = "result" if contract_only else item.value.id
+                    lookup = f"{receiver}[{key!r}]"
                     yield lookup, (*origin.rows, lookup)
-                if not isinstance(item, ast.Attribute):
+                if contract_only or not isinstance(item, ast.Attribute):
                     continue
                 attribute = _dotted_name(item)
                 owner, _, member = attribute.partition(".")
@@ -371,7 +393,7 @@ def _usage_block(statements, reviewed_calls, local_names, origins, bound):
         for name in rebound:
             origins.pop(name, None)
         bound.update(rebound)
-        if rows:
+        if rows or (contract_only and returned.class_name):
             single = isinstance(target, ast.Name)
             if single and isinstance(returned.mapping, bool):
                 mapping = (returned.mapping,)
@@ -380,11 +402,13 @@ def _usage_block(statements, reviewed_calls, local_names, origins, bound):
             else:
                 mapping = (False,) * len(names)
             for name, is_mapping in zip(names, mapping):
-                origins[name] = _UsageOrigin(rows, returned.methods if single else {}, is_mapping)
+                origins[name] = _UsageOrigin(
+                    rows, returned.methods if single else {}, is_mapping,
+                    returned.class_name if single else "",
+                )
 
 
-def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usage_bytes=820):
-    """Return a complete small example and separate bounded public API usage shapes."""
+def _reviewed_modules(sources):
     modules = {}
     for path, source in sources.items():
         source_path = PurePosixPath(path)
@@ -398,6 +422,57 @@ def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usag
         except (SyntaxError, ValueError, RecursionError):
             continue
         modules[".".join(parts)] = _reviewed_calls(declarations)
+    return modules
+
+
+def operator_api_contract(fixtures, sources, *, max_bytes=700):
+    """Read public method shapes and dictionary keys without copying test code."""
+    modules = _reviewed_modules(sources)
+    calls = {}
+    for source in tuple(fixtures.values())[:4]:
+        if len(source.encode()) > 128 * 1024:
+            continue
+        try:
+            body = ast.parse(source).body
+        except (SyntaxError, ValueError, RecursionError):
+            continue
+        _, reviewed_calls = _reviewed_imports(body, modules)
+        constructors = {
+            name: value for name, value in reviewed_calls.items() if value.class_name
+        }
+        for node in body:
+            if not isinstance(node, _FUNCTION) or not node.body:
+                continue
+            last = node.body[-1]
+            if not isinstance(last, ast.Return) or not isinstance(last.value, ast.Call):
+                continue
+            constructor = _dotted_name(last.value.func)
+            bound = set(_rebound_names(node)) | _fixture_arguments(node)
+            if (
+                constructor in constructors and constructor.split(".", 1)[0] not in bound
+                and sum(isinstance(item, ast.Return) for item in ast.walk(node)) == 1
+            ):
+                reviewed_calls[node.name] = constructors[constructor]
+        for node in body:
+            if not isinstance(node, _FUNCTION) or not node.name.startswith("test_"):
+                continue
+            for _, rows in _usage_shapes(node, reviewed_calls, contract_only=True):
+                if rows:
+                    calls.setdefault(rows[0], {}).update(dict.fromkeys(rows[1:]))
+    lines = []
+    for call, lookups in calls.items():
+        for line in (call, *lookups):
+            size = len(line.encode()) + 1
+            if size > max_bytes:
+                return "\n".join(lines)
+            lines.append(line)
+            max_bytes -= size
+    return "\n".join(lines)
+
+
+def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usage_bytes=820):
+    """Return a complete small example and separate bounded public API usage shapes."""
+    modules = _reviewed_modules(sources)
     if not any(modules.values()):
         return "", ""
     module_stems = {module.rsplit(".", 1)[-1] for module in modules}

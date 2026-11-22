@@ -98,6 +98,7 @@ from .review_solver_context import (
     focused_check_excerpt,
     focused_source_excerpt,
     imported_model_declarations,
+    operator_api_contract,
     repository_pytest_context,
     stock_assertion_progress,
     stock_assertion_failure_line,
@@ -109,6 +110,7 @@ from .review_solver_context import (
 from .review_stock_collection import stock_collection
 from .task_context import (
     MESSAGE_BYTES,
+    OPERATOR_API_CONTRACT,
     REPOSITORY_PYTEST_EXAMPLE,
     REPOSITORY_PYTEST_USAGE,
     TEST_MODULE_REPLY_ENDING,
@@ -679,6 +681,7 @@ def _test_authoring_messages(
     names, setup = _regression_context(fixtures)
     test_query = words(" ".join([*behaviors, names, setup, note]))
     sources = {path: content for path, content in current.items() if path != new_path}
+    operator_contract = operator_api_contract(fixtures, sources)
     api = "\n".join(
         _regression_api(path, content, test_query, 2100 // len(sources))
         for path, content in sources.items()
@@ -712,6 +715,7 @@ def _test_authoring_messages(
         "Use the operator examples as behavior and setup references, without copying them.\n"
         "Requested behaviors (quoted review notes):\n"
         + "\n".join(f"- {excerpt(body, 320)}" for body in behaviors if body)
+        + (OPERATOR_API_CONTRACT + operator_contract + "\n" if operator_contract else "")
         + (
             REPOSITORY_PYTEST_EXAMPLE + repository_example + "\n"
             if repository_example else ""
