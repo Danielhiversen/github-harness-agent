@@ -62,7 +62,10 @@ class FreeGateway:
     ):
         assert role == "coding"
         assert not tools
-        assert max_output_tokens == 3072
+        named = messages[-1]["content"].endswith(
+            "Respond with complete named Python definitions only."
+        )
+        assert max_output_tokens == (6144 if named else 3072)
         self.prompts.append(messages[-1]["content"])
         return SimpleNamespace(
             content=next(self.proposals),

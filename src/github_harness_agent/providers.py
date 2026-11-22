@@ -29,6 +29,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from .review_definitions import DEFINITION_ENDING
 from .task_context import (
     MESSAGE_BYTES,
     compact_focused_review,
@@ -41,6 +42,7 @@ DEFAULT_REQUEST_TIMEOUT = 60
 MAX_REQUEST_TIMEOUT = 900
 _FOCUSED_RETRY_INPUT_BYTES = 12 * 1024
 _FOCUSED_RETRY_OUTPUT_TOKENS = 1536
+_NEMOTRON = "nvidia/nemotron-3-ultra-550b-a55b"
 _OLLAMA_ORIGIN = "http://127.0.0.1:11434"
 _OLLAMA_API = f"{_OLLAMA_ORIGIN}/v1"
 _LOCAL_MODEL_NAME = re.compile(
@@ -327,15 +329,16 @@ def _chat_payload(
     }
     if (
         route.alias in {"nvidia", "nvidia-free"}
-        and route.model == "nvidia/nemotron-3-ultra-550b-a55b"
+        and route.model == _NEMOTRON
         and len(cleaned) == 2
         and cleaned[1].get("role") == "user"
         and str(cleaned[1].get("content") or "").startswith("Selected failure: ")
     ):
         # NIM defaults to high reasoning. Focused text edits need the limited
         # output for source, while native calls require the thinking parser.
-        settings = {"enable_thinking": bool(tools), "force_nonempty_content": True}
-        if tools:
+        thinking = bool(tools) or cleaned[1]["content"].endswith(DEFINITION_ENDING)
+        settings = {"enable_thinking": thinking, "force_nonempty_content": True}
+        if thinking:
             settings["medium_effort"] = True
         body["chat_template_kwargs"] = settings
     if route.alias.startswith("openrouter"):
@@ -631,6 +634,8 @@ class ProviderRouter:
                 raise ValueError("quality_priority must be an integer")
             attempt_timeout = item.get("attempt_timeout", 15)
             limit = _LOCAL_ATTEMPT_MAX if local is not None else 60
+            if alias in {"nvidia", "nvidia-free"} and model == _NEMOTRON:
+                limit = 120
             if (
                 type(attempt_timeout) not in {int, float}
                 or not 0 < attempt_timeout <= limit
@@ -816,7 +821,15 @@ class ProviderRouter:
         for route in routes:
             key = (route.alias, route.model)
             now = time.monotonic()
-            attempt_deadline = min(deadline, now + route.attempt_timeout)
+            attempt_limit = route.attempt_timeout
+            if route.model == _NEMOTRON and not (
+                role == "coding"
+                and not tools
+                and messages
+                and str(messages[-1].get("content") or "").endswith(DEFINITION_ENDING)
+            ):
+                attempt_limit = min(60, attempt_limit)
+            attempt_deadline = min(deadline, now + attempt_limit)
             attempt_timeout = attempt_deadline - now
             if attempt_timeout <= 0:
                 failures["gateway"] = "deadline exceeded"

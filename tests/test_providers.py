@@ -190,6 +190,34 @@ def test_nemotron_planner_has_its_own_reasoning_budget():
     assert payloads[0]["max_tokens"] == 4096
 
 
+@pytest.mark.parametrize("named", [False, True])
+def test_nemotron_extended_deadline_is_for_named_repair_only(named):
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(200, json=openai_response())
+
+    config = deployment("nvidia-free/nvidia/nemotron-3-ultra-550b-a55b")
+    config[0]["attempt_timeout"] = 110
+    router = routed(config, handle)
+    content = "Selected failure: test_index_order\n"
+    if named:
+        content += providers.DEFINITION_ENDING
+    router.complete(
+        role="coding",
+        messages=[{"role": "system", "content": "Edit."}, {"role": "user", "content": content}],
+        max_output_tokens=6144,
+        timeout=115,
+    )
+    payload = json.loads(requests[0].content)
+    assert payload["chat_template_kwargs"]["enable_thinking"] == named
+    assert payload["max_tokens"] == 6144
+    timeout = requests[0].extensions["timeout"]["read"]
+    limit = 110 if named else 60
+    assert limit - 3 < timeout <= limit
+
+
 def quality_order():
     config = deployment(OPENROUTER, OPENROUTER_SIBLING, KILO, OLLAMA)
     config[1]["url"] = config[0]["url"]

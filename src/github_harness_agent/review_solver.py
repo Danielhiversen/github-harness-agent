@@ -611,7 +611,9 @@ def _coding_completion(
         "coding",
         messages,
         after_provider=route,
-        max_output_tokens=3072,
+        max_output_tokens=(
+            6144 if messages[-1]["content"].endswith(DEFINITION_ENDING) else 3072
+        ),
     )
     return completion, None
 
@@ -951,7 +953,16 @@ def solve(executor, task, archive, budget, version):
                     check_command = commands[target[0]] if target in diagnostics else ()
                     named_definitions = (
                         target in failures
-                        and malformed.get(target, 0) >= RECOVERY_MODE_THRESHOLD
+                        and (
+                            malformed.get(target, 0) >= RECOVERY_MODE_THRESHOLD
+                            or (
+                                target in operator
+                                and continuation is None
+                                and repair is None
+                                and no_progress.get(target, 0) >= RECOVERY_MODE_THRESHOLD
+                                and attempts[target] % 3 == 0
+                            )
+                        )
                         # Import blocks cannot be replaced by naming a definition.
                         and (
                             not check_command
