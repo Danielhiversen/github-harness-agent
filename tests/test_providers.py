@@ -407,9 +407,15 @@ def test_gemini_tool_round_trip_replays_provider_signature():
 
 
 def test_gateway_requires_token_and_uses_provider_route():
+    upstream_payloads = []
+
+    def upstream(req):
+        upstream_payloads.append(json.loads(req.content))
+        return httpx.Response(200, json=openai_response())
+
     router = routed(
         deployment(KILO, OLLAMA),
-        lambda req: httpx.Response(200, json=openai_response()),
+        upstream,
     )
     app = create_model_gateway(router, "gateway-token")
     payload = {"role": "plain", "messages": []}
@@ -433,6 +439,11 @@ def test_gateway_requires_token_and_uses_provider_route():
         assert result.route == "ollama-local"
         assert result.configured_model == "gemma4:26b"
         assert result.model == "actual-model"
+        assert "max_output_tokens" not in json.loads(requests[-1].content)
+        local = next(route for route in router.routes if route.alias == "ollama-local")
+        assert upstream_payloads[-1]["max_tokens"] == local.max_tokens
+        assert client.complete(**payload, max_output_tokens=512).route == "kilo-free"
+        assert upstream_payloads[-1]["max_tokens"] == 512
         assert (
             client.complete(**payload, provider_offset=1, timeout=900).route
             == "ollama-local"
@@ -445,10 +456,13 @@ def test_gateway_requires_token_and_uses_provider_route():
         assert requests[-1].extensions["timeout"]["read"] == 900
         attempts = []
         result = client.complete(
-            **payload, on_attempt=lambda *attempt: attempts.append(attempt)
+            **payload,
+            on_attempt=lambda *attempt: attempts.append(attempt),
+            max_output_tokens=900,
         )
         assert attempts == [tuple(KILO.split("/", 1))]
         assert result.route == attempts[0][0]
+        assert upstream_payloads[-1]["max_tokens"] == 900
         assert http.post(f"{url}/complete/observed", json=payload).status_code == 401
         with pytest.raises(ProviderExhausted) as failure:
             client.complete(
@@ -462,6 +476,9 @@ def test_gateway_requires_token_and_uses_provider_route():
             {"provider_offset": -1},
             {"provider_offset": True},
             {"timeout": 901},
+            {"max_output_tokens": 0},
+            {"max_output_tokens": True},
+            {"max_output_tokens": "512"},
         ):
             assert (
                 http.post(
@@ -469,6 +486,63 @@ def test_gateway_requires_token_and_uses_provider_route():
                 ).status_code
                 == 422
             )
+
+
+@pytest.mark.parametrize("max_output_tokens", [None, 3072, 100_000])
+def test_gemini_output_limit_is_bounded_by_the_route(max_output_tokens):
+    payloads = []
+
+    def handle(request):
+        payloads.append(json.loads(request.content))
+        return httpx.Response(
+            200, json={"candidates": [{"content": {"parts": [{"text": "done"}]}}]}
+        )
+
+    router = routed(deployment(GOOGLE), handle)
+    route_max = router.routes[0].max_tokens
+    result = router.complete(
+        role="plain", messages=[], max_output_tokens=max_output_tokens
+    )
+    assert result.content == "done"
+    assert payloads[0]["generationConfig"]["maxOutputTokens"] == min(
+        max_output_tokens or route_max, route_max
+    )
+
+
+def test_gateway_preserves_requested_limit_when_observed_endpoint_is_unavailable():
+    requests = []
+
+    def dispatch(request):
+        requests.append((request.url.path, json.loads(request.content)))
+        if request.url.path.endswith("/observed"):
+            return httpx.Response(404)
+        return httpx.Response(
+            200,
+            json={
+                "route": "fixture",
+                "model": "fixture-model",
+                "role": "coding",
+                "content": "done",
+                "tool_calls": [],
+                "usage": {},
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(dispatch)) as http:
+        client = ModelGatewayClient(
+            "https://gateway.example.invalid", "token", client=http
+        )
+        result = client.complete(
+            role="coding",
+            messages=[],
+            max_output_tokens=512,
+            on_attempt=lambda *_: None,
+        )
+    assert result.content == "done"
+    assert [(path, body["max_output_tokens"]) for path, body in requests] == [
+        ("/complete/observed", 512),
+        ("/complete", 512),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -820,8 +894,11 @@ def mock_async_local(monkeypatch, handler):
     )
 
 
+@pytest.mark.parametrize("route_cap,requested", [(4096, None), (2048, 3072)])
 def test_pinned_unlisted_ollama_model_uses_loopback_inventory_and_completion(
     monkeypatch,
+    route_cap,
+    requested,
 ):
     calls = []
 
@@ -834,14 +911,16 @@ def test_pinned_unlisted_ollama_model_uses_loopback_inventory_and_completion(
         assert "authorization" not in request.headers
         body = json.loads(request.content)
         assert body["model"] == LOCAL_MODEL
-        assert body["max_tokens"] == 4096
+        assert body["max_tokens"] == route_cap
         assert 110 < request.extensions["timeout"]["read"] <= 120
         return httpx.Response(200, json={**openai_response(), "model": LOCAL_MODEL})
 
     mock_async_local(monkeypatch, handle)
-    router = ProviderRouter(load_manifest(), [pinned_local()])
+    router = ProviderRouter(load_manifest(), [pinned_local(local_max_tokens=route_cap)])
     assert calls == []
-    result = router.complete(role="plain", messages=[], timeout=120)
+    result = router.complete(
+        role="plain", messages=[], timeout=120, max_output_tokens=requested
+    )
     assert (result.route, result.model) == ("ollama-local", LOCAL_MODEL)
     assert calls == ["GET", "POST"]
     assert LOCAL_MODEL not in {

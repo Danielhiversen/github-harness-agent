@@ -209,7 +209,10 @@ def _call(identifier: str, name: str, arguments: Any) -> dict:
 
 
 def _gemini_payload(
-    route: _Route, messages: Sequence[Mapping], tools: Sequence[Mapping]
+    route: _Route,
+    messages: Sequence[Mapping],
+    tools: Sequence[Mapping],
+    max_tokens: int,
 ) -> dict:
     system = []
     history = []
@@ -268,7 +271,7 @@ def _gemini_payload(
 
     body: dict[str, Any] = {
         "contents": history,
-        "generationConfig": {"maxOutputTokens": route.max_tokens},
+        "generationConfig": {"maxOutputTokens": max_tokens},
     }
     if system:
         body["systemInstruction"] = {"parts": system}
@@ -286,7 +289,10 @@ def _gemini_payload(
 
 
 def _chat_payload(
-    route: _Route, messages: Sequence[Mapping], tools: Sequence[Mapping]
+    route: _Route,
+    messages: Sequence[Mapping],
+    tools: Sequence[Mapping],
+    max_tokens: int,
 ) -> dict:
     cleaned = []
     for msg in messages:
@@ -310,7 +316,7 @@ def _chat_payload(
     body: dict[str, Any] = {
         "model": route.model,
         "messages": cleaned,
-        "max_tokens": route.max_tokens,
+        "max_tokens": max_tokens,
     }
     if route.alias.startswith("openrouter"):
         body["provider"] = {"max_price": {"prompt": 0, "completion": 0}}
@@ -520,6 +526,13 @@ def _validate_offset(provider_offset: int) -> None:
         raise ValueError("provider_offset must be a nonnegative integer")
 
 
+def _validate_output_limit(max_output_tokens: int | None) -> None:
+    if max_output_tokens is not None and (
+        type(max_output_tokens) is not int or max_output_tokens <= 0
+    ):
+        raise ValueError("max_output_tokens must be a positive integer")
+
+
 def _tool_route_affinity(
     role: str,
     messages: Sequence[Mapping[str, Any]],
@@ -657,8 +670,10 @@ class ProviderRouter:
         exclude: Sequence[tuple[str, str]] = (),
         provider_offset: int = 0,
         after_provider: str | None = None,
+        max_output_tokens: int | None = None,
     ) -> Completion:
         _validate_offset(provider_offset)
+        _validate_output_limit(max_output_tokens)
         return self._complete(
             self.routes,
             role,
@@ -668,6 +683,7 @@ class ProviderRouter:
             exclusions=set(exclude),
             provider_offset=provider_offset,
             after_provider=after_provider,
+            max_output_tokens=max_output_tokens,
         )
 
     def _quota_block(self, route: _Route, now: float) -> tuple[str, float] | None:
@@ -757,6 +773,7 @@ class ProviderRouter:
         exclusions=frozenset(),
         provider_offset=0,
         after_provider=None,
+        max_output_tokens=None,
     ):
         deadline = time.monotonic() + _completion_timeout(timeout)
         routes, failures = self._ordered_routes(
@@ -793,9 +810,12 @@ class ProviderRouter:
                 continue
 
             try:
+                max_tokens = min(
+                    route.max_tokens, max_output_tokens or route.max_tokens
+                )
                 if route.protocol == "gemini":
                     url = f"{route.url}/models/{quote(route.model, safe='')}:generateContent"
-                    payload = _gemini_payload(route, messages, tools)
+                    payload = _gemini_payload(route, messages, tools, max_tokens)
                 else:
                     url = f"{route.url}/chat/completions"
                     route_messages = messages
@@ -806,7 +826,7 @@ class ProviderRouter:
                             role=role,
                             review_windows=True,
                         )
-                    payload = _chat_payload(route, route_messages, tools)
+                    payload = _chat_payload(route, route_messages, tools, max_tokens)
                     if (
                         route.local_input_bytes is not None
                         and wire_size(payload["messages"]) > route.local_input_bytes
@@ -844,6 +864,8 @@ class ProviderRouter:
                     or response.status_code == 503
                     and retry_after
                 ):
+                    logger.info("Provider deferred provider=%s configured_model=%s status=%d",
+                                route.alias, route.model, response.status_code)
                     cooldown = _retry_time(retry_after)
                     with self._lock:
                         self._quota_cooldown[route.quota_key] = cooldown
@@ -868,6 +890,8 @@ class ProviderRouter:
                 return
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
+                logger.info("Provider rejected provider=%s configured_model=%s status=%d",
+                            route.alias, route.model, status)
                 failures[route.alias] = {
                     401: "invalid or missing credentials",
                     403: "account or model ineligible",
@@ -876,6 +900,7 @@ class ProviderRouter:
                 if status is not None and status >= 500:
                     retry_times.append(self._defer_model(key))
             except (httpx.TimeoutException, TimeoutError):
+                logger.info("Provider timed out provider=%s configured_model=%s", route.alias, route.model)
                 failures[route.alias] = "upstream timeout"
                 retry_times.append(self._defer_model(key))
             except httpx.RequestError:
@@ -906,6 +931,7 @@ class _Request(BaseModel):
     exclude: list[tuple[str, str]] = Field(default_factory=list, max_length=1000)
     provider_offset: int = Field(default=0, ge=0, strict=True)
     after_provider: str | None = Field(default=None, max_length=128)
+    max_output_tokens: int | None = Field(default=None, gt=0, strict=True)
 
 
 def create_model_gateway(router: ProviderRouter, token: str) -> FastAPI:
@@ -940,6 +966,7 @@ def create_model_gateway(router: ProviderRouter, token: str) -> FastAPI:
                 exclusions=set(payload.exclude),
                 provider_offset=payload.provider_offset,
                 after_provider=payload.after_provider,
+                max_output_tokens=payload.max_output_tokens,
             )
             try:
                 for event in events:
@@ -991,9 +1018,11 @@ class ModelGatewayClient:
         exclude: Sequence[tuple[str, str]] = (),
         provider_offset: int = 0,
         after_provider: str | None = None,
+        max_output_tokens: int | None = None,
         on_attempt=None,
     ) -> Completion:
         _validate_offset(provider_offset)
+        _validate_output_limit(max_output_tokens)
         limit = _completion_timeout(timeout)
         # Leave time for the gateway to serialize and return an exhausted chain
         # without extending an explicit task deadline.
@@ -1017,6 +1046,11 @@ class ModelGatewayClient:
                     "exclude": list(exclude),
                     "provider_offset": provider_offset,
                     **({"after_provider": after_provider} if after_provider else {}),
+                    **(
+                        {"max_output_tokens": max_output_tokens}
+                        if max_output_tokens is not None
+                        else {}
+                    ),
                 },
             }
             if on_attempt is None:
@@ -1039,6 +1073,8 @@ class ModelGatewayClient:
                             timeout=timeout,
                             exclude=exclude,
                             provider_offset=provider_offset,
+                            after_provider=after_provider,
+                            max_output_tokens=max_output_tokens,
                         )
                     response.raise_for_status()
                     for line in response.iter_lines():

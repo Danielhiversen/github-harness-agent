@@ -34,9 +34,19 @@ class FreeGateway:
         self.proposals = iter(proposals)
         self.prompts = []
 
-    def complete(self, *, role, messages, tools, timeout, after_provider=None):
+    def complete(
+        self,
+        *,
+        role,
+        messages,
+        tools,
+        timeout,
+        after_provider=None,
+        max_output_tokens=None,
+    ):
         assert role == "coding"
         assert not tools
+        assert max_output_tokens == 3072
         self.prompts.append(messages[-1]["content"])
         return SimpleNamespace(
             content=next(self.proposals),

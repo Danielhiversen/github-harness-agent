@@ -109,6 +109,7 @@ class Gateway(Protocol):
         exclude: Sequence[tuple[str, str]] = (),
         provider_offset: int = 0,
         after_provider: str | None = None,
+        max_output_tokens: int | None = None,
     ): ...
 
 
@@ -321,6 +322,7 @@ class _Budget:
         after_provider=None,
         retry_oversize=True,
         review_windows=False,
+        max_output_tokens=None,
     ):
         options = (
             {"exclude": self.task.excluded_models} if self.task.excluded_models else {}
@@ -329,6 +331,8 @@ class _Budget:
             options["after_provider"] = after_provider
         elif self.task.provider_offset:
             options["provider_offset"] = self.task.provider_offset
+        if max_output_tokens is not None:
+            options["max_output_tokens"] = max_output_tokens
 
         def send(payload):
             self.claim("model request", self.limits.model_requests)

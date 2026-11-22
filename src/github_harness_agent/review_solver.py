@@ -42,6 +42,7 @@ _BLOCK = re.compile(
     r"^([^\n`]+\.py)\n<<<<<<< SEARCH\n(.*?)^=======\n(.*?)^>>>>>>> REPLACE[ \t]*(?:\n|$)",
     re.M | re.S,
 )
+_MARKER = re.compile(r"^(?:<{5,}|={5,}|>{5,})(?:[ \t]|$)", re.M)
 _TEST_RESULT = re.compile(r"^(FAILED|ERROR) ([^\s]+::[^\s]+)", re.M)
 _WORD = re.compile(r"[a-z]{3,}")
 _STOP = set(
@@ -57,16 +58,25 @@ def apply_blocks(response, sources, new_path):
     response = (response or "").strip().replace("\r\n", "\n")
     # Common Markdown fencing is harmless outside an edit.
     response = re.sub(r"(?m)^```[\w.-]*[ \t]*(?:\n|$)", "", response)
+    # Normalize a filename that a provider styled as Markdown. Only a header
+    # immediately preceding a SEARCH marker is considered.
+    response = re.sub(
+        r"(?mi)^(?:file:[ \t]+)?[`*]*([^\s`*]+\.py)[`*]*:?[ \t]*(?=\n<<<<<<< SEARCH$)",
+        r"\1",
+        response,
+    )
     if len(response) > 80000:
         raise ValueError("Response exceeded the edit limit")
     result = sources.copy()
     end = 0
     for match in _BLOCK.finditer(response + "\n"):
-        if response[end : match.start()].strip():
+        if _MARKER.search(response[end : match.start()]):
             raise ValueError(
                 "Return edit blocks only, with the exact relative filename"
             )
         path, old, new = match.groups()
+        if _MARKER.search(old) or _MARKER.search(new):
+            raise ValueError("Incomplete or nested SEARCH/REPLACE block")
         path = path.strip()
         if path not in sources:
             raise ValueError("File is outside the editable source list")
@@ -82,7 +92,7 @@ def apply_blocks(response, sources, new_path):
                 )
             result[path] = source.replace(old, new, 1)
         end = match.end()
-    if not end or response[end:].strip() or sources == result:
+    if not end or _MARKER.search(response[end:]) or sources == result:
         raise ValueError("No complete edit blocks changed the checkout")
     for path, source in result.items():
         if source != sources[path]:
@@ -424,6 +434,7 @@ def solve(executor, task, archive, budget, version):
                         "coding",
                         messages,
                         after_provider=last_routes.get(target),
+                        max_output_tokens=3072,
                     )
                     pending[future] = target, current
                     submitted += 1
