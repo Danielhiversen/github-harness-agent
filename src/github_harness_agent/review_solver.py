@@ -105,7 +105,13 @@ from .review_solver_context import (
     stock_pytest_excerpt,
 )
 from .review_stock_collection import stock_collection
-from .task_context import MESSAGE_BYTES, compact_focused_review, excerpt, wire_size
+from .task_context import (
+    MESSAGE_BYTES,
+    TEST_MODULE_REPLY_ENDING,
+    compact_focused_review,
+    excerpt,
+    wire_size,
+)
 from .test_updates import focused_pytest, has_runnable_test
 from .worker import Cancelled, CommandOutputExceeded, ExecutionError, LimitExceeded
 
@@ -128,6 +134,13 @@ Prefer small and unique search blocks and preserve unchanged code."""
 _SYSTEM_SUFFIX = """Use public production behavior. Never detect the verifier, hardcode fixture data,
 change checks, or relax the requested behavior."""
 _SYSTEM = _SYSTEM_PREFIX + _SEARCH_FORMAT + "\n" + _SYSTEM_SUFFIX
+_TEST_MODULE_SYSTEM = (
+    _SYSTEM_PREFIX
+    + "If using SEARCH/REPLACE, follow this format.\n"
+    + _SEARCH_FORMAT
+    + "\nFor the single unpublished test file, you may instead return one complete Python module.\n"
+    + _SYSTEM_SUFFIX
+)
 _DEFINITION_SYSTEM = _SYSTEM_PREFIX + DEFINITION_FORMAT + "\n" + _SYSTEM_SUFFIX
 _LINE_RANGE_SYSTEM = (
     _SYSTEM_PREFIX
@@ -139,6 +152,15 @@ _BLOCK = re.compile(
     re.M | re.S,
 )
 _MARKER = re.compile(r"^(?:<{5,}|={5,}|>{5,})(?:[ \t]|$)", re.M)
+_PYTHON_FENCE = re.compile(
+    r"(?P<fence>`{3,}|~{3,})(?:python|py)[ \t]*\n(?P<code>.*?)\n(?P=fence)",
+    re.S | re.I,
+)
+_FENCE_LINE = re.compile(r"^[ \t]*(?:`{3,}|~{3,})", re.M)
+_FILE_HEADER = re.compile(
+    r"^[ \t]*#?[ \t]*(?:file(?:name)?|path):[ \t]*[`'\"]?\S+\.py[`'\"]?[ \t]*$",
+    re.M | re.I,
+)
 _TEST_RESULT = re.compile(r"^(FAILED|ERROR) ([^\s]+::[^\s]+)", re.M)
 _TEST_SECTION = re.compile(r"^_{5,} (.+?) _{5,}$", re.M)
 _PYTEST_SECTION = re.compile(r"^={5,} ([^\n]+?) ={5,}$", re.M)
@@ -228,6 +250,48 @@ def apply_blocks(response, sources, new_path):
             except (SyntaxError, ValueError, RecursionError) as error:
                 raise ValueError(f"{path}: invalid Python: {error}") from None
     return result
+
+
+def _complete_test_module(response, path, limit):
+    if not isinstance(response, str):
+        return None
+    try:
+        maximum = min(limit, 80000)
+        if len(response.encode()) > maximum:
+            return None
+        response = response.replace("\r\n", "\n")
+        fenced = _PYTHON_FENCE.fullmatch(response.strip())
+        source = (fenced["code"] if fenced else response).rstrip("\n") + "\n"
+        data = source.encode()
+        if (
+            len(data) > maximum or _MARKER.search(source)
+            or _FENCE_LINE.search(source) or _FILE_HEADER.search(source)
+        ):
+            return None
+        tree = ast.parse(source, filename=path)
+        for index, statement in enumerate(tree.body):
+            if isinstance(statement, ast.Expr) and not (
+                isinstance(statement.value, ast.Call)
+                or (
+                    index == 0
+                    and isinstance(statement.value, ast.Constant)
+                    and isinstance(statement.value.value, str)
+                )
+            ):
+                return None
+        compile(tree, path, "exec", dont_inherit=True)
+        return source if has_runnable_test(path, data, declarations_only=True) else None
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+
+
+def _apply_test_reply(response, sources, path, *, allow_module, limit):
+    try:
+        return apply_blocks(response, sources, path)
+    except ValueError:
+        if allow_module and (module := _complete_test_module(response, path, limit)):
+            return {path: module}
+        raise
 
 
 def patch_for(original, sources):
@@ -540,7 +604,9 @@ def _regression_api(path, content, query, limit):
     return path + "\n" + excerpt("\n".join(text for _, text in signatures), limit)
 
 
-def _test_authoring_messages(current, review, fixtures, interfaces, new_path, note):
+def _test_authoring_messages(
+    current, review, fixtures, interfaces, new_path, note, *, allow_test_module=False
+):
     behaviors = list(
         dict.fromkeys(" ".join(body.split()) for _, _, body in review.feedback)
     )
@@ -584,10 +650,16 @@ def _test_authoring_messages(current, review, fixtures, interfaces, new_path, no
         + f"\nNew test file: {new_path}\n"
         + "\nCurrent checkout:\n"
         + f"Edit the test file at the exact path {new_path}.\n"
-        + "Respond with exact SEARCH/REPLACE blocks only."
+        + (
+            TEST_MODULE_REPLY_ENDING if allow_test_module
+            else "Respond with exact SEARCH/REPLACE blocks only."
+        )
     )
     return [
-        {"role": "system", "content": _SYSTEM},
+        {
+            "role": "system",
+            "content": _TEST_MODULE_SYSTEM if allow_test_module else _SYSTEM,
+        },
         {"role": "user", "content": request},
     ]
 
@@ -631,10 +703,17 @@ def _proposal_messages(
     private_source="",
     mock_detail="",
     parameter_focus="",
+    allow_test_module=False,
 ):
     if target == _TEST_GOAL:
         return _test_authoring_messages(
-            current, review, fixtures, interfaces, new_path, note
+            current,
+            review,
+            fixtures,
+            interfaces,
+            new_path,
+            note,
+            allow_test_module=allow_test_module,
         )
     diagnostic = failures.get(
         target,
@@ -3134,7 +3213,11 @@ def solve(executor, task, archive, budget, version):
                             len(repair.introduced),
                             len(repair.static_failures),
                         )
+                    allow_test_module = False
                     if target == _TEST_GOAL:
+                        allow_test_module = bool(
+                            not current[new_path] and (not test_draft or test_diagnostic)
+                        )
                         source = {**current, new_path: test_draft}
                         note = "\n".join(
                             item
@@ -3339,6 +3422,7 @@ def solve(executor, task, archive, budget, version):
                         ),
                         mock_detail=mock_detail,
                         parameter_focus=parameter_focus,
+                        allow_test_module=allow_test_module,
                         rejection=(
                             _private_repair_context(current, repair)
                             if repair is not None
@@ -3409,6 +3493,7 @@ def solve(executor, task, archive, budget, version):
                         localized_retry,
                         line_retry,
                         line_followup,
+                        allow_test_module,
                         repair,
                     )
                     if (
@@ -3457,6 +3542,7 @@ def solve(executor, task, archive, budget, version):
                 localized_retry,
                 line_retry,
                 line_followup,
+                allow_test_module,
                 repair,
             ) = pending.pop(future)
             scoped_line = line_retry is not None and line_retry.allowed_rows is not None
@@ -3537,6 +3623,18 @@ def solve(executor, task, archive, budget, version):
                     source = {new_path: test_draft}
                 try:
                     candidate = native_candidate
+                    if target == _TEST_GOAL:
+                        candidate = _apply_test_reply(
+                            completion.content,
+                            source,
+                            new_path,
+                            allow_module=(
+                                allow_test_module
+                                and original[new_path] == current[new_path] == ""
+                                and not _protected(new_path, task, new_test=True)
+                            ),
+                            limit=executor.limits.patch_bytes,
+                        )
                     if candidate is None and active_line_snapshot is not None:
                         candidate = apply_line_range_edit(
                             completion.content, source, active_line_snapshot,

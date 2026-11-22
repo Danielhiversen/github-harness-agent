@@ -2839,6 +2839,58 @@ def test_solver_repairs_an_unpublished_regression_test_in_place(
     assert "fresh offline" in compact
 
 
+@pytest.mark.parametrize("scenario", ("plain", "fenced", "retry", "accepted_content"))
+def test_solver_accepts_only_authorized_complete_test_modules(solver_case, scenario):
+    task, archive, runner, checkpoints = solver_case
+    fixed = BASE_SOURCE.replace("return -1", "return 1").replace("return -2", "return 2")
+    setup = "from fixture_calc import first, second\n" if scenario == "accepted_content" else ""
+    draft = DraftCheckpoint(
+        "harness2/base",
+        task.base_sha,
+        patch_for({SOURCE: BASE_SOURCE, NEW_TEST: ""}, {SOURCE: fixed, NEW_TEST: setup}),
+        guidance=_GUIDANCE,
+        last_editor=("fixture", "fixture/coder"),
+    )
+    task = replace(task, checkpoints={draft.key: draft})
+    response = f"```python\n{TEST}```" if scenario == "fenced" else TEST
+    bad = TEST.replace("(1, 2)", "(0, 0)")
+    gateway = (
+        FreeGateway(edit(NEW_TEST, "", bad), response)
+        if scenario == "retry" else FreeGateway(response)
+    )
+    verification = runner.path / "independent"
+    verification.mkdir()
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=2 if scenario == "retry" else 1),
+        verification_runner=FixtureRunner(verification),
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    if scenario == "accepted_content":
+        with pytest.raises(ReviewRoundExhausted):
+            solve(executor, task, archive, budget, "fixture-version")
+        assert "complete Python module" not in gateway.prompts[0]
+        assert not checkpoints
+        return
+
+    result = solve(executor, task, archive, budget, "fixture-version")
+    assert NEW_TEST.encode() in result.patch and b"(0, 0)" not in result.patch
+    assert all(check.returncode == 0 for check in result.checks)
+    assert any(NEW_TEST in check.command for check in result.checks)
+    assert "complete Python module" in gateway.prompts[0]
+    if scenario == "retry":
+        assert bad in gateway.prompts[1] and "complete Python module" in gateway.prompts[1]
+    request = gateway.prompts[-1].replace(
+        "\nCurrent checkout:\n", "\nCurrent checkout:\n" + "unused context\n" * 2000
+    )
+    compact = compact_focused_review(
+        [{"role": "system", "content": "Review guidance"}, {"role": "user", "content": request}],
+        max_bytes=8192,
+    )
+    assert compact is not None and "one complete Python module" in compact[-1]["content"]
+    assert not checkpoints
+
+
 def test_solver_does_not_keep_a_candidate_rejected_by_final_gate(solver_case):
     task, archive, runner, checkpoints = solver_case
     gateway = FreeGateway(

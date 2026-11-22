@@ -14,6 +14,11 @@ from .review_line_ranges import LINE_RANGE_ENDING
 MESSAGE_BYTES = 57344
 RETRY_MESSAGE_BYTES = 24576
 TOOL_RESULT_BYTES = 6000
+TEST_MODULE_REPLY_ENDING = (
+    "Respond with exact SEARCH/REPLACE blocks or one complete Python module for this "
+    "unpublished test file. A module can be plain Python or one Python fenced block. "
+    "Omit filenames and surrounding prose from the module."
+)
 PAGE_CHARS = 1800
 HISTORY_PAGES = 12
 HISTORY_ROWS = 4
@@ -600,7 +605,11 @@ def compact_focused_review(messages, *, max_bytes):
         return None
     context, checkout_marker, _ = text.partition("\nCurrent checkout:\n")
     goal, _, _ = context.partition("\nOther reviewer feedback:\n")
-    endings = ("Respond with exact SEARCH/REPLACE blocks only.", DEFINITION_ENDING)
+    endings = (
+        "Respond with exact SEARCH/REPLACE blocks only.",
+        DEFINITION_ENDING,
+        TEST_MODULE_REPLY_ENDING,
+    )
     ending = next((value for value in endings if text.endswith(value)), None)
     if not checkout_marker or "\nFocused source from " not in goal or ending is None:
         return None

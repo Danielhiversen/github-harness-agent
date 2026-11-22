@@ -203,7 +203,7 @@ def _is_assertion(statement):
     )
 
 
-def has_runnable_test(path: str, source: bytes) -> bool:
+def has_runnable_test(path: str, source: bytes, *, declarations_only=False) -> bool:
     """Check declarations before running the project's verification commands."""
     if path.endswith("_test.go"):
         return bool(re.search(rb"(?m)^\s*func\s+Test[A-Z0-9_]\w*\s*\(", source))
@@ -213,7 +213,7 @@ def has_runnable_test(path: str, source: bytes) -> bool:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return False
-    if any(_is_assertion(statement) for statement in tree.body):
+    if not declarations_only and any(_is_assertion(statement) for statement in tree.body):
         return True
     bodies = [
         tree.body,
