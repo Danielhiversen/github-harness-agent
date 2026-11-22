@@ -10,6 +10,7 @@ import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
+from textwrap import dedent
 
 from . import review_recovery
 from .check_artifacts import check_label
@@ -62,7 +63,12 @@ from .review_definitions import (
 )
 from .review_guard_probe import stock_guard_diagnostic
 from .review_guard_order import swap_traced_filters
-from .review_parameter_use import iteration_edit_windows, lost_iteration_argument
+from .review_parameter_use import (
+    iteration_argument_owner,
+    iteration_edit_windows,
+    lost_iteration_argument,
+)
+from .review_round_limit import prepare_round_limit_guard
 from .review_semantic_key import guard_traced_counter_once
 from .review_guards import guarded_sources
 from .review_mock_replay import (
@@ -1080,6 +1086,41 @@ def _trusted_operator_node(node, command, names):
     return matches == 1
 
 
+def _selected_operator_fixture(node, command, names, fixtures):
+    selectors = [arg for arg in command if _trusted_operator_node(node, (arg,), names)]
+    if len(selectors) != 1:
+        return None
+    configured, _, _ = selectors[0].partition("::")
+    selection = node.partition("::")[2]
+    relative = configured.removeprefix(review_recovery.OPERATOR_CHECK_ROOT + "/")
+    source = fixtures.get(relative)
+    if not source or not selection:
+        return None
+    qualified = selection.partition("[")[0].replace("::", ".")
+    try:
+        declarations = [
+            item for name, item in _symbols(ast.parse(source).body) if name == qualified
+        ]
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    if len(declarations) != 1 or not isinstance(
+        declaration := declarations[0], ast.FunctionDef
+    ):
+        return None
+    fixture = dedent(
+        "".join(
+            source.splitlines(keepends=True)[
+                declaration.lineno - 1 : declaration.end_lineno
+            ]
+        )
+    )
+    return (
+        (f"{configured}::{selection}", fixture)
+        if 0 < len(fixture.encode()) <= 6000
+        else None
+    )
+
+
 def _same_pytest_selection(before, after):
     return (
         before is not None
@@ -1777,8 +1818,8 @@ def solve(executor, task, archive, budget, version):
         verified = verify_stock_candidate(target, sources, probe_budget)
         return verified[0] if verified else None
 
-    def focused_guard_trial(target, proposal, probe):
-        focused = focused_pytest((commands[target[0]],), (target[1],))
+    def focused_guard_trial(target, proposal, probe, *, selector=None):
+        focused = focused_pytest((commands[target[0]],), (selector or target[1],))
         if focused is None:
             return False, ""
         focus = _GuardBudget(probe, wall_seconds=_STOCK_HUNK_SECONDS, reserve=0)
@@ -1795,6 +1836,96 @@ def solve(executor, task, archive, budget, version):
         if not run.passed and run.failed == {node} and checked.keys() == {(0, node)}:
             return False, checked[0, node]
         return False, ""
+
+    def round_limit_trial(target):
+        pytest_checks = [
+            index
+            for index, command in enumerate(commands)
+            if check_label(command, ()) == "pytest"
+        ]
+        if (
+            not _named_operator_cases({target}, commands)
+            or not _observed_operator_failures(
+                pytest_runs, {target}, task.pull_checks, operator_cases
+            )
+            or any(pytest_runs.get(index) is None for index in pytest_checks)
+            or budget.commands_remaining()
+            < 2 * len(commands) + 2 * len(pytest_checks) + 3
+            or budget.remaining() < 180
+        ):
+            return None, ""
+        selected = _selected_operator_fixture(
+            target[1], commands[target[0]], operator_cases, fixtures
+        )
+        if selected is None:
+            return None, ""
+        selector, fixture = selected
+        owner = iteration_argument_owner(fixture, original, current)
+        if owner is None:
+            return None, ""
+        allowed = {path for path in paths if not _protected(path, task, new_test=False)}
+        guard = prepare_round_limit_guard(
+            original, current, allowed, owner=owner, operator_fixture=fixture
+        )
+        if (
+            guard is None
+            or guard.sources.keys() != current.keys()
+            or any(
+                guard.sources[path] != current[path]
+                for path in current.keys() - allowed
+            )
+        ):
+            return None, ""
+        proposal = patch_for(original, guard.sources)
+        if not 0 < len(proposal) <= executor.limits.patch_bytes or proposal == patch:
+            return None, ""
+        advisory = excerpt(guard.advisory, 500)
+        probe = _GuardBudget(budget, wall_seconds=220, reserve=60)
+        try:
+            passed, _ = focused_guard_trial(target, proposal, probe, selector=selector)
+            if not passed:
+                return None, advisory
+            runs = {}
+            checked = evidence(
+                executor, task, archive, probe, proposal, commands, pytest_runs=runs
+            )
+            if checked or any(
+                not _same_pytest_selection(pytest_runs[index], runs.get(index))
+                for index in pytest_checks
+            ):
+                return None, advisory
+            for index in pytest_checks:
+                failed = index == target[0]
+                node = selector if failed else None
+                total = pytest_runs[index].passed + len(pytest_runs[index].failed)
+                baseline = stock_collection(
+                    executor,
+                    task,
+                    archive,
+                    probe,
+                    patch,
+                    commands[index],
+                    node,
+                    total,
+                    failed=failed,
+                )
+                if not baseline or baseline != stock_collection(
+                    executor,
+                    task,
+                    archive,
+                    probe,
+                    proposal,
+                    commands[index],
+                    node,
+                    total,
+                ):
+                    return None, advisory
+            return (guard.sources, proposal, checked, runs), ""
+        except Cancelled:
+            raise
+        except (ExecutionError, ValueError):
+            budget.remaining()
+            return None, advisory
 
     def verify_guard_order(target, sources):
         proposal = patch_for(original, sources)
@@ -2520,6 +2651,8 @@ def solve(executor, task, archive, budget, version):
     eager_trace, eager_advisory = None, ""
     precision_attempted = False
     mixed_guard_attempted = False
+    round_limit_snapshot = None
+    round_limit_advice = {}
     unavailable = {}
     test_draft = current.get(new_path, "")
     test_diagnostic = ""
@@ -2547,6 +2680,7 @@ def solve(executor, task, archive, budget, version):
         line_retries.clear()
         line_routes.clear()
         mock_diagnostics.clear()
+        round_limit_advice.clear()
         counter_sites.clear()
         last_routes.pop(target, None)
         notes.pop(target, None)
@@ -2614,6 +2748,33 @@ def solve(executor, task, archive, budget, version):
             launch_budget = min(
                 max_proposals - submitted, budget.model_requests_remaining()
             )
+            if (
+                len(operator) == 1
+                and not other_checks
+                and not pending
+                and retired is None
+                and private is None
+                and alternate is None
+                and patch
+                and actor is not None
+                and actor.role == "coding"
+                and actor.configured_model
+                and executor.verification_runner is not executor.runner
+                and needs_tests
+                and not current[new_path]
+                and launch_budget >= 1
+                and round_limit_snapshot is not current
+            ):
+                round_limit_snapshot = current
+                target = operator[0]
+                verified, advisory = round_limit_trial(target)
+                if verified is not None:
+                    current, patch, failures, pytest_runs = verified
+                    start_new_draft(target)
+                    _LOG.info("A private round-limit trial passed all configured checks")
+                    continue
+                if advisory:
+                    round_limit_advice[target] = advisory
             if (
                 not mixed_guard_attempted
                 and operator
@@ -3056,6 +3217,7 @@ def solve(executor, task, archive, budget, version):
                         can_plan
                         and not scoped_line
                         and not native
+                        and target not in round_limit_advice
                         and advice is None
                         and repair is None
                         and plan_count < 2
@@ -3107,6 +3269,22 @@ def solve(executor, task, archive, budget, version):
                             if tentative_trace else saved_trace
                         )
                         _LOG.info("Continuing an unpublished edit for tracked pytest case %s", target[1])
+                    if (
+                        not plan
+                        and repair is None
+                        and source is current
+                        and (advisory := round_limit_advice.pop(target, ""))
+                    ):
+                        mock_detail = "\n".join(
+                            filter(
+                                None,
+                                (
+                                    mock_detail,
+                                    "Verified draft source observation (quoted): "
+                                    + advisory,
+                                ),
+                            )
+                        )
                     # Begin with SEARCH. A localized retry can replace the one
                     # complete method only when both exact definitions fit.
                     if stock_fixture and (plan or advice is not None):

@@ -19,6 +19,7 @@ with os.fdopen(os.dup(1), "w") as result, open(os.devnull, "wb") as sink:
 
     class Selection:
         nodes = None
+        selected = None
         outcomes = {}
         incomplete = False
 
@@ -26,6 +27,16 @@ with os.fdopen(os.dup(1), "w") as result, open(os.devnull, "wb") as sink:
         def pytest_collection_finish(self, session):
             if 0 < len(session.items) <= 20000:
                 self.nodes = [item.nodeid for item in session.items]
+                selected = sys.argv[1]
+                if selected:
+                    matches = [
+                        item.nodeid for item in session.items
+                        if item.nodeid == selected or (
+                            str(item.path) + "::" + item.nodeid.split("::", 1)[-1] == selected
+                        )
+                    ]
+                    if len(matches) == 1:
+                        self.selected = matches[0]
 
         def pytest_runtest_logreport(self, report):
             if report.when == "call":
@@ -40,14 +51,14 @@ with os.fdopen(os.dup(1), "w") as result, open(os.devnull, "wb") as sink:
     status = pytest.main(sys.argv[3:], plugins=[selection])
     if (
         status != expected or selection.incomplete or selection.nodes is None
-        or sys.argv[1] not in selection.nodes
+        or (sys.argv[1] and selection.selected is None)
         or len(selection.nodes) != len(selection.outcomes)
         or set(selection.nodes) != selection.outcomes.keys()
         or any(result not in {"passed", "failed"} for result in selection.outcomes.values())
     ):
         sys.exit(4)
     failures = {name for name, outcome in selection.outcomes.items() if outcome == "failed"}
-    if failures != ({sys.argv[1]} if expected else set()):
+    if failures != ({selection.selected} if expected else set()):
         sys.exit(4)
     data = json.dumps(selection.nodes, ensure_ascii=True, separators=(",", ":")).encode()
     result.write(f"{len(selection.nodes)} {hashlib.sha256(data).hexdigest()}")
@@ -58,6 +69,8 @@ def stock_collection(
     executor, task, archive, budget, patch, command, node, expected, *, failed=False
 ):
     """Verify the observed pytest selection without returning node IDs or fixture values."""
+    if failed and not node:
+        return None
     interpreter = _interpreter(command)
     if interpreter is None:
         return None
@@ -83,7 +96,7 @@ def stock_collection(
                 "-B",
                 "-c",
                 _VERIFY_SELECTION,
-                node,
+                node or "",
                 str(int(failed)),
                 *args,
             ),

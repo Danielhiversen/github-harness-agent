@@ -710,3 +710,9 @@ def iteration_edit_windows(fixture, pinned, current):
         if writable
         else None
     )
+
+
+def iteration_argument_owner(fixture, pinned, current):
+    """Return the unambiguous reviewed definition whose exercised limit stopped being used."""
+    _, signal = _iteration_loss(fixture, pinned, current, unique=True)
+    return signal[:2] if signal is not None else None
