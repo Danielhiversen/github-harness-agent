@@ -178,17 +178,18 @@ def _tracked_python(snapshot, path):
         return None
 
 
-def _pytest_fixtures(body):
+def _pytest_fixtures(body, *, symbols=None):
     for node in body:
         if not isinstance(node, _FUNCTION):
             continue
         for decorator in node.decorator_list:
             call = decorator if isinstance(decorator, ast.Call) else None
             symbol = decorator.func if call else decorator
-            if not (
+            looks_like_fixture = (
                 isinstance(symbol, ast.Name) and symbol.id == "fixture"
                 or isinstance(symbol, ast.Attribute) and symbol.attr == "fixture"
-            ):
+            )
+            if not (looks_like_fixture if symbols is None else _dotted_name(symbol) in symbols):
                 continue
             options = {item.arg: item.value for item in call.keywords} if call else {}
             name = options.get("name")
@@ -246,6 +247,47 @@ def _reviewed_imports(body, modules):
                 {f"{local}.{name}": returned for name, returned in modules.get(qualified, {}).items()}
             )
     return bindings, reviewed_calls
+
+
+def _module_pytest_fixtures(body, imports):
+    bindings = Counter(name for item in body for name in _bindings(item))
+    symbols = set()
+    for local, declaration in imports.items():
+        if bindings[local] != 1:
+            continue
+        for alias in declaration.names:
+            if (alias.asname or alias.name) != local:
+                continue
+            if isinstance(declaration, ast.Import) and alias.name == "pytest":
+                symbols.add(f"{local}.fixture")
+            elif getattr(declaration, "module", None) == "pytest" and alias.name == "fixture":
+                symbols.add(local)
+    fixtures = {}
+    nodes = set()
+    for name, item, _ in _pytest_fixtures(body, symbols=symbols):
+        nodes.add(item)
+        fixtures[name] = item if name not in fixtures and bindings[item.name] == 1 else None
+    return fixtures, nodes
+
+
+def _local_fixture_setup(node, fixtures):
+    wanted = _fixture_arguments(node) & fixtures.keys()
+    selected = set()
+    for _ in range(4):
+        if not wanted:
+            return selected
+        for name in wanted:
+            fixture = fixtures[name]
+            if fixture is None:
+                return None
+            selected.add(fixture)
+        deps = {
+            dep for fixture in selected for dep in _fixture_arguments(fixture)
+        }
+        wanted = {
+            name for name in deps & fixtures.keys() if fixtures[name] not in selected
+        }
+    return None if wanted else selected
 
 
 def _source_root(path):
@@ -561,7 +603,8 @@ def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usag
                 imports, reviewed_calls = _reviewed_imports(body, modules)
                 if not reviewed_calls:
                     continue
-                fixtures = {node for _, node, _ in _pytest_fixtures(body)}
+                fixtures, fixture_nodes = _module_pytest_fixtures(body, imports)
+                unambiguous_fixtures = set(fixtures.values()) - {None}
                 members = tuple(
                     node
                     for declaration in body
@@ -571,7 +614,7 @@ def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usag
                 )
                 for node in (*body, *members):
                     if not isinstance(node, _FUNCTION) or not (
-                        node.name.startswith("test_") or node in fixtures
+                        node.name.startswith("test_") or node in fixture_nodes
                     ):
                         continue
                     if usage_bytes:
@@ -585,10 +628,23 @@ def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usag
                         for call in ast.walk(node) if isinstance(call, ast.Call)
                     ):
                         continue
-                    selected = {imports[name] for name in _references([node]) & imports.keys()}
-                    excerpt = f"# {path}\n" + "".join(
+                    if node in fixture_nodes and node not in unambiguous_fixtures:
+                        continue
+                    setup = _local_fixture_setup(node, fixtures)
+                    if setup is None:
+                        continue
+                    references = _references([node, *setup], include_attributes=False)
+                    selected = {imports[name] for name in references & imports.keys()}
+                    excerpt = f"# {path}\n"
+                    if PurePosixPath(path).name != "conftest.py" and (setup or node in fixture_nodes):
+                        excerpt += "# Module-local pytest fixture setup. Define it explicitly if reusing it.\n"
+                    excerpt += "".join(
                         "".join(lines[_start(item) - 1 : item.end_lineno])
-                        for item in sorted(selected, key=lambda item: item.lineno) + [node]
+                        for item in (
+                            *sorted(selected, key=lambda item: item.lineno),
+                            *sorted(setup - {node}, key=lambda item: item.lineno),
+                            node,
+                        )
                     )
                     if len(excerpt.encode()) <= max_bytes:
                         example = excerpt.rstrip()
@@ -1040,7 +1096,7 @@ def _start(node):
     )
 
 
-def _references(nodes):
+def _references(nodes, *, include_attributes=True):
     roots = []
     for node in nodes:
         if isinstance(node, ast.ClassDef):
@@ -1051,7 +1107,7 @@ def _references(nodes):
         name
         for node in roots
         for child in ast.walk(node)
-        if (name := getattr(child, "id", None) or getattr(child, "attr", None))
+        if (name := getattr(child, "id", None) or (include_attributes and getattr(child, "attr", None)))
         and not isinstance(getattr(child, "ctx", None), ast.Store)
     }
 

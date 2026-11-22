@@ -145,6 +145,74 @@ def test_repository_example_supports_module_imports_and_complete_pytest_fixtures
     assert example == "# tests/conftest.py\n" + source.rstrip()
 
 
+def test_repository_example_includes_module_local_fixture_dependencies():
+    archive = BytesIO()
+    source = (
+        "import pytest as pt\n"
+        "from pytest import fixture as setup\n"
+        "from pathlib import Path\n"
+        "from example.formatting import format_amount\n"
+        "from other import fixture\n"
+        "@pt.fixture\n"
+        "def base_path():\n"
+        "    return Path('input.txt')\n"
+        "@setup(name='amount')\n"
+        "def build_amount(base_path):\n"
+        "    return len(base_path.name)\n"
+        "@fixture\n"
+        "def amount():\n"
+        "    return 'unrelated setup'\n"
+        "def test_amount(amount):\n"
+        "    assert format_amount(amount) == '9'\n"
+    )
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        data = source.encode()
+        entry = tarfile.TarInfo("tests/test_formatting.py")
+        entry.size = len(data)
+        snapshot.addfile(entry, BytesIO(data))
+
+    production = {"src/example/formatting.py": "def format_amount(amount):\n    return str(amount)\n"}
+    example = review_solver_context.repository_pytest_example(archive.getvalue(), production)
+    assert "Module-local pytest fixture setup" in example
+    assert "from pathlib import Path" in example
+    assert "import pytest as pt" in example
+    assert "from pytest import fixture as setup" in example
+    assert "@pt.fixture\ndef base_path():" in example
+    assert "@setup(name='amount')\ndef build_amount(base_path):" in example
+    assert "def test_amount(amount):" in example
+    assert "unrelated setup" not in example
+    assert "from other import fixture" not in example
+
+
+@pytest.mark.parametrize("duplicate", (False, True))
+def test_repository_example_skips_oversized_or_ambiguous_local_fixture(duplicate):
+    archive = BytesIO()
+    source = (
+        "import pytest\n"
+        "from example.formatting import format_amount\n"
+        "@pytest.fixture(name='amount')\n"
+        "def provide_amount():\n"
+        + ("    return 9\n" if duplicate else "    # long setup\n" * 100 + "    return 9\n")
+        + ("@pytest.fixture\ndef amount():\n    return 10\n" if duplicate else "")
+        + "def test_amount(amount):\n    assert format_amount(amount) == '9'\n"
+        "def test_default():\n    assert format_amount(0) == '0'\n"
+    )
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        data = source.encode()
+        entry = tarfile.TarInfo("tests/test_formatting.py")
+        entry.size = len(data)
+        snapshot.addfile(entry, BytesIO(data))
+
+    example = review_solver_context.repository_pytest_example(
+        archive.getvalue(),
+        {"src/example/formatting.py": "def format_amount(amount):\n    return str(amount)\n"},
+        max_bytes=300,
+    )
+    assert "def test_default():" in example
+    assert "test_amount" not in example
+    assert len(example.encode()) <= 300
+
+
 def test_fresh_test_context_keeps_grounded_usage_from_oversized_tracked_test():
     archive = BytesIO()
     source = (
