@@ -267,8 +267,8 @@ def source_excerpt(source, target, max_chars=16000):
     )
 
 
-def _fixture_excerpt(fixtures, target, *, selected_only=False):
-    selected = []
+def _fixture_excerpt(fixtures, target, *, selected_only=False, selected_first=False):
+    selected, helpers = [], []
     source_name, _, selection = target.split("[", 1)[0].partition("::")
     test_name = selection.rsplit("::", 1)[-1]
     matching_paths = [
@@ -291,8 +291,9 @@ def _fixture_excerpt(fixtures, target, *, selected_only=False):
             name = item.name
             if (selected_only or name.startswith("test_")) and name != test_name:
                 continue
-            selected.append("".join(lines[item.lineno - 1 : item.end_lineno]))
-    return "".join(selected)[:6000]
+            text = "".join(lines[item.lineno - 1 : item.end_lineno])
+            (selected if selected_first and name == test_name else helpers).append(text)
+    return "".join([*selected, *helpers])[:6000]
 
 
 def _regression_context(fixtures):
@@ -471,7 +472,7 @@ def _proposal_messages(
         )
     else:
         focus = focused_source_excerpt(
-            current[path], target[1], review_note=body, anchor=line, max_chars=4800
+            current[path], target[1], review_note=body, anchor=line, max_chars=7600
         )
         lead = (
             f"Reviewer feedback: {body}\n"
@@ -496,7 +497,7 @@ def _proposal_messages(
         f"Editable checkout paths (use these exact names): {', '.join(editable)}\n"
         + lead
     )
-    fixture = _fixture_excerpt(fixtures, target[1])
+    fixture = _fixture_excerpt(fixtures, target[1], selected_first=True)
     request = (
         goal
         + (f"Last proposal feedback for this goal: {note}\n" if note else "")

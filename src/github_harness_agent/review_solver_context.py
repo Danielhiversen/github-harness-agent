@@ -9,6 +9,9 @@ from .check_diagnostics import check_locations
 _FUNCTION = (ast.FunctionDef, ast.AsyncFunctionDef)
 _IMPORT = (ast.Import, ast.ImportFrom)
 _ASSIGNMENT = (ast.Assign, ast.AnnAssign)
+_LOOP = (ast.For, ast.AsyncFor, ast.While)
+_CONTROL = (*_LOOP, ast.If, ast.With, ast.AsyncWith, ast.Try, ast.TryStar, ast.Match)
+
 
 
 def _diagnostic_window(lines, imports, row, limit):
@@ -164,6 +167,100 @@ def _consumers(active, candidates):
             yield node
 
 
+def _site_ranges(consumer, active):
+    parents = {
+        child: node
+        for node in ast.walk(consumer)
+        for child in ast.iter_child_nodes(node)
+    }
+    bindings = _bindings(active)
+    ranges = {}
+    for node in parents:
+        if isinstance(active, _ASSIGNMENT):
+            matches = isinstance(
+                node, (ast.Name, ast.Attribute)
+            ) and bindings & _references((node,))
+        else:
+            matches = isinstance(node, ast.Call) and bindings & _references(
+                (node.func,)
+            )
+        if not matches:
+            continue
+        current = node
+        while current is not consumer and not isinstance(current, ast.stmt):
+            current = parents[current]
+        if current is consumer:
+            continue
+        owner = parents.get(current)
+        surrounding = current
+        nearby = []
+        if owner is not None:
+            for _, siblings in ast.iter_fields(owner):
+                if isinstance(siblings, list) and current in siblings:
+                    start = siblings.index(current) + 1
+                    nearby = [
+                        item
+                        for item in siblings[start : start + 8]
+                        if isinstance(item, _CONTROL)
+                    ]
+                    break
+        if isinstance(current, _CONTROL):
+            block = current
+        elif nearby:
+            block = next(
+                (item for item in nearby if isinstance(item, _LOOP)), nearby[0]
+            )
+        else:
+            block = None
+            while (surrounding := parents.get(surrounding)) not in {None, consumer}:
+                if isinstance(surrounding, _CONTROL):
+                    block = surrounding
+                    break
+        call = (current.lineno, current.end_lineno)
+        if block is None:
+            contextual = (call[0], min(consumer.end_lineno, call[1] + 6))
+        else:
+            contextual = (min(call[0], block.lineno), max(call[1], block.end_lineno))
+        ranges[call, contextual] = (
+            2 if isinstance(block, _LOOP) else int(block is not None)
+        )
+    return sorted(ranges, key=lambda pair: (-ranges[pair], pair[0][0]))
+
+
+def _caller_excerpt(lines, consumer, active, limit):
+    """Show the full caller when possible, otherwise show exact call-site lines."""
+
+    def snippet(start, end):
+        return f"# Lines {start}-{end}\n" + "".join(lines[start - 1 : end]) + "\n"
+
+    complete = snippet(_start(consumer), consumer.end_lineno)
+    if len(complete) <= limit:
+        return complete
+    ranges = _site_ranges(consumer, active)
+    if not ranges:
+        return ""
+    call, contextual = ranges[0]
+    header = snippet(
+        _start(consumer), max(consumer.lineno, _start(consumer.body[0]) - 1)
+    )
+    whole = snippet(*contextual)
+    if len(header) + len(whole) <= limit:
+        return header + whole
+    # Preserve a body around the actual use instead of character-clipping the
+    # ends of the caller. Grow right first to retain subsequent controlled work.
+    start, end = call
+    for row in range(end + 1, contextual[1] + 1):
+        if len(header) + len(snippet(start, row)) > limit:
+            break
+        end = row
+    for row in range(start - 1, contextual[0] - 1, -1):
+        if len(header) + len(snippet(row, end)) > limit:
+            break
+        start = row
+    result = header + snippet(start, end)
+    return result if len(result) <= limit else ""
+
+
 def focused_source_excerpt(
     source, target, *, review_note="", anchor=None, max_chars=3000
 ):
@@ -250,11 +347,18 @@ def focused_source_excerpt(
     if isinstance(active, ast.ClassDef):
         declaration(active)
     else:
-        append(active, clip_to=max_chars * (55 if consumers else 66) // 100)
+        append(active, clip_to=max_chars * (45 if consumers else 66) // 100)
     if owner is not None:
         declaration(owner)
-    for node in consumers[:2]:
-        append(node, clip_to=min(max_chars // 4, remaining))
+    for index, node in enumerate(consumers[:2]):
+        limit = remaining if index == 0 else min(max_chars // 4, remaining)
+        chunk = _caller_excerpt(lines, node, active, limit)
+        if chunk:
+            excerpts.append(chunk)
+            seen.add(node)
+            remaining -= len(chunk)
+        elif isinstance(active, _ASSIGNMENT):
+            append(node, clip_to=limit)
 
     related = [active, *seen]
     for _ in range(2):

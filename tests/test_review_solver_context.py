@@ -7,6 +7,7 @@ from github_harness_agent.review_solver_context import (
 from github_harness_agent.task_context import compact_focused_review
 from github_harness_agent.review_solver import _proposal_messages
 from github_harness_agent.review_recovery import ReviewRecovery
+from github_harness_agent.task_context import compact_focused_review, wire_size
 
 
 def test_matching_method_includes_owner_imports_and_referenced_definitions():
@@ -206,3 +207,51 @@ def test_check_focus_rejects_unrecognized_tools_and_external_paths():
     assert focused_check_excerpt(
         ("pytest",), "/operator/core.py:1: AssertionError", sources
     ) is None
+
+
+def test_compact_review_keeps_middle_of_caller_and_selected_fixture():
+    filler = "".join(f"    ignored_{n} = {n}\n" for n in range(350))
+    scheduling = (
+        "    available = load_index(items)\n"
+        "    pending = []\n"
+        "    for candidate in available:\n"
+        "        if candidate.ready:\n"
+        "            pending.append(dispatch(candidate))\n"
+    )
+    source = (
+        "def load_index(items):\n    return sorted(items)\n\n"
+        "def publish(items):\n"
+        f"{filler}{scheduling}{filler}"
+        "    return pending\n"
+    )
+    target = (0, "test_publish.py::test_selected")
+    fixtures = {
+        "test_publish.py": (
+            "def setup_noise():\n"
+            + filler
+            + "def test_selected():\n    assert publish(inputs) == submitted\n"
+            + "def test_unrelated():\n    assert not publish([])\n"
+        )
+    }
+    review = ReviewRecovery((("module.py", 2, "Keep scheduling order"),), "")
+    messages = _proposal_messages(
+        target,
+        {"module.py": source},
+        {target: "Bad order"},
+        False,
+        "Earlier proposal omitted the dispatch body",
+        review,
+        fixtures,
+        (),
+        "",
+    )
+    compact = compact_focused_review(messages, max_bytes=12 * 1024)
+    assert compact is not None
+    assert wire_size(compact) <= 12 * 1024
+    content = compact[1]["content"]
+    assert scheduling in content
+    assert "def publish(items):" in content
+    assert "assert publish(inputs) == submitted" in content
+    assert "Keep scheduling order" in content
+    assert "Earlier proposal omitted the dispatch body" in content
+    assert "def test_unrelated" not in content

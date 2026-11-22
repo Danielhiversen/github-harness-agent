@@ -451,6 +451,20 @@ def _review_content(text: str, max_wire: int) -> str:
     return prefix + marker + compacted + span_evidence + suffix
 
 
+def _whole_line_prefix(text, max_wire):
+    if max_wire <= 2:
+        return ""
+    chunks = []
+    remaining = max_wire - 2
+    for line in text.splitlines(keepends=True):
+        size = wire_size(line) - 2
+        if size > remaining:
+            break
+        chunks.append(line)
+        remaining -= size
+    return "".join(chunks)
+
+
 def compact_focused_review(messages, *, max_bytes):
     """Retain the active review goal and focused source while dropping bulk context."""
     if [item.get("role") for item in messages] != ["system", "user"] or wire_size(
@@ -481,8 +495,19 @@ def compact_focused_review(messages, *, max_bytes):
     if budget <= 0:
         return None
     lead, marker, fixture = goal.partition("\nFixture for this goal:\n")
-    kept = _bounded_content(lead, budget)
-    kept += _bounded_content(marker + fixture, budget - wire_size(kept))
+    header, focus_marker, source = lead.partition("\nFocused source from ")
+    source, diagnostic_marker, diagnostic = source.partition("\nFailure details:\n")
+    if diagnostic_marker and marker:
+        fixture, _, _ = fixture.partition("\nImported API declarations:\n")
+        selected = _whole_line_prefix(marker + fixture, budget // 4)
+        summary = _bounded_content(header, budget // 8)
+        details = _bounded_content(diagnostic_marker + diagnostic, budget // 6)
+        source_budget = budget - wire_size(summary + details + selected)
+        focused = _whole_line_prefix(focus_marker + source, source_budget)
+        kept = summary + focused + details + selected
+    else:
+        kept = _bounded_content(lead, budget)
+        kept += _bounded_content(marker + fixture, budget - wire_size(kept))
     compact = [system, {**request, "content": kept + footer}]
     return compact if wire_size(compact) <= max_bytes else None
 
