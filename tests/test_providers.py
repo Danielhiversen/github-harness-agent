@@ -152,6 +152,25 @@ def test_compact_groq_reasoning_leaves_output_for_the_actual_edit():
     assert calls[0]["reasoning_effort"] == "low"
 
 
+@pytest.mark.parametrize("use_tool", [False, True])
+def test_nemotron_reserves_output_for_focused_reviews(use_tool):
+    name = "nvidia-free/nvidia/nemotron-3-ultra-550b-a55b"
+    router = routed(deployment(name), lambda req: httpx.Response(200, json=openai_response()))
+    route = router.routes[0]
+    messages = [
+        {"role": "system", "content": "Edit the module."},
+        {"role": "user", "content": "Selected failure: test_index_order"},
+    ]
+    tools = [{"type": "function", "function": {"name": "edit"}}] if use_tool else []
+    body = providers._chat_payload(route, messages, tools, 3072)
+    expected = {"enable_thinking": use_tool, "force_nonempty_content": True}
+    if use_tool:
+        expected["medium_effort"] = True
+    assert body["chat_template_kwargs"] == expected
+    messages[1]["content"] = "A general programming question"
+    assert "chat_template_kwargs" not in providers._chat_payload(route, messages, tools, 3072)
+
+
 def quality_order():
     config = deployment(OPENROUTER, OPENROUTER_SIBLING, KILO, OLLAMA)
     config[1]["url"] = config[0]["url"]

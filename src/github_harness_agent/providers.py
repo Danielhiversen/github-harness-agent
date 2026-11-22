@@ -325,6 +325,19 @@ def _chat_payload(
         "messages": cleaned,
         "max_tokens": max_tokens,
     }
+    if (
+        route.alias in {"nvidia", "nvidia-free"}
+        and route.model == "nvidia/nemotron-3-ultra-550b-a55b"
+        and len(cleaned) == 2
+        and cleaned[1].get("role") == "user"
+        and str(cleaned[1].get("content") or "").startswith("Selected failure: ")
+    ):
+        # NIM defaults to high reasoning. Focused text edits need the limited
+        # output for source, while native calls require the thinking parser.
+        settings = {"enable_thinking": bool(tools), "force_nonempty_content": True}
+        if tools:
+            settings["medium_effort"] = True
+        body["chat_template_kwargs"] = settings
     if route.alias.startswith("openrouter"):
         body["provider"] = {"max_price": {"prompt": 0, "completion": 0}}
     if tools:
