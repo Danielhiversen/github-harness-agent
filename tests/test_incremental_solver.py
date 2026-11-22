@@ -2,6 +2,7 @@ import sys
 import tarfile
 from dataclasses import replace
 from io import BytesIO
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -64,7 +65,11 @@ def solver_case(tmp_path, monkeypatch):
     with tarfile.open(fileobj=archive, mode="w") as snapshot:
         contents = {
             SOURCE: BASE_SOURCE.encode(),
-            "tests/test_existing.py": b"def test_existing():\n    assert True\n",
+            "tests/test_existing.py": (
+                b"import fixture_calc\n\n"
+                b"def test_existing():\n"
+                b"    assert not getattr(fixture_calc, 'broken_stock', False)\n"
+            ),
         }
         for path, content in contents.items():
             entry = tarfile.TarInfo(path)
@@ -138,7 +143,9 @@ def test_solver_keeps_verified_progress_across_free_gateway_proposals(solver_cas
         SECOND,
         edit(NEW_TEST, "", TEST),
     )
-    executor = PlainExecutor(runner, gateway, Limits(model_requests=5))
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=5, concurrent_probes=1)
+    )
     budget = _Budget(executor.limits, lambda: False, task)
 
     result = solve(executor, task, archive, budget, "fixture-version")
@@ -157,10 +164,81 @@ def test_solver_keeps_verified_progress_across_free_gateway_proposals(solver_cas
         (True, False, False),
         (True, True, False),
     ]
-    assert "No complete edit blocks" in gateway.prompts[1]
+    assert "No complete edit blocks" not in gateway.prompts[1]
     assert "Proposal was discarded" in gateway.prompts[3]
     assert all(check.returncode == 0 for check in result.checks)
     assert any(NEW_TEST in check.command for check in result.checks)
+
+
+@pytest.mark.parametrize("stale_regression", (False, True))
+def test_solver_verifies_another_goal_while_a_provider_is_still_working(
+    solver_case, stale_regression
+):
+    task, archive, runner, checkpoints = solver_case
+    first_started = Event()
+    second_saved = Event()
+
+    def save(checkpoint):
+        checkpoints.append(checkpoint)
+        if b"+    return 2\n" in checkpoint.patch:
+            second_saved.set()
+
+    task = replace(task, save_checkpoint=save)
+
+    class Gateway:
+        def complete(self, *, messages, **request):
+            goal = messages[-1]["content"].splitlines()[0]
+            if "test_first" in goal:
+                initial = not first_started.is_set()
+                first_started.set()
+                assert second_saved.wait(20), (
+                    "First provider waited for verified progress"
+                )
+                route, content = "slow", FIRST
+                if stale_regression and initial:
+                    content += edit(
+                        SOURCE,
+                        "def second():\n",
+                        "broken_stock = True\n\ndef second():\n",
+                    )
+                elif stale_regression:
+                    assert "test_existing" in messages[-1]["content"]
+            elif "test_second" in goal:
+                assert first_started.wait(20)
+                route, content = "fast", SECOND
+            else:
+                route, content = "fast", edit(NEW_TEST, "", TEST)
+            return SimpleNamespace(
+                role=request["role"],
+                route=route,
+                model=route,
+                configured_model=route,
+                content=content,
+                usage={"requests": 1},
+            )
+
+    expected_routes = (
+        ["fast", "slow", "slow", "fast"]
+        if stale_regression
+        else ["fast", "slow", "fast"]
+    )
+    executor = PlainExecutor(
+        runner,
+        Gateway(),
+        Limits(model_requests=len(expected_routes), concurrent_probes=2),
+    )
+    budget = _Budget(executor.limits, lambda: False, task)
+
+    result = solve(executor, task, archive, budget, "fixture-version")
+
+    assert b"+    return 1\n" not in checkpoints[0].patch
+    assert b"+    return 2\n" in checkpoints[0].patch
+    assert b"+    return 1\n" in result.patch
+    assert b"+    return 2\n" in result.patch
+    assert all(b"broken_stock" not in checkpoint.patch for checkpoint in checkpoints)
+    assert [route.route for route in result.route_trace] == expected_routes
+    assert result.usage == {"requests": len(expected_routes)}
+    assert budget.model_requests_remaining() == 0
 
 
 def test_solver_does_not_keep_a_candidate_rejected_by_final_gate(solver_case):
@@ -168,7 +246,9 @@ def test_solver_does_not_keep_a_candidate_rejected_by_final_gate(solver_case):
     gateway = FreeGateway(
         FIRST, SECOND, edit(NEW_TEST, "", TEST.replace("(1, 2)", "(0, 0)"))
     )
-    executor = PlainExecutor(runner, gateway, Limits(model_requests=3))
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=3, concurrent_probes=1)
+    )
     budget = _Budget(executor.limits, lambda: False, task)
 
     with pytest.raises(AttemptRejected, match="test_results"):

@@ -5,6 +5,7 @@ import difflib
 import json
 import logging
 import re
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import replace
 
 from .checkpoint import DraftCheckpoint
@@ -12,10 +13,14 @@ from .executor import (
     CandidateEvidence,
     RefinementEvidence,
     RouteEvidence,
+    _CandidateOutputError,
+    _RequestBudgetExceeded,
     _combined,
     _protected,
 )
+from .providers import ProviderExhausted
 from .review_recovery import operator_acceptance_context
+from .review_solver_context import focused_source_excerpt
 from .test_updates import has_runnable_test
 
 _LOG = logging.getLogger(__name__)
@@ -194,6 +199,61 @@ def _fixture_excerpt(fixtures, target):
     return "".join(selected)[:6000]
 
 
+def _proposal_messages(
+    target, current, failures, needs_tests, note, review, fixtures, interfaces, new_path
+):
+    diagnostic = failures.get(
+        target,
+        "Create runnable tests covering the requested behavior with offline fixtures.",
+    )
+    query = words(target[1] + " " + diagnostic[:600])
+    notes = sorted(
+        review.feedback,
+        key=lambda item: len(words(item[2]) & query),
+        reverse=True,
+    )
+    path, line, body = notes[0]
+    query |= words(body)
+    focus = focused_source_excerpt(
+        current[path], target[1], review_note=body, anchor=line, max_chars=3000
+    )
+    source = "\n".join(
+        f"FILE {name}\n"
+        + (
+            content
+            if name == path and len(content) <= 24000
+            else source_excerpt(content, query, 14500 // len(current))
+        )
+        for name, content in current.items()
+        if content
+    )
+    goal = (
+        f"Selected failure: {target[1]}\nReviewer feedback: {body}\n"
+        f"Focused source from {path}:\n{focus}\n"
+        f"Failure details:\n{diagnostic}\n"
+    )
+    fixture = _fixture_excerpt(fixtures, target[1])
+    request = (
+        goal
+        + (f"Last proposal feedback for this goal: {note}\n" if note else "")
+        + "\nFixture for this goal:\n"
+        + fixture
+        + "\nImported API declarations:\n"
+        + "\n".join(interfaces)
+        + "\nOther reviewer feedback:\n"
+        + "\n".join(item[2] for item in notes[1:])
+        + (f"\nNew test file: {new_path}\n" if needs_tests and not failures else "")
+        + "\nCurrent checkout:\n"
+        + source
+        + f"\nSelected failure: {target[1]}. Fix this failure without breaking passing behavior.\n"
+        + "Respond with exact SEARCH/REPLACE blocks only."
+    )
+    return [
+        {"role": "system", "content": _SYSTEM},
+        {"role": "user", "content": request},
+    ]
+
+
 def solve(executor, task, archive, budget, version):
     review = task.review_recovery
     if not (
@@ -290,158 +350,189 @@ def solve(executor, task, archive, budget, version):
     commands = tuple(dict.fromkeys((*task.pull_checks, *task.checks)))
     patch = patch_for(original, current)
     failures = evidence(executor, task, archive, budget, patch, commands)
-    note = review.previous_failure
-    last_route = None
+    notes = {}
+    last_routes = {}
     attempts = {}
     max_proposals = min(36, budget.model_requests_remaining())
     editor = actor
-    for turn in range(max_proposals + 1):
-        needs_tests = task.require_new_tests and not has_runnable_test(
-            new_path, current[new_path].encode()
-        )
-        if not failures and not needs_tests and patch:
-            result = executor._verify(task, archive, budget, patch, actor=actor)
-            return replace(
-                result,
-                refinement=RefinementEvidence(
-                    version,
-                    task.seed,
-                    task.repository,
-                    task.instructions,
-                    {"base": _GUIDANCE},
-                    (),
-                    (
-                        CandidateEvidence(
-                            "base",
-                            result.patch_digest,
-                            "Verified accumulated review fixes",
+    submitted = 0
+    pending = {}
+    unavailable = {}
+    pool = ThreadPoolExecutor(max_workers=executor.limits.concurrent_probes)
+    try:
+        while True:
+            needs_tests = task.require_new_tests and not has_runnable_test(
+                new_path, current[new_path].encode()
+            )
+            ready = not failures and not needs_tests and bool(patch)
+            if ready and not pending:
+                result = executor._verify(task, archive, budget, patch, actor=actor)
+                return replace(
+                    result,
+                    refinement=RefinementEvidence(
+                        version,
+                        task.seed,
+                        task.repository,
+                        task.instructions,
+                        {"base": _GUIDANCE},
+                        (),
+                        (
+                            CandidateEvidence(
+                                "base",
+                                result.patch_digest,
+                                "Verified accumulated review fixes",
+                            ),
                         ),
+                        "base",
                     ),
-                    "base",
+                )
+            # Check diagnoses and test authoring retain single-request behavior.
+            operator = [key for key in failures if key[0] < len(task.pull_checks)]
+            remaining = operator or list(failures) or [(-1, "new regression tests")]
+            limit = executor.limits.concurrent_probes if operator else 1
+            active = {target for target, _ in pending.values()}
+            available = sorted(
+                (
+                    key
+                    for key in remaining
+                    if key not in active and key not in unavailable
                 ),
+                key=lambda key: (attempts.get(key, 0), key),
             )
-        if turn == max_proposals:
-            break
-        remaining = list(failures) or [(-1, "new regression tests")]
-        target = min(
-            remaining,
-            key=lambda k: (k[0] >= len(task.pull_checks), attempts.get(k, 0), k),
-        )
-        attempts[target] = attempts.get(target, 0) + 1
-        diagnostic = failures.get(
-            target,
-            "Create runnable tests covering the requested behavior with offline fixtures.",
-        )
-        query = words(target[1] + " " + diagnostic[:600])
-        notes = sorted(
-            (body for _, _, body in review.feedback),
-            key=lambda body: len(words(body) & query),
-            reverse=True,
-        )
-        query |= words(notes[0])
-        source = "\n".join(
-            f"FILE {path}\n{source_excerpt(content, query, 14500 // len(paths))}"
-            for path, content in current.items()
-            if content
-        )
-        goal = (
-            f"Selected failure: {target[1]}\n{diagnostic}\nReviewer feedback:\n"
-            + "\n".join(notes)
-        )
-        fixture = _fixture_excerpt(fixtures, target[1])
-        request = (
-            goal
-            + "\nFixture for this goal:\n"
-            + fixture
-            + "\nImported API declarations:\n"
-            + "\n".join(interfaces)
-            + "\nCurrent checkout:\n"
-            + source
-            + f"\nSelected failure: {target[1]}. Fix this failure without breaking passing behavior.\n"
-            + (f"New test file: {new_path}\n" if needs_tests and not failures else "")
-            + (f"Last proposal feedback: {note}\n" if note else "")
-            + "Respond with exact SEARCH/REPLACE blocks only."
-        )
-        completion = budget.complete(
-            executor.gateway,
-            "coding",
-            [
-                {"role": "system", "content": _SYSTEM},
-                {"role": "user", "content": request},
-            ],
-            after_provider=last_route,
-        )
-        last_route = completion.route
-        editor = RouteEvidence.from_completion(completion)
-        try:
-            candidate = apply_blocks(completion.content, current, new_path)
-            if failures and needs_tests and candidate[new_path] != current[new_path]:
-                raise ValueError(
-                    "Fix existing verification failures first, then add the new test module."
-                )
-            proposed = patch_for(original, candidate)
-            if len(proposed) > executor.limits.patch_bytes:
-                raise ValueError("Patch exceeds the configured byte limit")
-            after = evidence(executor, task, archive, budget, proposed, commands)
-        except ValueError as error:
-            note = str(error)[:400]
-            _LOG.info(
-                "Review edit could not be applied for %s: %s",
-                target[1],
-                str(error).split(":", 1)[0][:120],
+            slots = min(
+                max_proposals - submitted,
+                budget.model_requests_remaining(),
+                limit - len(pending),
             )
-            continue
-        # Never trade a passing operator test for another one. Stock diagnostics
-        # can change while a behavior is corrected; finish those before publishing.
-        old_operator = {item for item in failures if item[0] < len(task.pull_checks)}
-        new_operator = {item for item in after if item[0] < len(task.pull_checks)}
-        progressed = new_operator < old_operator or (
-            new_operator == old_operator and after.keys() < failures.keys()
-        )
-        test_added = needs_tests and has_runnable_test(
-            new_path, candidate[new_path].encode()
-        )
-        if not progressed and not (test_added and not after):
-            note = (
-                "Proposal was discarded. Remaining diagnostics on that proposal: "
-                + " ".join(
-                    f"{name}: {value[-450:]}"
-                    for (_, name), value in list(after.items())[:5]
+            if not ready and slots > 0:
+                for target in available[:slots]:
+                    attempts[target] = attempts.get(target, 0) + 1
+                    messages = _proposal_messages(
+                        target,
+                        current,
+                        failures,
+                        needs_tests,
+                        notes.get(target, review.previous_failure),
+                        review,
+                        fixtures,
+                        interfaces,
+                        new_path,
+                    )
+                    future = pool.submit(
+                        budget.complete,
+                        executor.gateway,
+                        "coding",
+                        messages,
+                        after_provider=last_routes.get(target),
+                    )
+                    pending[future] = target, current
+                    submitted += 1
+            if not pending:
+                for target in remaining:
+                    if target in unavailable:
+                        raise unavailable[target]
+                break
+            done, _ = wait(
+                pending,
+                timeout=min(budget.remaining(), 0.25),
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                continue
+            future = next(future for future in pending if future in done)
+            target, snapshot = pending.pop(future)
+            try:
+                completion = future.result()
+            except ProviderExhausted as error:
+                unavailable[target] = error
+                continue
+            except _RequestBudgetExceeded:
+                continue
+            unavailable.clear()
+            if ready:
+                continue
+            last_routes[target] = completion.route
+            editor = RouteEvidence.from_completion(completion)
+            try:
+                candidate = apply_blocks(completion.content, current, new_path)
+                if (
+                    failures
+                    and needs_tests
+                    and candidate[new_path] != current[new_path]
+                ):
+                    raise ValueError(
+                        "Fix existing verification failures first, then add the new test module."
+                    )
+                proposed = patch_for(original, candidate)
+                if len(proposed) > executor.limits.patch_bytes:
+                    raise ValueError("Patch exceeds the configured byte limit")
+                after = evidence(executor, task, archive, budget, proposed, commands)
+            except ValueError as error:
+                notes[target] = str(error)[:400]
+                _LOG.info(
+                    "Review edit could not be applied for %s: %s",
+                    target[1],
+                    str(error).split(":", 1)[0][:120],
                 )
-            )[-2200:]
+                continue
+            # Never trade a passing operator test for another one. Stock diagnostics
+            # can change while a behavior is corrected; finish those before publishing.
+            old_operator = {
+                item for item in failures if item[0] < len(task.pull_checks)
+            }
+            new_operator = {item for item in after if item[0] < len(task.pull_checks)}
+            progressed = new_operator < old_operator or (
+                new_operator == old_operator and after.keys() < failures.keys()
+            )
+            test_added = needs_tests and has_runnable_test(
+                new_path, candidate[new_path].encode()
+            )
+            stale_regression = (
+                snapshot is not current and not after.keys() <= failures.keys()
+            )
+            if stale_regression or (not progressed and not (test_added and not after)):
+                notes[target] = (
+                    "Proposal was discarded. Remaining diagnostics on that proposal: "
+                    + " ".join(
+                        f"{name}: {value[-450:]}"
+                        for (_, name), value in list(after.items())[:5]
+                    )
+                )[-2200:]
+                _LOG.info(
+                    "Review goal %s: no verified improvement via %s",
+                    target[1],
+                    completion.route,
+                )
+                continue
+            current, failures, patch, actor = candidate, after, proposed, editor
+            last_routes.pop(target, None)
+            notes.pop(target, None)
+            if not failures and (
+                not task.require_new_tests
+                or has_runnable_test(new_path, current[new_path].encode())
+            ):
+                # The final verifier includes an isolated run of new tests. Keep the
+                # last partial checkpoint until that independent gate succeeds.
+                continue
             _LOG.info(
-                "Review goal %s: no verified improvement via %s",
-                target[1],
+                "Checkpointing review progress from %s: %d failed checks/tests remain",
                 completion.route,
+                len(after),
             )
-            continue
-        current, failures, patch, actor = candidate, after, proposed, editor
-        last_route = None
-        note = ""
-        if not failures and (
-            not task.require_new_tests
-            or has_runnable_test(new_path, current[new_path].encode())
-        ):
-            # The final verifier includes an isolated run of new tests. Keep the
-            # last partial checkpoint until that independent gate succeeds.
-            continue
-        _LOG.info(
-            "Checkpointing review progress from %s: %d failed checks/tests remain",
-            completion.route,
-            len(after),
-        )
-        task.save_checkpoint(
-            DraftCheckpoint(
-                _CHECKPOINT,
-                task.base_sha,
-                patch,
-                (),
-                _GUIDANCE,
-                (editor.route, editor.configured_model),
+            budget.remaining()
+            task.save_checkpoint(
+                DraftCheckpoint(
+                    _CHECKPOINT,
+                    task.base_sha,
+                    patch,
+                    (),
+                    _GUIDANCE,
+                    (editor.route, editor.configured_model),
+                )
             )
-        )
-    from .executor import _CandidateOutputError
-
+    finally:
+        # A running gateway request is already bounded by the shared deadline.
+        pool.shutdown(wait=False, cancel_futures=True)
     budget.reject(
         _CandidateOutputError(
             "Review solver retained verified progress; outstanding checks still fail"
