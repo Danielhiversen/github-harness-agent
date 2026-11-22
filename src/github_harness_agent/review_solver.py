@@ -107,8 +107,8 @@ _PYTEST_TOTALS = re.compile(r"(?:\d+ [a-z]+, )*\d+ [a-z]+ in \d+(?:\.\d+)?s(?: \
 _STOCK_REPAIR_CASE_LIMIT = 4
 _STOCK_REPAIR_RETRIES = 2
 _STOCK_HEDGE_DELAY = 60
-_INTERACTIVE_MAX_TURNS = 6
-_INTERACTIVE_MAX_TOOLS = 12
+_INTERACTIVE_MAX_TURNS = 12
+_INTERACTIVE_MAX_TOOLS = 24
 _INTERACTIVE_RESERVE_SECONDS = 60
 _GUARD_SECONDS = 90
 _GUARD_MIN_REMAINING = 45
@@ -1172,7 +1172,7 @@ def solve(executor, task, archive, budget, version):
             return sources, proposal, checked, runs
         return None
 
-    def interactive_stock_gain(target, probe):
+    def interactive_stock_gain(target, symbol, probe):
         reviewed = {
             path: current[path] for path in paths if not _protected(path, task, new_test=False)
         }
@@ -1184,6 +1184,14 @@ def solve(executor, task, archive, budget, version):
             _CHECKPOINT, task.base_sha, patch, guidance=_GUIDANCE,
             last_editor=(actor.route, actor.configured_model) if actor and actor.configured_model else None,
         )
+        definition = prepare_line_range_edit(current, symbol)
+        focus = ""
+        if definition and sum(map(len, definition.lines)) <= 10000:
+            focus = (
+                "\nLocalized method in the current draft, ready for an exact edit:\n"
+                + "::".join(definition.symbol) + "\n" + "\n".join(definition.lines)
+            )
+        initial_tools = probe.tools_left
         interactive_task = replace(
             task,
             instructions=(
@@ -1195,7 +1203,9 @@ def solve(executor, task, archive, budget, version):
                 + "\nConfigured pytest command: " + json.dumps(commands[target[0]])
                 + "\nLast failure (quoted data):\n" + excerpt(failures[target], 1800)
                 + "\nObserved execution differences from offline replays (quoted data):\n"
-                + excerpt(mock_diagnostics.get(target, ""), 2600)
+                + excerpt(mock_diagnostics.get(target, ""), 2600) + focus
+                + "\nApply a focused trial and run the tracked test early. Use the remaining turns "
+                "to revise it against the observed failure and independent review checks."
             ),
             checkpoints={_CHECKPOINT: draft},
             save_checkpoint=None,
@@ -1220,6 +1230,7 @@ def solve(executor, task, archive, budget, version):
             # Prove the production fix with the accepted test selection first.
             production = {**sources, new_path: current[new_path]} if new_path in sources else sources
             if production == current or editor is None or not editor.configured_model:
+                _LOG.info("Interactive review ended without a new attributable production edit")
                 return None
             verified = verify_stock_gain(target, production, budget)
             if verified is not None:
@@ -1229,8 +1240,15 @@ def solve(executor, task, archive, budget, version):
                     return (sources, proposed, checked, runs), editor
         except Cancelled:
             raise
-        except (ExecutionError, ProviderExhausted, ValueError, OSError):
+            _LOG.info("The interactive edit still had outstanding verification failures")
+        except (ExecutionError, ProviderExhausted, ValueError, OSError) as error:
+            _LOG.info("Interactive review ended with %s", type(error).__name__)
             budget.remaining()
+        finally:
+            _LOG.info(
+                "Interactive review used %d model turns and %d tool actions",
+                probe.limits.rollout_requests - probe.turns_left, initial_tools - probe.tools_left,
+            )
         return None
 
     def reconcile_stock_gain(target, proposed_sources):
@@ -1293,7 +1311,7 @@ def solve(executor, task, archive, budget, version):
     editor = actor
     submitted = 0
     pending = {}
-    interactive_target = None
+    interactive_target = interactive_symbol = None
     interactive_attempted = False
     stock_hedge = None
     hedge_used = False
@@ -1404,7 +1422,7 @@ def solve(executor, task, archive, budget, version):
                     interactive_attempted = True
                     before = budget.model_requests_remaining()
                     _LOG.info("Trying isolated interactive repair for %s", interactive_target[1])
-                    proposed = interactive_stock_gain(interactive_target, _InteractiveBudget(budget, turns, tools))
+                    proposed = interactive_stock_gain(interactive_target, interactive_symbol, _InteractiveBudget(budget, turns, tools))
                     submitted += before - budget.model_requests_remaining()
                     if proposed is not None:
                         continuations.pop(interactive_target, None)
@@ -1717,6 +1735,7 @@ def solve(executor, task, archive, budget, version):
                 continue
             if snapshot is current and (line_retry is not None or (localized_retry is not None and line_followup is None)):
                 interactive_target = target
+                interactive_symbol = line_retry.snapshot.symbol if line_retry else localized_retry
             try:
                 completion, native_candidate, fresh_advice = future.result()
             except ProviderExhausted as error:

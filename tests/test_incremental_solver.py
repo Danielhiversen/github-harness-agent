@@ -2141,6 +2141,9 @@ def test_saved_stock_plateau_tries_scoped_tools_then_verifies_regression(
                 phases.append("interactive")
                 outputs = [message["content"] for message in messages if message["role"] == "tool"]
                 if not outputs:
+                    task_prompt = "\n".join(str(m.get("content") or "") for m in messages)
+                    assert "Localized method in the current draft" in task_prompt
+                    assert "def stock_result():\n    return -3" in task_prompt
                     assert {tool["function"]["name"] for tool in tools} >= {"run", "edit_file"}, phases
                     calls = (
                         call("edit_file", {"path": "outside.py", "new_text": "bad = True\n"}),
