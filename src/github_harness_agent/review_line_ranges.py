@@ -150,6 +150,9 @@ def _edits(response, snapshot, indent):
         or len(response.encode()) > _MAX_REPLY
     ):
         raise ValueError("Line-range response is empty or exceeds the edit limit")
+    rows = response.strip().splitlines()
+    if len(rows) >= 3 and rows[0] in ("```", "```json") and rows[-1] == "```":
+        response = "\n".join(rows[1:-1])
     try:
         payload = json.loads(response, object_pairs_hook=_unique_object)
     except (ValueError, RecursionError):

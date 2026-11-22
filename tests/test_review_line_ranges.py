@@ -123,3 +123,17 @@ def test_ranges_keep_crlf_and_replace_absent_final_newline():
         )[PATH]
         == "class Queue:\r\n    def receive(self):\r\n        value = 2\r\n        return value"
     )
+
+
+
+def test_accepts_one_complete_json_fence_without_other_response_text():
+    sources = {PATH: SOURCE}
+    snapshot = _prepare(sources)
+    valid = _reply(snapshot, _edit(7, 7, "        return 42"))
+    expected = apply_line_range_edit(valid, sources, snapshot)
+    for tag in ("", "json"):
+        fenced = f"```{tag}\n{valid}\n```"
+        assert apply_line_range_edit(fenced, sources, snapshot) == expected
+        for ambiguous in ("proposal:\n" + fenced, fenced + "\n" + fenced, fenced[:-1]):
+            with pytest.raises(ValueError):
+                apply_line_range_edit(ambiguous, sources, snapshot)
