@@ -41,15 +41,42 @@ class CounterCallerSite:
     excerpts: str
 
 
+@dataclass(frozen=True)
+class CounterLoopReuse:
+    owner: CounterCallerLocation
+    mutation: CounterCallerLocation
+    body_line: int
+    variable: str
+    entries: int
+    mutations: int
+    pinned_mutations: int
+    node: str
+    assertion_line: int
+
+
+def _caller_location(source, location):
+    path, function, line = location
+    if source and 1 <= line <= len(source.splitlines()):
+        return CounterCallerLocation(path, function, line, hashlib.sha256(source.encode()).hexdigest())
+    return None
+
+
 class _ReplayDiagnostic(str):
-    def __new__(cls, text, site):
+    def __new__(cls, text, site, loop=None):
         result = super().__new__(cls, text)
         result.counter_site = site
+        result.counter_loop = loop
         return result
 
 
 def counter_caller_site(report):
     return report.counter_site if isinstance(report, _ReplayDiagnostic) else None
+
+
+def counter_loop_reuse(report):
+    if isinstance(report, _ReplayDiagnostic) and isinstance(report.counter_loop, CounterLoopReuse):
+        return report.counter_loop
+    return None
 
 
 def compact_observations(detail, limit):
@@ -399,7 +426,7 @@ def _divergent_caller_source(old, new, sources):
 
 def _loop_reuse(before, after, first_difference):
     if len(after) != 3:
-        return ""
+        return None
     old_events = before[1]
     old_bindings = before[2] if len(before) == 3 else None
     new_events, new_bindings = after[1:]
@@ -424,7 +451,7 @@ def _loop_reuse(before, after, first_difference):
         entries = {new_bindings[event][-1] for event in matches}
         if len(entries) < 2 or matches[-1] < first_difference:
             continue
-        caller, _, name, ordinal, _ = binding
+        caller, body_line, name, ordinal, _ = binding
         # Each distinct observed entry accounts for at least one mutation at
         # this draft site. A complete pinned window with fewer observed
         # mutations in total needs no comparable object binding.
@@ -434,7 +461,8 @@ def _loop_reuse(before, after, first_difference):
             return (
                 f"{_LOOP_OBSERVATION}`{name}`: record #{ordinal} at {len(matches)} mutations "
                 f"across {len(entries)} loop entries (object identity only). "
-                f"Pinned: {pinned_total} observed {unit}."
+                f"Pinned: {pinned_total} observed {unit}.",
+                (stack[caller], stack[0], body_line, name, len(entries), len(matches), pinned_total),
             )
         if old_bindings is None:
             continue
@@ -455,9 +483,10 @@ def _loop_reuse(before, after, first_difference):
             continue
         return (
             f"{_LOOP_OBSERVATION}`{name}`: record #{ordinal} at {len(matches)} mutations "
-            f"(caller line {stack[caller][2]}, object identity only within this evaluation)."
+            f"(caller line {stack[caller][2]}, object identity only within this evaluation).",
+            (stack[caller], stack[0], body_line, name, len(entries), len(matches), pinned_total),
         )
-    return ""
+    return None
 
 
 def _counter_difference(baseline, candidate, node, reviewed_sources=None):
@@ -517,8 +546,16 @@ def _counter_difference(baseline, candidate, node, reviewed_sources=None):
     rows = [
         render(label, events) for label, events in (("Pinned", old), ("Draft", new))
     ]
+    loop = None
     if reuse := _loop_reuse(base_windows[failed], windows[failed], first):
-        rows.append(reuse)
+        message, (owner, mutation, *details) = reuse
+        rows.append(message)
+        if reviewed_sources:
+            sources = reviewed_sources[1]
+            owner_site = _caller_location(sources.get(owner[0]), owner)
+            mutation_site = _caller_location(sources.get(mutation[0]), mutation)
+            if owner_site is not None and mutation_site is not None:
+                loop = CounterLoopReuse(owner_site, mutation_site, *details, node, line)
     text = (
         _COUNTER_HEADING + " "
         f"The pinned case passed and the draft failed at {node} line {line} (evaluation {failed + 1}). "
@@ -530,7 +567,9 @@ def _counter_difference(baseline, candidate, node, reviewed_sources=None):
         if reviewed_sources
         else None
     )
-    return _ReplayDiagnostic(text + site.excerpts, site) if site else text
+    if site or loop:
+        return _ReplayDiagnostic(text + (site.excerpts if site else ""), site, loop)
+    return text
 
 
 def mock_call_diagnostic(
@@ -600,5 +639,5 @@ def mock_call_diagnostic(
         baseline[1], candidate[1], base_node, reviewed_sources
     )
     text = "\n".join(filter(None, (counter, _differences(baseline[0], candidate[0]))))
-    site = counter_caller_site(counter)
-    return _ReplayDiagnostic(text, site) if site else text
+    site, loop = counter_caller_site(counter), counter_loop_reuse(counter)
+    return _ReplayDiagnostic(text, site, loop) if site or loop else text

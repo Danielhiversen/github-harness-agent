@@ -3848,3 +3848,162 @@ def test_resumed_stock_plateau_can_try_pinned_restore_before_planning(
         assert prompts[0].count("Synthetic binding.") == int(
             scenario == "rejected_seed"
         )
+
+
+@pytest.mark.parametrize("scenario", ["verified", "spoof", "unrelated", "regression", "escape", "after_seed"])
+def test_resumed_repeated_stock_uses_only_typed_scoped_coding(solver_case, monkeypatch, scenario):
+    from github_harness_agent import review_solver
+    from github_harness_agent.providers import ProviderExhausted
+    from github_harness_agent.review_mock_replay import (
+        CounterCallerSite,
+        _ReplayDiagnostic,
+        counter_caller_site,
+        counter_loop_reuse,
+    )
+
+    task, _, runner, checkpoints = solver_case
+    acceptance = Path(task.pull_checks[0][-1])
+    with acceptance.open("a") as stream:
+        stream.write(
+            "\nfrom fixture_calc import account_for\n"
+            "\ndef test_distinct_records():\n"
+            '    assert account_for([{"reference": "a"}, {"reference": "b"}])["encountered"] == 2\n'
+        )
+    mutation = '        result["encountered"] += 1'
+    before = BASE_SOURCE + (
+        "\ndef account_for(records):\n"
+        "    seen = set()\n"
+        '    result = {"encountered": 0}\n'
+        + "".join(
+            "    # Unrelated middle body to keep out of the localized prompt.\n"
+            if index == 16 else "    # Unchanged processing notes.\n"
+            for index in range(185 if scenario == "after_seed" else 35)
+        )
+        + "    for item in records[:1]:\n"
+        '        reference = item["reference"]\n'
+        + mutation + "\n"
+        "    return result\n"
+    )
+    current = (
+        before.replace("return -1", "return 1").replace("return -2", "return 2")
+        .replace("records[:1]", "records")
+    )
+    tracked = (
+        "from fixture_calc import account_for\n\n"
+        "def test_stock():\n"
+        '    item = {"reference": "a"}\n'
+        '    assert account_for([item, item])["encountered"] == 1\n'
+    )
+    patch = patch_for({SOURCE: before}, {SOURCE: current})
+    target = (1, "tests/test_existing.py::test_stock")
+    draft = DraftCheckpoint(
+        review_solver._CHECKPOINT, task.base_sha, patch, guidance=_GUIDANCE,
+        last_editor=("checkpoint-free", "fixture/checkpoint"),
+    )
+    task = replace(
+        task, checkpoints={draft.key: draft},
+        solver_recovery=SolverRecovery(
+            review_solver._recovery_digest(task, {acceptance.name: acceptance.read_text()}, patch),
+            ((review_solver._goal_digest(target), 0, 2),),
+        ),
+    )
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, source in {SOURCE: before, "tests/test_existing.py": tracked}.items():
+            data = source.encode()
+            member = tarfile.TarInfo(path)
+            member.size = len(data)
+            snapshot.addfile(member, BytesIO(data))
+
+    actual_replay = review_solver.mock_call_diagnostic
+    traces = []
+
+    def replay(*args, **kwargs):
+        report = actual_replay(*args, **kwargs)
+        signal = counter_loop_reuse(report)
+        assert signal and signal.entries == 2 and signal.pinned_mutations == 1
+        traces.append(signal)
+        if scenario == "spoof":
+            return str(report)
+        if scenario == "after_seed":
+            return _ReplayDiagnostic(
+                report, CounterCallerSite((signal.owner,), "Paired caller evidence."), signal
+            )
+        if scenario == "unrelated":
+            return _ReplayDiagnostic(
+                report, counter_caller_site(report),
+                replace(signal, node="tests/test_another.py::test_other"),
+            )
+        return report
+
+    monkeypatch.setattr(review_solver, "mock_call_diagnostic", replay)
+    monkeypatch.setattr(review_solver, "stock_guard_diagnostic", lambda *args: "")
+    phases = []
+    replacement = [
+        "        if reference not in seen:",
+        "            seen.add(reference)",
+        '            result["encountered"] += 1',
+    ]
+
+    class Gateway:
+        def complete(self, *, role, messages, timeout, **options):
+            prompt = messages[-1]["content"]
+            if role == "planning":
+                phases.append("planning")
+                raise ProviderExhausted(None, {"planner": "upstream timeout"})
+            if "Repair repeated logical processing with a small scoped edit" in prompt:
+                phases.append("precision")
+                assert 0 < timeout <= 35
+                assert "after_provider" in options and options["after_provider"] == "checkpoint-free"
+                assert 'assert account_for([item, item])["encountered"] == 1' in prompt
+                assert "across 2 loop entries" in prompt
+                assert "Unrelated middle body" not in prompt
+                assert "for item in records:" in prompt and "seen = set()" in prompt
+                row = int(re.search(r"(?m)^(\d+) \| " + re.escape(mutation) + "$", prompt)[1])
+                digest = re.search(r'"snapshot":"([a-f0-9]{64})"', prompt)[1]
+                change = replacement
+                if scenario == "regression":
+                    change = ["        if not seen:", *replacement[1:]]
+                elif scenario == "escape":
+                    row -= 18  # Hidden middle body, outside all editable numbered windows.
+                content = json.dumps({"snapshot": digest, "edits": [{"start": row, "end": row, "lines": change}]})
+                route = "precision-free"
+            elif "Private regression repair." in prompt:
+                phases.append("private")
+                content = "malformed"
+                route = "private-free"
+            elif prompt.startswith("Selected failure: new regression tests"):
+                phases.append("author")
+                content = edit(NEW_TEST, "", tracked.replace("test_stock", "test_repeated"))
+                route = "regression-author"
+            else:
+                phases.append("ordinary")
+                content = edit(SOURCE, mutation + "\n", "\n".join(replacement) + "\n")
+                route = "ordinary-free"
+            return SimpleNamespace(
+                role=role, route=route, model="fixture-coder", configured_model=route,
+                content=content, usage={}, tool_calls=(),
+            )
+
+    verification = runner.path / "verify"
+    verification.mkdir()
+    executor = PlainExecutor(
+        runner, Gateway(), Limits(model_requests=8, concurrent_probes=1),
+        verification_runner=FixtureRunner(verification),
+    )
+    result = solve(executor, task, archive.getvalue(), _Budget(executor.limits, lambda: False, task), "fixture")
+    expected = ["precision"] if scenario not in {"spoof", "unrelated"} else []
+    if scenario == "after_seed":
+        expected = ["private"] * 3 + expected
+    elif scenario != "verified":
+        expected += ["planning", "ordinary"]
+    assert phases == [*expected, "author"]
+    assert len(traces) == 1
+    assert checkpoints and checkpoints[-1].last_editor[0] == (
+        "precision-free" if scenario in {"verified", "after_seed"} else "ordinary-free"
+    )
+    assert all(b"if not seen:" not in checkpoint.patch for checkpoint in checkpoints)
+    assert b"if reference not in seen:" in result.patch
+    assert b"tests/test_existing.py" not in result.patch
+    assert NEW_TEST.encode() in result.patch
+    assert all(check.returncode == 0 for check in result.checks)

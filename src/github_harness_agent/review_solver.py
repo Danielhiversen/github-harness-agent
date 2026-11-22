@@ -65,12 +65,16 @@ from .review_guards import guarded_sources
 from .review_mock_replay import (
     compact_observations,
     counter_caller_site,
+    counter_loop_reuse,
     mock_call_diagnostic,
 )
 from .review_line_ranges import (
+    LINE_RANGE_ENDING,
     LineRangeSnapshot,
     apply_line_range_edit,
+    line_range_prompt,
     prepare_line_range_edit,
+    prepare_loop_line_range_edit,
 )
 from .review_planner import (
     apply_coding_advice,
@@ -145,6 +149,11 @@ _COMPOSITION_MIN_REMAINING = 60
 _STOCK_HUNK_PROBES = 3
 _STOCK_HUNK_SECONDS = 12
 _MODEL_FAILURE_THRESHOLD = 2
+_LOOP_PRECISION_MODEL_SECONDS = 35
+_LOOP_PRECISION_RESERVE_SECONDS = 65
+_LOOP_PRECISION_MIN_REMAINING = (
+    _LOOP_PRECISION_MODEL_SECONDS + _GUARD_SECONDS + _LOOP_PRECISION_RESERVE_SECONDS
+)
 _LONG_LOCALIZED_DEFINITION_BYTES = 6 * 1024
 _WORD = re.compile(r"[a-z]{3,}")
 _STOP = set(
@@ -1757,6 +1766,90 @@ def solve(executor, task, archive, budget, version):
             )
         )
 
+    def precision_stock_gain(target, signal):
+        node = target[1]
+        exact = node.partition("[")[0].removeprefix("/work/").removeprefix("./")
+        test_path = exact.partition("::")[0]
+        diagnostic = failures[target]
+        fixture = stock_fixtures.get((target, diagnostic), "")
+        if (
+            not fixture
+            or signal.node != exact
+            or signal.assertion_line != stock_assertion_failure_line(node, diagnostic)
+            or not _named_operator_cases({target}, commands)
+            or test_path in paths
+            or (task.test_update or "").partition("::")[0] == test_path
+        ):
+            return None
+        for site in (signal.owner, signal.mutation):
+            source = current.get(site.path, "")
+            if (
+                site.path not in paths or _protected(site.path, task, new_test=False)
+                or not source or hashlib.sha256(source.encode()).hexdigest() != site.source_digest
+            ):
+                return None
+        symbol = signal.owner.path, signal.owner.name
+        scoped = prepare_loop_line_range_edit(
+            current, symbol, signal.body_line, signal.variable, signal.owner.line,
+        )
+        if scoped is None:
+            return None
+        snapshot, visible_rows, allowed_rows = scoped
+        mutation = signal.mutation
+        rows = current[mutation.path].splitlines()
+        nearby = "\n".join(rows[max(0, mutation.line - 3):mutation.line + 2])
+        if wire_size(fixture) > 1700:
+            window = stock_pytest_excerpt(
+                archive, commands[target[0]], node, diagnostic, failure_window_only=True,
+            )
+            fixture = window + "\n" + excerpt(fixture, 1050)
+        instructions = (
+            f"Selected failure: {node}\n"
+            "Repair repeated logical processing with a small scoped edit. Identify the durable domain "
+            "identity and when the record should count. Distinct records must still be processed. "
+            "Preserve traversal and unrelated behavior. Do not use object IDs, clamp the numeric result, "
+            "hardcode keys or test values, or change tests. Equal objects and logical duplicates are distinct concepts.\n"
+            f"A paired replay observed the same object bound to `{signal.variable}` across "
+            f"{signal.entries} loop entries at this site and {signal.mutations} mutations. "
+            f"The pinned evaluation observed {signal.pinned_mutations} mutations in total. "
+            "Object identity is diagnostic evidence within the draft evaluation.\n"
+            f"Mutation source (quoted, read-only unless shown in editable rows): "
+            f"{mutation.path}:{mutation.line} {mutation.name}\n{excerpt(nearby, 390)}\n"
+            f"Immutable failing pytest input and setup (quoted):\n{fixture}\n"
+            f"Observed pytest failure (quoted):\n{excerpt(diagnostic, 450)}\n"
+            + line_range_prompt(snapshot, visible_rows=visible_rows)
+            + LINE_RANGE_ENDING
+        )
+        messages = [
+            {"role": "system", "content": _LINE_RANGE_SYSTEM},
+            {"role": "user", "content": instructions},
+        ]
+        if wire_size(messages) > 7500:
+            return None
+        try:
+            completion = budget.complete(
+                executor.gateway, "coding", messages,
+                after_provider=actor.route, max_output_tokens=2048, retry_oversize=False,
+                timeout_cap=_LOOP_PRECISION_MODEL_SECONDS,
+            )
+            editor = RouteEvidence.from_completion(completion)
+            if editor.role != "coding" or not editor.configured_model:
+                return None
+            proposed = apply_line_range_edit(
+                completion.content, current, snapshot, allowed_rows=allowed_rows,
+            )
+            verified = verify_stock_candidate(
+                target, proposed, _GuardBudget(budget, reserve=_LOOP_PRECISION_RESERVE_SECONDS),
+                accept_partial=True,
+            )
+            if verified is not None:
+                return *verified, editor
+        except Cancelled:
+            raise
+        except (ExecutionError, ProviderExhausted, ValueError):
+            budget.remaining()
+        return None
+
     def interactive_stock_gain(target, symbol, probe):
         reviewed = {
             path: current[path] for path in paths if not _protected(path, task, new_test=False)
@@ -2078,6 +2171,7 @@ def solve(executor, task, archive, budget, version):
     ):
         eager_target = None
     eager_trace, eager_advisory = None, ""
+    precision_attempted = False
     unavailable = {}
     test_draft = current.get(new_path, "")
     test_diagnostic = ""
@@ -2172,17 +2266,25 @@ def solve(executor, task, archive, budget, version):
             launch_budget = min(
                 max_proposals - submitted, budget.model_requests_remaining()
             )
+            precision_ready = (
+                eager_target is not None
+                and not precision_attempted
+                and executor.verification_runner is not executor.runner
+                and launch_budget >= 1 + int(needs_tests)
+                and budget.commands_remaining() >= 3 * len(commands) + 4
+                and budget.remaining() >= _LOOP_PRECISION_MIN_REMAINING
+            )
             if (
                 eager_target is not None
                 and current is eager_source
                 and failures.keys() == {eager_target}
                 and eager_trace is None
-                and not pinned_restore_attempted
+                and (not pinned_restore_attempted or precision_ready)
                 and patch
                 and not pending
                 and retired is None
                 and private is None
-                and alternate is None
+                and (alternate is None or pinned_restore_attempted)
                 and launch_budget >= 1 + int(needs_tests)
                 and budget.commands_remaining() >= 3 * len(commands) + 6
                 and budget.remaining() >= 115
@@ -2210,7 +2312,8 @@ def solve(executor, task, archive, budget, version):
                         original, current, counter_caller_site(eager_trace)
                     )
                     if (
-                        located is not None
+                        not pinned_restore_attempted
+                        and located is not None
                         and located.current != located.baseline
                         and len(located.current.encode()) >= _LONG_LOCALIZED_DEFINITION_BYTES
                         and budget.remaining() >= 75
@@ -2226,6 +2329,31 @@ def solve(executor, task, archive, budget, version):
                             continue
                         if eager_advisory:
                             mock_diagnostics[eager_target] = eager_advisory
+            if (
+                eager_target is not None
+                and current is eager_source
+                and failures.keys() == {eager_target}
+                and precision_ready
+                and (signal := counter_loop_reuse(eager_trace)) is not None
+                and not pending
+                and retired is None
+                and private is None
+                and (alternate is None or pinned_restore_attempted)
+                and budget.commands_remaining() >= 3 * len(commands) + 4
+                and budget.remaining() >= _LOOP_PRECISION_MIN_REMAINING
+            ):
+                precision_attempted = True
+                before = budget.model_requests_remaining()
+                proposed = precision_stock_gain(eager_target, signal)
+                submitted += before - budget.model_requests_remaining()
+                if proposed is not None:
+                    (current, patch, failures, pytest_runs), note, actor = proposed
+                    editor = actor
+                    start_new_draft(eager_target)
+                    if failures or needs_tests:
+                        save_verified_progress(patch, note, editor)
+                    continue
+                launch_budget = min(max_proposals - submitted, budget.model_requests_remaining())
             if interactive_target is None and len(failures) == 1:
                 sole_target = next(iter(failures))
                 # Let the ranked planner try a verified plateau first. If it

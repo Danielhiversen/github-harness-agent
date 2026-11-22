@@ -122,7 +122,45 @@ def prepare_line_range_edit(sources, symbol):
         return None
 
 
-def line_range_prompt(snapshot):
+def prepare_loop_line_range_edit(sources, symbol, body_line, variable, caller_line):
+    """Show only entry, verified loop and mutation windows of one definition."""
+    if not _valid_symbol(symbol):
+        return None
+    try:
+        scope = _scope(sources.get(symbol[0]), symbol[1])
+    except (ValueError, SyntaxError, RecursionError):
+        return None
+    if scope is None:
+        return None
+    loops = [
+        item for item in ast.walk(scope.node)
+        if isinstance(item, ast.For)
+        and isinstance(item.target, ast.Name)
+        and item.target.id == variable
+        and item.body[0].lineno == body_line
+        and body_line <= caller_line <= item.body[-1].end_lineno
+    ]
+    if len(loops) != 1 or body_line - loops[0].lineno > 5:
+        return None
+    snapshot = _snapshot(sources, symbol, scope)
+    first = snapshot.first_body_line
+    stop = len(snapshot.lines)
+    points = (
+        (first, first + 2),
+        (loops[0].lineno - scope.start - 1, body_line - scope.start + 2),
+        (caller_line - scope.start - 2, caller_line - scope.start + 2),
+    )
+    allowed = frozenset(
+        row for start, end in points
+        for row in range(max(first, start), min(stop, end) + 1)
+    )
+    visible = allowed | frozenset(range(1, first))
+    if len(visible) > 26 or sum(len(snapshot.lines[row - 1].encode()) for row in visible) > 2300:
+        return None
+    return snapshot, visible, allowed
+
+
+def line_range_prompt(snapshot, *, visible_rows=None):
     """Render the editor contract and exact line numbering for this snapshot."""
     path, qualified = snapshot.symbol
     first = snapshot.first_body_line
@@ -130,6 +168,12 @@ def line_range_prompt(snapshot):
     example_line = json.dumps(indent + "pass")
     numbered = "\n".join(
         f"{row} | {line}" for row, line in enumerate(snapshot.lines, 1)
+        if visible_rows is None or row in visible_rows
+    )
+    sparse = (
+        "Use only rows shown below in the definition body, with at most three edit ranges. "
+        "Do not span gaps between shown rows. Limit old and replacement lines to 24 in total.\n"
+        if visible_rows is not None else ""
     )
     return (
         f"Edit only {path}::{qualified} using numbered lines from this exact current definition.\n"
@@ -142,7 +186,7 @@ def line_range_prompt(snapshot):
         "Preserve exact indentation. Use an empty lines array to delete a range. To insert, "
         "replace an anchor line with itself and the inserted lines in their desired order.\n"
         "Do not include numbering, newline characters, or other output in replacement strings.\n"
-        f"Exact current definition (quoted data):\n{numbered}\n"
+        f"{sparse}Exact current definition (quoted data):\n{numbered}\n"
     )
 
 
@@ -194,7 +238,7 @@ def _edits(response, snapshot, indent):
     return edits
 
 
-def apply_line_range_edit(response, sources, snapshot):
+def apply_line_range_edit(response, sources, snapshot, *, allowed_rows=None):
     """Validate a proposal and return an independent source mapping."""
     if not isinstance(snapshot, LineRangeSnapshot) or not _valid_symbol(
         snapshot.symbol
@@ -208,8 +252,15 @@ def apply_line_range_edit(response, sources, snapshot):
         fresh = None
     if fresh != snapshot:
         raise ValueError("Current checkout does not match the line-range snapshot")
+    edits = _edits(response, snapshot, scope.indent)
+    if allowed_rows is not None and (
+        len(edits) > 3
+        or sum(end - start + 1 + len(lines) for start, end, lines in edits) > 24
+        or any(not allowed_rows.issuperset(range(start, end + 1)) for start, end, _ in edits)
+    ):
+        raise ValueError("Line ranges exceeded the shown scoped edit windows")
     rows = scope.rows.copy()
-    for start, end, replacement in reversed(_edits(response, snapshot, scope.indent)):
+    for start, end, replacement in reversed(edits):
         first, last = scope.start + start - 1, scope.start + end
         inserted = [line + scope.newline for line in replacement]
         if (
