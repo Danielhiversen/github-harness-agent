@@ -276,6 +276,7 @@ def test_operator_limit_uses_traversal_windows_and_verified_retry(
             "        self.depth = depth",
         )
     if cross_key:
+        current = current.replace("local = work[lane]", "local = work.get(lane, deque())")
         enqueue = (
             "                    work.setdefault(key, deque()).extendleft(reversed(child_list))"
             + "  # "
@@ -362,7 +363,8 @@ def test_operator_limit_uses_traversal_windows_and_verified_retry(
                     child,
                 ]
                 if nested:
-                    assert "state = local.popleft()" in prompt and "extendleft(parts)" in prompt
+                    scheduled = "extendleft(reversed(child_list))" if cross_key else "extendleft(parts)"
+                    assert "state = local.popleft()" in prompt and scheduled in prompt
                     lines = [child + " if state.depth < limit else []"]
                 if scenario == "outside":
                     row = 2  # Unshown validation row, inside the definition body.

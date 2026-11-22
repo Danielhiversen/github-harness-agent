@@ -430,55 +430,65 @@ def _subordinate_windows(
                         assignment.end_lineno,
                         cap=130,
                     )
-    for _, _, popped, _ in pops[:1]:
-        if expansion := _consumed_expansion(popped, items, end):
-            statement, value, child_loop = expansion
-            values.insert(0, value)
-            stop = (
-                value.end_lineno
-                if isinstance(statement, ast.For)
-                else statement.end_lineno
+    # A mapping lookup may return a queue whose pop produces the actual item.
+    # Prefer an expansion whose result is iterated over a container accessor.
+    expansions = [
+        (popped, expansion)
+        for _, _, popped, _ in pops
+        if (expansion := _consumed_expansion(popped, items, end)) is not None
+    ]
+    if expansions:
+        popped, expansion = max(
+            expansions,
+            key=lambda pair: isinstance(pair[1][0], ast.For) or pair[1][2] is not None,
+        )
+        statement, value, child_loop = expansion
+        values.insert(0, value)
+        stop = (
+            value.end_lineno
+            if isinstance(statement, ast.For)
+            else statement.end_lineno
+        )
+        branch = min(
+            (
+                item
+                for item in items
+                if isinstance(item, ast.If)
+                and popped.lineno
+                < item.lineno
+                < statement.lineno
+                <= item.end_lineno
+                <= end
+            ),
+            key=lambda item: item.end_lineno - item.lineno,
+            default=None,
+        )
+        if branch is None or not append(
+            "Candidate branch expanding the consumed item",
+            branch.lineno,
+            branch.end_lineno,
+            cap=520,
+        ):
+            append(
+                "Candidate expansion of the consumed item",
+                statement.lineno,
+                stop,
+                cap=420,
             )
-            branch = min(
-                (
-                    item
-                    for item in items
-                    if isinstance(item, ast.If)
-                    and popped.lineno
-                    < item.lineno
-                    < statement.lineno
-                    <= item.end_lineno
-                    <= end
-                ),
-                key=lambda item: item.end_lineno - item.lineno,
-                default=None,
+            if branch is not None:
+                append(
+                    "Candidate expansion guard",
+                    branch.lineno,
+                    branch.test.end_lineno,
+                    cap=180,
+                )
+        if child_loop is not None:
+            append(
+                "Candidate loop over produced items",
+                child_loop.lineno,
+                child_loop.iter.end_lineno,
+                cap=250,
             )
-            if branch is None or not append(
-                "Candidate branch expanding the consumed item",
-                branch.lineno,
-                branch.end_lineno,
-                cap=520,
-            ):
-                append(
-                    "Candidate expansion of the consumed item",
-                    statement.lineno,
-                    stop,
-                    cap=420,
-                )
-                if branch is not None:
-                    append(
-                        "Candidate expansion guard",
-                        branch.lineno,
-                        branch.test.end_lineno,
-                        cap=180,
-                    )
-            if child_loop is not None:
-                append(
-                    "Candidate loop over produced items",
-                    child_loop.lineno,
-                    child_loop.iter.end_lineno,
-                    cap=250,
-                )
     return "".join(sections), values
 
 
