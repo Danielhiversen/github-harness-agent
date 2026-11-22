@@ -219,7 +219,8 @@ def restore_solver_recovery(envelope, scope, head, parent):
 
 def _retire_drafts(data):
     envelope = data.pop("draft_checkpoints", None)
-    if envelope and envelope.get("drafts"):
+    # Legacy checkpoints may have an empty drafts mapping and still fence a review.
+    if envelope is not None and (envelope.get("drafts") or "solver_recovery" not in envelope):
         data["retired_draft_checkpoints"] = envelope
         return True
     return False
