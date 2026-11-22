@@ -140,16 +140,18 @@ def test_verified_counter_caller_localizes_and_survives_constrained_sparse_promp
     import httpx
     from test_providers import GROQ, deployment, openai_response, routed
 
-    from github_harness_agent.task_context import wire_size
+    from github_harness_agent.task_context import compact_focused_review, wire_size
 
     old = (
         "    def receive(self, value):\n"
         "        if value > 4:\n"
-        "            self.increment(value)\n"
+        "            self.fallback(value)\n"
         + "        # Keep the exact localized definition.\n" * 140
         + "        return value + 3\n"
     )
-    current = old.replace("value > 4", "value >= 4")
+    current = old.replace("value > 4", "value >= 4").replace(
+        "self.fallback(value)", "self.increment(value)"
+    )
     prefix = (
         "class Queue:\n"
         "    def fallback(self, value):\n"
@@ -159,7 +161,7 @@ def test_verified_counter_caller_localizes_and_survives_constrained_sparse_promp
     original = {PATH: prefix + old}
     sources = {PATH: prefix + current}
     shared = [PATH, "Queue.increment", 1]
-    pinned_stack = [shared, [PATH, "Queue.fallback", 4]]
+    pinned_stack = [shared, [PATH, "Queue.fallback", 4], [PATH, "Queue.receive", 8]]
     draft_stack = [shared, [PATH, "Queue.receive", 8]]
     report = _counter_difference(
         [1, None, [["a" * 64, [[pinned_stack, 0, 1]]]]],
@@ -219,8 +221,21 @@ def test_verified_counter_caller_localizes_and_survives_constrained_sparse_promp
     prompt = requests[0][-1]["content"]
     assert line_snapshot.digest in prompt and "return value + 3" in prompt
     assert "Pinned caller source" in prompt and "Draft caller source" in prompt
+    assert "Pinned outer caller source" in prompt
+    assert "self.fallback(value)" in prompt and "if value > 4:" in prompt
     assert "if value < 2:" in prompt and "if value >= 4:" in prompt
     assert "assert queue.receive(5) == 8" in prompt
+    # An even tighter provider keeps the immediate pair ahead of the extra window.
+    tighter = [
+        candidate
+        for cap in range(8000, 12 * 1024, 32)
+        if (candidate := compact_focused_review(calls[2][1], max_bytes=cap))
+        and "Pinned caller source" in candidate[-1]["content"]
+        and "Pinned outer caller source" not in candidate[-1]["content"]
+    ]
+    assert tighter and all(
+        "Draft caller source" in item[-1]["content"] for item in tighter
+    )
     untrusted = request_coding_advice(*planner_args)
     assert localized_retry_symbol(untrusted) is None
     assert calls[-1][2]["timeout_cap"] == 60

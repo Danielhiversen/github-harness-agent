@@ -243,7 +243,10 @@ def request_coding_advice(
         lead = excerpt(lead, 2200)
         if caller_excerpts:
             mock_detail = (
-                compact_observations(mock_detail.replace(caller_excerpts, "", 1), 1900)
+                compact_observations(
+                    mock_detail.replace(caller_excerpts, "", 1),
+                    3000 - len((COUNTER_CALLER_EVIDENCE + caller_excerpts).encode()),
+                )
                 + COUNTER_CALLER_EVIDENCE
                 + caller_excerpts
             )

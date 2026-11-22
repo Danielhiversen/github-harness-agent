@@ -225,9 +225,18 @@ def _counter_paths(task, runner, reviewed_paths, test_path):
 
 
 _CALLER_SOURCE_BYTES = 1024
+_OUTER_CALLER_BYTES = 384
 
 
-def _caller_source(label, location, sources):
+def _caller_source(
+    label,
+    location,
+    sources,
+    *,
+    callee=None,
+    include_iterator=False,
+    limit=_CALLER_SOURCE_BYTES // 2,
+):
     path, function, row = location
     source = sources.get(path)
     if not source:
@@ -251,7 +260,7 @@ def _caller_source(label, location, sources):
         return ""
     nodes = list(ast.walk(scope))
     header = f"\n{label} caller source (quoted): {path}:{row} {function}\n"
-    allowance = _CALLER_SOURCE_BYTES // 2 - len(header.encode())
+    allowance = limit - len(header.encode())
 
     def source_lines(start, end):
         return "".join(lines[start - 1 : end]).rstrip("\r\n") + "\n"
@@ -261,8 +270,15 @@ def _caller_source(label, location, sources):
         for item in nodes
         if isinstance(item, ast.Call)
         and item.lineno <= row <= item.end_lineno <= item.lineno + 5
+        and (
+            callee is None
+            or callee.rsplit(".", 1)[-1]
+            in (getattr(item.func, "id", None), getattr(item.func, "attr", None))
+        )
     ]
     call = max(calls, key=lambda item: item.end_lineno - item.lineno, default=None)
+    if callee is not None and len(calls) != 1:
+        return ""
     start, end = (call.lineno, call.end_lineno) if call else (row, row)
     guards = [
         item
@@ -270,24 +286,49 @@ def _caller_source(label, location, sources):
         if isinstance(item, ast.If)
         and item.lineno < start <= item.end_lineno
         and item.test.end_lineno < start
+        and (
+            not include_iterator
+            or item.body[0].lineno <= start <= item.body[-1].end_lineno
+        )
     ]
     guard = max(guards, key=lambda item: item.lineno, default=None)
+    iterator = (
+        max(
+            (
+                item
+                for item in nodes
+                if isinstance(item, (ast.For, ast.AsyncFor, ast.While))
+                and item.lineno < start <= item.end_lineno
+                and item.body[0].lineno <= start <= item.body[-1].end_lineno
+            ),
+            key=lambda item: item.lineno,
+            default=None,
+        )
+        if include_iterator
+        else None
+    )
     windows = (
         (max(scope.lineno, start - 1), min(scope.end_lineno, end + 1)),
         (start, end),
         (row, row),
     )
-    if guard is not None:
-        guard_end = guard.body[0].lineno - 1
+    contexts = [item for item in (guard, iterator) if item is not None]
+    for size in range(len(contexts), 0, -1):
+        anchors = sorted(contexts[:size], key=lambda item: item.lineno)
         for first, last in windows:
-            prefix = (
-                source_lines(guard.lineno, min(guard_end, first - 1))
-                if guard.lineno < first
-                else ""
-            )
-            if guard_end + 1 < first:
-                prefix += "# …\n"
-            snippet = prefix + source_lines(first, last)
+            spans = [
+                (item.lineno, min(first - 1, item.body[0].lineno - 1))
+                for item in anchors
+                if item.lineno < first
+            ] + [(first, last)]
+            chunks = []
+            previous_end = spans[0][0] - 1
+            for left, right in spans:
+                if previous_end + 1 < left:
+                    chunks.append("# …\n")
+                chunks.append(source_lines(left, right))
+                previous_end = right
+            snippet = "".join(chunks)
             if len(snippet.encode()) <= allowance:
                 return header + snippet
     for first, last in windows:
@@ -315,7 +356,23 @@ def _divergent_caller_source(old, new, sources):
         if pair is not None:
             offset, before, after = pair
             base = _caller_source("Pinned", before, sources[0])
-            attempted = _caller_source("Draft", after, sources[1])
+            attempted = outer = ""
+            if offset + 1 < len(base_stack) and base_stack[offset + 1][:2] == after[:2]:
+                direct = _caller_source(
+                    "Draft", after, sources[1], callee=draft_stack[offset - 1][1]
+                )
+                if direct:
+                    outer = _caller_source(
+                        "Pinned outer",
+                        base_stack[offset + 1],
+                        sources[0],
+                        callee=before[1],
+                        include_iterator=True,
+                        limit=_OUTER_CALLER_BYTES,
+                    )
+                    if outer:
+                        attempted = direct
+            attempted = attempted or _caller_source("Draft", after, sources[1])
             if not base or not attempted:
                 return None
             locations = tuple(
@@ -325,7 +382,7 @@ def _divergent_caller_source(old, new, sources):
                 for path, name, line in draft_stack[offset:]
                 if (source := sources[1].get(path))
             )
-            return CounterCallerSite(locations, base + attempted)
+            return CounterCallerSite(locations, base + attempted + outer)
     return None
 
 

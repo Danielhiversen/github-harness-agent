@@ -474,6 +474,7 @@ _LOCALIZED_BASELINE_EXCERPT = (
 )
 _LOCALIZED_FIXTURE = "\nFixture for this goal (quoted, read-only):\n"
 _LOCALIZED_FOCUS = "\nFocused source from "
+PINNED_OUTER_CALLER_HEADER = "\nPinned outer caller source (quoted): "
 COUNTER_CALLER_EVIDENCE = "\nVerified counter caller source windows (quoted):\n"
 _LOCALIZED_FAILURE = "\nFailure details:\n"
 _LOCALIZED_CHECKOUT = "\nCurrent checkout:\n"
@@ -560,14 +561,22 @@ def _compact_localized_review(messages, max_bytes):
     spare = max_bytes - wire_size(payload(markers))
     if spare < 0:
         return None
-    caller_size = wire_size(caller_excerpts) - 2
-    retain_callers = bool(caller_excerpts) and spare >= caller_size + 384
+    immediate, outer_marker, outer = caller_excerpts.partition(
+        PINNED_OUTER_CALLER_HEADER
+    )
+    caller_size = wire_size(immediate) - 2
+    retain_callers = bool(immediate) and spare >= caller_size + 384
     if retain_callers:
         spare -= caller_size
+        outer_size = wire_size(outer_marker + outer) - 2
+        if outer_marker and spare >= outer_size + 384:
+            spare -= outer_size
+        else:
+            caller_excerpts = immediate
     excerpts = [
         heading
         + (
-            (body if retain_callers else "")
+            (caller_excerpts if retain_callers else "")
             if share is None
             else _bounded_content(body, spare * share // 100)
         )

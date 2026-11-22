@@ -89,3 +89,63 @@ def test_caller_location_uses_existing_enclosing_definition_when_helper_is_new()
     assert localized.symbol == ("module.py", "original_route")
     assert "if allowed:" in localized.baseline
     assert "added_route(mapping, allowed)" in localized.current
+
+
+def test_skipped_caller_shows_the_pinned_outer_loop_and_guard_only_if_confirmed():
+    baseline = (
+        BASELINE
+        + """
+def traverse(mapping, entries):
+    for entry in entries:
+        if entry:
+            original_route(mapping, entry)
+"""
+    )
+    source = (
+        BASELINE
+        + """
+def traverse(mapping, entries):
+    for entry in entries:
+        increment(mapping)
+"""
+    )
+    pinned_row = (
+        baseline.splitlines().index("            original_route(mapping, entry)") + 1
+    )
+    draft_row = source.splitlines().index("        increment(mapping)") + 1
+    pinned = _report(
+        None,
+        [["module.py", "original_route", 7], ["module.py", "traverse", pinned_row]],
+    )
+    draft = _report(0, [["module.py", "traverse", draft_row]])
+    trace = _counter_difference(pinned, draft, "tests/test_demo.py::test_count")
+    detail = _counter_difference(
+        pinned,
+        draft,
+        "tests/test_demo.py::test_count",
+        ({"module.py": baseline}, {"module.py": source}),
+    )
+    assert detail.startswith(trace)
+    immediate, outer = detail.split("Pinned outer caller source", 1)
+    assert "Pinned caller source" in immediate and "Draft caller source" in immediate
+    assert "for entry in entries:" in outer and "if entry:" in outer
+    assert "original_route(mapping, entry)" in outer
+    assert len(outer.encode()) < 384
+
+    for mocked_baseline, mocked_draft in (
+        (
+            baseline.replace(
+                "original_route(mapping, entry)", "unrelated(mapping, entry)"
+            ),
+            source,
+        ),
+        (baseline, source.replace("increment(mapping)\n", "unrelated(mapping)\n")),
+    ):
+        detail = _counter_difference(
+            pinned,
+            draft,
+            "tests/test_demo.py::test_count",
+            ({"module.py": mocked_baseline}, {"module.py": mocked_draft}),
+        )
+        assert "Pinned caller source" in detail and "Draft caller source" in detail
+        assert "Pinned outer caller source" not in detail
