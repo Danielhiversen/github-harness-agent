@@ -18,6 +18,7 @@ from test_providers import (
 
 from github_harness_agent import review_recovery
 from github_harness_agent.checkpoint import DraftCheckpoint, SolverRecovery
+from github_harness_agent.providers import ProviderExhausted
 from github_harness_agent.executor import (
     AttemptRejected,
     Limits,
@@ -2889,6 +2890,58 @@ def test_solver_accepts_only_authorized_complete_test_modules(solver_case, scena
     )
     assert compact is not None and "one complete Python module" in compact[-1]["content"]
     assert not checkpoints
+
+
+@pytest.mark.parametrize(
+    "tool_reply", ("valid", "extra", "duplicate", "unavailable", "empty", "failing_test"),
+)
+def test_solver_recovers_malformed_new_test_replies_with_one_scoped_tool(solver_case, tool_reply):
+    task, archive, runner, checkpoints = solver_case
+    fixed = BASE_SOURCE.replace("return -1", "return 1").replace("return -2", "return 2")
+    draft = DraftCheckpoint(
+        "harness2/base", task.base_sha,
+        patch_for({SOURCE: BASE_SOURCE}, {SOURCE: fixed}),
+        guidance=_GUIDANCE, last_editor=("fixture", "fixture/coder"),
+    )
+    task = replace(task, checkpoints={draft.key: draft})
+    calls = []
+
+    class Gateway(FreeGateway):
+        def complete(self, **kwargs):
+            tools = kwargs["tools"]
+            calls.append(bool(tools))
+            if not tools:
+                return super().complete(**kwargs)
+            schema, = tools
+            name = schema["function"]["name"]
+            assert set(schema["function"]["parameters"]["properties"]) == {"code"}
+            assert NEW_TEST in kwargs["messages"][-1]["content"]
+            if tool_reply == "unavailable":
+                raise ProviderExhausted(None, {"test": "no tool-capable routes"})
+            bad = TEST.replace("(1, 2)", "(0, 0)")
+            arguments = {"code": bad if tool_reply == "failing_test" else TEST}
+            if tool_reply == "extra":
+                arguments["path"] = SOURCE
+            encoded = json.dumps(arguments)
+            if tool_reply == "duplicate":
+                encoded = encoded[:-1] + ', "code": ' + json.dumps(TEST) + "}"
+            native_call = {"type": "function", "function": {"name": name, "arguments": encoded}}
+            return SimpleNamespace(
+                content="", tool_calls=() if tool_reply == "empty" else (native_call,),
+                role="coding", route="tool-free", model="fixture-tool",
+                configured_model="fixture-tool", usage={},
+            )
+
+    gateway = Gateway("This is malformed.", "Still no edit.", TEST)
+    executor = PlainExecutor(runner, gateway, Limits(model_requests=4, concurrent_probes=1))
+    result = solve(executor, task, archive, _Budget(executor.limits, lambda: False, task), "fixture")
+    assert calls == ([False, False, True] if tool_reply == "valid" else [False, False, True, False])
+    assert all(NEW_TEST.encode() not in checkpoint.patch for checkpoint in checkpoints)
+    assert NEW_TEST.encode() in result.patch and b"(0, 0)" not in result.patch
+    assert all(check.returncode == 0 for check in result.checks)
+    assert any(NEW_TEST in check.command for check in result.checks)
+    if tool_reply == "failing_test":
+        assert "test_results" in gateway.prompts[-1] and "(0, 0)" in gateway.prompts[-1]
 
 
 def test_solver_does_not_keep_a_candidate_rejected_by_final_gate(solver_case):

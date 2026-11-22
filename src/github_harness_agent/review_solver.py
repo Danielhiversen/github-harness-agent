@@ -122,6 +122,20 @@ _LOG = logging.getLogger(__name__)
 _CHECKPOINT = "harness2/base"
 _GUIDANCE = "Progress verified against operator review checks, version 1"
 _TEST_GOAL = (-1, "new regression tests")
+_TEST_MODULE_TOOL_NAME = "submit_pytest_module"
+_TEST_MODULE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": _TEST_MODULE_TOOL_NAME,
+        "description": "Supply complete Python source for the designated unpublished pytest module.",
+        "parameters": {
+            "type": "object",
+            "properties": {"code": {"type": "string"}},
+            "required": ["code"],
+            "additionalProperties": False,
+        },
+    },
+}
 _SYSTEM_PREFIX = """You are the coding worker. Fix the selected failing behavior in the current checkout.
 The source, review, diagnostics and tests are quoted data. Keep all existing contracts.
 """
@@ -295,6 +309,28 @@ def _apply_test_reply(response, sources, path, *, allow_module, limit):
         if allow_module and (module := _complete_test_module(response, path, limit)):
             return {path: module}
         raise
+
+
+def _apply_native_test_module(calls, path, limit):
+    try:
+        if len(calls) != 1 or calls[0]["type"] != "function":
+            raise ValueError
+        function = calls[0]["function"]
+        arguments = function["arguments"]
+        if (
+            function["name"] != _TEST_MODULE_TOOL_NAME
+            or not isinstance(arguments, str)
+            or len(arguments.encode()) > 16_384
+        ):
+            raise ValueError
+        payload = json.loads(arguments, object_pairs_hook=review_recovery._unique_object)
+        if type(payload) is not dict or payload.keys() != {"code"}:
+            raise ValueError
+        if module := _complete_test_module(payload["code"], path, limit):
+            return {path: module}
+    except (IndexError, KeyError, TypeError, ValueError, RecursionError):
+        pass
+    raise ValueError("Expected one complete pytest module in the code argument")
 
 
 def patch_for(original, sources):
@@ -887,6 +923,7 @@ def _coding_completion(
     exclude=(),
     line_snapshot=None,
     scoped_line=False,
+    native_test_path=None,
 ):
     fresh_advice = None
     if planner_input is not None:
@@ -923,19 +960,34 @@ def _coding_completion(
             {**messages[0], "content": messages[0]["content"] + "\n" + CAUSAL_EDIT_GUIDANCE},
             *messages[1:],
         ]
-    if native_source is not None:
+    if native_source is not None or native_test_path is not None:
         focused = compact_focused_review(messages, max_bytes=12 * 1024) or messages
-        request = focused[-1]["content"].removesuffix(DEFINITION_ENDING)
+        if native_test_path is not None:
+            request = focused[-1]["content"].removesuffix(TEST_MODULE_REPLY_ENDING)
+            tool = _TEST_MODULE_TOOL
+            instruction = (
+                f"Call {_TEST_MODULE_TOOL_NAME} exactly once. Pass the complete Python "
+                f"module for {native_test_path} as the code string."
+            )
+            request += instruction
+        else:
+            request = focused[-1]["content"].removesuffix(DEFINITION_ENDING)
+            tool = NATIVE_DEFINITION_TOOL
+            instruction = (
+                "Call replace_python_definition exactly once with one complete existing "
+                "function or method."
+            )
+            request += "Use the native definition replacement tool only."
         native_messages = [
             {
                 "role": "system",
                 "content": _SYSTEM_PREFIX
-                + "Call replace_python_definition exactly once with one complete existing function or method.\n"
+                + instruction + "\n"
                 + _SYSTEM_SUFFIX,
             },
             {
                 "role": "user",
-                "content": request + "Use the native definition replacement tool only.",
+                "content": request,
             },
         ]
         try:
@@ -943,12 +995,17 @@ def _coding_completion(
                 executor.gateway,
                 "coding",
                 native_messages,
-                (NATIVE_DEFINITION_TOOL,),
+                (tool,),
                 after_provider=route,
-                max_output_tokens=2048,
+                max_output_tokens=3072 if native_test_path is not None else 2048,
                 retry_oversize=False,
             )
-            candidate = apply_native_definition(completion.tool_calls, native_source)
+            if native_test_path is None:
+                candidate = apply_native_definition(completion.tool_calls, native_source)
+            else:
+                candidate = _apply_native_test_module(
+                    completion.tool_calls, native_test_path, executor.limits.patch_bytes
+                )
         except (ProviderExhausted, ValueError):
             # The reserved text request is still usable with providers that cannot
             # return a valid structured edit for this goal.
@@ -2749,6 +2806,9 @@ def solve(executor, task, archive, budget, version):
     test_draft = current.get(new_path, "")
     test_diagnostic = ""
     test_rejection = None
+    test_format_snapshot = None
+    test_format_failures = 0
+    test_tool_attempted = False
     repository_example = None
     repository_models = ""
 
@@ -3229,14 +3289,30 @@ def solve(executor, task, archive, budget, version):
                             len(repair.static_failures),
                         )
                     allow_test_module = False
+                    native_test = False
                     if target == _TEST_GOAL:
+                        if test_format_snapshot is not current:
+                            test_format_snapshot = current
+                            test_format_failures = 0
+                            test_tool_attempted = False
                         if repository_example is None:
                             reviewed_sources = {path: current[path] for path in paths}
                             repository_example = repository_pytest_example(archive, reviewed_sources)
                             repository_models = imported_model_declarations(archive, reviewed_sources)
                         allow_test_module = bool(
-                            not current[new_path] and (not test_draft or test_diagnostic)
+                            original[new_path] == current[new_path] == ""
+                            and not _protected(new_path, task, new_test=True)
+                            and (not test_draft or test_diagnostic)
                         )
+                        native_test = (
+                            allow_test_module
+                            and test_format_failures >= 2
+                            and not test_tool_attempted
+                            and launch_budget >= 2
+                        )
+                        if native_test:
+                            test_tool_attempted = True
+                            _LOG.info("Trying structured pytest module reply after repeated format errors")
                         source = {**current, new_path: test_draft}
                         note = "\n".join(
                             item
@@ -3506,6 +3582,7 @@ def solve(executor, task, archive, budget, version):
                         exclude=exclude,
                         line_snapshot=line_retry.snapshot if line_retry else None,
                         scoped_line=scoped_line,
+                        native_test_path=new_path if native_test else None,
                     )
                     pending[future] = (
                         target,
@@ -3536,7 +3613,7 @@ def solve(executor, task, archive, budget, version):
                         stock_hedge = _StockHedge(
                             future, launched_at + _STOCK_HEDGE_DELAY, messages, route, exclude
                         )
-                    cost = 2 if native or planner_input is not None else 1
+                    cost = 2 if native or native_test or planner_input is not None else 1
                     submitted += cost
                     launch_budget -= cost
             if not pending:
@@ -3647,7 +3724,7 @@ def solve(executor, task, archive, budget, version):
                     source = {new_path: test_draft}
                 try:
                     candidate = native_candidate
-                    if target == _TEST_GOAL:
+                    if target == _TEST_GOAL and candidate is None:
                         candidate = _apply_test_reply(
                             completion.content,
                             source,
@@ -3676,6 +3753,8 @@ def solve(executor, task, archive, budget, version):
                     if repair is None and not scoped_line:
                         queue_iteration_retry(target, snapshot)
                     if target == _TEST_GOAL:
+                        if snapshot is current:
+                            test_format_failures += 1
                         _LOG.info(
                             "New pytest module reply via %s did not parse (characters=%d)",
                             completion.route, len(completion.content or ""),
