@@ -268,6 +268,8 @@ def test_known_thread_followup_waits_for_debounce():
     assert recent.retry_at == datetime(2026, 1, 2, 0, 0, 20, tzinfo=timezone.utc)
     settled = collect(github, known_threads=["A"], now=recent.retry_at)
     assert [item.reply_to for item in settled.items] == [None, 3, 3, 4]
+    assert settled.items[2].revision_at == datetime(2026, 1, 2, tzinfo=timezone.utc).timestamp()
+    assert settled.items[2].revision_at > settled.items[3].revision_at
 
 
 def test_recovers_reply_after_crash_without_duplicate_comment():

@@ -349,6 +349,7 @@ class ReviewRecovery:
     feedback: tuple[tuple[str, int, str], ...]
     previous_failure: str
     test_only: bool = False
+    latest_feedback: int = -1
 
     def request(self, read_source, checks, *, require_test=False, acceptance_source=""):
         paths = tuple(dict.fromkeys(path for path, _, _ in self.feedback))[:3]
@@ -417,6 +418,7 @@ def plan_recovery(feedback, rejection_count, previous_failure):
         return None
     notes = []
     threads = set()
+    latest_revision = (float("-inf"), -1)
     for item in feedback:
         path = item.get("path")
         if (
@@ -432,6 +434,10 @@ def plan_recovery(feedback, rejection_count, previous_failure):
         ):
             continue
         threads.add(item["thread"])
+        revision = item.get("revision_at")
+        latest_revision = max(latest_revision, (
+            revision if type(revision) in (int, float) else float("-inf"), len(notes),
+        ))
         line = item.get("line")
         notes.append(
             (
@@ -440,12 +446,15 @@ def plan_recovery(feedback, rejection_count, previous_failure):
                 excerpt(item.get("body") or "", 900),
             )
         )
-        if len(notes) == 12:
-            break
+    latest = latest_revision[1]
+    if latest >= 12:
+        notes[11] = notes[latest]
+        latest = 11
+    notes = tuple(notes[:12])
     if test_only and notes and notes[0][0].endswith(".py"):
-        return ReviewRecovery(tuple(notes), excerpt(previous_failure, 600), test_only=True)
+        return ReviewRecovery(notes, excerpt(previous_failure, 600), test_only=True)
     return (
-        ReviewRecovery(tuple(notes), excerpt(previous_failure, 600))
+        ReviewRecovery(notes, excerpt(previous_failure, 600), latest_feedback=latest)
         if len(threads) >= 2 or (production_path and notes and notes[0][0] == production_path)
         else None
     )

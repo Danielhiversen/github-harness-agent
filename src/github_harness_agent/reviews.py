@@ -80,6 +80,7 @@ class Feedback:
     diff_hunk: str | None = None
     diff_side: str | None = None
     test_update_head: str | None = None
+    revision_at: float | None = None
 
 
 ReviewItem = Feedback
@@ -345,6 +346,7 @@ def collect_reviews(
                     review["body"],
                     login,
                     test_update_head=test_update_head,
+                    revision_at=_review_revision(review).timestamp(),
                 )
 
     for page in pages(_REVIEW_THREADS, "reviewThreads"):
@@ -392,6 +394,7 @@ def collect_reviews(
                     if due > now:
                         retry_at = due if retry_at is None else min(retry_at, due)
                         continue
+                when = _review_time(edited_at or comment.get("publishedAt"))
                 inline_items.append(
                     (
                         Feedback(
@@ -406,9 +409,10 @@ def collect_reviews(
                             thread["originalLine"],
                             comments[0]["diffHunk"],
                             thread.get("diffSide"),
+                            revision_at=when.timestamp() if when else None,
                         ),
                         review_id,
-                        _review_time(edited_at or comment.get("publishedAt")),
+                        when,
                         bool(comment.get("replyTo")),
                     )
                 )

@@ -2500,6 +2500,34 @@ def _private_direct_call_context(sources, symbol):
     return "\nDirect call sites in the tentative file (read-only):\n" + "\n".join(excerpts) + "\n"
 
 
+def _private_requested_behavior(review):
+    bodies = [body for _, _, body in review.feedback]
+    if len(bodies) < 2:
+        return excerpt("".join(bodies), 600)
+    latest = bodies.pop(review.latest_feedback)
+    earlier = list(dict.fromkeys(body for body in bodies if body and body != latest))
+    if not earlier:
+        return excerpt(latest, 600)
+    if len(earlier) > 2:
+        earlier = [earlier[0], earlier[-1]]
+
+    latest_heading = "Latest feedback: "
+    earlier_heading = "\nEarlier feedback:"
+    available = 600 - len(latest_heading + earlier_heading) - 3 * len(earlier)
+    earlier_bytes = sum(len(body.encode()) for body in earlier)
+    latest_bytes = max(available * 2 // 3, available - earlier_bytes)
+    latest = excerpt(latest, latest_bytes)
+    remaining = available - len(latest.encode())
+    notes = []
+    for index, body in enumerate(earlier):
+        # Preserve the opening constraints before spending room on another earlier comment.
+        allowance = remaining * 2 // 3 if index == 0 and len(earlier) == 2 else remaining
+        note = excerpt(body, allowance)
+        notes.append("\n- " + note)
+        remaining -= len(note.encode())
+    return latest_heading + latest + earlier_heading + "".join(notes)
+
+
 def _private_method_retry(current, repair, target, review, origin_diagnostic="", choice_limit=0):
     snapshot = prepare_line_range_edit(repair.sources, repair.private_symbol)
     if snapshot is None:
@@ -2517,7 +2545,7 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="",
         "Private regression repair. The numbered tentative method fixed "
         + ", ".join(excerpt(node, 120) for _, node in sorted(repair.gained))
         + ". Preserve that gain while correcting " + excerpt(target[1], 160) + ".\n"
-        + "Requested behavior (quoted): " + excerpt(" ".join(body for _, _, body in review.feedback), 600) + "\n"
+        + "Requested behavior (quoted): " + _private_requested_behavior(review) + "\n"
         + ("Observed pytest failure: " + excerpt(observed, 450) + "\n" if observed else "")
         + ("Accepted target failure: " + excerpt(baseline_observed, 350) + "\n" if baseline_observed else "")
         + (excerpt(repair.retry_note, 450) + "\n" if repair.retry_note else "")

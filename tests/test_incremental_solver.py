@@ -6292,6 +6292,43 @@ def test_private_repair_replaces_literal_header_of_wide_suite(solver_case, caplo
     _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-private", caplog, fragment_case="literal")
 
 
+@pytest.mark.parametrize("full_method", (False, True))
+def test_private_repair_prioritizes_latest_review_across_threads(full_method):
+    from github_harness_agent.review_solver import _RegressionRepair, _private_method_retry
+
+    path = "scheduler.py"
+    first = "Preserve the once-per-window guarantee."
+    latest = "Retry delayed schedules from their original window."
+    reviews = plan_recovery([
+        {"path": path, "line": 2, "thread": thread, "reply_to": 1,
+         "body": body, "revision_at": revision}
+        for thread, body, revision in (
+            ("thread-a", first + " Background." * 80, 10),
+            ("thread-a", latest + " Details." * 80, 30),
+            ("thread-b", "Keep the worker timeout." + " Context." * 80, 20),
+        )
+    ], 3, "")
+    prefix = "def schedule():\n" + "    normalize_window()\n" * 24
+    before = {path: prefix + "    return 0\n"}
+    after = {path: prefix + "    return 1\n"}
+    target = (0, "control")
+    origin = (0, "target")
+    repair = _RegressionRepair(origin, after, {target: "failed"}, {origin}, {target},
+                               private_symbol=(path, "schedule"), retries=int(full_method))
+    retry = _private_method_retry(before, repair, target, reviews)
+    assert retry is not None
+    assert (retry.statement_fragment is None) == full_method
+    assert latest in retry.prompt and first in retry.prompt
+    assert retry.prompt.index(latest) < retry.prompt.index(first)
+    quoted = retry.prompt.split("Requested behavior (quoted): ")[1].split("\nSynthesize ")[0]
+    if full_method:
+        quoted = quoted.split("\n\nVerified change")[0]
+        criterion, separator, _ = retry.prompt.partition("Edit only scheduler.py::schedule using numbered lines")
+        assert separator
+        assert latest in criterion and first in criterion
+    assert len(quoted.strip().encode()) <= 600
+
+
 def test_visible_control_and_hidden_target_report_dynamic_facts_to_each_fragment(solver_case, caplog, monkeypatch):
     from github_harness_agent import review_solver
 
