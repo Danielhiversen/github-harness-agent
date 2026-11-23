@@ -423,6 +423,7 @@ class StatementFragment:
     last: int
     accepted: tuple[str, ...]
     literal: bool = False
+    accepted_digest: str | None = None
 
 
 def _covering_statements(tree, first, last):
@@ -507,7 +508,7 @@ def select_statement_fragment(accepted, tentative):
     if (len(changes) == 1 and 1 <= old_end - old_first <= 6 and 1 <= new_end - new_first <= 6
             and any(line.strip() for line in (*accepted.lines[old_first:old_end], *tentative.lines[new_first:new_end]))):
         return FragmentSelection("single-literal-hunk", *stats, StatementFragment(
-            new_first + 1, new_end, accepted.lines[old_first:old_end], literal=True,
+            new_first + 1, new_end, accepted.lines[old_first:old_end], literal=True, accepted_digest=accepted.digest,
         ))
     return FragmentSelection("no-common-suite-within-12-rows", *stats)
 
@@ -565,6 +566,40 @@ def _literal_exterior(lines, first, last):
     return exterior, crossing
 
 
+def _accepted_literal_exterior(sources, snapshot, fragment):
+    """Reconstruct the accepted repository snapshot from this hunk before trusting its exterior."""
+    if not fragment.accepted_digest:
+        return None
+    first, last = fragment.first, fragment.last
+    reverse = {"start": first, "end": last, "lines": list(fragment.accepted)}
+    try:
+        accepted_sources = apply_line_range_edit(
+            json.dumps({"snapshot": snapshot.digest, "edits": [reverse]}), sources, snapshot,
+            allowed_rows=frozenset(range(first, last + 1)),
+        )
+        accepted = prepare_line_range_edit(accepted_sources, snapshot.symbol)
+        if not accepted or accepted.digest != fragment.accepted_digest:
+            return None
+        # The reverse edit compiled the complete accepted module. Check the
+        # original tentative module as well before admitting this second shape.
+        compile(sources[snapshot.symbol[0]], snapshot.symbol[0], "exec")
+        return _literal_exterior(accepted.lines, first, first + len(fragment.accepted) - 1)
+    except (SyntaxError, ValueError, RecursionError, tokenize.TokenError):
+        return None
+
+
+def _exterior_mismatch(actual, permitted):
+    structure, _ = actual
+    for exterior, _ in permitted:
+        if structure == exterior:
+            return "lexical tokens"
+    owners = {tuple(row[1:]): row[0] for row in structure}
+    for exterior, _ in permitted:
+        if any(tuple(row[1:]) in owners and owners[tuple(row[1:])] != row[0] for row in exterior):
+            return "execution ownership"
+    return "AST"
+
+
 def _apply_literal_hunk(rows, sources, snapshot, fragment, *, restore_blank=False):
     first, last = fragment.first, fragment.last
     if not (snapshot.first_body_line <= first <= last <= len(snapshot.lines)
@@ -597,7 +632,10 @@ def _apply_literal_hunk(rows, sources, snapshot, fragment, *, restore_blank=Fals
     except (SyntaxError, ValueError, RecursionError, tokenize.TokenError):
         raise ValueError("Invalid literal hunk syntax") from None
     if actual != original:
-        raise ValueError("Literal hunk changed exterior Python syntax")
+        accepted = _accepted_literal_exterior(sources, snapshot, fragment)
+        if accepted is None or actual != accepted:
+            references = [original] if accepted is None else [original, accepted]
+            raise ValueError(f"Literal hunk changed exterior Python syntax ({_exterior_mismatch(actual, references)})")
     return revised
 
 

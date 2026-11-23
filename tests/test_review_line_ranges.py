@@ -558,3 +558,38 @@ def test_literal_blank_edges_retain_indentation_and_restore_only_verified_blank_
     for broken in ('"""', ")", "def escaped(): pass", ""):
         with pytest.raises(ValueError):
             apply_statement_fragment(broken, {PATH: tentative}, new, fragment)
+
+
+
+def test_literal_hunk_can_restore_verified_else_attachment_without_reverting_behavior():
+    from github_harness_agent.review_line_ranges import apply_statement_fragment, select_statement_fragment
+
+    prefix = "class Reader:\n    def score(self, active):\n        value = 0\n        if active:\n"
+    prefix += "".join(f"            value += 0  # context {i}\n" for i in range(26))
+    suffix = "        else:\n            value = 10\n        return value\n"
+    blank = " " * 7 + "\n"
+    inserted = "        if not active:\n            value = 6\n            value += 1\n"
+    accepted, tentative = prefix + blank + suffix, prefix + inserted + suffix
+    def snap(source):
+        return prepare_line_range_edit({PATH: source}, (PATH, "Reader.score"))
+    old, new = snap(accepted), snap(tentative)
+    fragment = select_statement_fragment(old, new).fragment
+    assert fragment.literal and len(fragment.accepted) == 1
+    fixed = apply_statement_fragment("elif not active: value = 7", {PATH: tentative}, new, fragment)
+    assert fixed[PATH] == prefix + "        elif not active: value = 7\n" + suffix
+    for version, expected in ((accepted, (0, 10)), (tentative, (10, 7)), (fixed[PATH], (0, 7))):
+        namespace = {}
+        exec(version, namespace)
+        reader = namespace["Reader"]()
+        assert (reader.score(True), reader.score(False)) == expected
+    from dataclasses import replace
+    wrong_reference = replace(fragment, accepted_digest="0" * 64)
+    with pytest.raises(ValueError, match=r"exterior Python syntax \(AST\)"):
+        apply_statement_fragment("elif not active: value = 7", {PATH: tentative}, new, wrong_reference)
+    # Even an authentic prior digest is unusable if the rest of the repository
+    # differs; the old fingerprint cannot be spliced into another checkout.
+    extra = {PATH: tentative, "other.py": "different_checkout = 1\n"}
+    extra_snapshot = prepare_line_range_edit(extra, new.symbol)
+    with pytest.raises(ValueError, match="exterior Python syntax"):
+        apply_statement_fragment("elif not active: value = 7", extra, extra_snapshot, fragment)
+    assert apply_statement_fragment("RESTORE_ACCEPTED_BLANK", {PATH: tentative}, new, fragment)[PATH] == accepted
