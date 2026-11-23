@@ -98,6 +98,7 @@ from .review_line_ranges import (
     ScopedRangeRejection,
     StatementFragment,
     select_statement_fragment,
+    preceding_local_names,
     apply_statement_fragment,
     full_method_native_tool,
     apply_line_range_edit,
@@ -2446,17 +2447,19 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="")
         baseline_observed = origin_diagnostic.partition("\nObserved pytest failure: ")[2]
         prompt = (
             context + ("Accepted target failure: " + excerpt(baseline_observed, 350) + "\n" if baseline_observed else "")
-            + "Synthesize only the replacement Python statements for the tentative fragment. "
-            "The accepted version passed the control but failed the target. The tentative version passed "
+            + ("Synthesize only the replacement lines for the exact tentative hunk. The surrounding suite is read-only. "
+               if fragment.literal else "Synthesize only the replacement Python statements for the tentative fragment. ")
+            + "The accepted version passed the control but failed the target. The tentative version passed "
             "the target but failed the control. Return only a Python fragment with its own relative indentation.\n"
             + "Method signature:\n" + "\n".join(snapshot.lines[:snapshot.first_body_line - 1])
+            + ("\nNames assigned earlier in this method: " + excerpt(", ".join(preceding_local_names(snapshot, first)), 250) if fragment.literal else "")
             + "\nPreceding context:\n" + excerpt(local, 700)
             + "\nAccepted fragment:\n" + ("\n".join(fragment.accepted) or "(empty)")
             + "\nTentative fragment to replace:\n" + "\n".join(snapshot.lines[first - 1:last])
             + "\nFollowing context:\n" + excerpt(following, 450)
         )
         if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": prompt}]) <= 6200:
-            log_selection("fragment", selection.reason)
+            log_selection("literal-hunk" if fragment.literal else "fragment", selection.reason)
             return _LineRetry(None, snapshot, allowed_rows=frozenset(range(first, last + 1)),
                               prompt=prompt, checkout=repair.sources, statement_fragment=fragment)
     reason = "retry-full-method" if repair.retries else "fragment-prompt-limit" if fragment else selection.reason

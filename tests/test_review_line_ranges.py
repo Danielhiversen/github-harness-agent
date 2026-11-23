@@ -494,3 +494,25 @@ def test_pure_edits_offer_a_surviving_statement_on_both_checkouts(mutation):
         replacement.insert(0 if offered[0] != line.rstrip() else 1, "        item_3 += 2")
     result = apply_statement_fragment("\n".join(replacement), {PATH: after}, new, decision.fragment)
     assert result[PATH] == original.replace(line, line+"        item_3 += 2\n")
+
+
+def test_literal_hunk_preserves_external_syntax_and_rejects_new_execution_scope():
+    from github_harness_agent.review_line_ranges import select_statement_fragment, apply_statement_fragment, preceding_local_names
+
+    wide = "".join(f"            total += {i}\n" for i in range(27))
+    prefix = "class Reader:\n    def collect(self, legacy):\n        total = 0\n"
+    suffix = "        return total\n\n    def unchanged(self):\n        return 47\n"
+    accepted = prefix + "        if False:\n" + wide + suffix
+    tentative = prefix + "        use = True\n        gate = use\n        if gate:\n" + wide + suffix
+    old, new = [prepare_line_range_edit({PATH: source}, (PATH, "Reader.collect")) for source in (accepted, tentative)]
+    selection = select_statement_fragment(old, new)
+    span = selection.fragment
+    assert selection.reason == "single-literal-hunk" and span.literal and span.last-span.first == 2
+    assert preceding_local_names(new, span.first) == ("total",)
+    result = apply_statement_fragment("if not legacy:", {PATH: tentative}, new, span)
+    assert result[PATH] == prefix + "        if not legacy:\n" + wide + suffix
+    for wrong in ("def nested():", "class Wrapper:", "if broken(", 's = """', "return 4", "pass\n"*13):
+        with pytest.raises(ValueError):
+            apply_statement_fragment(wrong, {PATH: tentative}, new, span)
+    with pytest.raises(ValueError, match="snapshot"):
+        apply_statement_fragment("if not legacy:", {PATH: accepted}, new, span)

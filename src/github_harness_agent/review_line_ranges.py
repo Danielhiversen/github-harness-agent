@@ -3,9 +3,11 @@
 import ast
 import difflib
 import hashlib
+import io
 import json
 import re
 import textwrap
+import tokenize
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
@@ -420,6 +422,7 @@ class StatementFragment:
     first: int
     last: int
     accepted: tuple[str, ...]
+    literal: bool = False
 
 
 def _covering_statements(tree, first, last):
@@ -501,11 +504,90 @@ def select_statement_fragment(accepted, tentative):
             old_mask = _masked_suite(old_tree, a, b)
             if old_mask is not None and old_mask == _masked_suite(new_tree, c, d):
                 return FragmentSelection("common-suite", *stats, StatementFragment(c + 1, d, accepted.lines[a:b]))
+    if (len(changes) == 1 and 1 <= old_end - old_first <= 6 and 1 <= new_end - new_first <= 6
+            and tentative.lines[new_first].strip() and accepted.lines[old_first].strip()):
+        return FragmentSelection("single-literal-hunk", *stats, StatementFragment(
+            new_first + 1, new_end, accepted.lines[old_first:old_end], literal=True,
+        ))
     return FragmentSelection("no-common-suite-within-12-rows", *stats)
 
 
 def isolate_statement_fragment(accepted, tentative):
     return select_statement_fragment(accepted, tentative).fragment
+
+
+def preceding_local_names(snapshot, first):
+    """Offer recent local bindings from the same method, excluding nested scopes."""
+    try:
+        method = ast.parse(textwrap.dedent("\n".join(snapshot.lines))).body[0]
+    except (SyntaxError, ValueError, RecursionError, IndexError):
+        return ()
+    found = {}
+    pending = list(method.body)
+    while pending:
+        node = pending.pop()
+        if getattr(node, "lineno", 0) >= first or isinstance(node, (
+            ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda, ast.ListComp,
+            ast.SetComp, ast.DictComp, ast.GeneratorExp,
+        )):
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            found[node.id] = max(found.get(node.id, 0), node.lineno)
+        pending.extend(ast.iter_child_nodes(node))
+    return tuple(sorted(found, key=lambda name: (-found[name], name))[:16])
+
+
+def _literal_exterior(lines, first, last):
+    """Track unchanged syntax, lexical boundaries, and enclosing execution scopes."""
+    text = textwrap.dedent("\n".join(lines))
+    tree = ast.parse(text)
+    exterior = []
+    scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda,
+              ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp)
+
+    def visit(node, owners):
+        start, end = getattr(node, "lineno", 0), getattr(node, "end_lineno", 0)
+        if start and (end < first or start > last):
+            where = ("before", start, end) if end < first else ("after", start-last, end-last)
+            exterior.append((owners, where, node.col_offset, ast.dump(node)))
+            return
+        if isinstance(node, scopes):
+            owners = (*owners, (type(node).__name__, getattr(node, "name", "")))
+        for child in ast.iter_child_nodes(node):
+            visit(child, owners)
+
+    visit(tree, ())
+    crossing = []
+    for token in tokenize.generate_tokens(io.StringIO(text).readline):
+        start, end = token.start[0], token.end[0]
+        if start < first <= end or start <= last < end:
+            crossing.append((token.type, min(0, start-first), max(0, end-last)))
+    return exterior, crossing
+
+
+def _apply_literal_hunk(rows, sources, snapshot, fragment):
+    first, last = fragment.first, fragment.last
+    if not (snapshot.first_body_line <= first <= last <= len(snapshot.lines)
+            and max(last-first+1, len(fragment.accepted)) <= 6 and len(rows) <= 12):
+        raise ValueError("Literal hunk exceeds its body window")
+    indent = re.match(r"[ \t]*", snapshot.lines[first-1])[0]
+    inserted = [indent + row if row else row for row in rows]
+    edit = {"start": first, "end": last, "lines": inserted}
+    revised = apply_line_range_edit(json.dumps({"snapshot": snapshot.digest, "edits": [edit]}),
+                                    sources, snapshot, allowed_rows=frozenset(range(first, last+1)))
+    updated = prepare_line_range_edit(revised, snapshot.symbol)
+    after = first + len(rows) - 1
+    if (updated is None or updated.lines[:first-1] != snapshot.lines[:first-1]
+            or updated.lines[after:] != snapshot.lines[last:]):
+        raise ValueError("Literal hunk changed its source boundaries")
+    try:
+        original = _literal_exterior(snapshot.lines, first, last)
+        actual = _literal_exterior(updated.lines, first, after)
+    except (SyntaxError, ValueError, RecursionError, tokenize.TokenError):
+        raise ValueError("Invalid literal hunk syntax") from None
+    if actual != original:
+        raise ValueError("Literal hunk changed exterior Python syntax")
+    return revised
 
 
 def apply_statement_fragment(reply, sources, snapshot, fragment):
@@ -519,6 +601,8 @@ def apply_statement_fragment(reply, sources, snapshot, fragment):
     rows = text.splitlines()
     if not rows or len(rows) > 18 or any(_INVALID_LINE.search(row) for row in rows):
         raise ValueError("Expected one small Python statement fragment")
+    if fragment.literal:
+        return _apply_literal_hunk(rows, sources, snapshot, fragment)
     try:
         replacement = ast.parse(text).body
         expected = ast.parse(textwrap.dedent("\n".join(snapshot.lines)))

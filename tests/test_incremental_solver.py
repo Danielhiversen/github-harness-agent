@@ -1270,7 +1270,14 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
         with operator.open("a") as stream:
             stream.write("    assert Reader().dispatch(True) == -3\n")
     caller_rows = 1
-    if fragment_case:
+    if fragment_case == "literal":
+        header = "        if False:\n"
+        tentative_header = "        choose = True\n        enabled = choose\n        if enabled:\n"
+        wide_body = "".join(f"            context_{i} = {i}\n" for i in range(32))
+        production = production.replace("        return self.read() - 2\n", header + wide_body
+                                        + "            return self.read() + 2\n        return self.read() - 2\n")
+        caller_rows += 34
+    elif fragment_case:
         padding = "".join(f"        context_{i} = {i}\n" for i in range(32))
         production = production.replace("        return self.read() - 2\n", padding + "        return self.read() - 2\n")
         caller_rows += 32
@@ -1346,6 +1353,15 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 reply = super().complete(**{**kwargs, "role": "coding", "max_output_tokens": 3072})
                 reply.role = "planning"
                 reply.content = json.dumps({"strategy": strategy})
+                return reply
+            if fragment_case == "literal" and "replacement lines for the exact tentative hunk" in prompt:
+                assert "Accepted fragment:\n" + header.rstrip() in prompt
+                assert "Tentative fragment to replace:\n" + tentative_header.rstrip() in prompt
+                assert "legacy=False" in prompt and "test_keep_helper" in prompt and "test_first" in prompt
+                assert "context_31" not in prompt and "def unrelated" not in prompt
+                reply = super().complete(**{**kwargs, "max_output_tokens": 3072})
+                reply.content = "if not legacy:"
+                private_models.append((reply.route, reply.configured_model))
                 return reply
             if fragment_case and "Synthesize only the replacement Python statements" in prompt:
                 assert not private_models and "test_keep_helper" in prompt and "test_first" in prompt
@@ -1507,7 +1523,9 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                             if failover.endswith("-multistage"):
                                 assert "Checkpoint assertion at line 4: assert first() == 1" in prompt
                                 assert "Pinned ancestor assertion at line 3: assert second() == 2" in prompt
-                    if semantic:
+                    if fragment_case == "literal":
+                        reply.content = edit(SOURCE, header, tentative_header)
+                    elif semantic:
                         if len(line_attempts) == 1:
                             reply.content = edit(SOURCE, "        return self.read() - 2\n", "        return self.read() + 1\n")
                         else:
@@ -1614,6 +1632,13 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
         assert "def unrelated" not in first_request and "withheld-operator-source" not in first_request
         assert "Observed pytest failure:" in first_request
         if private_case:
+            if fragment_case == "literal":
+                assert len(private_models) == 1 and b"+        if not legacy:" in result.patch
+                assert b"choose = True" not in result.patch
+                assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
+                assert any("mode=literal-hunk reason=single-literal-hunk hunks=1 changed_old=1 changed_new=3" in rec.getMessage()
+                           for rec in caplog.records)
+                return
             assert bool(planning_calls) == bool(private_plan)
             assert len(private_models) == (1 if fragment_case == "success" else 3)
             assert b"(-2 if legacy else 2)" in result.patch
@@ -6179,3 +6204,7 @@ def test_plain_method_reply_allowance_scales_and_skips_oversized_methods():
 @pytest.mark.parametrize("response", ("success", "malformed"))
 def test_private_method_synthesizes_only_the_changed_statement(solver_case, caplog, response):
     _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-private", caplog, fragment_case=response)
+
+
+def test_private_repair_replaces_literal_header_of_wide_suite(solver_case, caplog):
+    _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-private", caplog, fragment_case="literal")
