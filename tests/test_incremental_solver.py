@@ -1170,7 +1170,7 @@ def test_checked_caller_feedback_is_local_bounded_and_stops_duplicate_attempts(c
     assert "return 2" not in caplog.text and "candidate observation" not in caplog.text
 
 
-@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long", "checkpoint-caller", "checkpoint-caller-block", "checkpoint-caller-after-format", "checkpoint-caller-after-rejection", "checkpoint-caller-after-exhaustion", "checkpoint-caller-after-wider", "checkpoint-caller-after-semantic", "checkpoint-caller-after-implicit", "checkpoint-caller-after-method"))
+@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long", "checkpoint-caller", "checkpoint-caller-block", "checkpoint-caller-after-format", "checkpoint-caller-after-rejection", "checkpoint-caller-after-exhaustion", "checkpoint-caller-after-wider", "checkpoint-caller-after-semantic", "checkpoint-caller-after-implicit", "checkpoint-caller-after-method", "checkpoint-caller-after-testfirst", "checkpoint-caller-after-testfirst-green", "checkpoint-caller-after-testfirst-oldgreen", "checkpoint-caller-after-testfirst-setup", "checkpoint-caller-after-testfirst-alternate"))
 def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, failover, caplog):
     task, _, runner, checkpoints = solver_case
     raw_mode = failover in {"raw", "raw-restored"}
@@ -1179,6 +1179,16 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
     caller_retry = failover.startswith("checkpoint-caller-after-")
     wider = failover == "checkpoint-caller-after-wider"
     semantic = failover == "checkpoint-caller-after-semantic"
+    testfirst = "testfirst" in failover
+    early_case = "def test_dispatch_observable():\n    from fixture_calc import first\n    assert first() == 1\n"
+    early_routes = []
+    retain_early = failover.endswith(("-testfirst", "-alternate"))
+    if failover.endswith("-oldgreen"):
+        early_case = early_case.replace("first", "second").replace("== 1", "== -2")
+    elif failover.endswith("-setup"):
+        early_case = early_case.replace("assert first() == 1", "raise AssertionError('setup failure')")
+    elif failover.endswith("-green"):
+        early_case = early_case.replace("first() == 1", "isinstance(first(), int)")
     operator = Path(task.pull_checks[0][-1])
     with operator.open("a") as stream:
         stream.write("# withheld-operator-source " + "x" * review_recovery.MAX_OPERATOR_SOURCE + "\n")
@@ -1265,6 +1275,19 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
     class Gateway(FreeGateway):
         def complete(self, **kwargs):
             prompt = kwargs["messages"][-1]["content"]
+            if prompt.startswith("Test-first regression"):
+                assert testfirst and len(line_attempts) == 1
+                assert "withheld-operator-source" not in prompt and "def test_keep_helper" not in prompt
+                reply = super().complete(**{**kwargs, "max_output_tokens": 3072})
+                if early_routes:
+                    assert early_routes == [("free-first", "model-first")]
+                    assert tuple(early_routes) == kwargs["exclude"] and kwargs["after_provider"] == "free-first"
+                    reply.route, reply.configured_model = "free-second", "model-second"
+                else:
+                    reply.route, reply.configured_model = "free-first", "model-first"
+                early_routes.append((reply.route, reply.configured_model))
+                reply.content = "not a Python test" if failover.endswith("-alternate") and len(early_routes) == 1 else early_case
+                return reply
             if "Return only the complete Python function" in prompt:
                 assert raw_mode and not kwargs["tools"]
                 reply = super().complete(**kwargs)
@@ -1332,6 +1355,11 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
                         assert "could not be applied" in prompt
                     else:
                         assert "did not improve verification" in prompt and "additional failing check" in prompt
+                    if testfirst:
+                        assert ("independently authored repository test" in prompt) == retain_early
+                        if retain_early:
+                            assert "assert first() == 1" in prompt and "-3" in prompt
+                            assert "from fixture_calc import first" in prompt
                     if semantic:
                         if len(line_attempts) == 1:
                             reply.content = edit(SOURCE, "        return self.read() - 2\n", "        return self.read() + 1\n")
@@ -1393,6 +1421,9 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         replies = ("Numbered response expected.",) * (3 if semantic or failover.endswith("exhaustion") else 2 if caller_retry else 1) + (TEST,)
         gateway = Gateway(*replies)
         requests = len(replies)
+        if testfirst:
+            gateway = Gateway("numbered", early_case, *(("second author",) if not failover.endswith("-testfirst") else ()), "numbered", TEST)
+            requests = 5
     elif failover == "raw-restored":
         gateway = Gateway("def local_result():\n    return 1\n", TEST)
         requests = 2
@@ -1417,6 +1448,10 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         assert "self.read()" not in offered and "return" not in offered
         repeats = 2 if semantic or failover.endswith("exhaustion") else int(caller_retry)
         assert remaining_offers == [f"Requesting checkpoint method edit: direct caller only Reader.dispatch (body rows={caller_rows})"] * repeats
+        if testfirst:
+            assert len(early_routes) == (1 if failover.endswith("-testfirst") else 2)
+            assert any(prompt.startswith("Test-first regression") for prompt in gateway.prompts)
+            assert (b"test_dispatch_observable" in result.patch) == retain_early
         first_request = gateway.prompts[0]
         assert len(line_attempts) == 1 + repeats and not native_attempts and not raw_attempts
         assert len(re.findall(r"(?m)^\d+ \|", first_request)) > 110

@@ -4176,6 +4176,79 @@ def solve(executor, task, archive, budget, version):
     attempted_seed_cases = set()
     ancestor_assertion_hints = {}
 
+    test_first_attempted = False
+    test_first_witness = None
+
+    def author_red_regression(routes):
+        # Only public repository context is provided. The independent operator
+        # check and its diagnostic play no part in composing this test.
+        public = {path: current[path] for path in paths}
+        request = " ".join(body for _, _, body in review.feedback)
+        example, usage = repository_pytest_context(
+            task.regression_archive, public, request, exclude_generated=True,
+        )
+        query = words(request)
+        api = "\n".join(
+            _regression_api(path, content, query, 1500, anchors=[
+                line for location, line, _ in review.feedback if location == path
+            ])[0] for path, content in public.items()
+        )
+        setup = prior_generated_fixture_context(
+            archive, task.regression_archive, new_path, public, require_identical=True,
+        )
+        examples = "\n".join(filter(None, (setup, example, usage)))
+        protocol = production_protocol_example(setup.partition("\n")[2], public, query) if setup else ""
+
+        prompt = (
+            f"Test-first regression for {new_path}. Write exactly one original offline pytest test "
+            "that demonstrates the requested public behavior. Both current and historical production "
+            "are expected to fail its ordinary assertion. Return the complete Python module including imports.\n"
+            + excerpt(request, 1200) + "\nProduction APIs:\n" + api
+            + "\nRepository setup examples:\n" + excerpt(examples, 3200)
+            + ("\nProduction call and response handling:\n" + protocol if protocol else "")
+        )
+        messages = [{"role": "system", "content": _SYSTEM_PREFIX + _SYSTEM_SUFFIX},
+                    {"role": "user", "content": prompt}]
+        result = budget.complete(executor.gateway, "coding", messages, max_output_tokens=2048, retry_oversize=False,
+                                 exclude=tuple(routes), after_provider=routes[-1][0] if routes else None,
+                                 timeout_cap=min(75, budget.remaining() - 45))
+        model = result.route, result.configured_model
+        if model in routes or not result.configured_model:
+            return None
+        routes.append(model)
+        source = _complete_test_module(result.content, new_path, min(8192, executor.limits.patch_bytes))
+        if not source or not _one_test_draft(source):
+            return None
+        proof = _GuardBudget(budget, wall_seconds=45)
+
+        def exact_bytes(workspace, _tree):
+            staged = executor._command(workspace, proof, ("cat", "--", new_path), cap=executor.limits.patch_bytes)
+            if staged.stdout != source.encode():
+                raise ValueError("Staged regression differs from authored bytes")
+
+        assertions = []
+        for revision, changes in (
+            (archive, patch_for(original, {**current, new_path: source})),
+            (task.regression_archive, patch_for({new_path: ""}, {new_path: source})),
+        ):
+            runs = {}
+            failed = review_evidence(executor, task, revision, proof, changes, (focused_generated,),
+                                     pytest_runs=runs, on_staged=exact_bytes)
+            run = runs.get(0)
+            if not run or len(run.failed) != 1:
+                return None
+            observed = next(_focused_test_assertions(new_path, source, run, failed), None)
+            if observed is None:
+                return None
+            assertions.append(observed)
+        if assertions[0][:2] != assertions[1][:2]:
+            return None
+        _, row, rewritten = assertions[0]
+        return source, ("An independently authored repository test reached the same assertion on "
+                        "the checkpoint and pinned ancestor. Its failing assertion and observed result:\n"
+                        + excerpt(source.splitlines()[row - 1].strip(), 250) + "\n" + excerpt(rewritten, 350)
+                        + "\nOriginal test setup and scenario (quoted):\n" + excerpt(source, 1600))
+
     def failed_assertion_hint(source, run, fixed_failures):
         if (
             not run or not run.assertion_reached or len(run.failed) != 1
@@ -4368,6 +4441,17 @@ def solve(executor, task, archive, budget, version):
             needs_tests = task.require_new_tests and not has_runnable_test(
                 new_path, current[new_path].encode()
             )
+            if test_first_witness and not failures and needs_tests and not pending:
+                retained, _ = test_first_witness
+                test_first_witness = None
+                combined = patch_for(original, {**current, new_path: retained})
+                if len(combined) <= executor.limits.patch_bytes:
+                    try:
+                        return _finish_review(executor, task, archive, budget, combined, actor, version)
+                    except AttemptRejected as error:
+                        if not isinstance(error.__cause__, _VerificationRejected):
+                            raise
+                        _LOG.info("Test-first candidate failed final verification; resuming standard test authoring")
             ready = not failures and not needs_tests and bool(patch)
             if ready and not pending:
                 return _finish_review(
@@ -4420,6 +4504,35 @@ def solve(executor, task, archive, budget, version):
             launch_budget = min(
                 max_proposals - submitted, budget.model_requests_remaining()
             )
+            if (
+                not test_first_attempted and current is resumed_operator_checkout and needs_tests
+                and len(operator) == 1 and not other_checks and not pending and not private
+                and _named_operator_cases(operator, commands)
+                and any(run and run.passed and not run.deselected for run in pytest_runs.values())
+                and attempts.get(operator[0], 0) >= 1 and launch_budget >= 4 and focused_generated
+                and executor.verification_runner is not executor.runner
+                and getattr(executor.verification_runner, "network", "none") == "none"
+                and budget.commands_remaining() >= len(commands) * 2 + 12 and budget.remaining() >= 75
+            ):
+                test_first_attempted = True
+                routes = []
+                for _ in range(2):
+                    submitted += 1
+                    launch_budget -= 1
+                    try:
+                        test_first_witness = author_red_regression(routes)
+                    except Cancelled:
+                        raise
+                    except (ExecutionError, ProviderExhausted, OSError, ValueError):
+                        budget.remaining()
+                    if (
+                        test_first_witness or not routes or launch_budget < 3
+                        or budget.model_requests_remaining() < 3 or budget.remaining() < 75
+                        or budget.commands_remaining() < len(commands) * 2 + 12
+                    ):
+                        break
+                if test_first_witness:
+                    _LOG.info("Retained an authored regression with matching assertion failures on both revisions")
             if (
                 len(operator) == 1
                 and not other_checks
@@ -5256,6 +5369,13 @@ def solve(executor, task, archive, budget, version):
                             {"role": "system", "content": _LINE_RANGE_SYSTEM},
                             {"role": "user", "content": line_retry.prompt},
                         ]
+                    if test_first_witness and target in operator:
+                        hint = test_first_witness[1] + "\n"
+                        augmented = [*messages[:-1], {**messages[-1], "content": hint + messages[-1]["content"]}]
+                        if wire_size(augmented) <= RETRY_MESSAGE_BYTES:
+                            messages = augmented
+                            if native_line and line_retry:
+                                line_retry = replace(line_retry, native_prompt=hint + line_retry.native_prompt)
                     planner_input = None
                     if plan:
                         fixture = stock_fixture or _fixture_excerpt(
