@@ -2,7 +2,7 @@
 
 import base64
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 RECOVERY_MODE_THRESHOLD = 2
 RECOVERY_GOAL_LIMIT = 24
@@ -155,12 +155,42 @@ class RedWitness:
 
 
 @dataclass(frozen=True)
+class PrivateCaseTradeoff:
+    """Unpublished proposal to replay before resuming a one-for-one case repair."""
+
+    identity: str
+    origin: str
+    control: str
+    patch: bytes = field(repr=False)
+
+    def to_data(self):
+        return {"identity": self.identity, "origin": self.origin, "control": self.control,
+                "patch_b64": base64.b64encode(self.patch).decode("ascii")}
+
+    @classmethod
+    def from_data(cls, data):
+        if not isinstance(data, dict):
+            raise ValueError("Invalid private tradeoff")
+        hashes = tuple(data.get(key) for key in ("identity", "origin", "control"))
+        encoded = data.get("patch_b64")
+        if (not all(isinstance(value, str) and re.fullmatch("[a-f0-9]{64}", value) for value in hashes)
+                or hashes[1] == hashes[2] or not isinstance(encoded, str)
+                or not 0 < len(encoded) <= 4 * ((PRIVATE_PATCH_BYTES + 2) // 3)):
+            raise ValueError("Invalid private tradeoff")
+        patch = base64.b64decode(encoded, validate=True)
+        if not 0 < len(patch) <= PRIVATE_PATCH_BYTES:
+            raise ValueError("Invalid private tradeoff patch")
+        return cls(*hashes, patch)
+
+
+@dataclass(frozen=True)
 class SolverRecovery:
     identity: str
     goals: tuple[tuple[str, int, int], ...]
     alternate: PrivateRecovery | None = None
     test_seed: GeneratedTestSeed | None = None
     red_witness: RedWitness | None = None
+    tradeoff: PrivateCaseTradeoff | None = None
 
     def to_data(self):
         data = {"identity": self.identity, "goals": [list(goal) for goal in self.goals]}
@@ -168,6 +198,8 @@ class SolverRecovery:
             data["alternate"] = self.alternate.to_data()
         if self.test_seed is not None:
             data["test_seed"] = self.test_seed.to_data()
+        if self.tradeoff is not None:
+            data["tradeoff"] = self.tradeoff.to_data()
         if self.red_witness is not None:
             data["red_witness"] = self.red_witness.to_data()
         return data
@@ -189,12 +221,16 @@ class SolverRecovery:
             red_witness = RedWitness.from_data(value.get("red_witness"))
         except (ValueError, UnicodeError):
             red_witness = None
+        try:
+            tradeoff = PrivateCaseTradeoff.from_data(value.get("tradeoff"))
+        except ValueError:
+            tradeoff = None
         if (
             not isinstance(identity, str)
             or not re.fullmatch(r"[a-f0-9]{64}", identity)
             or not isinstance(goals, list)
             or len(goals) > RECOVERY_GOAL_LIMIT
-            or not (goals or alternate is not None or test_seed is not None or red_witness is not None)
+            or not (goals or alternate is not None or test_seed is not None or red_witness is not None or tradeoff is not None)
         ):
             raise ValueError("Invalid solver recovery state")
         records = {}
@@ -220,6 +256,7 @@ class SolverRecovery:
             alternate,
             test_seed,
             red_witness,
+            tradeoff,
         )
 
 

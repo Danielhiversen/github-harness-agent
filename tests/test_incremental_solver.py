@@ -1181,6 +1181,21 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
     _exercise_numbered_review(solver_case, failover, caplog)
 
 
+def test_testfirst_function_recovers_malformed_module(solver_case, caplog, monkeypatch):
+    from github_harness_agent import review_solver
+
+    setup = (
+        "from fixture_calc import first\n"
+        "def observe(function):\n    return function()\n"
+        "def test_hidden_scenario():\n    assert False, 'hidden operator assertion'\n"
+    )
+    monkeypatch.setattr(review_solver, "operator_acceptance_context",
+                        lambda *_: "fixture\n" + json.dumps({"operator/test_setup.py": setup}))
+    _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-function", caplog)
+    assert "Requesting a test-first function using approved setup helpers" in caplog.text
+    assert "hidden operator assertion" not in caplog.text
+
+
 def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve):
     task, _, runner, checkpoints = solver_case
     raw_mode = failover in {"raw", "raw-restored"}
@@ -1194,7 +1209,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
     private_case = failover.endswith("-private")
     private_models = []
     early_routes = []
-    retain_early = failover.endswith(("-testfirst", "-alternate", "-multistage", "-timeout", "-private", "-strengthen"))
+    retain_early = failover.endswith(("-testfirst", "-alternate", "-multistage", "-timeout", "-private", "-strengthen", "-function"))
     if failover.endswith("-multistage"):
         early_case = early_case.replace("import first", "import first, second").replace(
             "    assert first()", "    assert second() == 2\n    assert first()"
@@ -1314,6 +1329,16 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                      "def dispatch(self, legacy=False):\n    return self.read() + (-2 if legacy else 2)")
                 )
                 return reply
+            if failover.endswith("-function") and prompt.startswith("Write one original regression"):
+                assert early_routes == [("free-first", "model-first")]
+                assert tuple(early_routes) == kwargs["exclude"]
+                assert "def observe(function)" in prompt and "hidden operator assertion" not in prompt
+                assert "pinned ancestor should fail" in prompt
+                reply = super().complete(**{**kwargs, "max_output_tokens": 3072})
+                reply.route, reply.configured_model = "free-second", "model-second"
+                early_routes.append((reply.route, reply.configured_model))
+                reply.content = "def test_dispatch_observable():\n    assert observe(first) == 1\n"
+                return reply
             if prompt.startswith("Test-first regression"):
                 assert testfirst and len(line_attempts) == 1
                 assert "withheld-operator-source" not in prompt and "def test_keep_helper" not in prompt
@@ -1335,7 +1360,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                     assert "isinstance(first(), int)" in prompt
                     reply.route, reply.configured_model = "free-third", "model-third"
                 early_routes.append((reply.route, reply.configured_model))
-                reply.content = "not a Python test" if failover.endswith("-alternate") and len(early_routes) == 1 else early_case
+                reply.content = "not a Python test" if failover.endswith(("-alternate", "-function")) and len(early_routes) == 1 else early_case
                 if failover.endswith("-strengthen"):
                     if len(early_routes) == 1:
                         reply.content = "not a Python test"
@@ -1412,7 +1437,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                     if testfirst:
                         assert ("independently authored repository test" in prompt) == retain_early
                         if retain_early:
-                            assert "assert first() == 1" in prompt and "-3" in prompt
+                            assert ("assert observe(first) == 1" if failover.endswith("-function") else "assert first() == 1") in prompt and "-3" in prompt
                             assert "from fixture_calc import first" in prompt
                             if failover.endswith("-multistage"):
                                 assert "Checkpoint assertion at line 4: assert first() == 1" in prompt
@@ -5987,3 +6012,63 @@ def test_red_witness_is_replayed_in_fresh_solver(solver_case, caplog, restart):
     _exercise_numbered_review(
         solver_case, "checkpoint-caller-after-testfirst", caplog, run_solver=solve_and_restart,
     )
+
+
+@pytest.mark.parametrize("state", ("exact", "changed_checkpoint", "lost_gain", "new_guard"))
+def test_private_tradeoff_requires_fresh_evidence_after_restart(solver_case, caplog, state):
+    from github_harness_agent.controller import restore_solver_recovery
+    from github_harness_agent.worker import Cancelled
+
+    def exercise(executor, task, archive, budget, version):
+        saved = []
+
+        def save(record, durable):
+            if durable and record and record.tradeoff:
+                saved.append(json.loads(json.dumps(record.to_data())))
+
+        result = solve(executor, replace(task, save_solver_recovery=save), archive, budget, version)
+        envelope = {"scope": "review", "head": "head", "parent": "main", "solver_recovery": saved[0]}
+        for binding in (("old", "head", "main"), ("review", "old", "main"), ("review", "head", "old")):
+            assert restore_solver_recovery(envelope, *binding) is None
+        restored = restore_solver_recovery(envelope, "review", "head", "main")
+        resume = replace(task, solver_recovery=restored, save_solver_recovery=lambda *_: None)
+        if state == "changed_checkpoint":
+            key, draft = next(iter(resume.checkpoints.items()))
+            later = draft.patch.replace(b"+    return 2\n", b"+    return 2  # later checkpoint\n")
+            assert draft.patch != later
+            resume = replace(resume, checkpoints={key: replace(draft, patch=later)})
+        if state in {"lost_gain", "new_guard"}:
+            operator = Path(task.pull_checks[0][-1].partition("::")[0])
+            text = operator.read_text()
+            if state == "lost_gain":
+                text = text.replace("assert first() == 1", "assert first() == 777")
+            else:
+                text = text.replace("assert second() == 2", "assert second() == 2 and first() != 1")
+            assert text != operator.read_text()
+            operator.write_text(text)
+
+        class RestartGateway(FreeGateway):
+            def complete(self, **kwargs):
+                prompt = kwargs["messages"][-1]["content"]
+                private = "Private regression repair. The numbered tentative method" in prompt
+                assert private == (state == "exact")
+                if not private:
+                    raise Cancelled("Stop after verifying the stale private proposal was not offered")
+                assert "test_keep_helper" in prompt and "test_dispatch_observable" in prompt
+                reply = super().complete(**{**kwargs, "max_output_tokens": 3072})
+                reply.content = "def dispatch(self, legacy=False):\n    return self.read() + (-2 if legacy else 2)"
+                return reply
+
+        gateway = RestartGateway("scoped repair")
+        fresh = PlainExecutor(executor.runner, gateway, executor.limits, verification_runner=executor.verification_runner)
+        with caplog.at_level("ERROR", logger="github_harness_agent.review_solver"):
+            if state == "exact":
+                verified = solve(fresh, resume, archive, _Budget(fresh.limits, lambda: False, resume), version)
+                assert verified.patch == result.patch and len(gateway.prompts) == 1
+                assert any(c.command[0] == "verify-regression" and not c.returncode for c in verified.checks)
+            else:
+                with pytest.raises(Cancelled):
+                    solve(fresh, resume, archive, _Budget(fresh.limits, lambda: False, resume), version)
+        return result
+
+    _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-private", caplog, run_solver=exercise)

@@ -221,3 +221,20 @@ def test_matching_repair_draft_can_follow_issue_job_into_pr_adoption(tmp_path):
             ).fetchone()[0]
             is None
         )
+
+
+def test_private_tradeoff_serialization_and_retirement():
+    from github_harness_agent.checkpoint import PrivateCaseTradeoff
+    from github_harness_agent.controller import _retired_draft_envelope
+
+    private = PrivateCaseTradeoff("c"*64, "d"*64, "e"*64, b"private fixture bytes")
+    state = SolverRecovery("a"*64, (), tradeoff=private)
+    assert SolverRecovery.from_data(state.to_data()) == state
+    assert "private fixture bytes" not in repr(state)
+    assert "solver_recovery" not in _retired_draft_envelope({"solver_recovery": state.to_data()})
+    for malformed in ({"patch_b64": "%%%!"}, {"control": private.origin}, {"identity": "wrong"}):
+        data = state.to_data()
+        data["tradeoff"].update(malformed)
+        data["goals"] = [["b"*64, 1, 0]]
+        restored = SolverRecovery.from_data(data)
+        assert restored.tradeoff is None and restored.goals == (("b"*64, 1, 0),)

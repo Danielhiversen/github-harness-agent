@@ -33,6 +33,7 @@ from .checkpoint import (
     DraftCheckpoint,
     GeneratedTestSeed,
     PrivateRecovery,
+    PrivateCaseTradeoff,
     RedWitness,
     SolverRecovery,
 )
@@ -1404,6 +1405,7 @@ def _one_test_draft(source):
 
 def _operator_function_messages(
     projection, review, sources, new_path, ancestor, *, replace_smoke=False, feedback="", prior_function="",
+    test_first=False,
 ):
     requirements = "\n".join(f"- {excerpt(body, 900)}" for _, _, body in review.feedback)
     production = {path: source for path, source in sources.items() if path != new_path}
@@ -1414,7 +1416,8 @@ def _operator_function_messages(
         "Return exactly one new Python test function with a test_ name and an ordinary assert. "
         "Define any custom fake inside the function. Use the shown helpers by name. "
         "The runner assembles the referenced helpers and imports. "
-        "Assert the requested behavior that passes here and fails on the pinned ancestor.\n"
+        + ("Both the current production checkpoint and the pinned ancestor should fail the requested assertion.\n"
+           if test_first else "Assert the requested behavior that passes here and fails on the pinned ancestor.\n")
         + (
             "The current smoke test passed on both revisions. Replace it with a discriminating case.\n"
             if replace_smoke else ""
@@ -1436,7 +1439,10 @@ def _operator_function_messages(
         {"role": "user", "content": request},
     ]
 
-    if protocol := production_protocol_example(projection.preview, production, query):
+    if protocol := production_protocol_example(
+        projection.preview, production, query,
+        review_anchors=tuple((path, line) for path, line, _ in review.feedback),
+    ):
         messages[-1]["content"] = request + "\n\nProduction call and response handling (quoted):\n" + protocol
         if wire_size(messages) <= 12 * 1024:
             request = messages[-1]["content"]
@@ -2836,6 +2842,7 @@ def solve(executor, task, archive, budget, version):
     alternate = None
     test_seed = None
     durable_witness = None
+    tradeoff = None
     def witness_identity():
         return hashlib.sha256(json.dumps((
             retained_identity, task.regression_base, new_path, review.feedback,
@@ -2845,6 +2852,7 @@ def solve(executor, task, archive, budget, version):
     restored_raw_patch = patch
     if retained_recovery and retained_recovery.identity == retained_identity:
         alternate = retained_recovery.alternate
+        tradeoff = retained_recovery.tradeoff
         saved_witness = retained_recovery.red_witness
         if (current is resumed_operator_checkout and saved_witness is not None
                 and saved_witness.identity == witness_identity()):
@@ -2872,8 +2880,8 @@ def solve(executor, task, archive, budget, version):
         ]
         goals.sort(key=lambda goal: (-max(goal[1:]), goal[0]))
         state = (
-            SolverRecovery(retained_identity, tuple(goals[:RECOVERY_GOAL_LIMIT]), alternate, test_seed, durable_witness)
-            if goals or alternate is not None or test_seed is not None or durable_witness is not None
+            SolverRecovery(retained_identity, tuple(goals[:RECOVERY_GOAL_LIMIT]), alternate, test_seed, durable_witness, tradeoff)
+            if goals or alternate is not None or test_seed is not None or durable_witness is not None or tradeoff is not None
             else None
         )
         if state != retained_recovery:
@@ -3044,6 +3052,73 @@ def solve(executor, task, archive, budget, version):
         return _goal_digest(
             (retained_identity, review.feedback, task.protected_paths, task.test_update)
         )
+
+    def tradeoff_identity():
+        return _goal_digest((private_identity(), task.regression_base, new_path))
+
+    def checked_tradeoff(candidate_patch, checked, runs, probe):
+        if (current is not resumed_operator_checkout or len(failures) != 1 or len(checked) != 1
+                or failures.keys() == checked.keys()):
+            return None
+        origin, = failures
+        control, = checked
+        if (any(not 0 <= key[0] < len(task.pull_checks) for key in (origin, control))
+                or not _named_operator_cases({origin, control}, commands)):
+            return None
+        for number, command in enumerate(commands):
+            if check_label(command, ()) != "pytest":
+                continue
+            first, second = pytest_runs.get(number), runs.get(number)
+            if (not _same_pytest_selection(first, second) or first.deselected
+                    or (first.named_cases is not None and second.named_cases is not None
+                        and second.named_cases != first.named_cases)):
+                return None
+        if origin[1] not in pytest_runs[origin[0]].failed or control[1] not in runs[control[0]].failed:
+            return None
+        for case, revision, diagnostics, observed in (
+            (origin, candidate_patch, checked, runs), (control, patch, failures, pytest_runs),
+        ):
+            if _private_case_outcome(case, diagnostics, observed, commands) == "passed":
+                continue
+            focused = _operator_diagnostic_replay(commands[case[0]], case[1])
+            if not focused:
+                return None
+            proof = {}
+            failed = review_evidence(executor, task, archive, probe, revision, (focused,), pytest_runs=proof)
+            run = proof.get(0)
+            if failed or not run or run.passed != 1 or run.failed or run.deselected:
+                return None
+        return origin, control
+
+    def restore_tradeoff():
+        if (tradeoff.identity != tradeoff_identity() or current is not resumed_operator_checkout
+                or executor.runner is executor.verification_runner or not task.save_solver_recovery
+                or len(tradeoff.patch) > executor.limits.patch_bytes):
+            return None
+        sources = original.copy()
+        scope = {path: original[path] for path in paths if not _protected(path, task, new_test=False)}
+        probe = _GuardBudget(budget, wall_seconds=180, reserve=60)
+
+        def capture(ws, tree):
+            sources.update(executor._capture_scoped_sources(ws, probe, tree, scope, text_only=True))
+            if patch_for(original, sources) != tradeoff.patch:
+                raise ValueError("Tradeoff modifies files outside the reviewed source")
+
+        runs = {}
+        try:
+            checked = review_evidence(executor, task, archive, probe, tradeoff.patch, commands,
+                                      pytest_runs=runs, on_staged=capture)
+            cases = checked_tradeoff(tradeoff.patch, checked, runs, probe)
+            symbol = _private_changed_method(current, sources) if cases else None
+            if symbol and tuple(map(_goal_digest, cases)) == (tradeoff.origin, tradeoff.control):
+                origin, control = cases
+                _LOG.info("Reverified a private tradeoff against the accepted checkpoint and all guards")
+                return _RegressionRepair(origin, sources, checked, {origin}, {control}, private_symbol=symbol)
+        except Cancelled:
+            raise
+        except (ExecutionError, OSError, ValueError):
+            budget.remaining()
+        return None
 
     def restore_private_progress():
         nonlocal alternate
@@ -3503,13 +3578,15 @@ def solve(executor, task, archive, budget, version):
         return None, None
 
     def save_verified_progress(checkpoint_patch, note, editor):
-        nonlocal retained_failures, retained_identity, durable_witness
+        nonlocal retained_failures, retained_identity, durable_witness, tradeoff
         budget.remaining()
         malformed.clear()
         native_ready.clear()
         no_progress.clear()
         retained_failures = failures
         retained_identity = _recovery_digest(task, fixtures, checkpoint_patch)
+        if tradeoff and tradeoff.identity != tradeoff_identity():
+            tradeoff = None
         if durable_witness and durable_witness.identity != witness_identity():
             durable_witness = None
         retain_recovery()
@@ -4188,8 +4265,15 @@ def solve(executor, task, archive, budget, version):
     stock_edits = ()
     composition_attempted = False
     hunk_isolation_attempted = False
-    regression_repair = restore_private_progress()
-    repair_attempted = set()
+    regression_repair = None
+    if tradeoff and budget.commands_remaining() >= len(commands) * 2 + 8 and budget.remaining() >= 90:
+        regression_repair = restore_tradeoff()
+        if not regression_repair:
+            tradeoff = None
+            retain_recovery(durable=True)
+    if regression_repair is None:
+        regression_repair = restore_private_progress()
+    repair_attempted = {regression_repair.origin} if regression_repair and regression_repair.private_symbol else set()
     pinned_restore_attempted = regression_repair is not None
     pinned_restore_advice = {}
     eager_source = current
@@ -4273,10 +4357,12 @@ def solve(executor, task, archive, budget, version):
 
     test_first_attempted = False
     test_first_witness = None
+    test_first_format_misses = 0
 
     def author_red_regression(routes, after_provider, runnable_drafts):
-        # Only public repository context is provided. The independent operator
-        # check and its diagnostic play no part in composing this test.
+        nonlocal test_first_format_misses
+        # Only repository context and approved setup helpers are offered. The
+        # independent operator scenario and its diagnostic are kept out.
         public = {path: current[path] for path in paths}
         request = " ".join(body for _, _, body in review.feedback)
         example, usage = repository_pytest_context(
@@ -4315,6 +4401,19 @@ def solve(executor, task, archive, budget, version):
             )
         messages = [{"role": "system", "content": _SYSTEM_PREFIX + _SYSTEM_SUFFIX},
                     {"role": "user", "content": prompt}]
+        assembly = None
+        if test_first_format_misses and fixtures and not runnable_drafts:
+            assembly = operator_test_assembly(
+                fixtures, archive, task.regression_archive,
+                {path: public[path] for path in public if not _protected(path, task, new_test=False)},
+            )
+            if assembly:
+                scoped = _operator_function_messages(assembly, review, public, new_path, "", test_first=True)
+                if wire_size(scoped) <= 12 * 1024:
+                    messages = scoped
+                    _LOG.info("Requesting a test-first function using approved setup helpers")
+                else:
+                    assembly = None
         remaining = budget.remaining()
         result = budget.complete(executor.gateway, "coding", messages, max_output_tokens=2048, retry_oversize=False,
                                  exclude=tuple(routes), after_provider=after_provider,
@@ -4324,9 +4423,20 @@ def solve(executor, task, archive, budget, version):
             _LOG.info("Test-first authoring rejected duplicate or unidentified route")
             return None
         routes.append(model)
-        source = _complete_test_module(result.content, new_path, min(8192, executor.limits.patch_bytes))
+        max_bytes = min(8192, executor.limits.patch_bytes)
+        if assembly:
+            try:
+                source = assembly.assemble(result.content, max_bytes=max_bytes)
+            except ValueError:
+                source = None
+        else:
+            source = _complete_test_module(result.content, new_path, max_bytes)
         if not source or not _one_test_draft(source):
-            _LOG.info("Test-first authoring rejected test module format")
+            test_first_format_misses += 1
+            reply = result.content or ""
+            _LOG.info("Test-first rejected %s format: characters=%d fences=%d test declarations=%d",
+                      "function" if assembly else "module", len(reply), reply.count("```"),
+                      len(re.findall(r"(?m)^def test_\w+\(", reply)))
             return None
         if source in runnable_drafts:
             _LOG.info("Test-first author repeated a previously measured green test")
@@ -6513,6 +6623,20 @@ def solve(executor, task, archive, budget, version):
                         ),
                         static_failures=admitted_static,
                     )
+                    if (regression_repair.private_symbol and task.save_solver_recovery
+                            and executor.runner is not executor.verification_runner
+                            and 0 < len(proposed) <= PRIVATE_PATCH_BYTES and current is resumed_operator_checkout):
+                        try:
+                            cases = checked_tradeoff(proposed, after, after_runs, _GuardBudget(budget, wall_seconds=45))
+                        except Cancelled:
+                            raise
+                        except (ExecutionError, OSError, ValueError):
+                            budget.remaining()
+                            cases = None
+                        if cases:
+                            tradeoff = PrivateCaseTradeoff(tradeoff_identity(), *map(_goal_digest, cases), proposed)
+                            retain_recovery(durable=True)
+                            _LOG.info("Saved an independently checked private one-for-one tradeoff")
                     if stock_gain:
                         _LOG.info(
                             "Entering private stock repair with %d review case(s) and %d static check(s)",
