@@ -1141,7 +1141,36 @@ def test_pinned_setup_failures_recover_using_an_authored_function_and_only_neede
     assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
 
 
-@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long", "checkpoint-caller", "checkpoint-caller-block", "checkpoint-caller-after-format", "checkpoint-caller-after-rejection", "checkpoint-caller-after-exhaustion", "checkpoint-caller-after-wider"))
+def test_checked_caller_feedback_is_local_bounded_and_stops_duplicate_attempts(caplog):
+    from github_harness_agent.review_line_ranges import prepare_line_range_edit
+    from github_harness_agent.review_solver import _LineRetry, _checked_caller_retry
+
+    source = {SOURCE: "class Worker:\n    def evaluate(self):\n        return 1\n\n    def sibling(self):\n        return 'sibling-secret'\n"}
+    snapshot = prepare_line_range_edit(source, (SOURCE, "Worker.evaluate"))
+    retry = _LineRetry(None, snapshot, frozenset({2}), checkout=source, checkpoint_method_edit=True,
+                       direct_caller_only=True, caller_context="Retained verification context.\n")
+    candidate = {SOURCE: source[SOURCE].replace("return 1", "return 2")}
+    target = (0, "test_private.py::test_value")
+    before = {target: target[1] + "\nObserved pytest failure: assert 1 == 4"}
+    after = {target: "E   AssertionError: candidate observation was too low\nE   assert 2 == 4\n> assert hidden_operator_source()"}
+    excluded = (("free", "model"),)
+    with caplog.at_level("INFO", logger="github_harness_agent.review_solver"):
+        updated = _checked_caller_retry(retry, candidate, target, before, after, excluded)
+        assert updated and updated.snapshot == snapshot and updated.checkout is source
+        assert updated.excluded_models == excluded and not updated.caller_routes_reopened
+        for prompt in (updated.prompt, updated.native_prompt):
+            assert "assert 2 == 4" in prompt and "candidate observation was too low" in prompt
+            assert "+        return 2" in prompt and "2 |         return 1" in prompt
+            assert "hidden_operator_source" not in prompt and "sibling-secret" not in prompt
+        assert _checked_caller_retry(updated, candidate, target, before, after, excluded) is None
+        different_result = {target: target[1] + "\nObserved pytest failure: assert 3 == 4"}
+        changed = _checked_caller_retry(updated, candidate, target, before, different_result, excluded)
+        assert changed and len(changed.checked_caller_attempts) == 2 and "assert 2 == 4" not in changed.prompt
+    assert "repeated a checked edit" in caplog.text
+    assert "return 2" not in caplog.text and "candidate observation" not in caplog.text
+
+
+@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long", "checkpoint-caller", "checkpoint-caller-block", "checkpoint-caller-after-format", "checkpoint-caller-after-rejection", "checkpoint-caller-after-exhaustion", "checkpoint-caller-after-wider", "checkpoint-caller-after-semantic"))
 def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, failover, caplog):
     task, _, runner, checkpoints = solver_case
     raw_mode = failover in {"raw", "raw-restored"}
@@ -1149,6 +1178,7 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
     caller_edit = failover.startswith("checkpoint-caller")
     caller_retry = failover.startswith("checkpoint-caller-after-")
     wider = failover == "checkpoint-caller-after-wider"
+    semantic = failover == "checkpoint-caller-after-semantic"
     operator = Path(task.pull_checks[0][-1])
     with operator.open("a") as stream:
         stream.write("# withheld-operator-source " + "x" * review_recovery.MAX_OPERATOR_SOURCE + "\n")
@@ -1302,7 +1332,19 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
                         assert "could not be applied" in prompt
                     else:
                         assert "did not improve verification" in prompt and "additional failing check" in prompt
-                    if wider:
+                    if semantic:
+                        if len(line_attempts) == 1:
+                            reply.content = edit(SOURCE, "        return self.read() - 2\n", "        return self.read() + 1\n")
+                        else:
+                            assert line_attempts[1][0] == digest
+                            assert ("numbered-free-b", "alternate-code-model") in kwargs["exclude"]
+                            assert "Previous caller-only proposal was discarded after verification" in prompt
+                            assert "assert 0 == 1" in prompt
+                            assert "-        return self.read() - 2" in prompt and "+        return self.read() + 1" in prompt
+                            assert re.search(r"(?m)^\d+ \|         return self.read\(\) - 2$", prompt)
+                            reply.route, reply.configured_model = "numbered-free-c", "third-code-model"
+                            reply.content = edit(SOURCE, "        return self.read() - 2\n", "        return self.read() + 2\n")
+                    elif wider:
                         assert "to 48 in total" in prompt
                         reply.content = json.dumps({"symbol": "Reader.dispatch", "edits": [{
                             "start": absolute_first, "end": absolute_first + caller_rows - 1, "lines": after_body,
@@ -1342,7 +1384,7 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         "```python\ndef local_result():\n    return 1\n```",
     ) if failover == "raw" else ()
     if long_checkpoint:
-        replies = ("Numbered response expected.",) * (3 if failover.endswith("exhaustion") else 2 if caller_retry else 1) + (TEST,)
+        replies = ("Numbered response expected.",) * (3 if semantic or failover.endswith("exhaustion") else 2 if caller_retry else 1) + (TEST,)
         gateway = Gateway(*replies)
         requests = len(replies)
     elif failover == "raw-restored":
@@ -1367,7 +1409,7 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         assert "anchor Reader.read (" in offered
         assert (f"direct callers offered (1): Reader.dispatch (body rows={caller_rows})" if caller_edit else "direct callers offered (0): none") in offered
         assert "self.read()" not in offered and "return" not in offered
-        repeats = 2 if failover.endswith("exhaustion") else int(caller_retry)
+        repeats = 2 if semantic or failover.endswith("exhaustion") else int(caller_retry)
         assert remaining_offers == [f"Requesting checkpoint method edit: direct caller only Reader.dispatch (body rows={caller_rows})"] * repeats
         first_request = gateway.prompts[0]
         assert len(line_attempts) == 1 + repeats and not native_attempts and not raw_attempts

@@ -2069,6 +2069,8 @@ class _LineRetry:
     checkpoint_context: str = ""
     direct_caller_only: bool = False
     caller_routes_reopened: bool = False
+    caller_context: str = ""
+    checked_caller_attempts: tuple[str, ...] = ()
 
     @property
     def complete_single_method(self):
@@ -2076,6 +2078,73 @@ class _LineRetry:
             self.checkpoint_method_edit and not self.alternatives
             and self.allowed_rows == frozenset(range(self.snapshot.first_body_line, len(self.snapshot.lines) + 1))
         )
+
+
+def _checked_caller_retry(retry, candidate, target, before, after, excluded):
+    """Supply only a verifier-observed outcome and the discarded edit to the offered caller."""
+    if not retry.direct_caller_only or not retry.caller_context or len(retry.checked_caller_attempts) >= 6:
+        return None
+    path, method = retry.snapshot.symbol
+    if candidate.keys() != retry.checkout.keys() or any(
+        candidate[key] != retry.checkout[key] for key in candidate if key != path
+    ):
+        return None
+    trial = prepare_line_range_edit(candidate, retry.snapshot.symbol)
+    if trial is None or trial.lines == retry.snapshot.lines:
+        return None
+
+    def observed(key):
+        detail = after[key]
+        marker = "\nObserved pytest failure: "
+        if marker not in detail:
+            detail = _unpublished_case_detail("", key[1], detail)
+        return detail.partition(marker)[2]
+
+    evidence = [
+        (index, node, re.sub(r"\b0x[0-9a-fA-F]{6,}\b", "<address>", observed((index, node))))
+        for index, node in sorted(after)
+    ]
+    fingerprint = hashlib.sha256(json.dumps((trial.digest, evidence)).encode()).hexdigest()
+    if fingerprint in retry.checked_caller_attempts:
+        _LOG.info("Caller-only repair repeated a checked edit and verifier outcome")
+        return None
+    outcomes = (*retry.checked_caller_attempts, fingerprint)
+    if target in after:
+        report = f"The selected check still failed: {excerpt(target[1], 180)}."
+        if message := observed(target):
+            report += "\nObserved pytest failure on this proposal: " + excerpt(message, 520)
+    else:
+        report = "The selected failure was absent from this run; other verification failed."
+    added = sorted(after.keys() - before.keys())
+    if added:
+        report += f"\nAdditional failing checks: {len(added)}."
+        for key in added[:2]:
+            report += "\n" + excerpt(key[1], 140)
+            if message := observed(key):
+                report += " — " + excerpt(message, 180)
+    delta = "\n".join(difflib.unified_diff(
+        retry.snapshot.lines, trial.lines, fromfile="retained " + method,
+        tofile="checked " + method, n=1, lineterm="",
+    ))
+    visible = frozenset(range(1, len(retry.snapshot.lines) + 1))
+    for allowance in (1400, 700, 300):
+        context = (
+            retry.caller_context + "\nPrevious caller-only proposal was discarded after verification.\n"
+            + report + "\nIts local diff (quoted data):\n" + excerpt(delta, allowance)
+            + "\nUse this outcome to try a different correction. Edit the retained numbered method below.\n"
+        )
+        prompt = context + line_range_prompt(retry.snapshot, visible_rows=visible, full_method=True) + LINE_RANGE_ENDING
+        native = context + line_range_prompt(retry.snapshot, visible_rows=visible, native=True, full_method=True)
+        requests = (
+            [{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": text}]
+            for text in (prompt, native)
+        )
+        if all(wire_size(request) <= RETRY_MESSAGE_BYTES for request in requests):
+            return replace(
+                retry, prompt=prompt, native_prompt=native, checked_caller_attempts=outcomes,
+                excluded_models=excluded, caller_routes_reopened=False, native_ready=False, native_attempted=False,
+            )
+    return None
 
 
 @dataclass(frozen=True)
@@ -3864,12 +3933,12 @@ def solve(executor, task, archive, budget, version):
     anchored_line_attempted = set()
     raw_nested_attempts = {}
 
-    def retry_numbered_route(target, line_retry, editor, *, malformed=False, after=None, range_error=None):
+    def retry_numbered_route(target, line_retry, editor, *, malformed=False, after=None, range_error=None, checked_candidate=None):
         if (
             line_retry is None
             or line_retry.checkout is not current
             or target not in failures
-            or len(line_retry.excluded_models) >= 3
+            or (len(line_retry.excluded_models) >= 3 and not (line_retry.direct_caller_only and checked_candidate is not None))
             or not editor.configured_model
         ):
             return
@@ -3877,6 +3946,11 @@ def solve(executor, task, archive, budget, version):
         if model in line_retry.excluded_models:
             return
         excluded = (*line_retry.excluded_models, model)
+        if line_retry.direct_caller_only and checked_candidate is not None and after is not None:
+            followup = _checked_caller_retry(line_retry, checked_candidate, target, failures, after, excluded[-3:])
+            if followup:
+                line_retries[target] = followup
+            return
         if line_retry.checkpoint_context and len(line_retry.alternatives) == 1:
             caller, = line_retry.alternatives
             visible = frozenset(range(1, len(caller.lines) + 1))
@@ -3901,6 +3975,7 @@ def solve(executor, task, archive, budget, version):
                 line_retries[target] = replace(
                     line_retry, snapshot=caller, allowed_rows=allowed, prompt=text, native_prompt=native,
                     alternatives=(), checkpoint_context="", direct_caller_only=True, excluded_models=excluded,
+                    caller_context=context,
                     native_ready=False, native_attempted=False,
                 )
                 return
@@ -6205,8 +6280,8 @@ def solve(executor, task, archive, budget, version):
                     notes[target] = "The scoped helper replacement did not improve the verified checks."
                     continue
                 count_model_failure(rotation_key, snapshot, editor)
-                if after.keys() == failures.keys() or (line_retry and line_retry.checkpoint_context):
-                    retry_numbered_route(target, line_retry, editor, after=after)
+                if after.keys() == failures.keys() or (line_retry and (line_retry.checkpoint_context or line_retry.direct_caller_only)):
+                    retry_numbered_route(target, line_retry, editor, after=after, checked_candidate=candidate)
                 if fresh_stock:
                     interactive_misses[target] += 1
                 if snapshot is current and (
