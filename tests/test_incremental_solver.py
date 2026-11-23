@@ -6230,14 +6230,13 @@ def test_private_fragment_choices_verify_independent_options(solver_case, caplog
 ])
 def test_private_fragment_choices_reject_ambiguous_or_unscoped_options(response):
     from github_harness_agent.review_solver import _private_fragment_choices, _LineRetry
-    from github_harness_agent.review_line_ranges import prepare_line_range_edit, select_statement_fragment
+    from github_harness_agent.review_line_ranges import prepare_line_range_edit, StatementFragment
 
     key = ("example.py", "calculate")
     original = {key[0]: "def calculate():\n    return 0\n"}
     tentative = {key[0]: "def calculate():\n    return 4\n"}
-    before = prepare_line_range_edit(original, key)
     snapshot = prepare_line_range_edit(tentative, key)
-    selected = select_statement_fragment(before, snapshot).fragment
+    selected = StatementFragment(2, 2, (original[key[0]].splitlines()[1],))
     retry = _LineRetry(None, snapshot, statement_fragment=selected, fragment_choices=2)
     with pytest.raises(ValueError):
         _private_fragment_choices(response, tentative, snapshot, retry)
