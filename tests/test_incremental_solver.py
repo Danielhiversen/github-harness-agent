@@ -837,14 +837,14 @@ def test_single_pinned_production_review_fixes_all_checks_before_authoring_regre
     assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
 
 
-@pytest.mark.parametrize("scenario", ("rename", "helper", "passing_siblings", "ancestor_error"))
+@pytest.mark.parametrize("scenario", ("rename", "helper", "helper_repair", "passing_siblings", "ancestor_error"))
 def test_only_verified_discriminating_replacement_may_retire_an_unpublished_smoke(solver_case, scenario):
     task, archive, runner, _ = solver_case
     acceptance = Path(task.pull_checks[0][-1])
     with acceptance.open("a") as source:
         source.write(
             "\ndef fixture_marker(tmp_path):\n    return tmp_path / 'offline'\n"
-            if scenario == "helper" else "\n# " + "x" * review_recovery.MAX_OPERATOR_SOURCE + "\n"
+            if scenario.startswith("helper") else "\n# " + "x" * review_recovery.MAX_OPERATOR_SOURCE + "\n"
         )
     task = replace(
         task, inline_review_threads=1, regression_base=task.base_sha,
@@ -862,9 +862,11 @@ def test_only_verified_discriminating_replacement_may_retire_an_unpublished_smok
         smoke = smoke.replace("    assert", "    if first() == -1:\n        raise RuntimeError('setup failed')\n    assert")
         strengthened = TEST.replace("test_results", "test_smoke")
         proposals = (edit(NEW_TEST, smoke, TEST), edit(NEW_TEST, smoke, strengthened))
-    elif scenario == "helper":
+    elif scenario.startswith("helper"):
         authored = "def test_offline(tmp_path):\n    assert fixture_marker(tmp_path).name == 'offline'\n"
-        proposals = (authored, authored + "    assert (first(), second()) == (1, 2)\n")
+        invalid = authored.replace("== 'offline'", "== 'incorrect'")
+        prefix = (invalid,) if scenario == "helper_repair" else ()
+        proposals = (*prefix, authored, authored + "    assert (first(), second()) == (1, 2)\n")
     else:
         proposals = (edit(NEW_TEST, smoke, other_smoke), edit(NEW_TEST, smoke, TEST))
     helper_requests = []
@@ -874,8 +876,15 @@ def test_only_verified_discriminating_replacement_may_retire_an_unpublished_smok
             result = super().complete(**kwargs)
             if "Return exactly one new Python test function" in self.prompts[-1]:
                 helper_requests.append(self.prompts[-1])
+                if len(helper_requests) == 3:
+                    assert ("alternate-free", "alternate/free") in kwargs["exclude"]
+                    assert "passed on both revisions" in helper_requests[-1]
+                    assert "'offline'" in helper_requests[-1]
                 if len(helper_requests) == 2:
                     assert ("stand-in-free", "stand-in/free") in kwargs["exclude"]
+                    if scenario == "helper_repair":
+                        assert "Current verification rejected" in helper_requests[-1]
+                        assert "'incorrect'" in helper_requests[-1]
                     result.route = "alternate-free"
                     result.configured_model = "alternate/free"
             return result
@@ -883,7 +892,7 @@ def test_only_verified_discriminating_replacement_may_retire_an_unpublished_smok
     gateway = Gateway(FIRST, SECOND, smoke, *proposals)
     verifier = runner.path / "lone-smoke-verifier"
     verifier.mkdir()
-    executor = PlainExecutor(runner, gateway, Limits(model_requests=5, concurrent_probes=1),
+    executor = PlainExecutor(runner, gateway, Limits(model_requests=len(proposals) + 3, concurrent_probes=1),
                              verification_runner=FixtureRunner(verifier))
     result = solve(executor, task, archive, _Budget(executor.limits, lambda: False, task), "fixture")
 
@@ -893,8 +902,8 @@ def test_only_verified_discriminating_replacement_may_retire_an_unpublished_smok
     assert (b"def test_smoke():" in result.patch) == (scenario in {"passing_siblings", "ancestor_error"})
     assert (b"def test_sibling():" in result.patch) == (scenario == "passing_siblings")
     assert b"def test_other_smoke():" not in result.patch
-    if scenario == "helper":
-        assert len(helper_requests) == 2
+    if scenario.startswith("helper"):
+        assert len(helper_requests) == len(proposals)
         assert all("passed on both revisions" in prompt for prompt in helper_requests)
     else:
         assert "def test_smoke():" in gateway.prompts[-1]

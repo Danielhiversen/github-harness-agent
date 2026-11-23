@@ -1330,7 +1330,7 @@ def _one_test_draft(source):
         return False
 
 
-def _operator_function_messages(projection, review, sources, new_path, ancestor, *, replace_smoke=False):
+def _operator_function_messages(projection, review, sources, new_path, ancestor, *, replace_smoke=False, feedback=""):
     request = (
         f"Write one original regression test for {new_path}.\n"
         "Return exactly one new Python test function with a test_ name and an ordinary assert. "
@@ -1341,6 +1341,7 @@ def _operator_function_messages(projection, review, sources, new_path, ancestor,
             "The current smoke test passed on both revisions. Replace it with a discriminating case.\n"
             if replace_smoke else ""
         )
+        + ("\nPrevious authored function and verification feedback (quoted):\n" + feedback if feedback else "")
         + "\nRequested behavior (quoted review):\n"
         + "\n".join(f"- {excerpt(body, 900)}" for _, _, body in review.feedback)
         + "\n\nReviewed changes (quoted):\n" + excerpt(ancestor, 1400)
@@ -3885,6 +3886,7 @@ def solve(executor, task, archive, budget, version):
     prior_test_fallback = None
     helper_setup = None
     helper_attempts = 0
+    helper_feedback = ""
     helper_bad_model = ()
     test_model_failures = Counter()
     test_tool_attempts = set()
@@ -4599,6 +4601,7 @@ def solve(executor, task, archive, budget, version):
                             prior_test_fallback = None
                             helper_setup = None
                             helper_attempts = 0
+                            helper_feedback = ""
                             helper_bad_model = ()
                             test_model_failures = Counter()
                         if repository_example is None or (pinned_ancestor and repository_checkout is not current):
@@ -4669,9 +4672,9 @@ def solve(executor, task, archive, budget, version):
                         smoke = lone_both_pass_case()
                         if (
                             production_regression and allow_test_module and fixtures and test_seed is None
-                            and (helper_attempts == 0 or helper_attempts == 1 and helper_bad_model)
+                            and (helper_attempts == 0 or helper_attempts < 3 and (helper_feedback or helper_bad_model))
                             and (
-                                smoke
+                                smoke or helper_feedback
                                 or current is resumed_verified_checkout and not test_draft and not test_case_runs
                                 or test_setup_failures >= 2
                                 and not ((run := test_case_runs.get("focused")) and run.passed)
@@ -4686,7 +4689,7 @@ def solve(executor, task, archive, budget, version):
                             if helper_setup:
                                 offered = _operator_function_messages(
                                     helper_setup, review, current, new_path, ancestor_delta,
-                                    replace_smoke=bool(smoke),
+                                    replace_smoke=bool(smoke), feedback=helper_feedback,
                                 )
                                 if wire_size(offered) <= 12 * 1024:
                                     helper_authoring = helper_setup
@@ -5474,7 +5477,16 @@ def solve(executor, task, archive, budget, version):
                         )
                 candidate_run = next_case_runs.get("focused")
                 smoke = lone_both_pass_case() if snapshot is current else None
-                if helper_authoring is not None and (smoke or next_passed_ancestor) and result is None:
+                if helper_authoring is not None and result is None:
+                    outcome = "Current verification rejected the function. Correct its setup or assertions."
+                    if next_passed_ancestor:
+                        outcome = "The function passed on both revisions. Strengthen its scenario and assertions."
+                    elif next_ancestor_feedback:
+                        outcome = "The pinned run did not establish an assertion failure in the test."
+                    helper_feedback = (
+                        outcome + "\n" + excerpt(next_ancestor_feedback or next_diagnostic, 550)
+                        + "\nPrevious function:\n" + excerpt(completion.content or "", 1200)
+                    )
                     if editor.configured_model:
                         helper_bad_model = editor.route, editor.configured_model
                 if helper_authoring is not None and (
