@@ -17,6 +17,7 @@ from github_harness_agent.providers import (
     import_profiles,
     load_manifest,
 )
+from github_harness_agent.review_line_ranges import NATIVE_LINE_RANGE_TOOL
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -506,6 +507,85 @@ def test_provider_failures_use_next_eligible_model(first):
         .route
         == "ollama-local"
     )
+
+
+@pytest.mark.parametrize("first", (KILO, GOOGLE))
+@pytest.mark.parametrize("bad_count", (0, 2))
+def test_required_numbered_tool_rotates_after_wrong_call_count(first, bad_count, caplog):
+    requests = []
+    expected_name = NATIVE_LINE_RANGE_TOOL["function"]["name"]
+    args = {"edits": [{"start": 2, "end": 2, "lines": ["    return 2"]}]}
+    clarification = '{"clarification":"Fixture content must stay out of logs?"}'
+
+    def handler(request):
+        gateway = request.url.host.split(".")[0]
+        requests.append((gateway, json.loads(request.content)))
+        count = bad_count if len(requests) == 1 else 1
+        if gateway == "google":
+            parts = [
+                {"functionCall": {"id": f"call-{i}", "name": expected_name, "args": args}}
+                for i in range(count)
+            ] or [{"text": clarification}]
+            return httpx.Response(200, json={"candidates": [{"content": {"parts": parts}}]})
+        message = {
+            "tool_calls": [
+                {
+                    "id": f"call-{i}",
+                    "type": "function",
+                    "function": {"name": expected_name, "arguments": json.dumps(args)},
+                }
+                for i in range(count)
+            ],
+            "content": None if count else clarification,
+        }
+        return httpx.Response(200, json={"choices": [{"message": message}]})
+
+    router = routed(deployment(first, GROQ), handler)
+    with caplog.at_level(logging.INFO):
+        result = router.complete(
+            role="coding", messages=[{"role": "user", "content": "Edit the numbered lines."}],
+            tools=(NATIVE_LINE_RANGE_TOOL,),
+        )
+
+    assert result.route == "groq-free"
+    assert len(result.tool_calls) == 1
+    assert json.loads(result.tool_calls[0]["function"]["arguments"]) == args
+    assert [gateway for gateway, _ in requests] == [first.split("/")[0], "groq-free"]
+    for gateway, payload in requests:
+        if gateway == "google":
+            assert payload["toolConfig"]["functionCallingConfig"] == {
+                "mode": "ANY", "allowedFunctionNames": [expected_name],
+            }
+        else:
+            assert payload["tool_choice"] == {"type": "function", "function": {"name": expected_name}}
+    assert f"calls={bad_count}" in caplog.text
+    assert "Fixture content must stay out of logs" not in caplog.text
+
+
+@pytest.mark.parametrize("call_count", (0, 2))
+def test_lookalike_tool_schema_keeps_optional_reply_contract(call_count):
+    tool = {
+        **NATIVE_LINE_RANGE_TOOL,
+        "function": {**NATIVE_LINE_RANGE_TOOL["function"], "description": "Optional local fixture tool."},
+    }
+    clarification = '{"clarification":"Which lines should be edited?"}'
+
+    def handler(request):
+        assert "tool_choice" not in json.loads(request.content)
+        message = {
+            "content": None if call_count else clarification,
+            "tool_calls": [
+                {"id": f"call-{i}", "function": {"name": tool["function"]["name"], "arguments": '{"edits":[]}'}}
+                for i in range(call_count)
+            ],
+        }
+        return httpx.Response(200, json={"choices": [{"message": message}]})
+
+    router = routed(deployment(KILO), handler)
+    result = router.complete(role="coding", messages=[{"role": "user", "content": "Review."}], tools=(tool,))
+    assert len(result.tool_calls) == call_count
+    if not call_count:
+        assert result.content == clarification
 
 
 def test_gemini_tool_round_trip_replays_provider_signature():

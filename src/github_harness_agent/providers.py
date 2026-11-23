@@ -30,6 +30,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from .review_definitions import CAUSAL_EDIT_GUIDANCE, DEFINITION_ENDING, LOCALIZED_METHOD_HEADING
+from .review_line_ranges import NATIVE_LINE_RANGE_TOOL
 from .task_context import (
     MESSAGE_BYTES,
     compact_focused_review,
@@ -220,6 +221,12 @@ def _call(identifier: str, name: str, arguments: Any) -> dict:
     }
 
 
+def _required_numbered_tool_name(tools):
+    if len(tools) == 1 and tools[0] == NATIVE_LINE_RANGE_TOOL:
+        return NATIVE_LINE_RANGE_TOOL["function"]["name"]
+    return None
+
+
 def _gemini_payload(
     route: _Route,
     messages: Sequence[Mapping],
@@ -297,6 +304,10 @@ def _gemini_payload(
             for tool in tools
         ]
         body["tools"] = [{"functionDeclarations": declarations}]
+        if name := _required_numbered_tool_name(tools):
+            body["toolConfig"] = {
+                "functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [name]},
+            }
     return body
 
 
@@ -355,6 +366,11 @@ def _chat_payload(
         body["provider"] = {"max_price": {"prompt": 0, "completion": 0}}
     if tools:
         body["tools"] = list(tools)
+        if name := _required_numbered_tool_name(tools):
+            if route.alias in {"kilo-free", "groq-free", "openrouter", "openrouter-free"}:
+                body["tool_choice"] = {"type": "function", "function": {"name": name}}
+            elif route.alias == "mistral":
+                body["tool_choice"] = "any"
     return body
 
 
@@ -362,6 +378,7 @@ def _decode(
     route: _Route, role: str, body: dict, tools: Sequence[Mapping]
 ) -> Completion:
     context = None
+    required_numbered_tool = _required_numbered_tool_name(tools)
     if route.protocol == "gemini":
         candidate = body["candidates"][0]
         if candidate.get("finishReason") not in {None, "STOP"}:
@@ -374,7 +391,7 @@ def _decode(
         calls = tuple(
             _call(fn.get("id") or f"gemini-{index}", fn["name"], fn.get("args", {}))
             for index, part in enumerate(parts)
-            if (fn := part.get("functionCall"))
+            if (fn := part.get("functionCall")) or (required_numbered_tool and "functionCall" in part)
         )
         usage = body.get("usageMetadata") or {}
         input_tokens = usage.get("promptTokenCount")
@@ -395,12 +412,19 @@ def _decode(
             _call(call["id"], call["function"]["name"], call["function"]["arguments"])
             for call in (message.get("tool_calls") or [])
         )
-        if not calls and (legacy := message.get("function_call")):
-            calls = (_call("legacy-function", legacy["name"], legacy["arguments"]),)
+        if (not calls or required_numbered_tool) and (legacy := message.get("function_call")):
+            calls += (_call("legacy-function", legacy["name"], legacy["arguments"]),)
         usage = body.get("usage") or {}
         input_tokens = usage.get("prompt_tokens")
         output_tokens = usage.get("completion_tokens")
         model = body.get("model") or route.model
+
+    if required_numbered_tool and len(calls) != 1:
+        logger.info(
+            "Provider rejected required numbered tool count provider=%s configured_model=%s calls=%d",
+            route.alias, route.model, len(calls),
+        )
+        raise ValueError("Provider must return exactly one numbered tool call")
 
     allowed_tools = {
         tool["function"]["name"]: tool["function"].get("parameters", {})
