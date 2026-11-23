@@ -345,12 +345,38 @@ def _single_hunk(response, path, original):
     return start - 1, old, new
 
 
+def _complete_method_edits(text, snapshot):
+    rows = text.splitlines()
+    indent = re.match(r"[ \t]*", snapshot.lines[0])[0]
+    if indent and not rows[0].startswith(indent):
+        rows = [indent + row if row else row for row in rows]
+    body = snapshot.first_body_line - 1
+    if tuple(rows[:body]) != snapshot.lines[:body]:
+        raise ValueError("Complete method must preserve the exact header and decorators")
+    old = snapshot.lines[body:]
+    new = rows[body:]
+    edits = []
+    for op, i, j, k, n in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        replacement = new[k:n]
+        if i == j:
+            if i:
+                i -= 1
+                replacement = [old[i], *replacement]
+            else:
+                j += 1
+                replacement = [*replacement, old[0]]
+        edits.append({"start": body + i + 1, "end": body + j, "lines": replacement})
+    return edits
+
+
 def apply_offered_line_reply(response, sources, snapshots, *, block_pattern, full_method=False):
     """Bind a textual free-model edit to one of the actually offered full definitions."""
     if not isinstance(response, str) or not 0 < len(response.encode()) <= _MAX_REPLY:
         raise ValueError("Expected a bounded scoped edit")
     text = response.replace("\r\n", "\n").strip("\n")
-    fenced = re.fullmatch(r"```(?:json|diff|patch|text)?[ \t]*\n(.*)\n```", text, re.S | re.I)
+    fenced = re.fullmatch(r"```(?:json|diff|patch|text|python|py)?[ \t]*\n(.*)\n```", text, re.S | re.I)
     if fenced:
         text = fenced[1]
     path = snapshots[0].symbol[0]
@@ -373,10 +399,15 @@ def apply_offered_line_reply(response, sources, snapshots, *, block_pattern, ful
                 matches = [s for s in matches if s.digest.startswith(prefix)]
             else:
                 matches = [s for s in matches if prefix in (s.symbol[1], "::".join(s.symbol))]
-        if len(matches) != 1 or not ({"symbol", "snapshot"} & payload.keys()):
+        if len(matches) != 1:
             raise ValueError("The reply must identify exactly one offered definition")
         selected = matches[0]
         edits = payload["edits"]
+    elif re.match(r"(?:@|(?:async[ \t]+)?def[ \t]+)", text.lstrip()):
+        if len(snapshots) != 1 or not full_method:
+            raise ValueError("A complete method requires one fully displayed definition")
+        selected = snapshots[0]
+        edits = _complete_method_edits(text, selected)
     else:
         if text.startswith(("diff --git ", "--- ")):
             start, old, new = _single_hunk(text, path, original)

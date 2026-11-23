@@ -1170,7 +1170,7 @@ def test_checked_caller_feedback_is_local_bounded_and_stops_duplicate_attempts(c
     assert "return 2" not in caplog.text and "candidate observation" not in caplog.text
 
 
-@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long", "checkpoint-caller", "checkpoint-caller-block", "checkpoint-caller-after-format", "checkpoint-caller-after-rejection", "checkpoint-caller-after-exhaustion", "checkpoint-caller-after-wider", "checkpoint-caller-after-semantic"))
+@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long", "checkpoint-caller", "checkpoint-caller-block", "checkpoint-caller-after-format", "checkpoint-caller-after-rejection", "checkpoint-caller-after-exhaustion", "checkpoint-caller-after-wider", "checkpoint-caller-after-semantic", "checkpoint-caller-after-implicit", "checkpoint-caller-after-method"))
 def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, failover, caplog):
     task, _, runner, checkpoints = solver_case
     raw_mode = failover in {"raw", "raw-restored"}
@@ -1344,6 +1344,12 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
                             assert re.search(r"(?m)^\d+ \|         return self.read\(\) - 2$", prompt)
                             reply.route, reply.configured_model = "numbered-free-c", "third-code-model"
                             reply.content = edit(SOURCE, "        return self.read() - 2\n", "        return self.read() + 2\n")
+                    elif failover.endswith("implicit"):
+                        assert "may omit snapshot" in prompt
+                        reply.content = json.dumps({"edits": [{"start": 2, "end": 2, "lines": ["        return self.read() + 2"]}]})
+                    elif failover.endswith("method"):
+                        assert "complete Python method" in prompt and "exact SEARCH/REPLACE" in prompt
+                        reply.content = "def dispatch(self):\n    return self.read() + 2"
                     elif wider:
                         assert "to 48 in total" in prompt
                         reply.content = json.dumps({"symbol": "Reader.dispatch", "edits": [{

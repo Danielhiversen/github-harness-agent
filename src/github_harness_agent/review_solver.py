@@ -212,8 +212,13 @@ _TEST_MODULE_SYSTEM = (
 _DEFINITION_SYSTEM = _SYSTEM_PREFIX + DEFINITION_FORMAT + "\n" + _SYSTEM_SUFFIX
 _LINE_RANGE_SYSTEM = (
     _SYSTEM_PREFIX
-    + "Use only the numbered line-range JSON edit format in the request.\n"
+    + "Use only an edit format explicitly permitted in the request.\n"
     + _SYSTEM_SUFFIX
+)
+_SINGLE_METHOD_ENDING = (
+    "Return one edit. For this sole method you may omit snapshot from the JSON. "
+    "Alternatively return one exact SEARCH/REPLACE block, or the complete Python method with its "
+    "exact header and a small body change. The same scope and changed-row limits apply."
 )
 _BLOCK = re.compile(
     r"^([^\n`]+\.py)\n<<<<<<< SEARCH\n(.*?)^=======\n(.*?)^>>>>>>> REPLACE[ \t]*(?:\n|$)",
@@ -2133,7 +2138,7 @@ def _checked_caller_retry(retry, candidate, target, before, after, excluded):
             + report + "\nIts local diff (quoted data):\n" + excerpt(delta, allowance)
             + "\nUse this outcome to try a different correction. Edit the retained numbered method below.\n"
         )
-        prompt = context + line_range_prompt(retry.snapshot, visible_rows=visible, full_method=True) + LINE_RANGE_ENDING
+        prompt = context + line_range_prompt(retry.snapshot, visible_rows=visible, full_method=True) + _SINGLE_METHOD_ENDING
         native = context + line_range_prompt(retry.snapshot, visible_rows=visible, native=True, full_method=True)
         requests = (
             [{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": text}]
@@ -2225,7 +2230,7 @@ def _review_anchored_line_retry(review, sources, path, node, diagnostic, *, whol
                     if len(choices) == 2:
                         break
                 if not choices:
-                    prompt = heading + line_range_prompt(snapshot, visible_rows=visible, full_method=True) + LINE_RANGE_ENDING
+                    prompt = heading + line_range_prompt(snapshot, visible_rows=visible, full_method=True) + _SINGLE_METHOD_ENDING
                     native = heading + line_range_prompt(snapshot, visible_rows=visible, native=True, full_method=True)
                     if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": prompt}]) <= RETRY_MESSAGE_BYTES:
                         retry = replace(retry, prompt=prompt, native_prompt=native)
@@ -3969,7 +3974,7 @@ def solve(executor, task, archive, budget, version):
                     if observed:
                         result += "\nObserved pytest failure on the previous proposal: " + excerpt(observed, 350)
             context = line_retry.checkpoint_context + result + "\nWork only on the direct caller shown below.\n"
-            text = context + line_range_prompt(caller, visible_rows=visible, full_method=True) + LINE_RANGE_ENDING
+            text = context + line_range_prompt(caller, visible_rows=visible, full_method=True) + _SINGLE_METHOD_ENDING
             native = context + line_range_prompt(caller, visible_rows=visible, native=True, full_method=True)
             if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": text}]) <= RETRY_MESSAGE_BYTES:
                 line_retries[target] = replace(
@@ -5538,7 +5543,7 @@ def solve(executor, task, archive, budget, version):
                         if candidate == source:
                             raise ValueError("The pytest edit did not change the draft.")
                     if candidate is None and active_line_snapshot is not None:
-                        if scoped_line and (line_retry.alternatives or line_retry.direct_caller_only):
+                        if scoped_line and (line_retry.alternatives or line_retry.complete_single_method):
                             candidate = apply_offered_line_reply(
                                 completion.content, source, (line_retry.snapshot, *line_retry.alternatives), block_pattern=_BLOCK,
                                 full_method=line_retry.complete_single_method,

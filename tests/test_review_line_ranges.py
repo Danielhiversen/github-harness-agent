@@ -343,3 +343,41 @@ def test_full_and_partial_method_limits_report_counts_without_content():
     with pytest.raises(ValueError, match="valid Python"):
         apply_line_range_edit(invalid, sources, snapshot, allowed_rows=allowed, full_method=True)
     assert "confidential" not in sources[PATH]
+
+
+@pytest.mark.parametrize("form", ("implicit", "python", "indented"))
+def test_sole_method_text_rechecks_snapshot_and_preserves_other_definitions(form):
+    from github_harness_agent.review_solver import _BLOCK
+
+    sources = {PATH: SOURCE}
+    snapshot = prepare_line_range_edit(sources, (PATH, "Queue.unrelated"))
+    raw = "def unrelated(self):\n    return 10"
+    reply = {
+        "implicit": json.dumps({"edits": [_edit(2, 2, "        return 10")]}),
+        "python": "```python\n" + raw + "\n```",
+        "indented": "    def unrelated(self):\n        return 10",
+    }[form]
+    def apply(current, choices):
+        return apply_offered_line_reply(reply, current, choices, block_pattern=_BLOCK, full_method=True)
+    assert apply(sources, (snapshot,)) == {PATH: SOURCE.replace("return 9", "return 10")}
+    with pytest.raises(ValueError):
+        apply({PATH: "# stale\n" + SOURCE}, (snapshot,))
+    with pytest.raises(ValueError):
+        apply(sources, (snapshot, _prepare(sources)))
+
+
+@pytest.mark.parametrize("reply", (
+    "def different(self):\n    return 10", "def unrelated(self, other):\n    return 10",
+    "async def unrelated(self):\n    return 10", "@property\ndef unrelated(self):\n    return 10",
+    "def unrelated(self):\n    return 10\ndef foreign():\n    return 12",
+    "def unrelated(self):\n    return (", "def unrelated(self):\n" + "    pass\n" * 50,
+    json.dumps({"path": "other.py", "edits": [_edit(2, 2, "        return 10")]}),
+    json.dumps({"snapshot": "unknown", "edits": [_edit(2, 2, "        return 10")]}),
+))
+def test_sole_method_text_rejects_foreign_invalid_or_oversize_replies(reply):
+    from github_harness_agent.review_solver import _BLOCK
+
+    sources = {PATH: SOURCE}
+    snapshot = prepare_line_range_edit(sources, (PATH, "Queue.unrelated"))
+    with pytest.raises(ValueError):
+        apply_offered_line_reply(reply, sources, (snapshot,), block_pattern=_BLOCK, full_method=True)
