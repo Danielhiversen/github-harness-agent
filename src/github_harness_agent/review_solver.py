@@ -3774,7 +3774,8 @@ def solve(executor, task, archive, budget, version):
     test_format_failures = 0
     test_setup_failures = 0
     prior_test_attempted = False
-    prior_test_example = ""
+    prior_test_source = ""
+    prior_test_fallback = None
     test_model_failures = Counter()
     test_tool_attempts = set()
     test_line_attempts = set()
@@ -3787,16 +3788,16 @@ def solve(executor, task, archive, budget, version):
     repository_models = ""
     attempted_seed_cases = set()
 
-    def verified_prior_example():
+    def verified_prior_seed():
         if budget.commands_remaining() < len(commands) + 6 or budget.remaining() < 35:
-            return ""
+            return None
         previous = prior_generated_test_seed(
             archive, task.regression_archive, new_path,
             {path: current[path] for path in paths if not _protected(path, task, new_test=False)},
             " ".join(body for _, _, body in review.feedback),
         )
         if previous is None:
-            return ""
+            return None
         path, name, source = previous
         projected = patch_for({new_path: ""}, {new_path: source})
         proof = _GuardBudget(budget, wall_seconds=25)
@@ -3813,17 +3814,13 @@ def solve(executor, task, archive, budget, version):
                     (run := runs.get(0)) and run.passed == 1
                     and _covers_generated_seed(run, new_path, (name,))
                 ):
-                    return ""
+                    return None
         except Cancelled:
             raise
         except (ExecutionError, LimitExceeded):
             budget.remaining()
-            return ""
-        return (
-            f"# Prior test seed passed on both revisions. Source: {path}.\n"
-            "# Reuse its setup in a self-contained new module and assert the requested behavior "
-            "that differs on the pinned ancestor.\n" + source
-        )
+            return None
+        return path, name, source, run
 
     def count_test_model_failure(snapshot, editor, categories):
         if snapshot is current and test_model_failures is not None and editor.configured_model:
@@ -4410,12 +4407,9 @@ def solve(executor, task, archive, budget, version):
                             test_case_runs = {}
                             test_setup_failures = 0
                             prior_test_attempted = False
-                            prior_test_example = ""
+                            prior_test_source = ""
+                            prior_test_fallback = None
                             test_model_failures = Counter()
-                        revision = (test_checkout_digest, hashlib.sha256(test_draft.encode()).digest())
-                        if revision != test_format_revision:
-                            test_format_revision = revision
-                            test_format_failures = 0
                         if repository_example is None or (pinned_ancestor and repository_checkout is not current):
                             repository_checkout = current
                             reviewed_sources = {path: current[path] for path in paths}
@@ -4453,9 +4447,33 @@ def solve(executor, task, archive, budget, version):
                         if (
                             production_regression and allow_test_module and focused_generated
                             and test_setup_failures >= 2 and not prior_test_attempted
+                            and not ((run := test_case_runs.get("focused")) and run.passed)
                         ):
                             prior_test_attempted = True
-                            prior_test_example = verified_prior_example()
+                            if seed := verified_prior_seed():
+                                path, name, prior_test_source, run = seed
+                                prior_test_fallback = (
+                                    test_draft, test_diagnostic, test_ancestor_feedback,
+                                    test_rejection, test_case_runs,
+                                )
+                                test_draft = prior_test_source
+                                test_case_runs = {"focused": run}
+                                test_rejection = None
+                                test_diagnostic = (
+                                    f"This editable predecessor seed from {path} passed on both revisions. "
+                                    f"Keep its working setup and strengthen {new_path}::{name} to assert the "
+                                    "requested behavior. Prefer one named replacement of that test function."
+                                )
+                                test_ancestor_feedback = (
+                                    "The editable predecessor seed also passed on the pinned ancestor. "
+                                    "Author an assertion that passes here and fails there."
+                                )
+                                notes.pop(target, None)
+                                _LOG.info("Started new pytest authoring from the verified predecessor seed")
+                        revision = (test_checkout_digest, hashlib.sha256(test_draft.encode()).digest())
+                        if revision != test_format_revision:
+                            test_format_revision = revision
+                            test_format_failures = 0
                         native_test = (
                             allow_test_module
                             and test_format_failures >= 2
@@ -4693,7 +4711,7 @@ def solve(executor, task, archive, budget, version):
                         mock_detail=mock_detail,
                         parameter_focus=parameter_focus,
                         allow_test_module=allow_test_module,
-                        repository_example=prior_test_example or repository_example or "",
+                        repository_example=repository_example or "",
                         repository_usage=repository_usage,
                         repair_failed_tests=target == _TEST_GOAL and bool(test_draft and test_diagnostic),
                         prefer_test_module=bool(
@@ -5225,6 +5243,21 @@ def solve(executor, task, archive, budget, version):
                 )
                 previous_run = test_case_runs.get("focused")
                 candidate_run = next_case_runs.get("focused")
+                if prior_test_fallback is not None and snapshot is current:
+                    if candidate_run and candidate_run.passed and not lost_test:
+                        prior_test_fallback = None
+                    elif focused_rejection is not None and not (candidate_run and candidate_run.assertion_reached):
+                        (
+                            test_draft, test_diagnostic, test_ancestor_feedback,
+                            test_rejection, test_case_runs,
+                        ) = prior_test_fallback
+                        prior_test_fallback = None
+                        notes[target] = (
+                            "The seeded edit failed before reaching a test-body assertion. "
+                            "Restored the previous unpublished draft."
+                        )
+                        _LOG.info("Restored the previous pytest draft after the seeded edit regressed setup")
+                        continue
                 if (
                     production_regression and allow_test_module and snapshot is current
                     and focused_rejection is not None
@@ -5285,6 +5318,11 @@ def solve(executor, task, archive, budget, version):
                     _LOG.info("Retained the prior unpublished draft after losing a verified passing pytest case")
                     continue
                 if result is not None:
+                    if next_draft == prior_test_source:
+                        notes[target] = (
+                            "Strengthen the predecessor seed with an assertion for the reviewed behavior."
+                        )
+                        continue
                     if test_seed is not None and (
                         next_draft == test_seed.source
                         or not _covers_generated_seed(

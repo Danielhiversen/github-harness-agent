@@ -708,8 +708,8 @@ TEST = (
 
 @pytest.mark.parametrize(
     ("oversized", "committed_setup"),
-    ((False, False), (True, False), (False, True), (False, "retry")),
-    ids=("quoted", "oversized", "committed-setup", "prior-green-seed"),
+    ((False, False), (True, False), (False, True), (False, "retry"), (False, "fallback")),
+    ids=("quoted", "oversized", "committed-setup", "prior-green-seed", "prior-seed-fallback"),
 )
 def test_single_pinned_production_review_fixes_all_checks_before_authoring_regression(
     solver_case, oversized, committed_setup,
@@ -754,17 +754,25 @@ def test_single_pinned_production_review_fixes_all_checks_before_authoring_regre
         regression_base=task.base_sha, regression_archive=archive, regression_edit_path=SOURCE,
     )
     proposals = (TEST,)
-    if committed_setup == "retry":
+    if committed_setup in {"retry", "fallback"}:
         missing = "def test_missing(missing_setup):\n    assert missing_setup\n"
         still_missing = missing.replace("missing_setup", "other_setup")
-        unchanged = previous.decode()
-        corrected = unchanged.replace("import first\n", "import first, second\n").replace(
-            "assert first() in {-1, 1}, 'old assertion marker'",
-            "assert (first(), second()) == (1, 2)",
-        )
+        target = f"REPLACE {test_path}::test_previous\n"
         proposals = (
             missing, edit(test_path, missing, still_missing),
-            edit(test_path, still_missing, unchanged), edit(test_path, unchanged, corrected),
+            *(
+                (
+                    target + "def test_previous(sample_config):\n    assert first() != 0\n",
+                    target + "def test_previous(sample_config):\n"
+                    "    from fixture_calc import second\n"
+                    "    assert (first(), second()) == (1, 2)\n",
+                )
+                if committed_setup == "retry" else
+                (
+                    target + "def test_previous(missing_seed_fixture):\n    assert first() == 1\n",
+                    edit(test_path, still_missing, TEST),
+                )
+            ),
         )
     gateway = FreeGateway(FIRST, SECOND, *proposals)
     independent = runner.path / "production-regression-verifier"
@@ -789,14 +797,23 @@ def test_single_pinned_production_review_fixes_all_checks_before_authoring_regre
     if committed_setup:
         assert "def sample_config(tmp_path):" in proof
         assert "def test_previous" not in proof and "old assertion marker" not in proof
+    if committed_setup in {"retry", "fallback"}:
+        assert "editable predecessor seed" not in retries[0]
+        draft = retries[1].split(f"Unpublished test file {test_path} to revise:\n", 1)[1]
+        assert "editable predecessor seed" in retries[1]
+        assert "def test_previous(sample_config):" in draft
+        assert "def make_config(tmp_path):" in draft
+        assert "def test_missing" not in draft
+        assert f"+++ b/{NEW_TEST}\n".encode() not in result.patch
     if committed_setup == "retry":
-        assert "Prior test seed passed on both revisions" not in retries[0]
-        assert "Prior test seed passed on both revisions" in retries[1]
-        assert "def test_previous(sample_config):" in retries[1]
-        assert "def make_config(tmp_path):" in retries[1]
         assert "The new tests also pass on the ancestor" in retries[2]
         assert b"old assertion marker" not in result.patch
-        assert f"+++ b/{NEW_TEST}\n".encode() not in result.patch
+        assert b"+def make_config(tmp_path):" in result.patch
+        assert b"+    assert (first(), second()) == (1, 2)" in result.patch
+    elif committed_setup == "fallback":
+        assert "Restored the previous unpublished draft" in retries[2]
+        assert "def test_missing(other_setup):" in retries[2]
+        assert b"+def make_config(tmp_path):" not in result.patch
     assert b"+    return 1\n" in result.patch and b"+    return 2\n" in result.patch
     assert f"+++ b/{test_path}".encode() in result.patch
     assert any(check.command == task.pull_checks[0] and check.returncode == 0 for check in result.checks)
