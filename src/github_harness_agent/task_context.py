@@ -29,6 +29,9 @@ TEST_REPAIR_GUIDANCE = (
 )
 TEST_VERIFICATION_FEEDBACK = "\nLatest verification or edit feedback:\n"
 TEST_VERIFICATION_SOURCE = "\nVerified failure source (quoted data):\n"
+TEST_ANCESTOR_EVIDENCE = "\nPinned regression ancestor (quoted verification and source):\n"
+TEST_ONLY_REQUIREMENTS = "\nTest-only requirements (quoted review):\n"
+TEST_ONLY_CONTEXT = "\nTest authoring context:\n"
 PAGE_CHARS = 1800
 HISTORY_PAGES = 12
 HISTORY_ROWS = 4
@@ -653,10 +656,30 @@ def compact_focused_review(messages, *, max_bytes):
         kept = summary + focused + details + selected
     else:
         front, names_marker, tail = lead.partition("\nOperator test names:")
+        if not names_marker and test_path:
+            front, names_marker, tail = lead.partition(TEST_ONLY_CONTEXT)
         examples, usage_marker, usage = front.partition(REPOSITORY_PYTEST_USAGE)
         operator, example_marker, example = examples.partition(REPOSITORY_PYTEST_EXAMPLE)
         before, contract_marker, contract = operator.partition(OPERATOR_API_CONTRACT)
         before, helpers_marker, helpers = before.partition(REVIEWED_TEST_HELPERS)
+        priority = ""
+        selected_goal, requirements_marker, requirements = before.partition(TEST_ONLY_REQUIREMENTS)
+        if test_path and requirements_marker:
+            details, edit_marker, instructions = requirements.partition("\nEdit only ")
+            if edit_marker:
+                block = selected_goal + requirements_marker + details
+                requested, ancestor_marker, ancestor = block.partition(TEST_ANCESTOR_EVIDENCE)
+                priority = _bounded_content(requested + "\n", budget)
+                if priority:
+                    remaining = budget - wire_size(priority)
+                    if ancestor_marker:
+                        priority += _whole_line_prefix(
+                            ancestor_marker + ancestor + "\n",
+                            min(1400, remaining - min(250, remaining // 4)),
+                        )
+                    budget -= wire_size(priority)
+                    before = edit_marker + instructions
+                    lead = lead.removeprefix(block)
         preserved = ""
         if repair_guidance and TEST_VERIFICATION_FEEDBACK in tail:
             names, details_marker, details = tail.partition(TEST_VERIFICATION_FEEDBACK)
@@ -686,6 +709,7 @@ def compact_focused_review(messages, *, max_bytes):
         else:
             kept = _bounded_content(lead, budget)
             kept += _bounded_content(marker + fixture, budget - wire_size(kept))
+        kept = priority + kept
     compact = [system, {**request, "content": kept + footer}]
     return compact if wire_size(compact) <= max_bytes else None
 

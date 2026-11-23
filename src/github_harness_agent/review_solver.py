@@ -54,7 +54,7 @@ from .review_composition import (
 )
 from .review_delta_context import interactive_stock_focus
 from .review_assertions import assertion_progress, operator_assertions
-from .review_delta_context import private_operator_source
+from .review_delta_context import private_operator_source, reviewed_ancestor_delta
 from .review_prefix_replay import observe_prefix_progress
 from .review_definitions import (
     CAUSAL_EDIT_GUIDANCE,
@@ -121,6 +121,9 @@ from .task_context import (
     REPOSITORY_PYTEST_USAGE,
     REVIEWED_TEST_HELPERS,
     TEST_MODULE_REPLY_ENDING,
+    TEST_ANCESTOR_EVIDENCE,
+    TEST_ONLY_CONTEXT,
+    TEST_ONLY_REQUIREMENTS,
     TEST_REPAIR_GUIDANCE,
     TEST_REVIEW_BEHAVIORS,
     TEST_VERIFICATION_FEEDBACK,
@@ -1167,12 +1170,15 @@ def _regression_api(path, content, query, limit, *, anchors=()):
 def _test_authoring_messages(
     current, review, fixtures, interfaces, new_path, note, *,
     allow_test_module=False, repository_example="", repository_usage="",
-    repair_failed_tests=False,
+    repair_failed_tests=False, ancestor_evidence="",
 ):
     behaviors = list(
         dict.fromkeys(" ".join(body.split()) for _, _, body in review.feedback)
     )
-    names, setup = _regression_context(fixtures)
+    names, setup = ("", "") if review.test_only else _regression_context(fixtures)
+    requirements = "\n".join(
+        f"- {excerpt(body, 900 if review.test_only else 320)}" for body in behaviors if body
+    )
     test_query = words(" ".join([*behaviors, names, setup, note]))
     sources = {path: content for path, content in current.items() if path != new_path}
     failure_source = test_failure_focus(sources, note) if repair_failed_tests else ""
@@ -1220,7 +1226,10 @@ def _test_authoring_messages(
     )
     request = (
         "Selected failure: new regression tests\n"
+        + (TEST_ONLY_REQUIREMENTS + requirements + "\n" if review.test_only else "")
+        + (TEST_ANCESTOR_EVIDENCE + ancestor_evidence + "\n" if ancestor_evidence else "")
         + setup_guidance
+        + ("\n" if review.test_only else "")
         + f"Edit only {new_path}. "
         + (
             TEST_REPAIR_GUIDANCE
@@ -1235,9 +1244,9 @@ def _test_authoring_messages(
         + (
             "Use the already-passing acceptance suite as behavior and setup context only. "
             "Avoid copying its cases or reproducing its inventory in the repository tests."
+            if not review.test_only else ""
         )
-        + TEST_REVIEW_BEHAVIORS
-        + "\n".join(f"- {excerpt(body, 320)}" for body in behaviors if body)
+        + (TEST_REVIEW_BEHAVIORS + requirements if not review.test_only else "")
         + (REVIEWED_TEST_HELPERS + "".join(reviewed_helpers) if reviewed_helpers else "")
         + (OPERATOR_API_CONTRACT + operator_contract + "\n" if operator_contract else "")
         + (
@@ -1245,7 +1254,7 @@ def _test_authoring_messages(
             if repository_example else ""
         )
         + (REPOSITORY_PYTEST_USAGE + repository_usage + "\n" if repository_usage else "")
-        + f"\nOperator test names: {names}\n"
+        + (TEST_ONLY_CONTEXT if review.test_only else f"\nOperator test names: {names}\n")
         + (
             TEST_VERIFICATION_FEEDBACK + excerpt(note, 1600) + "\n"
             if note
@@ -1256,8 +1265,7 @@ def _test_authoring_messages(
         + "\n".join(api)
         + "\nFixture for this goal:\n"
         + (f"Unpublished test file {new_path} to revise:\n{draft}\n" if draft else "")
-        + "Operator fixture setup excerpt (quoted data):\n"
-        + setup
+        + ("Operator fixture setup excerpt (quoted data):\n" + setup if not review.test_only else "")
         + "\nImported API declarations:\n"
         + excerpt("\n".join(interfaces), 1300)
         + f"\nNew test file: {new_path}\n"
@@ -1321,6 +1329,7 @@ def _proposal_messages(
     repository_example="",
     repository_usage="",
     repair_failed_tests=False,
+    ancestor_evidence="",
 ):
     if target == _TEST_GOAL:
         return _test_authoring_messages(
@@ -1334,6 +1343,7 @@ def _proposal_messages(
             repository_example=repository_example,
             repository_usage=repository_usage,
             repair_failed_tests=repair_failed_tests,
+            ancestor_evidence=ancestor_evidence,
         )
     diagnostic = failures.get(
         target,
@@ -2113,6 +2123,15 @@ def solve(executor, task, archive, budget, version):
     failures = evidence(executor, task, archive, budget, patch, commands, pytest_runs=pytest_runs)
     if review.test_only and failures:
         raise ExecutionError("Required checks failed on the unchanged baseline for the test-only review")
+    pinned_ancestor = bool(review.test_only and task.regression_base and task.regression_archive)
+    ancestor_delta = (
+        reviewed_ancestor_delta(
+            task.regression_archive,
+            {path: current[path] for path in paths if not _protected(path, task, new_test=False)},
+            review.feedback,
+        )
+        if pinned_ancestor else ""
+    )
     notes = {}
     rejected = {}
     last_routes = {}
@@ -3412,6 +3431,7 @@ def solve(executor, task, archive, budget, version):
         if test_seed else ""
     )
     test_rejection = None
+    test_ancestor_feedback = ""
     fixture_requests = (
         explicit_fixture_requests(review.feedback) if task.inline_review_threads >= 2 else ()
     )
@@ -4207,6 +4227,12 @@ def solve(executor, task, archive, budget, version):
                         repository_example=repository_example or "",
                         repository_usage=repository_usage,
                         repair_failed_tests=target == _TEST_GOAL and bool(test_draft and test_diagnostic),
+                        ancestor_evidence=(
+                            (test_ancestor_feedback or
+                             "Write an assertion that passes here and fails on the pinned ancestor.")
+                            + ("\n" + ancestor_delta if ancestor_delta else "")
+                            if target == _TEST_GOAL and pinned_ancestor else ""
+                        ),
                         rejection=(
                             _private_repair_context(current, repair)
                             if repair is not None
@@ -4596,6 +4622,7 @@ def solve(executor, task, archive, budget, version):
                 next_draft = candidate[new_path]
                 next_rejection = focused_rejection
                 next_case_runs = after_runs
+                next_ancestor_feedback = ""
                 result = None
                 if after:
                     _LOG.info(
@@ -4622,6 +4649,9 @@ def solve(executor, task, archive, budget, version):
                         failures_by_check = {}
                         for index, check in enumerate(rejection.checks):
                             if not check.returncode:
+                                continue
+                            if pinned_ancestor and check.command == ("verify-regression", task.regression_base):
+                                next_ancestor_feedback = excerpt(check.output, 420)
                                 continue
                             nodes = [node for _, node in _TEST_RESULT.findall(check.output)]
                             categories = set()
@@ -4653,6 +4683,20 @@ def solve(executor, task, archive, budget, version):
                     _lost_passing_test(test_case_runs, next_case_runs, new_path)
                     if allow_test_module and test_checkout_snapshot is current else None
                 )
+                previous_run = test_case_runs.get("focused")
+                candidate_run = next_case_runs.get("focused")
+                if (
+                    test_ancestor_feedback and previous_run and previous_run.named_cases
+                    and not previous_run.failed and focused_rejection is not None
+                    and (not candidate_run or candidate_run.named_cases is None)
+                ):
+                    notes[target] = (
+                        "The last edit failed before completing the focused pytest run. "
+                        "Revise the retained runnable draft using this latest feedback:\n"
+                        + excerpt(next_diagnostic, 550)
+                    )
+                    _LOG.info("Retained the runnable pytest draft awaiting pinned ancestor proof")
+                    continue
                 if lost_test:
                     notes[target] = (
                         f"The last edit regressed or removed the already-passing case {lost_test}. "
@@ -4704,6 +4748,7 @@ def solve(executor, task, archive, budget, version):
                 test_draft = next_draft
                 test_rejection = next_rejection
                 test_diagnostic = next_diagnostic
+                test_ancestor_feedback = next_ancestor_feedback
                 test_case_runs = next_case_runs if allow_test_module else {}
                 notes.pop(target, None)
                 continue

@@ -299,6 +299,35 @@ def test_test_repair_prioritizes_the_missing_fixture_and_setup_frame():
     assert "a fixture available in this module's scope" in lead
 
 
+def test_test_only_requirements_survive_compaction_without_operator_inventory():
+    path = "src/example/formatting.py"
+    new_path = "tests/test_review_regressions.py"
+    required = (
+        "Construct a nested item, round-trip its identifier, "
+        "preserve the original name, and check the empty result."
+    )
+    body = "Context. " * 41 + required + " Applicability." * 22
+    assert 800 <= len(body.encode()) <= 900
+    review = ReviewRecovery(feedback=((path, 1, body),), previous_failure="", test_only=True)
+    source = "def format_item(item):\n    return item\n"
+    fixture = "def test_operator_internal():\n    assert format_item('operator-internal')\n"
+    messages = _proposal_messages(
+        (-1, "new regression tests"), {path: source, new_path: ""}, {}, True, "",
+        review, {"tests/test_operator.py": fixture}, ["bulky context\n" * 150],
+        new_path, allow_test_module=True,
+    )
+    compact = compact_focused_review(messages, max_bytes=2600)
+
+    assert compact is not None and wire_size(compact) <= 2600
+    for variant in (messages, compact):
+        prompt = variant[-1]["content"]
+        assert required in prompt.partition("Edit only")[0]
+        assert "Operator test names:" not in prompt
+        assert "Operator fixture setup excerpt" not in prompt
+        assert "operator-internal" not in prompt
+        assert prompt.endswith(TEST_MODULE_REPLY_ENDING)
+
+
 def test_fresh_test_prompt_distinguishes_requested_fixtures_from_acceptance_inventory():
     path = "src/example/formatting.py"
     new_path = "tests/test_review_regressions.py"

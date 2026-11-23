@@ -2,12 +2,14 @@
 
 import ast
 import re
+import tarfile
 from collections import Counter
 from difflib import SequenceMatcher
+from io import BytesIO
 from pathlib import PurePosixPath
 
 from .review_definitions import _symbols
-from .review_solver_context import _start
+from .review_solver_context import _start, _tracked_python
 from .task_context import excerpt
 
 _FUNCTION = (ast.FunctionDef, ast.AsyncFunctionDef)
@@ -70,16 +72,16 @@ def _delta_rows(lines, start, end, allowance, prefix):
     return head + marker + _rows(lines, tail_start, end, half, prefix)
 
 
-def _changes(before, after):
+def _changes(before, after, *, labels=("baseline", "draft"), limit=1900):
     old_start, old = before
     new_start, new = after
     matcher = SequenceMatcher(None, old, new)
     hunks, regions = [], []
-    remaining = 1900
+    remaining = limit
     for tag, i, j, k, end in matcher.get_opcodes():
         if tag == "equal":
             continue
-        header = f"@@ baseline line {old_start + i}, draft line {new_start + k} @@\n"
+        header = f"@@ {labels[0]} line {old_start + i}, {labels[1]} line {new_start + k} @@\n"
         allowance = min(520, (remaining - len(header) - 1) // 2)
         minimum, maximum = max(0, k - 3), min(len(new), max(end, k + 1) + 3)
         regions.append((minimum, maximum))
@@ -102,6 +104,53 @@ def _changes(before, after):
         hunks.append(hunk)
         remaining -= len(hunk)
     return "".join(hunks), regions
+
+
+def reviewed_ancestor_delta(archive, sources, feedback, *, max_bytes=900):
+    """Ground new tests in changed public definitions on both reviewed revisions."""
+    scripts = {"bin", "script", "scripts", "tool", "tools"}
+    try:
+        with tarfile.open(fileobj=BytesIO(archive), mode="r:*") as snapshot:
+            previous = {
+                path: "".join(tracked[0])
+                for path in sources
+                if not scripts.intersection(PurePosixPath(path).parts)
+                and (tracked := _tracked_python(snapshot, path)) is not None
+            }
+    except (OSError, tarfile.TarError):
+        return ""
+    before = _definitions(previous)
+    current = _definitions({path: sources[path] for path in previous})
+
+    def tokens(value):
+        return set(re.findall(r"[a-z][a-z0-9]{2,}", value.casefold()))
+
+    candidates = []
+    for key in before.keys() & current.keys():
+        path, _, name = key.partition("::")
+        first, lines = current[key]
+        if any(part.startswith("_") for part in name.split(".")) or lines == before[key][1]:
+            continue
+        relevant = [(line, body) for reviewed_path, line, body in feedback if reviewed_path == path]
+        query = tokens(" ".join(body for _, body in relevant))
+        score = (
+            any(first <= row < first + len(lines) for row, _ in relevant),
+            len(query & tokens(name)),
+        )
+        if any(score):
+            candidates.append((score, key))
+    sections = []
+    remaining = max_bytes
+    for _, key in sorted(candidates, reverse=True)[:2]:
+        delta, _ = _changes(
+            before[key], current[key], labels=("ancestor", "current"),
+            limit=remaining - len(key.encode()) - 2,
+        )
+        section = f"{key}\n{delta}"
+        if delta and (size := len(section.encode())) <= remaining:
+            sections.append(section)
+            remaining -= size
+    return "".join(sections)
 
 
 def _search_source(

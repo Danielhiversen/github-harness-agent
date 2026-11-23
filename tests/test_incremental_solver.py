@@ -3237,7 +3237,7 @@ def test_solver_restores_independently_verified_test_seed(solver_case, scenario)
 
 
 @pytest.mark.parametrize(
-    "scenario", ("success", "baseline_failure", "no_collection", "ordinary", "protected_anchor")
+    "scenario", ("success", "baseline_failure", "no_collection", "ordinary", "protected_anchor", "ancestor")
 )
 def test_single_test_only_review_adds_an_independent_module(solver_case, monkeypatch, scenario):
     task, _, runner, checkpoints = solver_case
@@ -3257,7 +3257,7 @@ def test_single_test_only_review_adds_an_independent_module(solver_case, monkeyp
             "",
         ),
     )
-    if scenario in {"ordinary", "protected_anchor"}:
+    if scenario in {"ordinary", "protected_anchor", "ancestor"}:
         task = replace(task, pull_checks=())
     archive = BytesIO()
     fixed = BASE_SOURCE.replace("return -1", "return 1").replace("return -2", "return 2")
@@ -3274,13 +3274,44 @@ def test_single_test_only_review_adds_an_independent_module(solver_case, monkeyp
             entry = tarfile.TarInfo(path)
             entry.size = len(content)
             snapshot.addfile(entry, BytesIO(content))
-    if scenario == "no_collection":
+    if scenario == "ancestor":
+        ancestor = BytesIO()
+        with tarfile.open(fileobj=ancestor, mode="w") as snapshot:
+            data = BASE_SOURCE.encode()
+            entry = tarfile.TarInfo(SOURCE)
+            entry.size = len(data)
+            snapshot.addfile(entry, BytesIO(data))
+        task = replace(task, regression_base="2" * 40, regression_archive=ancestor.getvalue())
+        green = "from fixture_calc import first\n\ndef test_results():\n    assert isinstance(first(), int)\n"
+        loses_collection = green.replace("import first", "import unavailable")
+        proposals = (green, loses_collection, edit(next_path, green, TEST))
+    elif scenario == "no_collection":
         proposals = ("__test__ = False\n" + TEST,)
     else:
         proposals = (edit(SOURCE, "return 1\n", "return 3\n"), TEST)
     gateway = FreeGateway(*proposals)
     executor = PlainExecutor(runner, gateway, Limits(model_requests=len(proposals)))
     budget = _Budget(executor.limits, lambda: False, task)
+    if scenario == "ancestor":
+        result = solve(executor, task, archive.getvalue(), budget, "fixture")
+        initial, retry, after_collection = gateway.prompts
+        for prompt in (initial, retry, after_collection):
+            assert "-    return -1" in prompt and "+    return 1" in prompt
+            assert "return -2" not in prompt
+        for prompt in (retry, after_collection):
+            lead = prompt.partition("Edit only")[0]
+            assert "The new tests also pass on the ancestor." in lead
+            compact = compact_focused_review(
+                [{"role": "system", "content": "Use quoted source data."},
+                 {"role": "user", "content": prompt}], max_bytes=1600,
+            )
+            assert compact and "-    return -1" in compact[-1]["content"]
+            assert "The new tests also pass on the ancestor." in compact[-1]["content"]
+        assert "ImportError" in after_collection
+        assert f"Unpublished test file {next_path} to revise:\n{green}" in after_collection
+        assert f"+++ b/{next_path}".encode() in result.patch
+        assert any(check.command[0] == "verify-regression" and not check.returncode for check in result.checks)
+        return
     if scenario == "protected_anchor":
         rollouts = []
 
