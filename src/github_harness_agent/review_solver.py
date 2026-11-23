@@ -4241,12 +4241,16 @@ def solve(executor, task, archive, budget, version):
             if observed is None:
                 return None
             assertions.append(observed)
-        if assertions[0][:2] != assertions[1][:2]:
+        if assertions[0][0] != assertions[1][0]:
             return None
-        _, row, rewritten = assertions[0]
-        return source, ("An independently authored repository test reached the same assertion on "
-                        "the checkpoint and pinned ancestor. Its failing assertion and observed result:\n"
-                        + excerpt(source.splitlines()[row - 1].strip(), 250) + "\n" + excerpt(rewritten, 350)
+        rows = source.splitlines()
+        diagnostics = [
+            f"{revision} assertion at line {row}: {excerpt(rows[row - 1].strip(), 250)}\n"
+            + excerpt(rewritten, 350)
+            for revision, (_, row, rewritten) in zip(("Checkpoint", "Pinned ancestor"), assertions)
+        ]
+        return source, ("An independently authored repository test failed on both revisions.\n"
+                        + "\n".join(diagnostics)
                         + "\nOriginal test setup and scenario (quoted):\n" + excerpt(source, 1600))
 
     def failed_assertion_hint(source, run, fixed_failures):
@@ -4532,7 +4536,7 @@ def solve(executor, task, archive, budget, version):
                     ):
                         break
                 if test_first_witness:
-                    _LOG.info("Retained an authored regression with matching assertion failures on both revisions")
+                    _LOG.info("Retained an authored regression with verified assertion failures on both revisions")
             if (
                 len(operator) == 1
                 and not other_checks

@@ -1170,7 +1170,7 @@ def test_checked_caller_feedback_is_local_bounded_and_stops_duplicate_attempts(c
     assert "return 2" not in caplog.text and "candidate observation" not in caplog.text
 
 
-@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long", "checkpoint-caller", "checkpoint-caller-block", "checkpoint-caller-after-format", "checkpoint-caller-after-rejection", "checkpoint-caller-after-exhaustion", "checkpoint-caller-after-wider", "checkpoint-caller-after-semantic", "checkpoint-caller-after-implicit", "checkpoint-caller-after-method", "checkpoint-caller-after-testfirst", "checkpoint-caller-after-testfirst-green", "checkpoint-caller-after-testfirst-oldgreen", "checkpoint-caller-after-testfirst-setup", "checkpoint-caller-after-testfirst-alternate"))
+@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long", "checkpoint-caller", "checkpoint-caller-block", "checkpoint-caller-after-format", "checkpoint-caller-after-rejection", "checkpoint-caller-after-exhaustion", "checkpoint-caller-after-wider", "checkpoint-caller-after-semantic", "checkpoint-caller-after-implicit", "checkpoint-caller-after-method", "checkpoint-caller-after-testfirst", "checkpoint-caller-after-testfirst-green", "checkpoint-caller-after-testfirst-oldgreen", "checkpoint-caller-after-testfirst-setup", "checkpoint-caller-after-testfirst-alternate", "checkpoint-caller-after-testfirst-multistage"))
 def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, failover, caplog):
     task, _, runner, checkpoints = solver_case
     raw_mode = failover in {"raw", "raw-restored"}
@@ -1182,8 +1182,12 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
     testfirst = "testfirst" in failover
     early_case = "def test_dispatch_observable():\n    from fixture_calc import first\n    assert first() == 1\n"
     early_routes = []
-    retain_early = failover.endswith(("-testfirst", "-alternate"))
-    if failover.endswith("-oldgreen"):
+    retain_early = failover.endswith(("-testfirst", "-alternate", "-multistage"))
+    if failover.endswith("-multistage"):
+        early_case = early_case.replace("import first", "import first, second").replace(
+            "    assert first()", "    assert second() == 2\n    assert first()"
+        )
+    elif failover.endswith("-oldgreen"):
         early_case = early_case.replace("first", "second").replace("== 1", "== -2")
     elif failover.endswith("-setup"):
         early_case = early_case.replace("assert first() == 1", "raise AssertionError('setup failure')")
@@ -1360,6 +1364,9 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
                         if retain_early:
                             assert "assert first() == 1" in prompt and "-3" in prompt
                             assert "from fixture_calc import first" in prompt
+                            if failover.endswith("-multistage"):
+                                assert "Checkpoint assertion at line 4: assert first() == 1" in prompt
+                                assert "Pinned ancestor assertion at line 3: assert second() == 2" in prompt
                     if semantic:
                         if len(line_attempts) == 1:
                             reply.content = edit(SOURCE, "        return self.read() - 2\n", "        return self.read() + 1\n")
@@ -1422,7 +1429,7 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         gateway = Gateway(*replies)
         requests = len(replies)
         if testfirst:
-            gateway = Gateway("numbered", early_case, *(("second author",) if not failover.endswith("-testfirst") else ()), "numbered", TEST)
+            gateway = Gateway("numbered", early_case, *(("second author",) if not failover.endswith(("-testfirst", "-multistage")) else ()), "numbered", TEST)
             requests = 5
     elif failover == "raw-restored":
         gateway = Gateway("def local_result():\n    return 1\n", TEST)
@@ -1449,7 +1456,7 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         repeats = 2 if semantic or failover.endswith("exhaustion") else int(caller_retry)
         assert remaining_offers == [f"Requesting checkpoint method edit: direct caller only Reader.dispatch (body rows={caller_rows})"] * repeats
         if testfirst:
-            assert len(early_routes) == (1 if failover.endswith("-testfirst") else 2)
+            assert len(early_routes) == (1 if failover.endswith(("-testfirst", "-multistage")) else 2)
             assert any(prompt.startswith("Test-first regression") for prompt in gateway.prompts)
             assert (b"test_dispatch_observable" in result.patch) == retain_early
         first_request = gateway.prompts[0]
