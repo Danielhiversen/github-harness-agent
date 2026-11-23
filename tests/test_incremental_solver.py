@@ -1175,7 +1175,7 @@ def test_checked_caller_feedback_is_local_bounded_and_stops_duplicate_attempts(c
     assert "return 2" not in caplog.text and "candidate observation" not in caplog.text
 
 
-@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long", "checkpoint-caller", "checkpoint-caller-block", "checkpoint-caller-after-format", "checkpoint-caller-after-rejection", "checkpoint-caller-after-exhaustion", "checkpoint-caller-after-wider", "checkpoint-caller-after-semantic", "checkpoint-caller-after-implicit", "checkpoint-caller-after-method", "checkpoint-caller-after-testfirst", "checkpoint-caller-after-testfirst-green", "checkpoint-caller-after-testfirst-oldgreen", "checkpoint-caller-after-testfirst-setup", "checkpoint-caller-after-testfirst-alternate", "checkpoint-caller-after-testfirst-multistage", "checkpoint-caller-after-testfirst-timeout", "checkpoint-caller-after-testfirst-unavailable"))
+@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long", "checkpoint-caller", "checkpoint-caller-block", "checkpoint-caller-after-format", "checkpoint-caller-after-rejection", "checkpoint-caller-after-exhaustion", "checkpoint-caller-after-wider", "checkpoint-caller-after-semantic", "checkpoint-caller-after-implicit", "checkpoint-caller-after-method", "checkpoint-caller-after-testfirst", "checkpoint-caller-after-testfirst-green", "checkpoint-caller-after-testfirst-oldgreen", "checkpoint-caller-after-testfirst-setup", "checkpoint-caller-after-testfirst-alternate", "checkpoint-caller-after-testfirst-multistage", "checkpoint-caller-after-testfirst-timeout", "checkpoint-caller-after-testfirst-unavailable", "checkpoint-caller-after-testfirst-private"))
 def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, failover, caplog):
     task, _, runner, checkpoints = solver_case
     raw_mode = failover in {"raw", "raw-restored"}
@@ -1186,8 +1186,10 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
     semantic = failover == "checkpoint-caller-after-semantic"
     testfirst = "testfirst" in failover
     early_case = "def test_dispatch_observable():\n    from fixture_calc import first\n    assert first() == 1\n"
+    private_case = failover.endswith("-private")
+    private_models = []
     early_routes = []
-    retain_early = failover.endswith(("-testfirst", "-alternate", "-multistage", "-timeout"))
+    retain_early = failover.endswith(("-testfirst", "-alternate", "-multistage", "-timeout", "-private"))
     if failover.endswith("-multistage"):
         early_case = early_case.replace("import first", "import first, second").replace(
             "    assert first()", "    assert second() == 2\n    assert first()"
@@ -1223,6 +1225,10 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         ).replace("return Reader().read()", "return Reader().dispatch()")
         with operator.open("a") as stream:
             stream.write("def test_keep_helper():\n    from fixture_calc import Reader\n    assert Reader().read() == -1\n")
+    if private_case:
+        production = production.replace("def dispatch(self):", "def dispatch(self, legacy=False):")
+        with operator.open("a") as stream:
+            stream.write("    assert Reader().dispatch(True) == -3\n")
     caller_rows = 1
     if wider:
         before_body = ["        deltas = (", *(["            0,"] * 16), "        )", "        return self.read() - 2 + sum(deltas)"]
@@ -1284,6 +1290,22 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
     class Gateway(FreeGateway):
         def complete(self, **kwargs):
             prompt = kwargs["messages"][-1]["content"]
+            if private_case and "Private regression repair. The numbered tentative method" in prompt:
+                assert "test_first" in prompt and "test_keep_helper" in prompt
+                assert "test_dispatch_observable" in prompt and "return self.read() + 2" in prompt
+                assert "Observed pytest failure:" in prompt and "Correct the dispatch result" in prompt
+                assert "withheld-operator-source" not in prompt
+                assert tuple(private_models) == kwargs.get("exclude", ())
+                reply = super().complete(**{**kwargs, "max_output_tokens": 3072})
+                reply.route = "private-free-" + str(len(private_models))
+                reply.configured_model = "private-model-" + str(len(private_models))
+                private_models.append((reply.route, reply.configured_model))
+                reply.content = (
+                    "unusable" if len(private_models) == 1 else
+                    ("def dispatch(self, legacy=False):\n    return self.read() - 2" if len(private_models) == 2 else
+                     "def dispatch(self, legacy=False):\n    return self.read() + (-2 if legacy else 2)")
+                )
+                return reply
             if prompt.startswith("Test-first regression"):
                 assert testfirst and len(line_attempts) == 1
                 assert "withheld-operator-source" not in prompt and "def test_keep_helper" not in prompt
@@ -1442,6 +1464,9 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         if testfirst:
             gateway = Gateway("numbered", early_case, *(("second author",) if not failover.endswith(("-testfirst", "-multistage", "-unavailable")) else ()), "numbered", TEST)
             requests = 5
+            if private_case:
+                gateway = Gateway("anchor", early_case, "caller", "invalid", "undo", "repaired")
+                requests = 7
     elif failover == "raw-restored":
         gateway = Gateway("def local_result():\n    return 1\n", TEST)
         requests = 2
@@ -1467,7 +1492,7 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         repeats = 2 if semantic or failover.endswith("exhaustion") else int(caller_retry)
         assert remaining_offers == [f"Requesting checkpoint method edit: direct caller only Reader.dispatch (body rows={caller_rows})"] * repeats
         if testfirst:
-            assert len(early_routes) == (1 if failover.endswith(("-testfirst", "-multistage", "-unavailable")) else 2)
+            assert len(early_routes) == (1 if failover.endswith(("-testfirst", "-multistage", "-unavailable", "-private")) else 2)
             assert any(prompt.startswith("Test-first regression") for prompt in gateway.prompts)
             assert (b"test_dispatch_observable" in result.patch) == retain_early
         first_request = gateway.prompts[0]
@@ -1476,7 +1501,9 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         assert "Reviewed dispatch" in first_request and "return local_result()" in first_request
         assert "def unrelated" not in first_request and "withheld-operator-source" not in first_request
         assert "Observed pytest failure:" in first_request
-        if caller_edit:
+        if private_case:
+            assert len(private_models) == 3 and b"(-2 if legacy else 2)" in result.patch
+        elif caller_edit:
             assert b"+        return self.read() + 2" in result.patch and b"-            return -1" not in result.patch
         else:
             assert b"+            return 1" in result.patch

@@ -2290,6 +2290,7 @@ class _RegressionRepair:
     introduced: set[tuple[int, str]]
     attempts: int = 0
     stock_origin: bool = False
+    private_symbol: tuple[str, str] | None = None
     retries: int = 0
     retry_note: str = ""
     retry_named: bool = False
@@ -2320,6 +2321,59 @@ class _RegressionRepair:
         ):
             return min(self.introduced - {self.retry_target})
         return min(self.introduced)
+
+
+def _private_changed_method(current, tentative):
+    changed = [path for path in current if current[path] != tentative[path]]
+    if len(changed) != 1:
+        return None
+    path, = changed
+    before, after = current[path].splitlines(), tentative[path].splitlines()
+    try:
+        original = dict(_symbols(ast.parse(current[path]).body))
+        revised = dict(_symbols(ast.parse(tentative[path]).body))
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    for name, old in original.items():
+        new = revised.get(name)
+        if not isinstance(old, (ast.FunctionDef, ast.AsyncFunctionDef)) or type(new) is not type(old):
+            continue
+        if (old.lineno == new.lineno and before[:old.lineno] == after[:new.lineno]
+                and before[old.end_lineno:] == after[new.end_lineno:]):
+            return path, name
+    return None
+
+
+def _private_method_retry(repair, target, review):
+    snapshot = prepare_line_range_edit(repair.sources, repair.private_symbol)
+    if snapshot is None:
+        return None
+    visible = frozenset(range(1, len(snapshot.lines) + 1))
+    allowed = frozenset(range(snapshot.first_body_line, len(snapshot.lines) + 1))
+    observed = repair.failures[target].partition("\nObserved pytest failure: ")[2]
+    context = (
+        "Private regression repair. The numbered tentative method fixed "
+        + ", ".join(excerpt(node, 120) for _, node in sorted(repair.gained))
+        + ". Preserve that gain while correcting " + excerpt(target[1], 160) + ".\n"
+        + "Requested behavior (quoted): " + excerpt(" ".join(body for _, _, body in review.feedback), 600) + "\n"
+        + ("Observed pytest failure: " + excerpt(observed, 450) + "\n" if observed else "")
+        + (excerpt(repair.retry_note, 450) + "\n" if repair.retry_note else "")
+    )
+    prompt = context + line_range_prompt(snapshot, visible_rows=visible, full_method=True) + _SINGLE_METHOD_ENDING
+    if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": prompt}]) > RETRY_MESSAGE_BYTES:
+        return None
+    return _LineRetry(None, snapshot, allowed_rows=allowed, prompt=prompt, checkout=repair.sources,
+                      checkpoint_method_edit=True)
+
+
+def _retry_private_method(repair, target, editor, note):
+    if not repair.private_symbol or repair.retries >= 2 or not editor.configured_model:
+        return None
+    model = editor.route, editor.configured_model
+    if model in repair.excluded_models:
+        return None
+    return replace(repair, retries=repair.retries + 1, retry_target=target, retry_note=note,
+                   excluded_models=(*repair.excluded_models, model))
 
 
 def _retry_stock_repair(repair, target, note, named_definitions, *, checked=False):
@@ -4928,6 +4982,8 @@ def solve(executor, task, archive, budget, version):
                         and (line_retry.checkout is not current or repair is not None)
                     ):
                         line_retry = None
+                    if repair is not None and repair.private_symbol and target in repair.introduced:
+                        line_retry = _private_method_retry(repair, target, review)
                     if (
                         production_regression and repair is None and target in operator
                         and not (current is resumed_operator_checkout and line_retry is not None)
@@ -5397,7 +5453,7 @@ def solve(executor, task, archive, budget, version):
                             {"role": "system", "content": _LINE_RANGE_SYSTEM},
                             {"role": "user", "content": line_retry.prompt},
                         ]
-                    if test_first_witness and target in operator:
+                    if test_first_witness and (target in operator or repair is not None and target in repair.introduced):
                         hint = test_first_witness[1] + "\n"
                         augmented = [*messages[:-1], {**messages[-1], "content": hint + messages[-1]["content"]}]
                         if wire_size(augmented) <= RETRY_MESSAGE_BYTES:
@@ -5448,7 +5504,10 @@ def solve(executor, task, archive, budget, version):
                         if line_retry and not scoped_line else last_routes.get(target)
                     )
                     advice_source = "planning" if planner_input is not None else "guided" if advice is not None else None
-                    if line_retry is not None and line_retry.direct_caller_only:
+                    if repair is not None and repair.private_symbol and line_retry is not None:
+                        _LOG.info("Requesting private method repair for %s (attempt %d)",
+                                  repair.private_symbol[1], repair.retries + 1)
+                    elif line_retry is not None and line_retry.direct_caller_only:
                         _LOG.info(
                             "Requesting checkpoint method edit: direct caller only %s (body rows=%d)",
                             line_retry.snapshot.symbol[1], len(line_retry.allowed_rows),
@@ -5866,6 +5925,10 @@ def solve(executor, task, archive, budget, version):
                         + ". Use the unchanged stock-passing draft and follow the requested edit format.",
                         not named_definitions,
                     )
+                elif repair is not None and repair.private_symbol:
+                    regression_repair = _retry_private_method(
+                        repair, target, editor, "Previous proposal could not be applied. Use this tentative checkout.",
+                    )
                 _LOG.info(
                     "Review edit could not be applied for %s: %s",
                     target[1],
@@ -6274,6 +6337,14 @@ def solve(executor, task, archive, budget, version):
                         )
                 else:
                     pending_static = {}
+                if not improved and repair.private_symbol:
+                    observed = after.get(target, "").partition("\nObserved pytest failure: ")[2]
+                    reason = "The proposal lost the original gain." if repair.gained & new_operator else "Coverage did not improve."
+                    if observed:
+                        reason += " Observed pytest failure: " + excerpt(observed, 300)
+                    regression_repair = _retry_private_method(repair, target, editor, reason)
+                    if regression_repair:
+                        continue
                 if not improved or introduced or pending_static:
                     if improved and (repair.stock_origin or repair.attempts == 0):
                         regression_repair = replace(
@@ -6343,6 +6414,10 @@ def solve(executor, task, archive, budget, version):
                         gained,
                         introduced,
                         stock_origin=bool(stock_gain),
+                        private_symbol=(
+                            _private_changed_method(current, candidate)
+                            if production_regression and not stock_gain and len(introduced) == 1 else None
+                        ),
                         static_failures=admitted_static,
                     )
                     if stock_gain:
