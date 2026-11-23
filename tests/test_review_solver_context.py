@@ -267,6 +267,151 @@ def test_fresh_test_context_keeps_grounded_usage_from_oversized_tracked_test():
         assert prompt.endswith(TEST_MODULE_REPLY_ENDING)
 
 
+def test_repository_usage_includes_relevant_tracked_mock_payload_for_oversized_test():
+    archive = BytesIO()
+    large_value = "large-private-response-value " * 40
+    source = (
+        "import pytest\n"
+        "from unittest.mock import patch as stub\n"
+        "from example.processor import Processor, build_processor, normalize\n"
+        "def test_small_helper():\n"
+        "    assert normalize('one') == 'one'\n"
+        "@stub('example.processor.clock', return_value={'ignored': 42})\n"
+        "def test_background_clock(clock):\n"
+        "    return normalize('background')\n"
+        "@pytest.fixture\n"
+        "def offline_transport(monkeypatch):\n"
+        "    class FakeTransport:\n"
+        "        def fetch_response(self):\n"
+        f"            payload = {{'items': [{{'value': {large_value!r}, 'unit': 'hidden-unit'}}]}}\n"
+        "            return payload\n"
+        "    monkeypatch.setattr(Processor, '_transport', FakeTransport)\n"
+        "def test_fetch_snapshot(offline_transport):\n"
+        + "    # long qualification fixture\n" * 40
+        + "    client = build_processor()\n"
+        "    observation = client.fetch()\n"
+        "    assert observation == 'hidden-assertion'\n"
+    )
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        data = source.encode()
+        entry = tarfile.TarInfo("tests/test_processor.py")
+        entry.size = len(data)
+        snapshot.addfile(entry, BytesIO(data))
+    production = {"src/example/processor.py": (
+        "class Processor:\n    def fetch(self): ...\n"
+        "def build_processor() -> Processor:\n    return Processor()\n"
+        "def normalize(text):\n    return text\n"
+    )}
+
+    example, usage = review_solver_context.repository_pytest_context(
+        archive.getvalue(), production, "fetch snapshot items response", usage_bytes=420,
+    )
+
+    assert "def test_small_helper" in example
+    assert "def test_fetch_snapshot" not in example
+    assert "monkeypatch.setattr(Processor, '_transport', FakeTransport)" in usage
+    assert "FakeTransport.fetch_response" in usage
+    assert "{'items': [{'value': ..., 'unit': ...}]}" in usage
+    assert "observation = client.fetch()" in usage
+    assert all(value not in usage for value in (
+        "hidden-assertion", "large-private-response-value", "hidden-unit", "ignored",
+    ))
+    assert len(usage.encode()) <= 420
+
+
+@pytest.mark.parametrize("shadowed", (False, True))
+def test_repository_usage_preserves_namespaced_mock_decorator_and_redacts_payload_values(shadowed):
+    archive = BytesIO()
+    source = (
+        "from unittest.mock import patch as stub\n"
+        "from example.processor import fetch\n"
+        + ("def stub(*args, **kwargs):\n    return lambda fn: fn\n" if shadowed else "")
+        + "@stub('example.processor.http_client.get', return_value={'result': ['hidden-value']})\n"
+        "def test_fetch(mock_get):\n"
+        "    result = fetch()\n"
+        "    assert result\n"
+    )
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        data = source.encode()
+        entry = tarfile.TarInfo("tests/test_processor.py")
+        entry.size = len(data)
+        snapshot.addfile(entry, BytesIO(data))
+
+    _, usage = review_solver_context.repository_pytest_context(
+        archive.getvalue(), {"src/example/processor.py": "def fetch(): ...\n"}, "fetch",
+    )
+    mock_call = "@stub('example.processor.http_client.get', return_value={'result': [...]})"
+    assert (mock_call in usage) is not shadowed
+    assert "result = fetch()" in usage
+    assert "hidden-value" not in usage
+    assert "assert" not in usage
+
+
+def test_repository_usage_keeps_return_shape_bound_to_a_tracked_patch_context():
+    archive = BytesIO()
+    source = (
+        "from unittest.mock import patch\n"
+        "from example.processor import fetch\n"
+        "def test_fetch():\n"
+        "    with patch('example.processor.request') as request:\n"
+        "        payload = {'response': ['private response content']}\n"
+        "        request.return_value.json.return_value = payload\n"
+        "        result = fetch()\n"
+        "        assert result\n"
+    )
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        data = source.encode()
+        entry = tarfile.TarInfo("tests/test_processor.py")
+        entry.size = len(data)
+        snapshot.addfile(entry, BytesIO(data))
+    _, usage = review_solver_context.repository_pytest_context(
+        archive.getvalue(), {"src/example/processor.py": "def fetch(): ...\n"}, "fetch response",
+    )
+    assert "with patch('example.processor.request') as request:" in usage
+    assert "request.return_value.json.return_value = {'response': [...]}" in usage
+    assert "result = fetch()" in usage
+    assert "private response content" not in usage
+
+
+@pytest.mark.parametrize(
+    ("keyword", "payload", "shape"),
+    (
+        ("return_value", "{'items': ['private sample']}", "{'items': [...]}"),
+        ("side_effect", "[{'items': ['private sample']}, {'items': []}]", "[{'items': [...]}, ...]"),
+    ),
+)
+def test_repository_usage_keeps_patch_object_targets_and_variable_payload_shapes(keyword, payload, shape):
+    archive = BytesIO()
+    source = (
+        "import unittest.mock\n"
+        "from example.processor import Processor\n"
+        "def test_process():\n"
+        "    backend = HttpBackend()\n"
+        f"    parsed = {payload}\n"
+        f"    with unittest.mock.patch.object(backend, 'load_data', {keyword}=parsed) as observed:\n"
+        "        processor = Processor(backend)\n"
+        "        result = processor.fetch()\n"
+        "        assert result\n"
+        "        observed.assert_called_once()\n"
+    )
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        data = source.encode()
+        entry = tarfile.TarInfo("tests/test_processor.py")
+        entry.size = len(data)
+        snapshot.addfile(entry, BytesIO(data))
+    _, usage = review_solver_context.repository_pytest_context(
+        archive.getvalue(),
+        {"src/example/processor.py": "class Processor:\n    def fetch(self): ...\n"},
+        "fetch data",
+    )
+    assert (
+        f"with unittest.mock.patch.object(backend, 'load_data', {keyword}={shape}) as observed:"
+    ) in usage
+    assert "result = processor.fetch()" in usage
+    assert "private sample" not in usage
+    assert "assert_called_once" not in usage
+
+
 def test_test_repair_prioritizes_the_missing_fixture_and_setup_frame():
     path = "src/example/formatting.py"
     new_path = "tests/test_review_regressions.py"

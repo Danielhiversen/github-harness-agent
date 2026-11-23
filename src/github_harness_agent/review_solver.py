@@ -3989,7 +3989,8 @@ def solve(executor, task, archive, budget, version):
                         if repository_example is None:
                             reviewed_sources = {path: current[path] for path in paths}
                             repository_example, repository_usage = repository_pytest_context(
-                                archive, reviewed_sources, " ".join(body for _, _, body in review.feedback)
+                                task.regression_archive or archive,
+                                reviewed_sources, " ".join(body for _, _, body in review.feedback),
                             )
                             repository_models = imported_model_declarations(archive, reviewed_sources)
                         allow_test_module = bool(

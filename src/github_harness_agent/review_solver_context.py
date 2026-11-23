@@ -567,8 +567,189 @@ def operator_api_contract(fixtures, sources, *, max_bytes=700):
     return "\n".join(lines)
 
 
+def _mock_patch_imports(body, imports):
+    names = Counter(name for item in body for name in _bindings(item))
+    patches = {}
+    for local, node in imports.items():
+        if names[local] != 1:
+            continue
+        for alias in node.names:
+            name = alias.asname or alias.name
+            if isinstance(node, ast.Import) and name.split(".", 1)[0] == local:
+                suffix = {"unittest": ".mock.patch", "unittest.mock": ".patch"}.get(alias.name)
+            elif getattr(node, "module", None) == "unittest" and alias.name == "mock" and name == local:
+                suffix = ".patch"
+            elif getattr(node, "module", None) == "unittest.mock" and alias.name == "patch" and name == local:
+                suffix = ""
+            else:
+                continue
+            if suffix is not None:
+                binding = name + suffix
+                patches[binding] = patches[binding + ".object"] = node
+    return patches
+
+
+def _mock_bindings(body):
+    names = Counter(name for item in body for name in _bindings(item))
+    bindings = {}
+    for item in body:
+        if isinstance(item, (*_FUNCTION, ast.ClassDef)) and names[item.name] == 1:
+            bindings[item.name] = item
+        elif isinstance(item, _ASSIGNMENT):
+            targets = item.targets if isinstance(item, ast.Assign) else (item.target,)
+            if len(targets) == 1 and isinstance(target := targets[0], ast.Name) and names[target.id] == 1:
+                bindings[target.id] = item.value
+    return bindings
+
+
+def _mock_payload(node, bindings, depth=0):
+    if depth >= 3:
+        return "..."
+    if isinstance(node, ast.Name):
+        node = bindings.get(node.id)
+    if isinstance(node, ast.Dict):
+        entries = [
+            f"{key.value!r}: {_mock_payload(value, bindings, depth + 1)}"
+            for key, value in zip(node.keys[:5], node.values[:5])
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,47}", key.value)
+        ]
+        if len(entries) < len(node.keys):
+            entries.append("...")
+        return "{" + ", ".join(entries) + "}"
+    if isinstance(node, (ast.Tuple, ast.List)):
+        first = _mock_payload(node.elts[0], bindings, depth + 1) if node.elts else ""
+        if len(node.elts) > 1 and first != "...":
+            first += ", ..."
+        return f"[{first}]" if isinstance(node, ast.List) else f"({first},)" if first else "()"
+    return "..."
+
+
+def _mock_value(node, bindings):
+    if isinstance(node, ast.Lambda):
+        names = ", ".join(arg.arg for arg in (*node.args.posonlyargs, *node.args.args))
+        return f"lambda {names}: {_mock_payload(node.body, bindings)}"
+    shape = _mock_payload(node, bindings)
+    return _shape_operand(node) if shape == "..." or len(shape.encode()) > 150 else shape
+
+
+def _fake_method_shapes(node, bindings):
+    if isinstance(node, ast.ClassDef):
+        methods = [
+            (f"{node.name}.{item.name}", item)
+            for item in node.body if isinstance(item, _FUNCTION)
+        ][:4]
+    else:
+        methods = [(node.name, node)] if isinstance(node, _FUNCTION) else []
+    for name, method in methods:
+        if isinstance(last := method.body[-1], ast.Return):
+            payload = _mock_payload(last.value, {**bindings, **_mock_bindings(method.body[:-1])})
+            yield f"# {name}(...) returns {payload}"
+        else:
+            yield f"# {name}(...)"
+
+
+def _mock_actions(statements):
+    for statement in statements:
+        if isinstance(statement, (ast.With, ast.AsyncWith)):
+            for item in statement.items:
+                if isinstance(item.context_expr, ast.Call):
+                    yield item.context_expr, item.optional_vars, statement.body
+            yield from _mock_actions(statement.body)
+        elif isinstance(statement, (ast.Expr, *_ASSIGNMENT)) and isinstance(statement.value, ast.Call):
+            yield statement.value, None, ()
+
+
+def _mock_return_shapes(alias, statements, bindings):
+    if not isinstance(alias, ast.Name) or any(alias.id in _rebound_names(item) for item in statements):
+        return
+    for index, statement in enumerate(statements):
+        if not isinstance(statement, _ASSIGNMENT):
+            continue
+        targets = statement.targets if isinstance(statement, ast.Assign) else (statement.target,)
+        if len(targets) != 1:
+            continue
+        name = _dotted_name(targets[0])
+        if not name.startswith(alias.id + ".") or not name.endswith((".return_value", ".side_effect")):
+            continue
+        payload = _mock_payload(statement.value, {**bindings, **_mock_bindings(statements[:index])})
+        row = f"{name} = {payload}"
+        if payload != "..." and len(row.encode()) <= 250:
+            yield row
+
+
+def _mock_setup_shapes(node, setup, module_bindings, patches, fixture_names):
+    found = {}
+    for scope in (*sorted(setup, key=lambda item: item.lineno), node):
+        arguments = _fixture_arguments(scope)
+        rebound = set(_rebound_names(scope))
+        setters = {
+            name: declaration for name, declaration in patches.items()
+            if name.split(".", 1)[0] not in arguments | rebound
+        }
+        for name, helpers in (
+            ("monkeypatch", ("monkeypatch.setattr",)),
+            ("mocker", ("mocker.patch", "mocker.patch.object")),
+        ):
+            if name in arguments and name not in rebound | fixture_names:
+                setters.update(dict.fromkeys(helpers))
+        if not setters:
+            continue
+        actions = [
+            (item, None, ()) for item in scope.decorator_list if isinstance(item, ast.Call)
+        ]
+        actions.extend(_mock_actions(scope.body))
+        for call, alias, block in actions:
+            if (name := _dotted_name(call.func)) not in setters or not call.args:
+                continue
+            count = 2 if name.endswith(".object") or (
+                name == "monkeypatch.setattr" and not isinstance(call.args[0], ast.Constant)
+            ) else 1
+            target = [
+                repr(arg.value) if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,119}", arg.value) else _dotted_name(arg)
+                for arg in call.args[:count]
+            ]
+            if len(target) != count or not all(target):
+                continue
+            bindings = {
+                **{key: item for key, item in module_bindings.items() if key not in arguments | rebound},
+                **_mock_bindings([item for item in scope.body if item.lineno < call.lineno]),
+            }
+            values = call.args[count:]
+            args = [*target, *(_mock_value(item, bindings) for item in values)]
+            args.extend(
+                f"{kw.arg}={_mock_value(kw.value, bindings)}" if kw.arg else "**..."
+                for kw in call.keywords
+            )
+            row = f"{name}({', '.join(args)})"
+            if call in scope.decorator_list:
+                row = "@" + row
+            elif block:
+                suffix = f" as {alias.id}" if isinstance(alias, ast.Name) else ""
+                row = f"with {row}{suffix}:"
+            if len(row.encode()) > 250:
+                continue
+            if declaration := setters[name]:
+                found.setdefault(ast.unparse(declaration))
+            found.setdefault(row)
+            for returned in _mock_return_shapes(alias, block, bindings):
+                found.setdefault(returned)
+            for value in (*values, *(kw.value for kw in call.keywords)):
+                for method in _fake_method_shapes(bindings.get(_dotted_name(value)), bindings):
+                    if len(method.encode()) <= 250:
+                        found.setdefault(method)
+            if len(found) >= 5:
+                return tuple(found)[:5]
+    return tuple(found)
+
+
+def _usage_relevance(symbol, query_words):
+    return len(_words(symbol.replace("_", " ")) & query_words)
+
+
 def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usage_bytes=820):
-    """Return a complete small example and separate bounded public API usage shapes."""
+    """Return a small example plus bounded tracked API and mock setup shapes."""
     modules = _reviewed_modules(sources)
     if not any(modules.values()):
         return "", ""
@@ -576,6 +757,8 @@ def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usag
     query_words = _words(query.replace("_", " "))
     example = ""
     shapes = []
+    mock_usage = ()
+    mock_rank = (-1, False)
 
     try:
         with tarfile.open(fileobj=BytesIO(archive), mode="r:") as snapshot:
@@ -605,6 +788,9 @@ def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usag
                     continue
                 fixtures, fixture_nodes = _module_pytest_fixtures(body, imports)
                 unambiguous_fixtures = set(fixtures.values()) - {None}
+                if usage_bytes:
+                    module_bindings = _mock_bindings(body)
+                    patches = _mock_patch_imports(body, imports)
                 members = tuple(
                     node
                     for declaration in body
@@ -618,9 +804,27 @@ def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usag
                     ):
                         continue
                     if usage_bytes:
-                        for symbol, rows in _usage_shapes(node, reviewed_calls):
-                            relevance = _words(symbol.replace("_", " ")) & query_words
-                            shapes.append((len(relevance), "." in symbol or "[" in symbol, path, rows))
+                        grounded = tuple(_usage_shapes(node, reviewed_calls))
+                        for symbol, rows in grounded:
+                            matches = _usage_relevance(symbol, query_words)
+                            shapes.append((matches, "." in symbol or "[" in symbol, path, rows))
+                        invocations = [(symbol, rows) for symbol, rows in grounded if rows[-1].endswith(")")]
+                        if invocations and node.name.startswith("test_"):
+                            symbol, invocation = max(invocations, key=lambda entry: (
+                                _usage_relevance(entry[0], query_words), "." in entry[0]
+                            ))
+                            setup = _local_fixture_setup(node, fixtures)
+                            if setup is not None:
+                                mock_rows = _mock_setup_shapes(node, setup, module_bindings, patches, fixtures.keys())
+                                matched = _usage_relevance(" ".join((symbol, node.name, *mock_rows)), query_words)
+                                rank = matched, "." in symbol
+                                context = (f"# {path}::{node.name} tracked mock setup and API usage", *mock_rows, *invocation)
+                                if (
+                                    mock_rows and rank > mock_rank
+                                    and len("\n".join(context).encode()) + 1 <= usage_bytes
+                                ):
+                                    mock_rank = rank
+                                    mock_usage = context
                     if example or node in members:
                         continue
                     if not any(
@@ -652,8 +856,10 @@ def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usag
                             return example, ""
     except (tarfile.TarError, OSError, EOFError):
         pass
-    usage = []
-    shown = set()
+    usage = ["\n".join(mock_usage)] if mock_usage else []
+    shown = set(mock_usage)
+    if mock_usage:
+        usage_bytes -= len(usage[0].encode()) + 1
     for _, _, path, rows in sorted(shapes, key=lambda item: item[:2], reverse=True):
         additions = [row for row in rows if row not in shown]
         if not additions:
