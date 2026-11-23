@@ -5124,6 +5124,10 @@ def solve(executor, task, archive, budget, version):
                 if target == _TEST_GOAL and rotated and snapshot is current:
                     # Try the configured routes again when the alternatives are exhausted.
                     test_model_failures = None
+                    if helper_authoring is not None and helper_feedback:
+                        # A runnable proposal can use its verification details even
+                        # when all other configured models are unavailable.
+                        helper_bad_model = ()
                 elif line_followup is not None:
                     line_retries[target] = line_followup
                 elif line_retry is not None:
@@ -5203,8 +5207,8 @@ def solve(executor, task, archive, budget, version):
                         candidate = apply_scoped_raw_definition(completion.content, source, raw_symbol)
                     if target == _TEST_GOAL:
                         if helper_authoring is not None:
-                            if helper_bad_model and editor.route == helper_bad_model[0]:
-                                raise ValueError("The fixture authoring retry requires a different coding route")
+                            if helper_bad_model == (editor.route, editor.configured_model):
+                                raise ValueError("The fixture authoring retry selected an excluded coding model")
                             candidate = {new_path: helper_authoring.assemble(
                                 completion.content, max_bytes=executor.limits.patch_bytes,
                             )}

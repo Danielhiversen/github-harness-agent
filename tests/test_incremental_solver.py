@@ -837,7 +837,7 @@ def test_single_pinned_production_review_fixes_all_checks_before_authoring_regre
     assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
 
 
-@pytest.mark.parametrize("scenario", ("rename", "helper", "helper_repair", "passing_siblings", "ancestor_error"))
+@pytest.mark.parametrize("scenario", ("rename", "helper", "helper_repair", "helper_same_route", "helper_exhausted", "passing_siblings", "ancestor_error"))
 def test_only_verified_discriminating_replacement_may_retire_an_unpublished_smoke(solver_case, scenario):
     task, archive, runner, _ = solver_case
     acceptance = Path(task.pull_checks[0][-1])
@@ -866,7 +866,8 @@ def test_only_verified_discriminating_replacement_may_retire_an_unpublished_smok
         authored = "def test_offline(tmp_path):\n    assert fixture_marker(tmp_path).name == 'offline'\n"
         invalid = authored.replace("== 'offline'", "== 'incorrect'")
         prefix = (invalid,) if scenario == "helper_repair" else ()
-        proposals = (*prefix, authored, authored + "    assert (first(), second()) == (1, 2)\n")
+        middle = ("unavailable",) if scenario == "helper_exhausted" else ()
+        proposals = (*prefix, authored, *middle, authored + "    assert (first(), second()) == (1, 2)\n")
     else:
         proposals = (edit(NEW_TEST, smoke, other_smoke), edit(NEW_TEST, smoke, TEST))
     helper_requests = []
@@ -877,7 +878,10 @@ def test_only_verified_discriminating_replacement_may_retire_an_unpublished_smok
             if "Return exactly one new Python test function" in self.prompts[-1]:
                 helper_requests.append(self.prompts[-1])
                 if len(helper_requests) == 3:
-                    assert ("alternate-free", "alternate/free") in kwargs["exclude"]
+                    if scenario == "helper_exhausted":
+                        assert ("stand-in-free", "stand-in/free") not in kwargs.get("exclude", ())
+                    else:
+                        assert ("alternate-free", "alternate/free") in kwargs["exclude"]
                     assert "passed on both revisions" in helper_requests[-1]
                     assert "'offline'" in helper_requests[-1]
                 if len(helper_requests) == 2:
@@ -885,7 +889,10 @@ def test_only_verified_discriminating_replacement_may_retire_an_unpublished_smok
                     if scenario == "helper_repair":
                         assert "Current verification rejected" in helper_requests[-1]
                         assert "'incorrect'" in helper_requests[-1]
-                    result.route = "alternate-free"
+                    if scenario == "helper_exhausted":
+                        raise ProviderExhausted(None, {"gateway": "all eligible models excluded"})
+                    if scenario != "helper_same_route":
+                        result.route = "alternate-free"
                     result.configured_model = "alternate/free"
             return result
 
