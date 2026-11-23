@@ -1330,14 +1330,18 @@ def _one_test_draft(source):
         return False
 
 
-def _operator_function_messages(projection, review, sources, new_path, ancestor):
+def _operator_function_messages(projection, review, sources, new_path, ancestor, *, replace_smoke=False):
     request = (
         f"Write one original regression test for {new_path}.\n"
         "Return exactly one new Python test function with a test_ name and an ordinary assert. "
         "Define any custom fake inside the function. Use the shown helpers by name. "
         "The runner assembles the referenced helpers and imports. "
         "Assert the requested behavior that passes here and fails on the pinned ancestor.\n"
-        "\nRequested behavior (quoted review):\n"
+        + (
+            "The current smoke test passed on both revisions. Replace it with a discriminating case.\n"
+            if replace_smoke else ""
+        )
+        + "\nRequested behavior (quoted review):\n"
         + "\n".join(f"- {excerpt(body, 900)}" for _, _, body in review.feedback)
         + "\n\nReviewed changes (quoted):\n" + excerpt(ancestor, 1400)
         + "\n\nAvailable production APIs:\n"
@@ -3856,6 +3860,7 @@ def solve(executor, task, archive, budget, version):
     )
     test_rejection = None
     test_ancestor_feedback = ""
+    test_passed_ancestor = False
     fixture_requests = (
         explicit_fixture_requests(review.feedback)
         if production_regression or task.inline_review_threads >= 2 else ()
@@ -3992,6 +3997,22 @@ def solve(executor, task, archive, budget, version):
             kind = tuple(sorted(categories)) or ("verification",)
             key = pair, kind
             test_model_failures[key] = min(test_model_failures[key] + 1, _MODEL_FAILURE_THRESHOLD)
+
+    def lone_both_pass_case():
+        if not (
+            production_regression and len(review.feedback) == 1 and not review.test_only
+            and test_checkout_snapshot is current and test_seed is None and test_passed_ancestor
+            and original[new_path] == current[new_path] == ""
+            and not _protected(new_path, task, new_test=True) and _one_test_draft(test_draft)
+        ):
+            return None
+        run = test_case_runs.get("focused")
+        if run and run.passed == 1 and not run.failed and not run.deselected and run.named_cases:
+            if len(run.named_cases) == 1:
+                node = next(iter(run.named_cases))
+                if node.startswith(new_path + "::"):
+                    return node
+        return None
 
     def retain_test_seed(candidate, runs):
         nonlocal test_seed
@@ -4571,6 +4592,7 @@ def solve(executor, task, archive, budget, version):
                             test_checkout_snapshot = current
                             test_checkout_digest = hashlib.sha256(patch).digest()
                             test_case_runs = {}
+                            test_passed_ancestor = False
                             test_setup_failures = 0
                             prior_test_attempted = False
                             prior_test_source = ""
@@ -4623,10 +4645,11 @@ def solve(executor, task, archive, budget, version):
                                 path, name, prior_test_source, run = seed
                                 prior_test_fallback = (
                                     test_draft, test_diagnostic, test_ancestor_feedback,
-                                    test_rejection, test_case_runs,
+                                    test_rejection, test_case_runs, test_passed_ancestor,
                                 )
                                 test_draft = prior_test_source
                                 test_case_runs = {"focused": run}
+                                test_passed_ancestor = True
                                 test_rejection = None
                                 test_diagnostic = (
                                     f"This editable predecessor seed from {path} passed on both revisions. "
@@ -4643,11 +4666,12 @@ def solve(executor, task, archive, budget, version):
                         if revision != test_format_revision:
                             test_format_revision = revision
                             test_format_failures = 0
+                        smoke = lone_both_pass_case()
                         if (
                             production_regression and allow_test_module and fixtures and test_seed is None
                             and (helper_attempts == 0 or helper_attempts == 1 and helper_bad_model)
                             and (
-                                prior_test_source and test_draft == prior_test_source
+                                smoke
                                 or current is resumed_verified_checkout and not test_draft and not test_case_runs
                                 or test_setup_failures >= 2
                                 and not ((run := test_case_runs.get("focused")) and run.passed)
@@ -4662,6 +4686,7 @@ def solve(executor, task, archive, budget, version):
                             if helper_setup:
                                 offered = _operator_function_messages(
                                     helper_setup, review, current, new_path, ancestor_delta,
+                                    replace_smoke=bool(smoke),
                                 )
                                 if wire_size(offered) <= 12 * 1024:
                                     helper_authoring = helper_setup
@@ -5384,6 +5409,7 @@ def solve(executor, task, archive, budget, version):
                 next_rejection = focused_rejection
                 next_case_runs = after_runs
                 next_ancestor_feedback = ""
+                next_passed_ancestor = False
                 result = None
                 if after:
                     _LOG.info(
@@ -5413,9 +5439,10 @@ def solve(executor, task, archive, budget, version):
                                 continue
                             if pinned_ancestor and check.command == ("verify-regression", task.regression_base):
                                 next_ancestor_feedback = excerpt(check.output, 420)
+                                next_passed_ancestor = "The new tests also pass on the ancestor." in check.output
                                 test_check_labels.add(
                                     "ancestor/tests passed on both revisions"
-                                    if "The new tests also pass on the ancestor." in check.output
+                                    if next_passed_ancestor
                                     else "ancestor/no verified assertion failure"
                                 )
                                 continue
@@ -5446,17 +5473,30 @@ def solve(executor, task, archive, budget, version):
                             result.checks, focused_generated
                         )
                 candidate_run = next_case_runs.get("focused")
-                if helper_authoring is not None and not (candidate_run and candidate_run.passed):
+                smoke = lone_both_pass_case() if snapshot is current else None
+                if helper_authoring is not None and (smoke or next_passed_ancestor) and result is None:
+                    if editor.configured_model:
+                        helper_bad_model = editor.route, editor.configured_model
+                if helper_authoring is not None and (
+                    not (candidate_run and candidate_run.passed) or (smoke and result is None)
+                ):
                     notes[target] = (
-                        "The fixture-based proposal failed on the fixed checkout. "
+                        "The fixture-based proposal did not pass regression verification. "
                         "Continue from the retained unpublished draft.\n" + excerpt(next_diagnostic, 550)
                     )
                     continue
-                replaced_exploratory_seed = helper_authoring is not None and test_draft == prior_test_source
                 lost_test = (
                     _lost_passing_test(test_case_runs, next_case_runs, new_path)
-                    if allow_test_module and test_checkout_snapshot is current
-                    and not replaced_exploratory_seed else None
+                    if allow_test_module and test_checkout_snapshot is current else None
+                )
+                retire_smoke = bool(
+                    smoke and lost_test == smoke and result is not None
+                    and candidate_run and candidate_run.named_cases and candidate_run.passed
+                    and not candidate_run.failed and not candidate_run.deselected
+                    and any(
+                        check.command == ("verify-regression", task.regression_base) and check.returncode == 0
+                        for check in result.checks
+                    )
                 )
                 previous_run = test_case_runs.get("focused")
                 if (
@@ -5474,7 +5514,7 @@ def solve(executor, task, archive, budget, version):
                     elif focused_rejection is not None and not (candidate_run and candidate_run.assertion_reached):
                         (
                             test_draft, test_diagnostic, test_ancestor_feedback,
-                            test_rejection, test_case_runs,
+                            test_rejection, test_case_runs, test_passed_ancestor,
                         ) = prior_test_fallback
                         prior_test_fallback = None
                         notes[target] = (
@@ -5535,7 +5575,7 @@ def solve(executor, task, archive, budget, version):
                     )
                     _LOG.info("Retained the runnable pytest draft awaiting pinned ancestor proof")
                     continue
-                if lost_test:
+                if lost_test and not retire_smoke:
                     notes[target] = (
                         f"The last edit regressed or removed the already-passing case {lost_test}. "
                         "This prompt shows the retained draft and its original failure. Preserve the passing case."
@@ -5585,6 +5625,9 @@ def solve(executor, task, archive, budget, version):
                         "Add coverage for these explicit review fixture requests:\n"
                         + "\n".join(f"- {request}" for request in missing)
                     )
+                    if retire_smoke:
+                        notes[target] = next_diagnostic
+                        continue
                     _LOG.info("Retained passing pytest draft with %d missing fixture requests", len(missing))
                 if allow_test_module and snapshot is current:
                     retain_test_seed(candidate, next_case_runs)
@@ -5594,6 +5637,7 @@ def solve(executor, task, archive, budget, version):
                 test_rejection = next_rejection
                 test_diagnostic = next_diagnostic
                 test_ancestor_feedback = next_ancestor_feedback
+                test_passed_ancestor = snapshot is current and next_passed_ancestor
                 test_case_runs = next_case_runs if allow_test_module else {}
                 notes.pop(target, None)
                 continue
