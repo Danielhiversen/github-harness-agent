@@ -92,6 +92,7 @@ from .review_mock_replay import (
 )
 from .review_line_ranges import (
     LINE_RANGE_ENDING,
+    PLAIN_METHOD_ENDING,
     NATIVE_LINE_RANGE_TOOL,
     LineRangeSnapshot,
     ScopedRangeRejection,
@@ -1909,6 +1910,7 @@ def _coding_completion(
     native_line_retry=None,
     raw_python=False,
     plan_private_method=False,
+    raw_method_tokens=None,
 ):
     if plan_private_method:
         messages = private_method_planning_assist(executor, budget, messages, line_snapshot, RETRY_MESSAGE_BYTES)
@@ -2036,7 +2038,8 @@ def _coding_completion(
             exclude=exclude,
             after_provider=route,
             max_output_tokens=(
-                2048 if scoped_line
+                raw_method_tokens if raw_method_tokens is not None
+                else 2048 if scoped_line
                 else 3072 if fresh_line_snapshot is not None else max_tokens
             ),
             retry_oversize=not (scoped_line or raw_python),
@@ -2115,6 +2118,7 @@ class _LineRetry:
     caller_routes_reopened: bool = False
     caller_context: str = ""
     checked_caller_attempts: tuple[str, ...] = ()
+    raw_context: str = ""
 
     @property
     def complete_single_method(self):
@@ -2122,6 +2126,24 @@ class _LineRetry:
             self.checkpoint_method_edit and not self.alternatives
             and self.allowed_rows == frozenset(range(self.snapshot.first_body_line, len(self.snapshot.lines) + 1))
         )
+
+
+def _plain_method_request(retry):
+    """Offer a whole method only when the request and estimated reply fit."""
+    if not retry.raw_context or not retry.complete_single_method:
+        return None
+    code = "\n".join(retry.snapshot.lines)
+    # Account for indentation and punctuation as well as room for a small edit.
+    required = max(2048, (len(code.encode()) + 2) // 3 + 512)
+    if required > 6144:
+        return None
+    prompt = (
+        "Repair the following Python method. Return only its complete Python definition, "
+        "with the exact original header, indentation and a small body change.\n"
+        + retry.raw_context + "\nCurrent method:\n" + code + "\n" + PLAIN_METHOD_ENDING
+    )
+    messages = [{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": prompt}]
+    return (messages, required) if wire_size(messages) <= RETRY_MESSAGE_BYTES else None
 
 
 def _checked_caller_retry(retry, candidate, target, before, after, excluded):
@@ -2410,7 +2432,7 @@ def _private_method_retry(current, repair, target, review):
         prompt = context + evidence + numbered
         if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": prompt}]) <= RETRY_MESSAGE_BYTES:
             return _LineRetry(None, snapshot, allowed_rows=allowed, prompt=prompt, checkout=repair.sources,
-                              checkpoint_method_edit=True)
+                              checkpoint_method_edit=True, raw_context=(context + evidence if repair.retries and repair.retries > repair.stalled_edits else ""))
     return None
 
 
@@ -4135,6 +4157,7 @@ def solve(executor, task, archive, budget, version):
 
     planning_attempts = {}
     planned_private_methods = set()
+    raw_method_attempts = set()
     retry_advice = {}
     line_retries = {}
     line_routes = {}
@@ -4188,6 +4211,8 @@ def solve(executor, task, archive, budget, version):
                     native_ready=False, native_attempted=False,
                 )
                 return
+        if malformed and line_retry.direct_caller_only:
+            line_retry = replace(line_retry, raw_context=line_retry.caller_context)
         if line_retry.checkpoint_method_edit and isinstance(range_error, ScopedRangeRejection):
             note = f"Previous edit rejected: {range_error}\n"
             if note not in line_retry.prompt:
@@ -5269,8 +5294,15 @@ def solve(executor, task, archive, budget, version):
                     scoped_line = (
                         line_retry is not None and line_retry.allowed_rows is not None
                     )
+                    plain_method = None
+                    if scoped_line and line_retry.raw_context:
+                        key = target, line_retry.snapshot.digest
+                        if key not in raw_method_attempts:
+                            plain_method = _plain_method_request(line_retry)
+                            if plain_method:
+                                raw_method_attempts.add(key)
                     native_line = (
-                        scoped_line and line_retry.native_ready and not line_retry.native_attempted
+                        not plain_method and scoped_line and line_retry.native_ready and not line_retry.native_attempted
                         and launch_budget >= 2
                     )
                     if native_line:
@@ -5693,6 +5725,8 @@ def solve(executor, task, archive, budget, version):
                         messages = _test_line_messages(
                             test_line_snapshot, note, source, repository_usage=repository_usage,
                         )
+                    elif plain_method:
+                        messages = plain_method[0]
                     elif scoped_line:
                         messages = [
                             {"role": "system", "content": _LINE_RANGE_SYSTEM},
@@ -5707,7 +5741,7 @@ def solve(executor, task, archive, budget, version):
                                 line_retry = replace(line_retry, native_prompt=hint + line_retry.native_prompt)
                     plan_private_method = bool(
                         repair and repair.private_symbol and repair.stalled_edits and repair.excluded_models
-                        and scoped_line and line_retry.complete_single_method and not native_line
+                        and scoped_line and line_retry.complete_single_method and not native_line and not plain_method
                         and launch_budget >= 3 and budget.remaining() >= 90
                         and (target, line_retry.snapshot.digest) not in planned_private_methods
                     )
@@ -5758,6 +5792,8 @@ def solve(executor, task, archive, budget, version):
                         if line_retry and not scoped_line else last_routes.get(target)
                     )
                     advice_source = "planning" if planner_input is not None else "guided" if advice is not None else None
+                    if plain_method:
+                        _LOG.info("Requesting one plain Python method repair (%d body rows)", len(line_retry.allowed_rows))
                     if repair is not None and repair.private_symbol and line_retry is not None:
                         _LOG.info("Requesting private method repair for %s (attempt %d)",
                                   repair.private_symbol[1], repair.retries + 1)
@@ -5791,7 +5827,7 @@ def solve(executor, task, archive, budget, version):
                         scoped_line=scoped_line,
                         native_test_path=new_path if native_test else None,
                         native_line_retry=line_retry if native_line else None,
-                        plan_private_method=plan_private_method,
+                        plan_private_method=plan_private_method, raw_method_tokens=plain_method[1] if plain_method else None,
                     )
                     pending[future] = (
                         target,

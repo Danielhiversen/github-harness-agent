@@ -10,6 +10,7 @@ from pathlib import PurePosixPath
 
 from .review_definitions import _symbols, _unique_object
 
+PLAIN_METHOD_ENDING = "Return only the complete Python method."
 LINE_RANGE_ENDING = "Respond with the single line-range JSON object only."
 _NATIVE_TOOL_NAME = "replace_python_line_ranges"
 NATIVE_LINE_RANGE_TOOL = {

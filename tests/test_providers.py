@@ -1668,3 +1668,21 @@ def test_gateway_compacts_localized_review_without_cutting_editable_method(
     assert "test_priority: edit([5, 6]) -> result == 12" in text
     assert "Compare dispatch" in text
     assert body.replace("values_", "pinned_values_") not in text
+
+
+def test_complete_method_request_skips_routes_without_capacity():
+    calls = []
+    def handle(request):
+        calls.append(json.loads(request.content))
+        return httpx.Response(200, json=openai_response())
+
+    config = deployment("nvidia-free/nvidia/nemotron-3-ultra-550b-a55b")
+    router = routed(config, handle)
+    cap = router.routes[0].max_tokens
+    messages = [{"role": "system", "content": "Make a scoped edit."},
+                {"role": "user", "content": "Current method: def example(): pass\n" + providers.PLAIN_METHOD_ENDING}]
+    with pytest.raises(ProviderExhausted):
+        router.complete(role="coding", messages=messages, max_output_tokens=cap + 1)
+    assert calls == []
+    router.complete(role="coding", messages=messages, max_output_tokens=4096)
+    assert calls[0]["max_tokens"] == 4096

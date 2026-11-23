@@ -1348,6 +1348,10 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 assert "test_dispatch_observable" in prompt and "return self.read() + 2" in prompt
                 assert "Observed pytest failure:" in prompt and "Correct the dispatch result" in prompt
                 assert "-        return self.read() - 2" in prompt and "+        return self.read() + 2" in prompt
+                if len(private_models) == 1:
+                    assert "Current method:\n    def dispatch(self, legacy=False):" in prompt
+                    assert "complete Python definition" in prompt and not re.search(r"(?m)^\d+ \|", prompt)
+                    assert not kwargs["tools"]
                 if len(private_models) == 2:
                     assert "original target failed; previously passing control passed" in prompt
                     assert (strategy in prompt) == (private_plan == "success")
@@ -6123,3 +6127,21 @@ def test_private_tradeoff_requires_fresh_evidence_after_restart(solver_case, cap
 @pytest.mark.parametrize("outcome", ("success", "unavailable"))
 def test_private_method_uses_free_behavioral_plan_after_failed_repair(solver_case, caplog, outcome):
     _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-private", caplog, private_plan=outcome)
+
+
+def test_plain_method_reply_allowance_scales_and_skips_oversized_methods():
+    from github_harness_agent.review_solver import _LineRetry, _plain_method_request
+    from github_harness_agent.review_line_ranges import prepare_line_range_edit
+
+    for context, fits in (("Observed outcome: incorrect value.", True), ("long diagnostic" * 2000, False)):
+        source = "def execute():\n" + "    # A substantial original line kept intact during the edit.\n" * 125 + "    return 1\n"
+        snapshot = prepare_line_range_edit({"service.py": source}, ("service.py", "execute"))
+        retry = _LineRetry(None, snapshot, allowed_rows=frozenset(range(snapshot.first_body_line, len(snapshot.lines) + 1)),
+                           checkpoint_method_edit=True, raw_context=context)
+        request = _plain_method_request(retry)
+        if fits:
+            messages, allowance = request
+            assert source.rstrip() in messages[-1]["content"] and "Observed outcome:" in messages[-1]["content"]
+            assert 2048 < allowance <= 6144
+        else:
+            assert request is None

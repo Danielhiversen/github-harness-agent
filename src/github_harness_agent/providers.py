@@ -29,6 +29,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from .review_line_ranges import PLAIN_METHOD_ENDING
 from .review_definitions import CAUSAL_EDIT_GUIDANCE, DEFINITION_ENDING, LOCALIZED_METHOD_HEADING
 from .review_line_ranges import NATIVE_LINE_RANGE_TOOL
 from .task_context import (
@@ -926,7 +927,14 @@ class ProviderRouter:
             try:
                 attempt_limit = route.attempt_timeout
                 last_prompt = str(messages[-1].get("content") or "") if messages else ""
-                extended = not tools and (
+                plain_method = role == "coding" and not tools and last_prompt.endswith(PLAIN_METHOD_ENDING)
+                if plain_method and (
+                    (max_output_tokens is not None and route.max_tokens < max_output_tokens)
+                    or (route.local_input_bytes is not None and wire_size(messages) > route.local_input_bytes)
+                ):
+                    failures[route.alias] = "complete method exceeds route capacity"
+                    continue
+                extended = plain_method or not tools and (
                     (role == "coding" and (_causal_edit(messages) or last_prompt.endswith(DEFINITION_ENDING)))
                     or (role == "planning" and LOCALIZED_METHOD_HEADING in last_prompt)
                 )
@@ -964,6 +972,7 @@ class ProviderRouter:
                         )
                 groq_edit = (
                     route.alias == "groq-free"
+                    and not plain_method
                     and role == "coding"
                     and not tools
                     and max_output_tokens is not None
