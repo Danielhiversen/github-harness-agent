@@ -22,6 +22,7 @@ from .check_diagnostics import (
     check_failure_summary,
     check_locations,
     ordinary_static_locations,
+    ordinary_mypy_errors,
     ordinary_unused_import_failure,
     static_error_message,
 )
@@ -2712,6 +2713,48 @@ def _retry_stock_repair(repair, target, note, named_definitions, *, checked=Fals
     )
 
 
+def _mypy_line_retry(sources, paths, command, diagnostic):
+    errors = ordinary_mypy_errors(command, diagnostic)
+    if not 0 < len(errors) <= 12:
+        return None
+    traced = {path for path, _, _ in errors}
+    if len(traced) != 1 or not traced <= set(paths):
+        return None
+    path, = traced
+    source = sources[path]
+    try:
+        definitions = tuple(
+            (name, node) for name, node in _symbols(ast.parse(source).body)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    if any(row > len(source.splitlines()) for _, row, _ in errors):
+        return None
+    for _, row, _ in errors:
+        owners = [(name, node) for name, node in definitions if node.lineno < row <= node.end_lineno]
+        if not owners:
+            continue
+        name, node = min(owners, key=lambda owner: owner[1].end_lineno - owner[1].lineno)
+        spans = [(max(node.lineno + 1, line - 3), min(node.end_lineno, line + 3))
+                 for _, line, _ in errors if node.lineno < line <= node.end_lineno]
+        result = prepare_window_line_range_edit(sources, (path, name), spans)
+        if not result:
+            continue
+        snapshot, visible, allowed = result
+        facts = "\n".join(f"{file}:{line}: error: {message}" for file, line, message in errors)
+        context = (
+            "Only the repository mypy check failed. Correct its type errors and preserve the passing behavior.\n"
+            "Verified mypy diagnostics (quoted data, file-relative rows):\n"
+            + excerpt(facts, 2400) + "\n"
+        )
+        prompt = context + line_range_prompt(snapshot, visible_rows=visible) + LINE_RANGE_ENDING
+        if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": prompt}]) <= RETRY_MESSAGE_BYTES:
+            native = context + line_range_prompt(snapshot, visible_rows=visible, native=True)
+            return _LineRetry(None, snapshot, allowed, prompt, checkout=sources, native_prompt=native)
+    return None
+
+
 def _localized_static_failures(keys, static_runs, sources, allowed):
     if len(keys) > _STOCK_REPAIR_STATIC_LIMIT:
         return None
@@ -4528,6 +4571,7 @@ def solve(executor, task, archive, budget, version):
     line_routes = {}
     iteration_attempted = set()
     anchored_line_attempted = set()
+    mypy_line_attempted = set()
     raw_nested_attempts = {}
 
     def retry_numbered_route(target, line_retry, editor, *, malformed=False, after=None, range_error=None, checked_candidate=None):
@@ -5683,6 +5727,17 @@ def solve(executor, task, archive, budget, version):
                         and (line_retry.checkout is not current or repair is not None)
                     ):
                         line_retry = None
+                    if (
+                        line_retry is None and repair is None and failures.keys() == {target}
+                        and check_label(commands[target[0]], ()) == "mypy"
+                        and target[1] == f"check {target[0] + 1} (exit 1)"
+                    ):
+                        revision = hashlib.sha256(patch).digest()
+                        if revision not in mypy_line_attempted:
+                            mypy_line_attempted.add(revision)
+                            line_retry = _mypy_line_retry(current, paths, commands[target[0]], failures[target])
+                            if line_retry is not None:
+                                _LOG.info("Requesting a scoped repair for the sole mypy failure")
                     if repair is not None and repair.private_symbol and target in repair.introduced:
                         choice_limit = min(3, max_proposals - submitted - 1,
                                            (budget.commands_remaining() - len(commands) - 6) // max(1, len(commands)))
@@ -7246,6 +7301,21 @@ def solve(executor, task, archive, budget, version):
             progressed = new_operator < old_operator or (
                 new_operator == old_operator and after.keys() < failures.keys()
             )
+            if (
+                not progressed and repair is None and scoped_line and snapshot is current
+                and failures.keys() == after.keys() == {target}
+                and check_label(commands[target[0]], ()) == "mypy"
+            ):
+                before_errors = Counter(
+                    (path, message) for path, _, message in ordinary_mypy_errors(commands[target[0]], failures[target])
+                )
+                after_errors = Counter(
+                    (path, message) for path, _, message in ordinary_mypy_errors(commands[target[0]], after[target])
+                )
+                progressed = bool(after_errors and after_errors < before_errors and all(
+                    _same_pytest_selection(pytest_runs.get(number), after_runs.get(number))
+                    for number, command in enumerate(commands) if check_label(command, ()) == "pytest"
+                ))
             partial = not progressed and assertion_progress(
                 assertions, task.pull_checks, target, failures, after
             )

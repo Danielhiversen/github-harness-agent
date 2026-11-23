@@ -6605,3 +6605,91 @@ def test_interactive_operator_repair_receives_only_verifier_outcomes(solver_case
         solver_case, "checkpoint-caller-after-testfirst-private", caplog,
         fragment_case="history", interactive=True,
     )
+
+
+def test_promoted_stock_checkpoint_localizes_remaining_mypy_errors(solver_case, monkeypatch, caplog):
+    task, _, runner, checkpoints = solver_case
+    mypy = ("mypy", ".")
+    task = replace(task, checks=(*task.checks, mypy), require_new_tests=False)
+    Path(task.pull_checks[0][-1]).write_text(
+        "from fixture_calc import first, second\n"
+        "def test_control():\n    assert (first(), second()) == (-1, -2)\n"
+    )
+    production = BASE_SOURCE + (
+        "\ndef stock():\n    return -3\n"
+        "\ndef breadth():\n    return 3  # untyped breadth\n"
+        "\ndef ordering():\n    return 3  # untyped ordering\n"
+    )
+    promoted = production.replace("return -3", "return breadth() + ordering() - 3")
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        for path, source in {
+            SOURCE: production,
+            "tests/test_existing.py": (
+                "from fixture_calc import stock\n"
+                "def test_stock_goal():\n    assert stock() == 3\n"
+            ),
+        }.items():
+            data = source.encode()
+            entry = tarfile.TarInfo(path)
+            entry.size = len(data)
+            snapshot.addfile(entry, BytesIO(data))
+    raw = archive.getvalue()
+    original_command = FixtureWorkspace.command
+
+    def command(workspace, argv, *args, **kwargs):
+        if tuple(argv) != mypy:
+            return original_command(workspace, argv, *args, **kwargs)
+        source = (workspace.root / SOURCE).read_text()
+        messages = [
+            f'{SOURCE}:{row}: error: Argument 1 to "{line.rsplit(" ", 1)[-1]}" has incompatible type "object"; expected "int"  [arg-type]'
+            for row, line in enumerate(source.splitlines(), 1)
+            if "return breadth()" in source and "# untyped " in line
+        ]
+        return SimpleNamespace(
+            returncode=int(bool(messages)),
+            stdout=(("\n".join(messages) + f"\nFound {len(messages)} errors in 1 file\n") if messages else "Success\n").encode(),
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(FixtureWorkspace, "command", command)
+    patch = patch_for({SOURCE: production}, {SOURCE: promoted})
+    checkpoint = DraftCheckpoint("harness2/base", task.base_sha, patch, guidance=_GUIDANCE)
+    requests = []
+
+    class Gateway:
+        def complete(self, **kwargs):
+            prompt = kwargs["messages"][-1]["content"]
+            requests.append((prompt, kwargs.get("exclude", ()), bool(kwargs["tools"])))
+            assert 'has incompatible type "object"; expected "int"  [arg-type]' in prompt
+            route = "free-route-" + str(len(requests))
+            content = "Incomplete edit"
+            if kwargs["tools"]:
+                raise ProviderExhausted(None)
+            if len(requests) > 1:
+                name = "ordering" if "Edit only fixture_calc.py::ordering" in prompt else "breadth"
+                assert f"def {name}():" in prompt
+                digest = re.search(r'"snapshot":"([0-9a-f]{64})"', prompt)[1]
+                content = json.dumps({"snapshot": digest, "edits": [
+                    {"start": 2, "end": 2, "lines": [f"    return 3  # typed {name}"]},
+                ]})
+            return SimpleNamespace(
+                content=content, tool_calls=(), role="coding", route=route, model=route,
+                configured_model=route, usage={},
+            )
+
+    executor = PlainExecutor(runner, Gateway(), Limits(model_requests=8, concurrent_probes=1))
+    with caplog.at_level("INFO", logger="github_harness_agent.review_solver"):
+        controls = _Budget(executor.limits, lambda: False, task)
+        before = evidence(executor, task, raw, controls, b"", (*task.pull_checks, *task.checks))
+        assert tuple(node for _, node in before) == ("tests/test_existing.py::test_stock_goal",)
+        task = replace(task, checkpoints={checkpoint.key: checkpoint})
+        result = solve(executor, task, raw, _Budget(executor.limits, lambda: False, task), "fixture")
+    assert len(requests) == 4 and requests[1][2]
+    assert requests[1][1] == requests[2][1] == (("free-route-1", "free-route-1"),)
+    assert "Edit only fixture_calc.py::ordering" in requests[-1][0]
+    assert all(check.returncode == 0 for check in result.checks)
+    assert b"+    return breadth() + ordering() - 3" in result.patch
+    assert b"+    return 3  # typed breadth" in result.patch
+    assert b"+    return 3  # typed ordering" in result.patch
+    assert len(checkpoints) == 1 and b"typed breadth" in checkpoints[0].patch

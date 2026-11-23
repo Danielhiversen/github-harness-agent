@@ -126,6 +126,21 @@ def ordinary_static_locations(command, output):
     return ()
 
 
+def ordinary_mypy_errors(command, output):
+    """Return normalized locations and exact type messages from a complete mypy report."""
+    if check_label(command, ()) != "mypy":
+        return ()
+    locations = ordinary_static_locations(command, output)
+    if not locations:
+        return ()
+    errors = (line.partition(": error: ")[2] for line in _ANSI_COLOR.sub("", output).splitlines()
+              if ": error:" in line)
+    return tuple(
+        (path.removeprefix("/work/").removeprefix("./"), row, message)
+        for (path, row), message in zip(locations, errors, strict=True)
+    )
+
+
 def ordinary_unused_import_failure(command, output):
     """Recognize a complete Ruff report containing only unused imports."""
     if check_label(command, ()) != "ruff" or not ordinary_static_locations(
