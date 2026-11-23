@@ -6203,7 +6203,7 @@ def test_resumed_repeated_stock_uses_only_typed_scoped_coding(solver_case, monke
     assert all(check.returncode == 0 for check in result.checks)
 
 
-@pytest.mark.parametrize("restart", ("exact", "changed_review", "changed_checkpoint", "no_longer_red", "checkpoint_green"))
+@pytest.mark.parametrize("restart", ("exact", "changed_review", "changed_checkpoint", "no_longer_red", "checkpoint_green", "promoted"))
 def test_red_witness_is_replayed_in_fresh_solver(solver_case, caplog, restart):
     from github_harness_agent.controller import restore_solver_recovery
     from github_harness_agent.worker import Cancelled
@@ -6212,13 +6212,29 @@ def test_red_witness_is_replayed_in_fresh_solver(solver_case, caplog, restart):
 
     def solve_and_restart(executor, task, archive, budget, version):
         records = []
+        promoted = []
+        recovery = None
 
         def save(state, durable):
-            if durable and state and state.red_witness:
-                records.append(json.loads(json.dumps(state.to_data())))
+            nonlocal recovery
+            recovery = json.loads(json.dumps(state.to_data())) if state else None
+            if durable and recovery and state.red_witness:
+                records.append(recovery)
 
-        result = original_solve(executor, replace(task, save_solver_recovery=save), archive, budget, version)
-        record = records[0]
+        def save_checkpoint(checkpoint):
+            promoted.append((checkpoint, recovery))
+            task.save_checkpoint(checkpoint)
+
+        result = original_solve(executor, replace(task, save_solver_recovery=save, save_checkpoint=save_checkpoint),
+                                archive, budget, version)
+        if restart == "promoted":
+            checkpoint, record = promoted[-1]
+            assert checkpoint.patch != next(iter(task.checkpoints.values())).patch
+            assert record and "counterexample" in record and "red_witness" in record
+            assert "tradeoff" not in record
+            task = replace(task, checkpoints={checkpoint.key: checkpoint})
+        else:
+            record = records[0]
         assertion = "assert second() == 2" if restart == "checkpoint_green" else "assert first() == 1"
         assert assertion in record["red_witness"]["source"]
         witness = record["red_witness"]
@@ -6265,10 +6281,15 @@ def test_red_witness_is_replayed_in_fresh_solver(solver_case, caplog, restart):
         gateway = RestartGateway("scoped production edit", *([TEST] if restart == "checkpoint_green" else []))
         fresh = PlainExecutor(executor.runner, gateway, executor.limits, verification_runner=executor.verification_runner)
         with caplog.at_level("ERROR", logger="github_harness_agent.review_solver"):
-            if restart in {"exact", "checkpoint_green"}:
+            if restart in {"exact", "checkpoint_green", "promoted"}:
                 verified = original_solve(fresh, resumed, archive, _Budget(fresh.limits, lambda: False, resumed), version)
-                assert verified.patch == result.patch and len(gateway.prompts) == (2 if restart == "checkpoint_green" else 1)
+                expected_requests = {"exact": 1, "checkpoint_green": 2, "promoted": 0}
+                assert verified.patch == result.patch and len(gateway.prompts) == expected_requests[restart]
                 assert any(c.command[0] == "verify-regression" and not c.returncode for c in verified.checks)
+                if restart == "promoted":
+                    assert verified.regression_counterexample == result.regression_counterexample
+                    assert any(c.command == ("verify-regression-counterexample",) and not c.returncode
+                               for c in verified.checks)
             else:
                 with pytest.raises(Cancelled):
                     original_solve(fresh, resumed, archive, _Budget(fresh.limits, lambda: False, resumed), version)

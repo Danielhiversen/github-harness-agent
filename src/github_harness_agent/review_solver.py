@@ -36,6 +36,7 @@ from .checkpoint import (
     PrivateRecovery,
     PrivateCaseTradeoff,
     RedWitness,
+    RegressionCounterexample,
     SolverRecovery,
 )
 from .executor import (
@@ -3174,13 +3175,6 @@ def solve(executor, task, archive, budget, version):
         and patch and patch == draft.patch and len(failures) == 1 and not current[new_path]
         else None
     )
-    if (
-        resumed_operator_checkout is not None
-        and executor.verification_runner is not executor.runner
-        and _is_partial_operator_counterexample(failures, pytest_runs, commands, len(task.pull_checks))
-    ):
-        budget.regression_counterexample = patch
-        _LOG.info("Retained a verified partial checkpoint for regression coverage")
     if review.test_only and failures:
         raise ExecutionError("Required checks failed on the unchanged baseline for the test-only review")
     notes = {}
@@ -3200,10 +3194,42 @@ def solve(executor, task, archive, budget, version):
     test_seed = None
     durable_witness = None
     tradeoff = None
-    def witness_identity():
+    counterexample = None
+
+    def witness_binding(recovery_identity):
         return hashlib.sha256(json.dumps((
-            retained_identity, task.regression_base, new_path, review.feedback,
+            recovery_identity, task.regression_base, new_path, review.feedback,
         )).encode()).hexdigest()
+
+    def witness_identity():
+        return counterexample.identity if counterexample else witness_binding(retained_identity)
+
+    if production_regression:
+        saved = retained_recovery.counterexample if retained_recovery and retained_recovery.identity == retained_identity else None
+        if saved and saved.identity == witness_binding(_recovery_digest(task, fixtures, saved.patch)):
+            if executor.verification_runner is executor.runner:
+                raise ExecutionError("Saved regression counterexample requires independent verification")
+            if len(saved.patch) > executor.limits.patch_bytes:
+                raise ExecutionError("Saved regression counterexample exceeds the patch limit")
+            if saved.patch == patch:
+                observed, runs = failures, pytest_runs
+            else:
+                runs = {}
+                observed = review_evidence(executor, task, archive, budget, saved.patch, commands, pytest_runs=runs)
+            if (not _is_partial_operator_counterexample(observed, runs, commands, len(task.pull_checks))
+                    or _goal_digest(next(iter(observed))) != saved.goal):
+                raise ExecutionError("Saved regression counterexample no longer verifies")
+            counterexample = saved
+            budget.regression_counterexample = saved.patch
+        elif (resumed_operator_checkout is not None and executor.verification_runner is not executor.runner
+              and _is_partial_operator_counterexample(failures, pytest_runs, commands, len(task.pull_checks))):
+            budget.regression_counterexample = patch
+            if len(patch) <= PRIVATE_PATCH_BYTES:
+                counterexample = RegressionCounterexample(
+                    witness_binding(retained_identity), _goal_digest(next(iter(failures))), patch,
+                )
+        if budget.regression_counterexample is not None:
+            _LOG.info("Retained a verified partial checkpoint for regression coverage")
 
     restored_raw_targets = set()
     restored_raw_patch = patch
@@ -3211,7 +3237,7 @@ def solve(executor, task, archive, budget, version):
         alternate = retained_recovery.alternate
         tradeoff = retained_recovery.tradeoff
         saved_witness = retained_recovery.red_witness
-        if (current is resumed_operator_checkout and saved_witness is not None
+        if ((current is resumed_operator_checkout or counterexample is not None) and saved_witness is not None
                 and saved_witness.identity == witness_identity()):
             durable_witness = saved_witness
         if task.require_new_tests and not failures and not current[new_path]:
@@ -3237,8 +3263,8 @@ def solve(executor, task, archive, budget, version):
         ]
         goals.sort(key=lambda goal: (-max(goal[1:]), goal[0]))
         state = (
-            SolverRecovery(retained_identity, tuple(goals[:RECOVERY_GOAL_LIMIT]), alternate, test_seed, durable_witness, tradeoff)
-            if goals or alternate is not None or test_seed is not None or durable_witness is not None or tradeoff is not None
+            SolverRecovery(retained_identity, tuple(goals[:RECOVERY_GOAL_LIMIT]), alternate, test_seed, durable_witness, tradeoff, counterexample)
+            if goals or alternate or test_seed or durable_witness or tradeoff or counterexample
             else None
         )
         if state != retained_recovery:
@@ -4939,9 +4965,14 @@ def solve(executor, task, archive, budget, version):
 
         assertions = []
         checkpoint_pass = None
+        test_patch = patch_for({new_path: ""}, {new_path: source})
+        checkpoint_changes = (
+            counterexample.patch + test_patch if counterexample
+            else patch_for(original, {**current, new_path: source})
+        )
         for stage, revision, changes in (
-            ("checkpoint", archive, patch_for(original, {**current, new_path: source})),
-            ("pinned ancestor", task.regression_archive, patch_for({new_path: ""}, {new_path: source})),
+            ("checkpoint", archive, checkpoint_changes),
+            ("pinned ancestor", task.regression_archive, test_patch),
         ):
             runs = {}
             failed = review_evidence(executor, task, revision, proof, changes, (focused_generated,),

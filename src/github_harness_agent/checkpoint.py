@@ -184,6 +184,32 @@ class PrivateCaseTradeoff:
 
 
 @dataclass(frozen=True)
+class RegressionCounterexample:
+    """Original production-only checkpoint bound to its verified residual case."""
+
+    identity: str
+    goal: str
+    patch: bytes = field(repr=False)
+
+    def to_data(self):
+        return {"identity": self.identity, "goal": self.goal,
+                "patch_b64": base64.b64encode(self.patch).decode("ascii")}
+
+    @classmethod
+    def from_data(cls, data):
+        if not isinstance(data, dict):
+            raise ValueError("Invalid regression counterexample")
+        identity, goal, encoded = (data.get(key) for key in ("identity", "goal", "patch_b64"))
+        if (not all(isinstance(value, str) and re.fullmatch("[a-f0-9]{64}", value) for value in (identity, goal))
+                or not isinstance(encoded, str) or not 0 < len(encoded) <= 4 * ((PRIVATE_PATCH_BYTES + 2) // 3)):
+            raise ValueError("Invalid regression counterexample")
+        patch = base64.b64decode(encoded, validate=True)
+        if not 0 < len(patch) <= PRIVATE_PATCH_BYTES:
+            raise ValueError("Invalid regression counterexample patch")
+        return cls(identity, goal, patch)
+
+
+@dataclass(frozen=True)
 class SolverRecovery:
     identity: str
     goals: tuple[tuple[str, int, int], ...]
@@ -191,6 +217,7 @@ class SolverRecovery:
     test_seed: GeneratedTestSeed | None = None
     red_witness: RedWitness | None = None
     tradeoff: PrivateCaseTradeoff | None = None
+    counterexample: RegressionCounterexample | None = None
 
     def to_data(self):
         data = {"identity": self.identity, "goals": [list(goal) for goal in self.goals]}
@@ -202,6 +229,8 @@ class SolverRecovery:
             data["tradeoff"] = self.tradeoff.to_data()
         if self.red_witness is not None:
             data["red_witness"] = self.red_witness.to_data()
+        if self.counterexample is not None:
+            data["counterexample"] = self.counterexample.to_data()
         return data
 
     @classmethod
@@ -225,12 +254,16 @@ class SolverRecovery:
             tradeoff = PrivateCaseTradeoff.from_data(value.get("tradeoff"))
         except ValueError:
             tradeoff = None
+        try:
+            counterexample = RegressionCounterexample.from_data(value.get("counterexample"))
+        except ValueError:
+            counterexample = None
         if (
             not isinstance(identity, str)
             or not re.fullmatch(r"[a-f0-9]{64}", identity)
             or not isinstance(goals, list)
             or len(goals) > RECOVERY_GOAL_LIMIT
-            or not (goals or alternate is not None or test_seed is not None or red_witness is not None or tradeoff is not None)
+            or not (goals or alternate or test_seed or red_witness or tradeoff or counterexample)
         ):
             raise ValueError("Invalid solver recovery state")
         records = {}
@@ -257,6 +290,7 @@ class SolverRecovery:
             test_seed,
             red_witness,
             tradeoff,
+            counterexample,
         )
 
 
