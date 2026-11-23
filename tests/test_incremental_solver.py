@@ -1383,9 +1383,15 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
 
                 probe = call("run", {"argv": ["verify_review"]}, 1)
                 if stage == 0:
-                    calls = (call("run", {"argv": ["cat", SOURCE]}, 0),)
+                    assert f"Run {NEW_TEST} as a read-only local regression" in messages
+                    calls = (
+                        call("run", {"argv": ["cat", SOURCE]}, 0),
+                        call("run", {"argv": ["cat", NEW_TEST]}, 1),
+                    )
                 elif stage == 1:
                     assert "if enabled:" in messages and "context_31" in messages
+                    assert any(reply["content"] == "exit 0\n" + early_case for reply in kwargs["messages"]
+                               if reply["role"] == "tool")
                     calls = (change(tentative_header, first), probe)
                 elif stage == 2:
                     assert "Independent verifier: requested target passed; previously passing control failed." in messages
@@ -1393,11 +1399,11 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 elif stage == 3:
                     assert "Independent verifier: requested target passed; previously passing control passed." in messages
                     calls = (
-                        call("edit_file", {"path": NEW_TEST, "new_text": early_case}, 0),
+                        call("edit_file", {"path": NEW_TEST, "old_text": "assert first() == 1", "new_text": "assert True"}, 0),
                         call("run", {"argv": [sys.executable, "-m", "pytest", "-q", NEW_TEST]}, 1),
                     )
                 else:
-                    assert "1 passed" in messages
+                    assert "That file is outside the scoped review." in messages and "1 passed" in messages
                     calls = ()
                 return SimpleNamespace(
                     content=None if calls else "Completed.", tool_calls=calls, role="coding",

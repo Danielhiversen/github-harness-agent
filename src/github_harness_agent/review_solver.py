@@ -4142,7 +4142,7 @@ def solve(executor, task, archive, budget, version):
             save_verified_progress(patch, note, editor)
         return True
 
-    def interactive_operator_repair(repair, control, probe):
+    def interactive_operator_repair(repair, control, probe, witness_source):
         origin = repair.origin
         if origin == control or any(number >= len(task.pull_checks) for number, _ in (origin, control)):
             return None
@@ -4152,11 +4152,19 @@ def solve(executor, task, archive, budget, version):
         goals = tuple((index, case[1]) for index, case in enumerate((origin, control)))
         path, name = repair.private_symbol
         reviewed = {path: repair.sources[path]}
-        if not _protected(new_path, task, new_test=True):
-            reviewed[new_path] = ""
-        seed = patch_for(original, {**current, path: reviewed[path]})
+        seed_sources = {**current, path: reviewed[path]}
+        seed = patch_for(original, seed_sources)
         if not seed or len(seed) > executor.limits.patch_bytes:
             return None
+        local_witness = False
+        if not current[new_path] and not _protected(new_path, task, new_test=True):
+            if witness_source:
+                witness_seed = patch_for(original, {**seed_sources, new_path: witness_source})
+                if len(witness_seed) <= executor.limits.patch_bytes:
+                    # The initial tree includes the witness, but the editable scope excludes it.
+                    seed, local_witness = witness_seed, True
+            if not local_witness:
+                reviewed[new_path] = ""
         checked = {}
         probe_count = 0
 
@@ -4193,6 +4201,9 @@ def solve(executor, task, archive, budget, version):
             "independent operator cases, without access to their sources. Keep both behaviors working.\n"
             f"Reviewed method: {path}::{name}\n"
             f"Editable paths: {json.dumps(list(reviewed))}\n"
+            + (f"Run {new_path} as a read-only local regression. Its assertions failed independently "
+               "on the accepted checkpoint and pinned ancestor. Keep its source unchanged.\n"
+               if local_witness else "")
             + "Requested behavior (quoted): " + excerpt(" ".join(body for _, _, body in review.feedback), 850) + "\n"
             + (excerpt(repair.retry_note.split(" Observed pytest failure:", 1)[0], 220) + "\n"
                if repair.retry_note else "")
@@ -5233,6 +5244,7 @@ def solve(executor, task, archive, budget, version):
                 _LOG.info("Trying isolated interactive operator repair after checked proposals")
                 checked = interactive_operator_repair(
                     regression_repair, repair_target, _InteractiveBudget(budget, turns, tools, wall_seconds=240),
+                    test_first_witness[0] if test_first_witness and test_first_witness[1] else "",
                 )
                 submitted += before - budget.model_requests_remaining()
                 if checked is not None:
