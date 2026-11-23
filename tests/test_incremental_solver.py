@@ -41,6 +41,7 @@ from github_harness_agent.review_solver import (
     _generic_verifier_failure,
     _rejected_attempt,
     _line_failure_details,
+    _operator_function_messages,
     apply_blocks,
     evidence,
     patch_for,
@@ -837,6 +838,29 @@ def test_single_pinned_production_review_fixes_all_checks_before_authoring_regre
     assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
 
 
+@pytest.mark.parametrize("bulky", (False, True))
+def test_helper_authoring_prioritizes_reviewed_api_and_fits_prior_case(bulky):
+    review = SimpleNamespace(feedback=(("domain.py", 70, "Exercise the requested partition limit."),))
+    methods = [f"def irrelevant_{i}(value): return value" for i in range(80)]
+    methods.insert(37, "def partition(limit, records): return records[:limit]")
+    methods.append("class Batch:\n    def __init__(self, size): self.size = size")
+    prior = "def test_case():\n" + "    # previous setup\n" * 70 + "    value = midpoint()\n" + "    # final setup\n" * 70
+    messages = _operator_function_messages(
+        SimpleNamespace(preview="σ" * 1300 if bulky else "mock_factory()"),
+        review, {"domain.py": "\n".join(methods)}, NEW_TEST, "",
+        feedback="E   assert 4 == 7\nE   TypeError: Batch() got an unexpected keyword argument 'limit'",
+        prior_function=prior,
+    )
+    prompt = messages[-1]["content"]
+    assert "def partition(limit, records)" in prompt
+    assert "E   assert 4 == 7" in prompt
+    assert "Batch.__init__(self, size)" in prompt.partition("Production API at the reported failure:")[2]
+    assert "def test_case():" in prompt
+    if not bulky:
+        assert prior in prompt
+    assert wire_size(messages) <= 12 * 1024
+
+
 @pytest.mark.parametrize("scenario", ("rename", "helper", "helper_repair", "helper_same_route", "helper_exhausted", "passing_siblings", "ancestor_error"))
 def test_only_verified_discriminating_replacement_may_retire_an_unpublished_smoke(solver_case, scenario):
     task, archive, runner, _ = solver_case
@@ -888,6 +912,7 @@ def test_only_verified_discriminating_replacement_may_retire_an_unpublished_smok
                     assert ("stand-in-free", "stand-in/free") in kwargs["exclude"]
                     if scenario == "helper_repair":
                         assert "Current verification rejected" in helper_requests[-1]
+                        assert "offline" in helper_requests[-1].partition("Requested behavior")[0]
                         assert "'incorrect'" in helper_requests[-1]
                     if scenario == "helper_exhausted":
                         raise ProviderExhausted(None, {"gateway": "all eligible models excluded"})

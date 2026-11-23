@@ -1330,7 +1330,13 @@ def _one_test_draft(source):
         return False
 
 
-def _operator_function_messages(projection, review, sources, new_path, ancestor, *, replace_smoke=False, feedback=""):
+def _operator_function_messages(
+    projection, review, sources, new_path, ancestor, *, replace_smoke=False, feedback="", prior_function="",
+):
+    requirements = "\n".join(f"- {excerpt(body, 900)}" for _, _, body in review.feedback)
+    production = {path: source for path, source in sources.items() if path != new_path}
+    focus = test_failure_focus(production, feedback) if feedback else ""
+    query = words(" ".join((requirements, projection.preview, ancestor, feedback, prior_function)))
     request = (
         f"Write one original regression test for {new_path}.\n"
         "Return exactly one new Python test function with a test_ name and an ordinary assert. "
@@ -1343,19 +1349,29 @@ def _operator_function_messages(projection, review, sources, new_path, ancestor,
         )
         + ("\nPrevious authored function and verification feedback (quoted):\n" + feedback if feedback else "")
         + "\nRequested behavior (quoted review):\n"
-        + "\n".join(f"- {excerpt(body, 900)}" for _, _, body in review.feedback)
+        + requirements
         + "\n\nReviewed changes (quoted):\n" + excerpt(ancestor, 1400)
         + "\n\nAvailable production APIs:\n"
         + "\n".join(
-            _regression_api(path, source, set(), 650)[0]
-            for path, source in sources.items() if path != new_path
+            _regression_api(path, source, query, 650)[0]
+            for path, source in production.items()
         )
+        + ("\n\nProduction API at the reported failure:\n" + focus if focus else "")
         + "\n\nApproved setup helpers and imports (quoted):\n" + projection.preview
     )
-    return [
+    messages = [
         {"role": "system", "content": _SYSTEM_PREFIX + "Return only the complete Python test function.\n" + _SYSTEM_SUFFIX},
         {"role": "user", "content": request},
     ]
+
+    if prior_function:
+        for limit in (6000, 3000, 1200, 600):
+            messages[-1]["content"] = request + "\n\nPrevious function (quoted):\n" + excerpt(prior_function, limit)
+            if wire_size(messages) <= 12 * 1024:
+                break
+        else:
+            messages[-1]["content"] = request
+    return messages
 
 
 def _regression_api(path, content, query, limit, *, anchors=()):
@@ -3887,6 +3903,7 @@ def solve(executor, task, archive, budget, version):
     helper_setup = None
     helper_attempts = 0
     helper_feedback = ""
+    helper_function = ""
     helper_bad_model = ()
     test_model_failures = Counter()
     test_tool_attempts = set()
@@ -4602,6 +4619,7 @@ def solve(executor, task, archive, budget, version):
                             helper_setup = None
                             helper_attempts = 0
                             helper_feedback = ""
+                            helper_function = ""
                             helper_bad_model = ()
                             test_model_failures = Counter()
                         if repository_example is None or (pinned_ancestor and repository_checkout is not current):
@@ -4689,7 +4707,7 @@ def solve(executor, task, archive, budget, version):
                             if helper_setup:
                                 offered = _operator_function_messages(
                                     helper_setup, review, current, new_path, ancestor_delta,
-                                    replace_smoke=bool(smoke), feedback=helper_feedback,
+                                    replace_smoke=bool(smoke), feedback=helper_feedback, prior_function=helper_function,
                                 )
                                 if wire_size(offered) <= 12 * 1024:
                                     helper_authoring = helper_setup
@@ -5487,10 +5505,17 @@ def solve(executor, task, archive, budget, version):
                         outcome = "The function passed on both revisions. Strengthen its scenario and assertions."
                     elif next_ancestor_feedback:
                         outcome = "The pinned run did not establish an assertion failure in the test."
-                    helper_feedback = (
-                        outcome + "\n" + excerpt(next_ancestor_feedback or next_diagnostic, 550)
-                        + "\nPrevious function:\n" + excerpt(completion.content or "", 1200)
-                    )
+                    # Put pytest's rewritten assertion or exception before traceback
+                    # frames so it survives excerpting on long execution diagnostics.
+                    reasons = [
+                        line.strip() for (_, node), detail in after.items()
+                        if node.removeprefix("./").startswith(new_path + "::")
+                        for line in detail.splitlines()
+                        if re.match(r"^E\s+(?:assert\b|[\w.]*(?:Error|Exception):)", line)
+                    ]
+                    detail = next_ancestor_feedback or next_diagnostic
+                    helper_feedback = outcome + "\n" + excerpt("\n".join((*reasons[:2], detail)), 750)
+                    helper_function = completion.content or ""
                     if editor.configured_model:
                         helper_bad_model = editor.route, editor.configured_model
                 if helper_authoring is not None and (
