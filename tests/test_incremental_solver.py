@@ -837,6 +837,98 @@ def test_single_pinned_production_review_fixes_all_checks_before_authoring_regre
     assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
 
 
+@pytest.mark.parametrize("alternate", (False, True))
+def test_pinned_setup_failures_recover_using_an_authored_function_and_only_needed_helpers(
+    solver_case, alternate, caplog,
+):
+    task, archive, runner, _ = solver_case
+    test_path = NEW_TEST
+    if alternate:
+        addition = BytesIO(archive)
+        previous = b"from fixture_calc import first\n\ndef test_previous():\n    assert first() in {-1, 1}\n"
+        with tarfile.open(fileobj=addition, mode="a") as snapshot:
+            entry = tarfile.TarInfo(NEW_TEST)
+            entry.size = len(previous)
+            snapshot.addfile(entry, BytesIO(previous))
+        archive = addition.getvalue()
+        test_path = NEW_TEST.removesuffix(".py") + "_2.py"
+    with Path(task.pull_checks[0][-1]).open("a") as target:
+        target.write(
+            "\nfrom types import SimpleNamespace\n"
+            "UNUSED_STATE = object()\n"
+            "def make_transport(fetch, token):\n"
+            "    return SimpleNamespace(fetch=fetch)\n"
+            "def build_client(fetch):\n"
+            "    return make_transport(fetch, token='fixture')\n"
+            "def make_config(tmp_path):\n"
+            "    path = tmp_path / 'sample.txt'\n"
+            "    path.write_text('synthetic input')\n"
+            "    return path\n"
+            "def make_unused():\n"
+            "    return 'unused setup sentinel'\n"
+            "def assert_operator_only():\n"
+            "    assert first() != 94, 'operator assertion sentinel'\n"
+        )
+    task = replace(
+        task, inline_review_threads=1, regression_base=task.base_sha,
+        regression_archive=archive, regression_edit_path=SOURCE,
+        review_recovery=replace(task.review_recovery, feedback=(
+            (SOURCE, 2, "Correct both results and test them in one scenario using offline fixture setup."),
+        )),
+    )
+    missing = "def test_missing(missing_setup):\n    assert missing_setup\n"
+    still_missing = missing.replace("missing_setup", "other_setup")
+    authored = (
+        "def test_authored(tmp_path):\n"
+        "    def fake_fetch():\n"
+        "        return 'synthetic input'\n"
+        "    client = build_client(fake_fetch)\n"
+        "    path = make_config(tmp_path)\n"
+        "    assert path.read_text() == client.fetch()\n"
+        "    assert (first(), second()) == (1, 2)\n"
+    )
+    projections = []
+
+    class Gateway(FreeGateway):
+        def complete(self, **kwargs):
+            result = super().complete(**kwargs)
+            if "Return exactly one new Python test function" in self.prompts[-1]:
+                projections.append(self.prompts[-1])
+                if len(projections) == 2:
+                    assert ("stand-in-free", "stand-in/free") in kwargs["exclude"]
+                    result.route = "alternate-free"
+                    result.configured_model = "alternate/free"
+            return result
+
+    proposals = (FIRST, SECOND, missing, edit(test_path, missing, still_missing))
+    gateway = Gateway(*proposals, *(("invalid prose",) if alternate else ()), authored)
+    independent = runner.path / "operator-helper-verifier"
+    independent.mkdir()
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=6 if alternate else 5, concurrent_probes=1),
+        verification_runner=FixtureRunner(independent),
+    )
+    with caplog.at_level("INFO", logger="github_harness_agent.review_solver"):
+        result = solve(executor, task, archive, _Budget(executor.limits, lambda: False, task), "fixture")
+
+    assert len(projections) == 1 + int(alternate)
+    if alternate:
+        assert "Started new pytest authoring from the verified predecessor seed" in caplog.text
+        assert f"+++ b/{NEW_TEST}\n".encode() not in result.patch
+    assert "def make_transport(fetch, token):" in projections[-1]
+    assert "operator assertion sentinel" not in projections[-1]
+    assert all(marker in result.patch for marker in (
+        b"+def test_authored(tmp_path):", b"+    def fake_fetch():",
+        b"+def make_config(tmp_path):", b"+def make_transport(fetch, token):",
+        b"+    return make_transport(fetch, token='fixture')",
+    ))
+    assert all(marker not in result.patch for marker in (
+        b"UNUSED_STATE", b"unused setup sentinel", b"operator assertion sentinel", b"def test_first",
+        b"def test_previous",
+    ))
+    assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
+
+
 @pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored"))
 def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, failover):
     task, _, runner, checkpoints = solver_case

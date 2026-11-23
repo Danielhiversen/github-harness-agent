@@ -106,6 +106,7 @@ from .review_planner import (
 )
 from .review_recovery import operator_acceptance_context
 from .review_solver_context import (
+    OperatorTestAssembly,
     _pytest_fixtures,
     _rewritten_assertion,
     extended_pytest_context,
@@ -113,6 +114,7 @@ from .review_solver_context import (
     focused_source_excerpt,
     imported_model_declarations,
     operator_api_contract,
+    operator_test_assembly,
     prior_generated_fixture_context,
     prior_generated_test_seed,
     repository_pytest_context,
@@ -1316,6 +1318,39 @@ def _regression_context(fixtures):
         if chunks:
             setup.append(path + "\n" + excerpt("".join(chunks), 2200 // len(fixtures)))
     return ", ".join(dict.fromkeys(names)), "\n".join(setup)
+
+
+def _one_test_draft(source):
+    try:
+        return sum(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_")
+            for node in ast.walk(ast.parse(source))
+        ) <= 1
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+
+
+def _operator_function_messages(projection, review, sources, new_path, ancestor):
+    request = (
+        f"Write one original regression test for {new_path}.\n"
+        "Return exactly one new Python test function with a test_ name and an ordinary assert. "
+        "Define any custom fake inside the function. Use the shown helpers by name. "
+        "The runner assembles the referenced helpers and imports. "
+        "Assert the requested behavior that passes here and fails on the pinned ancestor.\n"
+        "\nRequested behavior (quoted review):\n"
+        + "\n".join(f"- {excerpt(body, 900)}" for _, _, body in review.feedback)
+        + "\n\nReviewed changes (quoted):\n" + excerpt(ancestor, 1400)
+        + "\n\nAvailable production APIs:\n"
+        + "\n".join(
+            _regression_api(path, source, set(), 650)[0]
+            for path, source in sources.items() if path != new_path
+        )
+        + "\n\nApproved setup helpers and imports (quoted):\n" + projection.preview
+    )
+    return [
+        {"role": "system", "content": _SYSTEM_PREFIX + "Return only the complete Python test function.\n" + _SYSTEM_SUFFIX},
+        {"role": "user", "content": request},
+    ]
 
 
 def _regression_api(path, content, query, limit, *, anchors=()):
@@ -3836,6 +3871,9 @@ def solve(executor, task, archive, budget, version):
     prior_test_attempted = False
     prior_test_source = ""
     prior_test_fallback = None
+    helper_setup = None
+    helper_attempts = 0
+    helper_bad_model = ()
     test_model_failures = Counter()
     test_tool_attempts = set()
     test_line_attempts = set()
@@ -4519,6 +4557,8 @@ def solve(executor, task, archive, budget, version):
                     native_test = False
                     test_line_snapshot = None
                     test_raw_retry = None
+                    helper_authoring = None
+                    helper_messages = None
                     if target == _TEST_GOAL:
                         if test_checkout_snapshot is not current:
                             test_checkout_snapshot = current
@@ -4528,6 +4568,9 @@ def solve(executor, task, archive, budget, version):
                             prior_test_attempted = False
                             prior_test_source = ""
                             prior_test_fallback = None
+                            helper_setup = None
+                            helper_attempts = 0
+                            helper_bad_model = ()
                             test_model_failures = Counter()
                         if repository_example is None or (pinned_ancestor and repository_checkout is not current):
                             repository_checkout = current
@@ -4593,8 +4636,33 @@ def solve(executor, task, archive, budget, version):
                         if revision != test_format_revision:
                             test_format_revision = revision
                             test_format_failures = 0
+                        if (
+                            production_regression and allow_test_module and fixtures and test_seed is None
+                            and (helper_attempts == 0 or helper_attempts == 1 and helper_bad_model)
+                            and (
+                                prior_test_source and test_draft == prior_test_source
+                                or test_setup_failures >= 2
+                                and not ((run := test_case_runs.get("focused")) and run.passed)
+                            )
+                            and _one_test_draft(test_draft)
+                        ):
+                            if helper_setup is None:
+                                helper_setup = operator_test_assembly(
+                                    fixtures, archive, task.regression_archive,
+                                    {path: current[path] for path in paths if not _protected(path, task, new_test=False)},
+                                ) or False
+                            if helper_setup:
+                                offered = _operator_function_messages(
+                                    helper_setup, review, current, new_path, ancestor_delta,
+                                )
+                                if wire_size(offered) <= 12 * 1024:
+                                    helper_authoring = helper_setup
+                                    helper_messages = offered
+                                    helper_attempts += 1
+                                else:
+                                    helper_setup = False
                         native_test = (
-                            allow_test_module
+                            allow_test_module and helper_authoring is None
                             and test_format_failures >= 2
                             and revision not in test_tool_attempts
                             and launch_budget >= 2
@@ -4604,7 +4672,8 @@ def solve(executor, task, archive, budget, version):
                             test_tool_attempts.add(revision)
                             _LOG.info("Trying structured pytest module reply after repeated format errors")
                         elif (
-                            allow_test_module and test_format_failures > RECOVERY_MODE_THRESHOLD
+                            allow_test_module and helper_authoring is None
+                            and test_format_failures > RECOVERY_MODE_THRESHOLD
                             and (prior := test_raw_attempts.get(revision, ())) is not None
                             and len(prior) < 2
                             and (raw := _failed_test_line_snapshot(
@@ -4614,7 +4683,8 @@ def solve(executor, task, archive, budget, version):
                             test_raw_attempts[revision] = None
                             test_raw_retry = _RawTestRetry(raw, revision, prior)
                         elif (
-                            allow_test_module and test_format_failures and revision not in test_line_attempts
+                            allow_test_module and helper_authoring is None
+                            and test_format_failures and revision not in test_line_attempts
                         ):
                             test_line_snapshot = _failed_test_line_snapshot(
                                 new_path, test_draft, test_diagnostic, test_case_runs.get("focused"),
@@ -4793,7 +4863,7 @@ def solve(executor, task, archive, budget, version):
                             parameter_focus = parameter_note
                         elif parameter_note:
                             mock_detail = "\n".join(filter(None, (mock_detail, parameter_note)))
-                    messages = _proposal_messages(
+                    messages = helper_messages or _proposal_messages(
                         target,
                         source,
                         diagnostics,
@@ -4901,6 +4971,8 @@ def solve(executor, task, archive, budget, version):
                         ))
                     if test_raw_retry is not None:
                         exclude = tuple(dict.fromkeys((*exclude, *test_raw_retry.excluded_models)))
+                    if helper_authoring is not None and helper_bad_model:
+                        exclude = tuple(dict.fromkeys((*exclude, helper_bad_model)))
                     if line_retry is not None and line_retry.excluded_models:
                         exclude = tuple(dict.fromkeys((*exclude, *line_retry.excluded_models)))
                     route = (
@@ -4935,7 +5007,7 @@ def solve(executor, task, archive, budget, version):
                         line_retry,
                         line_followup,
                         allow_test_module,
-                        test_raw_retry or test_line_snapshot,
+                        helper_authoring or test_raw_retry or test_line_snapshot,
                         None,
                         repair,
                     )
@@ -4992,6 +5064,7 @@ def solve(executor, task, archive, budget, version):
             ) = pending.pop(future)
             test_raw_retry = test_retry if isinstance(test_retry, _RawTestRetry) else None
             test_line_snapshot = test_retry if isinstance(test_retry, LineRangeSnapshot) else None
+            helper_authoring = test_retry if isinstance(test_retry, OperatorTestAssembly) else None
             scoped_line = line_retry is not None and line_retry.allowed_rows is not None
             if (
                 paired or continuation is not None or advised
@@ -5093,7 +5166,13 @@ def solve(executor, task, archive, budget, version):
                     if raw_nested is not None:
                         candidate = apply_scoped_raw_definition(completion.content, source, raw_symbol)
                     if target == _TEST_GOAL:
-                        if test_raw_retry is not None:
+                        if helper_authoring is not None:
+                            if helper_bad_model and editor.route == helper_bad_model[0]:
+                                raise ValueError("The fixture authoring retry requires a different coding route")
+                            candidate = {new_path: helper_authoring.assemble(
+                                completion.content, max_bytes=executor.limits.patch_bytes,
+                            )}
+                        elif test_raw_retry is not None:
                             pair = editor.route, editor.configured_model
                             if pair in test_raw_retry.excluded_models:
                                 raise ValueError("Raw pytest edit requires a distinct coding route and model")
@@ -5139,6 +5218,8 @@ def solve(executor, task, archive, budget, version):
                         if snapshot is current:
                             test_format_failures += 1
                             count_test_model_failure(snapshot, editor, ("edit format",))
+                            if helper_authoring is not None and editor.configured_model:
+                                helper_bad_model = editor.route, editor.configured_model
                             if test_raw_retry is not None and editor.configured_model:
                                 pair = editor.route, editor.configured_model
                                 prior = test_raw_retry.excluded_models
@@ -5356,12 +5437,20 @@ def solve(executor, task, archive, budget, version):
                         next_case_runs["focused"] = _focused_generated_run(
                             result.checks, focused_generated
                         )
+                candidate_run = next_case_runs.get("focused")
+                if helper_authoring is not None and not (candidate_run and candidate_run.passed):
+                    notes[target] = (
+                        "The fixture-based proposal failed on the fixed checkout. "
+                        "Continue from the retained unpublished draft.\n" + excerpt(next_diagnostic, 550)
+                    )
+                    continue
+                replaced_exploratory_seed = helper_authoring is not None and test_draft == prior_test_source
                 lost_test = (
                     _lost_passing_test(test_case_runs, next_case_runs, new_path)
-                    if allow_test_module and test_checkout_snapshot is current else None
+                    if allow_test_module and test_checkout_snapshot is current
+                    and not replaced_exploratory_seed else None
                 )
                 previous_run = test_case_runs.get("focused")
-                candidate_run = next_case_runs.get("focused")
                 if (
                     test_raw_retry is not None and previous_run and previous_run.passed
                     and (not candidate_run or candidate_run.named_cases is None or candidate_run.deselected)

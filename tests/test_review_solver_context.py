@@ -743,6 +743,59 @@ def test_prior_seed_can_reference_pinned_fixtures_without_quoting_restricted_set
         assert seed is None
 
 
+def test_operator_assembly_selects_lexical_setup_dependencies_and_rejects_unsafe_responses():
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w"):
+        pass
+    source = (
+        "import json\n"
+        "import math\n"
+        "current_settings = object()\n"
+        "def make_config(tmp_path):\n"
+        "    path = tmp_path / 'sample.json'\n"
+        "    path.write_text(json.dumps({'enabled': True}))\n"
+        "    return path\n"
+        "def make_unused():\n"
+        "    return math.pi\n"
+        "def make_settings():\n"
+        "    return current_settings\n"
+        "def make_sensitive():\n"
+        "    return dict(token='production-shaped-value')\n"
+        "def make_eager(value=object()):\n"
+        "    return value\n"
+        "def make_assertion():\n"
+        "    assert True, 'private assertion'\n"
+        "def test_hidden():\n"
+        "    assert True, 'private scenario'\n"
+    )
+    plan = review_solver_context.operator_test_assembly(
+        {"operator/test_support.py": source}, archive.getvalue(), archive.getvalue(), {},
+    )
+    assert "def make_config" in plan.preview and "def make_unused" in plan.preview
+    assert all(value not in plan.preview for value in (
+        "current_settings", "production-shaped-value", "make_eager", "private assertion", "private scenario",
+    ))
+
+    function = (
+        "def test_authored(tmp_path):\n"
+        "    make_unused = 'sample.json'\n"
+        "    assert make_config(tmp_path).name == make_unused\n"
+    )
+    projected = plan.assemble(f"```python\n{function}```", max_bytes=3000)
+    assert "import json" in projected and "def make_config" in projected
+    assert "import math" not in projected and "def make_unused" not in projected
+    for unusable in (
+        function + "\nobject()\n",
+        function.replace("make_config(tmp_path)", "make_settings()"),
+        function.replace("make_config(tmp_path)", "make_sensitive()"),
+        function.replace("make_config(tmp_path)", "make_config(tmp_path, token='fixture')"),
+        function.replace("assert make_config", "from os import environ\n    assert make_config"),
+        function + "\ndef test_second():\n    assert False\n",
+    ):
+        with pytest.raises(ValueError, match="one new test function"):
+            plan.assemble(unusable, max_bytes=3000)
+
+
 def test_test_repair_prioritizes_the_missing_fixture_and_setup_frame():
     path = "src/example/formatting.py"
     new_path = "tests/test_review_regressions.py"

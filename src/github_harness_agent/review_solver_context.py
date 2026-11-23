@@ -901,7 +901,7 @@ def _extended_context_path(path):
     })
 
 
-def _complete_pytest_nodes(body, node, setup):
+def _complete_pytest_nodes(body, node, setup, *, references=None):
     bindings = {}
     for item in body:
         if isinstance(item, (*_IMPORT, *_ASSIGNMENT, *_FUNCTION)) and (
@@ -911,7 +911,9 @@ def _complete_pytest_nodes(body, node, setup):
                 bindings.setdefault(name, []).append(item)
     selected = {node, *setup}
     for _ in range(8):
-        needed = _references(selected, include_attributes=False) & bindings.keys()
+        needed = (
+            references(selected) if references else _references(selected, include_attributes=False)
+        ) & bindings.keys()
         if any(len(bindings[name]) != 1 for name in needed):
             return ()
         extra = {bindings[name][0] for name in needed} - selected
@@ -950,7 +952,9 @@ def _prior_setup_import(node, modules):
     )
 
 
-def _prior_setup_source(items, fixtures, modules, *, sample=None, reference_helpers=False):
+def _prior_setup_source(
+    items, fixtures, modules, *, sample=None, reference_helpers=False, fixture_placeholders=False,
+):
     available = _PRIOR_SETUP_FIXTURES | {name for name, fixture in fixtures.items() if fixture in items}
     fixture_nodes = set(fixtures.values())
     for item in items:
@@ -962,7 +966,7 @@ def _prior_setup_source(items, fixtures, modules, *, sample=None, reference_help
             (item in fixture_nodes or item is sample) and _fixture_arguments(item) - available
         ):
             return ""
-        borrowed = reference_helpers and item is not sample
+        borrowed = (reference_helpers or fixture_placeholders) and item is not sample
         token_arguments = {
             node.arg for node in ast.walk(item) if isinstance(node, ast.arg)
             and "token" in _words(node.arg.replace("_", " "))
@@ -1004,16 +1008,29 @@ def _prior_setup_source(items, fixtures, modules, *, sample=None, reference_help
         symbol.get_name() for symbol in module.get_symbols()
         if symbol.is_assigned() or symbol.is_imported()
     }
+    if _global_references(module) - globals_in_source:
+        return ""
+    return source
+
+
+def _global_references(module):
+    names = set()
     pending = [module]
     while pending:
         table = pending.pop()
-        if any(
-            symbol.is_referenced() and symbol.is_global() and symbol.get_name() not in globals_in_source
+        names.update(
+            symbol.get_name()
             for symbol in table.get_symbols()
-        ):
-            return ""
+            if symbol.is_referenced() and symbol.is_global()
+        )
         pending.extend(table.get_children())
-    return source
+    return names
+
+
+def _lexical_references(items):
+    return _global_references(symtable.symtable(
+        "\n\n".join(ast.unparse(item) for item in items), "<pytest fixture assembly>", "exec",
+    ))
 
 
 def _prior_reference_modules(archive, ancestor_archive, roots, imports):
@@ -1080,6 +1097,91 @@ def _prior_reference_header(body, fixture_nodes, modules):
         if _bindings(item) & {"pytest_plugins", "__file__", "__spec__", "__package__"}:
             return False
     return True
+
+
+@dataclass(frozen=True)
+class OperatorTestAssembly:
+    declarations: tuple
+    fixtures: dict
+    modules: frozenset
+    preview: str
+
+    def assemble(self, response, *, max_bytes):
+        if not isinstance(response, str) or not 0 < len(response.encode()) <= 6000:
+            raise ValueError("Expected one complete Python test function")
+        response = response.strip()
+        if wrapped := re.fullmatch(r"```(?:python|py)?[ \t]*\n(.*?)\n```", response, re.S):
+            response = wrapped[1]
+        try:
+            body = ast.parse(response).body
+            if (
+                len(body) == 1 and isinstance(test := body[0], ast.FunctionDef)
+                and test.name.startswith("test_") and not test.decorator_list
+                and any(isinstance(node, ast.Assert) for node in ast.walk(test))
+            ):
+                setup = _local_fixture_setup(test, self.fixtures)
+                items = None if setup is None else _complete_pytest_nodes(
+                    self.declarations, test, setup, references=_lexical_references,
+                )
+                if (
+                    items and any(item is not test and isinstance(item, _FUNCTION) for item in items)
+                    and _prior_reference_header(items, set(self.fixtures.values()), self.modules)
+                    and (source := _prior_setup_source(
+                        items, self.fixtures, self.modules, sample=test, fixture_placeholders=True,
+                    ))
+                    and len(source.encode()) < max_bytes
+                ):
+                    return source + "\n"
+        except (SyntaxError, ValueError, RecursionError):
+            pass
+        raise ValueError("Expected one new test function with an assertion and approved fixture references")
+
+
+def operator_test_assembly(fixtures, archive, ancestor_archive, sources, *, max_bytes=6200):
+    """Select one bounded, closed setup API from authorized operator pytest source."""
+    roots = {name.split(".", 1)[0] for name in _reviewed_modules(sources)}
+    for source in tuple(fixtures.values())[:4]:
+        if len(source.encode()) > 128 * 1024:
+            continue
+        try:
+            body = ast.parse(source).body
+            imports, _ = _reviewed_imports(body, {})
+            local, fixture_nodes, _ = _module_pytest_fixtures(body, imports)
+            helpers = [
+                item for item in body if isinstance(item, _FUNCTION) and not item.name.startswith("test_")
+            ][:24]
+            if not helpers:
+                continue
+            modules = frozenset(_prior_reference_modules(
+                archive, ancestor_archive, roots,
+                [item for item in body if isinstance(item, _IMPORT)]
+                + [node for helper in helpers for node in ast.walk(helper) if isinstance(node, _IMPORT)],
+            ))
+            approved = {item for item in body if isinstance(item, _IMPORT) and _prior_setup_import(item, modules)}
+            for helper in helpers:
+                dependencies = _local_fixture_setup(helper, local) if helper in fixture_nodes else ()
+                if dependencies is None or not (items := _complete_pytest_nodes(
+                    body, helper, dependencies, references=_lexical_references,
+                )):
+                    continue
+                selected = sorted(approved.union(items), key=lambda item: item.lineno)
+                if (
+                    _prior_reference_header(selected, fixture_nodes, modules)
+                    and (preview := _prior_setup_source(
+                        selected, local, modules, fixture_placeholders=True,
+                    ))
+                    and len(preview.encode()) <= max_bytes
+                ):
+                    approved.update(items)
+            declarations = tuple(sorted(approved, key=lambda item: item.lineno))
+            if any(isinstance(item, _FUNCTION) for item in declarations):
+                return OperatorTestAssembly(
+                    declarations, {name: item for name, item in local.items() if item in approved},
+                    modules, "\n\n".join(ast.unparse(item) for item in declarations),
+                )
+        except (SyntaxError, ValueError, RecursionError):
+            continue
+    return None
 
 
 def _prior_reference_seed(archive, ancestor_archive, path, body, items, test, fixtures, fixture_nodes, modules):
