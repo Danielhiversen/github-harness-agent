@@ -109,6 +109,8 @@ def test_replaces_nested_function_by_exact_lexical_owner(native):
 
     result = replace("Reader.decode.normalize", body)
     assert result["module.py"] == original.replace("return value + item", "return value.strip() + item")
+    unannotated = body.replace("item: str = ''", "item = ''").replace(" -> str", "")
+    assert replace("Reader.decode.normalize", unannotated) == result
     for symbol in ("normalize", "decode.normalize", "Reader.normalize"):
         with pytest.raises(ValueError):
             replace(symbol, body)
@@ -116,8 +118,50 @@ def test_replaces_nested_function_by_exact_lexical_owner(native):
         replace("Reader.decode.normalize", body.replace("item: str = ''", "item"))
     with pytest.raises(ValueError, match="signature and decorators"):
         replace("Reader.decode.normalize", body.removeprefix("@decorate\n"))
+    with pytest.raises(ValueError, match="signature and decorators"):
+        replace("Reader.decode.normalize", body.replace("-> str", "-> bytes"))
+    with pytest.raises(ValueError, match="signature and decorators"):
+        replace("Reader.render.normalize", "def normalize(item: str):\n    return item")
     with pytest.raises(ValueError, match="syntax|valid"):
         replace("Reader.decode.normalize", body.replace("nonlocal value", "nonlocal missing"))
+
+
+def test_omitted_annotations_splice_body_under_exact_multiline_declaration():
+    source = (
+        "def outer():\n"
+        "    @decorate ('value')\n"
+        "    def inner(\n"
+        "        α: str, /, *args: str, flag: bool = False, **kwargs: str\n"
+        "    ) -> str:  # preserve exact header\n"
+        "        # retain the declaration's leading comment\n"
+        "        return α\n"
+        "    return inner('input')\n"
+    ).replace("\n", "\r\n")
+    reply = (
+        "REPLACE module.py::outer.inner\n"
+        "@decorate('value')\n"
+        "def inner(α, /, *args, flag=False, **kwargs): return α.upper()\n"
+    )
+    result = apply_definitions(reply, {"module.py": source})
+    assert result["module.py"] == source.replace("return α\r\n", "return α.upper()\r\n")
+    signature = "α, /, *args, flag=False, **kwargs"
+    for changed in (
+        "α, *args, flag=False, **kwargs",
+        "α, /, *inputs, flag=False, **kwargs",
+        "α, /, *args, flag=True, **kwargs",
+    ):
+        with pytest.raises(ValueError, match="signature and decorators"):
+            apply_definitions(reply.replace(signature, changed), {"module.py": source})
+
+
+def test_omitted_annotations_preserve_inline_declaration_and_replace_suite():
+    source = "def outer():\n    def inner(value: str): return value\n    return inner('input')\n"
+    reply = "REPLACE module.py::outer.inner\ndef inner(value):\n    upper = value.upper()\n    return upper"
+    result = apply_definitions(reply, {"module.py": source})
+    assert result["module.py"] == source.replace(
+        "def inner(value: str): return value",
+        "def inner(value: str):\n        upper = value.upper()\n        return upper",
+    )
 
 
 def test_nested_function_rejects_duplicate_owners_and_overlapping_edits():

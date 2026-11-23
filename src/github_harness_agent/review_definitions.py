@@ -5,6 +5,7 @@ import json
 import re
 import textwrap
 from collections import defaultdict
+from copy import deepcopy
 from pathlib import PurePosixPath
 
 CAUSAL_EDIT_GUIDANCE = "Reason through the observed passing and failing executions before producing the scoped edit."
@@ -294,6 +295,7 @@ def _apply_definition_edits(sources, documents, replacements, *, functions_only=
     added_imports = defaultdict(dict)
     indexes = {}
     nested_paths = set()
+    spliced_bodies = defaultdict(dict)
     for path, name, body in replacements:
         if path not in documents:
             raise ValueError("File is outside the editable Python source list")
@@ -329,7 +331,7 @@ def _apply_definition_edits(sources, documents, replacements, *, functions_only=
                 if isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     start = min([definition.lineno, *(item.lineno for item in definition.decorator_list)])
                     body = "\n".join(body.splitlines()[start - 1:definition.end_lineno])
-                    nodes = [definition]
+                    nodes = _parse(body, path).body
         if (
             len(nodes) != 1
             or type(nodes[0]) is not type(old)
@@ -340,14 +342,19 @@ def _apply_definition_edits(sources, documents, replacements, *, functions_only=
             )
         if (functions_only or is_nested) and not isinstance(old, _FUNCTION):
             raise ValueError("Expected a function or method, including for class-based pytest tests")
+        lines = sources[path].splitlines(keepends=True)
         if is_nested:
-            signature = ("args", "returns", "decorator_list", "type_params")
-            if any(_definition_field(old, field) != _definition_field(nodes[0], field) for field in signature):
-                raise ValueError("Nested replacement must preserve its signature and decorators")
             if "\f" in body or "\r" in body:
                 raise ValueError("Nested replacement requires valid indentation")
             nested_paths.add(path)
-        lines = sources[path].splitlines(keepends=True)
+            new = nodes[0]
+            if _nested_signature(old) != _nested_signature(new):
+                if not _only_omitted_annotations(old, new):
+                    raise ValueError("Nested replacement must preserve its signature and decorators")
+                start, suite = _splice_nested_body(lines, old, body, new)
+                edits[path].append((start, old.end_lineno, suite))
+                spliced_bodies[path][name] = _definition_field(new, "body")
+                continue
         start = _definition_start(old) - 1
         margin = lines[start][: len(lines[start]) - len(lines[start].lstrip())]
         edits[path].append(
@@ -371,7 +378,13 @@ def _apply_definition_edits(sources, documents, replacements, *, functions_only=
         revised = "".join((*output, *lines[cursor:]))
         if len(revised.encode()) > _LIMIT:
             raise ValueError("Edited file exceeds the source limit")
-        _parse(revised, path)
+        parsed = _parse(revised, path)
+        if path in spliced_bodies:
+            index = _definition_index(parsed)
+            for name, expected in spliced_bodies[path].items():
+                scopes = _qualified_scope(index, name)
+                if not scopes or _definition_field(scopes[-1], "body") != expected:
+                    raise ValueError("Nested replacement body cannot be spliced into the original scope")
         if path in nested_paths:
             try:
                 compile(revised, path, "exec", dont_inherit=True)
@@ -388,3 +401,57 @@ def _definition_field(node, field):
     if isinstance(value, list):
         return tuple(ast.dump(item) for item in value)
     return ast.dump(value) if value is not None else None
+
+
+def _nested_signature(node):
+    return tuple(
+        _definition_field(node, field) for field in ("args", "returns", "decorator_list", "type_params")
+    )
+
+
+def _only_omitted_annotations(old, new):
+    filled = deepcopy(new.args)
+    old_args = (node for node in ast.iter_child_nodes(old.args) if isinstance(node, ast.arg))
+    new_args = (node for node in ast.iter_child_nodes(filled) if isinstance(node, ast.arg))
+    for original, proposed in zip(old_args, new_args):
+        if proposed.annotation is None:
+            proposed.annotation = original.annotation
+    return (
+        ast.dump(old.args) == ast.dump(filled)
+        and (new.returns is None or _definition_field(old, "returns") == _definition_field(new, "returns"))
+        and all(
+            _definition_field(old, field) == _definition_field(new, field)
+            for field in ("decorator_list", "type_params")
+        )
+    )
+
+
+def _suite_start(lines, node):
+    first = node.body[0]
+    if isinstance(first, _DEF) and first.decorator_list:
+        row = _definition_start(first) - 1
+        return row, lines[row][:len(lines[row]) - len(lines[row].lstrip(" \t"))]
+    row = first.lineno - 1
+    return row, lines[row].encode()[:first.col_offset].decode()
+
+
+def _splice_nested_body(lines, old, reply, new):
+    """Keep the old declaration and move the proposed suite into its indentation."""
+    start, prefix = _suite_start(lines, old)
+    replacement = reply.splitlines(keepends=True)
+    proposed_start, proposed_prefix = _suite_start(replacement, new)
+    if proposed_prefix.strip():
+        replacement[proposed_start] = replacement[proposed_start][len(proposed_prefix):]
+    suite = textwrap.dedent("".join(replacement[proposed_start:])).rstrip("\n")
+    if prefix.strip():
+        if "\n" not in suite:
+            suite = prefix + suite
+        else:
+            declaration = lines[old.lineno - 1]
+            margin = declaration[:len(declaration) - len(declaration.lstrip(" \t"))]
+            indent = margin + ("\t" if margin.endswith("\t") else "    ")
+            suite = prefix.rstrip(" \t") + "\n" + textwrap.indent(suite, indent)
+    else:
+        suite = textwrap.indent(suite, prefix)
+    newline = "\r\n" if lines[start].endswith("\r\n") else "\n"
+    return start, suite.replace("\n", newline) + newline
