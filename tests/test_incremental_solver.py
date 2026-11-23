@@ -705,15 +705,37 @@ TEST = (
 )
 
 
-@pytest.mark.parametrize("oversized", (False, True), ids=("quoted", "oversized"))
+@pytest.mark.parametrize(
+    ("oversized", "committed_setup"),
+    ((False, False), (True, False), (False, True)),
+    ids=("quoted", "oversized", "committed-setup"),
+)
 def test_single_pinned_production_review_fixes_all_checks_before_authoring_regression(
-    solver_case, oversized,
+    solver_case, oversized, committed_setup,
 ):
     task, archive, runner, _ = solver_case
     if oversized:
         acceptance = Path(task.pull_checks[0][-1])
         with acceptance.open("a") as stream:
             stream.write("# withheld-operator-source " + "x" * review_recovery.MAX_OPERATOR_SOURCE + "\n")
+    test_path = NEW_TEST
+    if committed_setup:
+        addition = BytesIO(archive)
+        previous = (
+            b"import pytest\n"
+            b"from fixture_calc import first\n"
+            b"@pytest.fixture\n"
+            b"def sample_config(tmp_path):\n"
+            b"    return tmp_path / 'sample.json'\n"
+            b"def test_previous(sample_config):\n"
+            b"    assert first() in {-1, 1}, 'old assertion marker'\n"
+        )
+        with tarfile.open(fileobj=addition, mode="a") as snapshot:
+            entry = tarfile.TarInfo(NEW_TEST)
+            entry.size = len(previous)
+            snapshot.addfile(entry, BytesIO(previous))
+        archive = addition.getvalue()
+        test_path = NEW_TEST.removesuffix(".py") + "_2.py"
     body = (
         "Correct the first and second results and cover both values in one scenario.\n\n"
         "Update production code and add a new regression test.\n"
@@ -748,8 +770,11 @@ def test_single_pinned_production_review_fixes_all_checks_before_authoring_regre
     assert "passes here and fails on the pinned ancestor" in proof
     assert "-    return -1" in proof and "+    return 1" in proof
     assert "def first():\n    return 1" in proof.partition("Optional tracked pytest")[2]
+    if committed_setup:
+        assert "def sample_config(tmp_path):" in proof
+        assert "def test_previous" not in proof and "old assertion marker" not in proof
     assert b"+    return 1\n" in result.patch and b"+    return 2\n" in result.patch
-    assert f"+++ b/{NEW_TEST}".encode() in result.patch
+    assert f"+++ b/{test_path}".encode() in result.patch
     assert any(check.command == task.pull_checks[0] and check.returncode == 0 for check in result.checks)
     assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
 

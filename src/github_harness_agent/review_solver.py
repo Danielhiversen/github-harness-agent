@@ -4326,6 +4326,7 @@ def solve(executor, task, archive, budget, version):
                             repository_example, repository_usage = repository_pytest_context(
                                 task.regression_archive or archive,
                                 reviewed_sources, " ".join(body for _, _, body in review.feedback),
+                                exclude_generated=production_regression,
                             )
                             repository_models = imported_model_declarations(archive, reviewed_sources)
                             if pinned_ancestor:
@@ -4342,8 +4343,9 @@ def solve(executor, task, archive, budget, version):
                                 )
                                 prior_setup = prior_generated_fixture_context(
                                     archive, task.regression_archive, new_path, public_sources,
-                                ) if review.test_only else ""
-                                if prior_setup and len(prior_setup.encode()) <= 850:
+                                    require_identical=production_regression,
+                                ) if review.test_only or production_regression else ""
+                                if prior_setup and (production_regression or len(prior_setup.encode()) <= 850):
                                     repository_example = prior_setup
                                 elif prior_setup:
                                     extended_context = "\n\n".join(filter(None, (extended_context, prior_setup)))

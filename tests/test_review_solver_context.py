@@ -550,6 +550,54 @@ def test_prior_generated_fixture_context_quotes_only_complete_predecessor_setup(
     ) == ""
 
 
+@pytest.mark.parametrize("case", ("identical", "tampered", "missing", "oversized", "head-link", "ancestor-link"))
+def test_mixed_context_requires_identical_regular_predecessor(case):
+    prior_path = "tests/test_review_regressions.py"
+    new_path = "tests/test_review_regressions_2.py"
+    previous = (
+        "import pytest\n"
+        "from example.configuration import load\n"
+        "@pytest.fixture\n"
+        "def sample_path(tmp_path):\n"
+        "    return tmp_path / 'sample.json'\n"
+        "def test_prior(sample_path):\n"
+        "    assert load(sample_path) == 'old result'\n"
+    )
+
+    def archive(source, *, link=False):
+        buffer = BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as snapshot:
+            if source is not None:
+                entry = tarfile.TarInfo(prior_path)
+                if link:
+                    entry.type = tarfile.SYMTYPE
+                    entry.linkname = "elsewhere.py"
+                    snapshot.addfile(entry)
+                else:
+                    data = source.encode()
+                    entry.size = len(data)
+                    snapshot.addfile(entry, BytesIO(data))
+        return buffer.getvalue()
+
+    source = previous + "# " + "x" * (128 * 1024) if case == "oversized" else previous
+    head = archive(source if case != "tampered" else source + "# only bytes changed\n", link=case == "head-link")
+    ancestor = archive(source if case != "missing" else None, link=case == "ancestor-link")
+    production = {"src/example/configuration.py": "def load(path): ...\n"}
+    context = review_solver_context.prior_generated_fixture_context(
+        head, ancestor, new_path, production, require_identical=True,
+    )
+
+    if case == "identical":
+        assert "def sample_path(tmp_path):" in context
+        assert "def test_prior" not in context and "old result" not in context
+        normal = review_solver_context.repository_pytest_context(
+            ancestor, production, exclude_generated=True,
+        )
+        assert normal == ("", "")
+    else:
+        assert context == ""
+
+
 def test_test_repair_prioritizes_the_missing_fixture_and_setup_frame():
     path = "src/example/formatting.py"
     new_path = "tests/test_review_regressions.py"

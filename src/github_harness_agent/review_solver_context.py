@@ -23,6 +23,7 @@ _STOCK_NODE = re.compile(
     r"(?P<path>(?:[\w-][\w.-]*/)*[\w-][\w.-]*\.py)"
     r"(?P<name>(?:::[A-Za-z_]\w*)*::test\w*)"
 )
+_GENERATED_TEST_STEM = re.compile(r"test_review_regressions(?:_\d+)?")
 _INTEGER_COMPARISON = re.compile(r"(-?[1-9][0-9]{0,17}|0) +== +([1-9][0-9]{0,17}|0)")
 _LOOKUP_PROGRESS = (
     "The tracked pytest comparison now evaluates at the previous lookup failure."
@@ -827,7 +828,7 @@ def _temporary_file_shapes(setup, module_bindings, imports, fixture_names):
 def _extended_context_path(path):
     if path.is_absolute() or any(part.startswith(".") for part in path.parts):
         return False
-    if re.fullmatch(r"test_review_regressions(?:_\d+)?", path.stem):
+    if _GENERATED_TEST_STEM.fullmatch(path.stem):
         return False
     return not _words(str(path)).intersection({
         "operator", "secret", "secrets", "credential", "credentials",
@@ -932,8 +933,10 @@ def _prior_setup_source(items, fixtures, modules):
     return source
 
 
-def prior_generated_fixture_context(archive, ancestor_archive, new_path, sources, *, max_bytes=1700):
-    """Quote setup only from the immediate generated sibling added after the ancestor."""
+def prior_generated_fixture_context(
+    archive, ancestor_archive, new_path, sources, *, max_bytes=1700, require_identical=False,
+):
+    """Quote setup from the immediate generated sibling under the selected ancestor policy."""
     match = re.fullmatch(r"tests/test_review_regressions_([1-9]\d?)\.py", new_path)
     if not match or not 2 <= int(match[1]) <= 32:
         return ""
@@ -942,13 +945,20 @@ def prior_generated_fixture_context(archive, ancestor_archive, new_path, sources
     path = f"tests/test_review_regressions{suffix}.py"
     try:
         with tarfile.open(fileobj=BytesIO(ancestor_archive), mode="r:") as ancestor:
-            if path in ancestor.getnames():
+            if require_identical:
+                pinned = _tracked_python(ancestor, path)
+                if pinned is None:
+                    return ""
+            elif path in ancestor.getnames():
                 return ""
         with tarfile.open(fileobj=BytesIO(archive), mode="r:") as snapshot:
             tracked = _tracked_python(snapshot, path)
     except (tarfile.TarError, OSError, EOFError):
         return ""
     if tracked is None:
+        return ""
+    # The decoded UTF-8 lines retain every newline and all whitespace.
+    if require_identical and tracked[0] != pinned[0]:
         return ""
     _, body = tracked
     imports, _ = _reviewed_imports(body, {})
@@ -1062,7 +1072,7 @@ def _invoked_anchored_apis(node, setup, imports, fixtures, preferred_apis):
 
 def repository_pytest_context(
     archive, sources, query="", *, max_bytes=850, usage_bytes=820, ranked=False,
-    preferred_apis=(),
+    preferred_apis=(), exclude_generated=False,
 ):
     """Return a small example plus bounded tracked API and fixture setup shapes."""
     modules = _reviewed_modules(sources)
@@ -1086,6 +1096,7 @@ def repository_pytest_context(
                     and member.size <= 128 * 1024
                     and _STOCK_NODE.fullmatch(member.name + "::test_example")
                     and (not ranked or _extended_context_path(path))
+                    and (not exclude_generated or not _GENERATED_TEST_STEM.fullmatch(path.stem))
                     and (
                         path.name == "conftest.py"
                         or path.name.startswith("test_")
