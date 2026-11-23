@@ -40,7 +40,7 @@ from .rebase import (
 )
 from .review_recovery import plan_recovery
 from .reviews import ReviewItem, collect_reviews, map_feedback, reply_to_review
-from .test_updates import authorized_test_update, requests_new_tests
+from .test_updates import authorized_regression_base, authorized_test_update, requests_new_tests
 from .store import LeaseLost
 from .task_context import build_task_context, github_history, review_source_context
 
@@ -564,11 +564,21 @@ class Controller:
                         for item in data.get("feedback", ())
                     )
 
+                try:
+                    regression_base = authorized_regression_base(
+                        data.get("feedback", ()) if stage == "repair" else ()
+                    )
+                except ValueError as error:
+                    raise ExecutionError(str(error)) from error
+                if regression_base and target.repo.casefold() != repo.casefold():
+                    raise ExecutionError("Regression verification requires a same-repository ancestor")
+
                 if (
                     prepared is not None
                     and (
                         (needs_new_tests() and not prepared.get("verified_new_tests"))
                         or prepared.get("pull_checks", []) != pull_checks
+                        or prepared.get("regression_base") != regression_base
                     )
                     and publisher.branch_head(repo, branch) == origin
                 ):
@@ -762,6 +772,7 @@ class Controller:
                         )
                         if stage == "repair"
                         else None,
+                        regression_base=regression_base,
                     )
 
                     try:
@@ -873,6 +884,7 @@ class Controller:
                         "usage": result.usage,
                         "verified_new_tests": task.require_new_tests,
                         "pull_checks": pull_checks,
+                        **({"regression_base": regression_base} if regression_base else {}),
                         "refinement": dataclasses.asdict(result.refinement)
                         if result.refinement
                         else None,
@@ -897,6 +909,8 @@ class Controller:
                     store.save(job, "queued")
                     return
                 if latest != target and published_head != prepared["sha"]:
+                    if regression_base and latest.repo.casefold() != repo.casefold():
+                        raise RebaseConflict("Regression verification requires a same-repository ancestor")
                     parent = branch_parent(
                         api, path, repo, origin, latest, identity, previous_base
                     )
@@ -914,6 +928,8 @@ class Controller:
                         test_update=current_test_update(),
                         require_new_tests=needs_new_tests(),
                         pull_checks=tuple(map(tuple, pull_checks)),
+                        verify_base_first=bool(regression_base),
+                        regression_base=regression_base,
                     )
 
                     try:

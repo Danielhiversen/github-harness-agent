@@ -52,6 +52,7 @@ _CONDITIONAL = re.compile(
     r"\b(?:only\s+if|if\s+(?:needed|possible|appropriate|necessary|feasible|you\s+can))\b",
     re.IGNORECASE,
 )
+_HTML_COMMENT = re.compile(r"<!--.*?(?:-->|\Z)", re.DOTALL)
 
 
 def _test_directive(line):
@@ -101,7 +102,7 @@ def authorized_test_update(feedback: Iterable[Mapping]) -> str | None:
 
 
 def _review_sentences(body: str):
-    body = re.sub(r"<!--.*?(?:-->|\Z)", " ", body, flags=re.DOTALL)
+    body = _HTML_COMMENT.sub(" ", body)
     for line in _review_prose(body):
         line = re.sub(r"(`+).*?\1", " ", line)
         line = re.sub(r"[\"“][^\"”]*[\"”]", " ", line)
@@ -151,6 +152,30 @@ def requests_test_only_module(body: str) -> bool:
     )
 
 
+def authorized_regression_base(feedback: Iterable[Mapping]) -> str | None:
+    """Read an immutable baseline from authorized inline test-only feedback."""
+    items = tuple(feedback)
+    revisions = set()
+    directive = "Verify regression against:"
+    for item in items:
+        if not (
+            item.get("key", "").startswith("comment:")
+            and item.get("author") and item.get("path") and item.get("thread") and item.get("reply_to")
+            and requests_test_only_module(item["body"])
+        ):
+            continue
+        body = _HTML_COMMENT.sub(" ", item["body"])
+        for line in _review_prose(body):
+            if line.strip().startswith(directive):
+                sha = line.strip().removeprefix(directive).strip().lower()
+                if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
+                    raise ValueError("Verify regression against requires a full commit SHA")
+                revisions.add(sha)
+    if revisions and (len(items) != 1 or len(revisions) != 1):
+        raise ValueError("Use one regression verification SHA in a standalone test-only review")
+    return next(iter(revisions), None)
+
+
 def focused_pytest(checks, selectors, report=None, *, verbose=False):
     """Reuse the configured pytest launcher with an explicit node selection."""
     for command in checks:
@@ -193,6 +218,37 @@ def passed_pytest_report(report: bytes) -> bool:
         for test in tests
         for result in test
     )
+
+
+def regression_assertion_report(green: bytes, red: bytes) -> bool:
+    """Require an identified passing case to report a call-phase assertion failure."""
+
+    def cases(report):
+        result = {}
+        for item in ET.fromstring(report).findall(".//testcase"):
+            key = item.get("classname"), item.get("name")
+            if not all(key) or key in result:
+                return {}
+            result[key] = item
+        return result
+
+    try:
+        green_cases = cases(green)
+        red_cases = cases(red)
+    except ET.ParseError:
+        return False
+    for name, case in red_cases.items():
+        passing = green_cases.get(name)
+        if passing is None or any(child.tag in {"failure", "error", "skipped"} for child in passing):
+            continue
+        if any(child.tag in {"error", "skipped"} for child in case):
+            continue
+        failure = case.find("failure")
+        if failure is not None and re.match(
+            r"(?:AssertionError(?::|$)|assert\s)", failure.get("message", "")
+        ):
+            return True
+    return False
 
 
 def _definition(body, types, name):

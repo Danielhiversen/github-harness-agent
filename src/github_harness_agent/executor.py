@@ -7,6 +7,7 @@ import re
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from math import isfinite
@@ -32,6 +33,7 @@ from .test_updates import (
     focused_pytest,
     has_runnable_test,
     passed_pytest_report,
+    regression_assertion_report,
     valid_test_update,
 )
 from .task_context import (
@@ -207,6 +209,8 @@ class TaskSnapshot:
     solver_recovery: SolverRecovery | None = None
     save_solver_recovery: Callable[[SolverRecovery | None, bool], None] | None = None
     retry_after_provider: str | None = None
+    regression_base: str | None = None
+    regression_archive: bytes | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -542,6 +546,7 @@ class PlainExecutor:
     ) -> ExecutionResult:
         budget = _Budget(self.limits, cancelled, task)
         archive = self._archive(task, checkout, budget)
+        task = self._pin_regression(task, checkout, budget)
         patch, _, actor = self._rollout(
             task,
             archive,
@@ -560,7 +565,9 @@ class PlainExecutor:
         cancelled: Callable[[], bool] = lambda: False,
     ) -> ExecutionResult:
         budget = _Budget(self.limits, cancelled, task)
-        return self._verify(task, self._archive(task, checkout, budget), budget, patch)
+        archive = self._archive(task, checkout, budget)
+        task = self._pin_regression(task, checkout, budget)
+        return self._verify(task, archive, budget, patch)
 
     def _archive(self, task, checkout, budget):
         budget.remaining()
@@ -570,15 +577,22 @@ class PlainExecutor:
             raise ExecutionError("At least one trusted required check is required")
         if len(task.repository_guidance) > 3000:
             raise ExecutionError("Repository guidance exceeds the configured size")
+        return self._checkout_archive(
+            checkout, budget, task.base_sha, "Pinned checkout",
+            no_replace=bool(task.regression_base),
+        )
+
+    def _checkout_archive(self, checkout, budget, sha, label, *, no_replace):
         try:
             result = run_process(
                 [
                     "git",
+                    *(("--no-replace-objects",) if no_replace else ()),
                     "-c",
                     "core.hooksPath=/dev/null",
                     "archive",
                     "--format=tar",
-                    task.base_sha,
+                    sha,
                 ],
                 budget.remaining(),
                 budget.cancelled,
@@ -587,11 +601,32 @@ class PlainExecutor:
             )
         except CommandOutputExceeded as error:
             raise LimitExceeded(
-                f"Pinned checkout exceeds the archive limit ({self.limits.archive_bytes} bytes)"
+                f"{label} exceeds the archive limit ({self.limits.archive_bytes} bytes)"
             ) from error
         if result.returncode:
-            raise ExecutionError("Could not archive the pinned checkout")
+            raise ExecutionError(f"Could not archive the {label.lower()}")
         return result.stdout
+
+    def _pin_regression(self, task, checkout, budget):
+        sha = task.regression_base
+        if sha is None:
+            return task
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha) or sha == task.base_sha:
+            raise ExecutionError("Regression verification requires a full SHA for a strict ancestor")
+        for args, expected in (
+            (("cat-file", "-t", sha), b"commit\n"),
+            (("merge-base", "--is-ancestor", sha, task.base_sha), b""),
+        ):
+            result = run_process(
+                ("git", "--no-replace-objects", *args),
+                budget.remaining(), budget.cancelled, cwd=checkout,
+                cap=self.limits.command_output_bytes,
+            )
+            if result.returncode or result.stdout != expected:
+                raise ExecutionError("Regression verification requires a locally available ancestor commit")
+        return replace(task, regression_archive=self._checkout_archive(
+            checkout, budget, sha, "Regression ancestor", no_replace=True,
+        ))
 
     def _command(self, workspace, budget, argv, *, data=b"", cap=None, checked=True):
         result = workspace.command(
@@ -1897,6 +1932,42 @@ class PlainExecutor:
                 break
         return checks
 
+    def _regression_sources(self, workspace, budget, paths):
+        return tuple(
+            self._command(workspace, budget, ("cat", "--", path), cap=self.limits.patch_bytes).stdout
+            for path in paths
+        )
+
+    def _verify_test_regression(self, task, budget, patch, new_tests, green_report, green_sources):
+        command = ("verify-regression", task.regression_base)
+        report = f".git/gha-regression-{uuid4().hex}.xml"
+        pytest = focused_pytest(task.checks, new_tests, report, verbose=True)
+        if not (pytest and green_report and task.regression_archive):
+            return CheckEvidence(command, 1, "Run the new tests with the configured pytest launcher before checking the ancestor.")
+        budget.claim("command", budget.limits.commands)
+        with self.verification_runner.workspace(
+            task.regression_archive, budget.remaining, budget.cancelled,
+        ) as workspace:
+            self._stage_baseline(workspace, budget)
+            applied = self._git(
+                workspace, budget, "apply", "--index", "--binary", data=patch, checked=False,
+            )
+            if applied.returncode:
+                return CheckEvidence(command, 1, "Use new test paths that can be added unchanged to the verified ancestor.")
+            if self._regression_sources(workspace, budget, new_tests) != green_sources:
+                return CheckEvidence(command, 1, "The generated test sources must be byte-identical on both revisions.")
+            result = self._command(workspace, budget, pytest, checked=False)
+            if result.returncode == 1:
+                red_report = self._command(workspace, budget, ("cat", report), checked=False)
+                if red_report.returncode == 0 and regression_assertion_report(green_report, red_report.stdout):
+                    return CheckEvidence(command, 0, "A named test passed on the candidate and failed by assertion on the verified ancestor.")
+        detail = (
+            "The new tests also pass on the ancestor. Assert the reviewed behavior that differs on the pinned revision."
+            if result.returncode == 0 else
+            "Setup, import, and collection failures cannot prove the reviewed behavior. Use APIs available on both revisions."
+        )
+        return CheckEvidence(command, 1, "A named assertion must fail on the ancestor. " + detail)
+
     def _verify(self, task, archive, budget, patch, refinement=None, *, actor=None):
         if not patch:
             budget.reject(
@@ -1930,7 +2001,9 @@ class PlainExecutor:
                 self._git(workspace, budget, "apply", "--index", "--binary", data=patch)
                 new_tests, amended_test = self._check_patch_paths(
                     workspace, task, budget, baseline_tree,
-                    new_tests_only=bool(task.review_recovery and task.review_recovery.test_only),
+                    new_tests_only=bool(
+                        task.regression_base or (task.review_recovery and task.review_recovery.test_only)
+                    ),
                 )
             except (_CandidateOutputError, CommandOutputExceeded) as error:
                 budget.reject(error, actor)
@@ -1978,6 +2051,8 @@ class PlainExecutor:
         new_python_tests = tuple(path for path in new_tests if path.endswith(".py"))
         if task.require_new_tests and new_python_tests:
             selections.append(new_python_tests)
+        green_report = b""
+        green_sources = ()
         if (new_tests or selections) and trusted_passed:
             with self.verification_runner.workspace(
                 archive, budget.remaining, budget.cancelled
@@ -2002,18 +2077,39 @@ class PlainExecutor:
                     )
                     if not focused:
                         continue
-                    check = self._run_checks(workspace, budget, (focused,))[0]
-                    if check.returncode == 0:
-                        result = self._command(
-                            workspace, budget, ("cat", report), checked=False
-                        )
-                        if result.returncode or not passed_pytest_report(result.stdout):
-                            check = CheckEvidence(
-                                focused,
-                                1,
-                                "The selected test coverage did not pass as executed pytest tests.",
+                    regression_green = task.regression_base and selectors == new_python_tests
+                    focused_workspace = (
+                        self.verification_runner.workspace(archive, budget.remaining, budget.cancelled)
+                        if regression_green else nullcontext(workspace)
+                    )
+                    with focused_workspace as selected:
+                        if regression_green:
+                            self._stage_baseline(selected, budget)
+                            self._git(
+                                selected, budget, "apply", "--index", "--binary", data=patch,
                             )
+                            green_sources = self._regression_sources(selected, budget, selectors)
+                        check = self._run_checks(selected, budget, (focused,))[0]
+                        if check.returncode == 0:
+                            result = self._command(selected, budget, ("cat", report), checked=False)
+                            if result.returncode or not passed_pytest_report(result.stdout):
+                                check = CheckEvidence(
+                                    focused,
+                                    1,
+                                    "The selected test coverage did not pass as executed pytest tests.",
+                                )
+                            elif regression_green:
+                                green_report = result.stdout
                     checks.append(check)
+        if task.regression_base and not any(check.returncode for check in checks):
+            regression = self._verify_test_regression(
+                task, budget, patch, new_python_tests, green_report, green_sources
+            )
+            checks.append(regression)
+            if regression.returncode:
+                rejection = _VerificationRejected(regression.output)
+                rejection.checks = tuple(checks)
+                budget.reject(rejection, actor)
         failures = [check for check in checks if check.returncode]
         if failures:
             rejection = all(0 < check.returncode < 125 for check in failures)
@@ -2069,6 +2165,7 @@ class Harness2Executor(PlainExecutor):
 
         budget = _Budget(self.limits, cancelled, task)
         archive = self._archive(task, checkout, budget)
+        task = self._pin_regression(task, checkout, budget)
         try:
             if task.verify_base_first:
                 return verify_review_repair(self, task, archive, budget)
