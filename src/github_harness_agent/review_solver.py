@@ -4129,7 +4129,10 @@ def solve(executor, task, archive, budget, version):
                                 prior_setup = prior_generated_fixture_context(
                                     archive, task.regression_archive, new_path, public_sources,
                                 )
-                                extended_context = "\n\n".join(filter(None, (extended_context, prior_setup)))
+                                if prior_setup and len(prior_setup.encode()) <= 850:
+                                    repository_example = prior_setup
+                                elif prior_setup:
+                                    extended_context = "\n\n".join(filter(None, (extended_context, prior_setup)))
                         allow_test_module = bool(
                             original[new_path] == current[new_path] == ""
                             and not _protected(new_path, task, new_test=True)

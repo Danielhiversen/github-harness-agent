@@ -3267,12 +3267,16 @@ def test_single_test_only_review_adds_an_independent_module(solver_case, monkeyp
     archive = BytesIO()
     fixed = BASE_SOURCE.replace("return -1", "return 1").replace("return -2", "return 2")
     existing_test = "def test_prior_coverage():\n    assert True\n"
+    prior_setup = (
+        "def make_sample():\n    return (4, 2)\n\n"
+        "def test_prior_sample():\n    assert make_sample() == (4, 2)\n"
+    )
     next_path = "tests/test_review_regressions_2.py"
     with tarfile.open(fileobj=archive, mode="w") as snapshot:
         contents = {
             SOURCE: BASE_SOURCE if scenario == "baseline_failure" else fixed,
             "tests/test_existing.py": existing_test,
-            NEW_TEST: existing_test,
+            NEW_TEST: prior_setup if scenario == "ancestor" else existing_test,
         }
         for path, source in contents.items():
             content = source.encode()
@@ -3320,6 +3324,12 @@ def test_single_test_only_review_adds_an_independent_module(solver_case, monkeyp
         for prompt in (initial, retry, after_collection):
             assert "-    return -1" in prompt and "+    return 1" in prompt
             assert "return -2" not in prompt
+            main_prompt = prompt.partition("Optional tracked pytest and production context")[0]
+            assert "def make_sample()" in main_prompt
+            messages = [{"role": "system", "content": "Use quoted setup."}, {"role": "user", "content": prompt}]
+            compact_setup = compact_focused_review(messages, max_bytes=wire_size(messages) - 1)
+            assert compact_setup and "def make_sample()" in compact_setup[-1]["content"]
+            assert "Optional tracked pytest and production context" not in compact_setup[-1]["content"]
             optional = prompt.partition("Optional tracked pytest and production context")[2]
             assert "def first():\n    return 1" in optional
         assert "together in one test execution" in initial
