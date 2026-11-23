@@ -4852,10 +4852,13 @@ def solve(executor, task, archive, budget, version):
                 routes = []
                 after_provider = None
                 runnable_drafts = {}
-                for attempt in (1, 2, 3):
-                    if attempt == 3 and not runnable_drafts and not test_first_runtime:
+                skipped_formats = 0
+                for attempt in range(1, 6):
+                    has_repair = bool(runnable_drafts or test_first_runtime)
+                    if attempt - skipped_formats > 2 + int(has_repair):
                         break
                     _LOG.info("Requesting test-first regression authoring, attempt %d", attempt)
+                    previous_misses = test_first_format_misses
                     submitted += 1
                     launch_budget -= 1
                     try:
@@ -4875,6 +4878,11 @@ def solve(executor, task, archive, budget, version):
                         _LOG.info("Test-first attempt ended without a verified regression")
                         budget.remaining()
                         after_provider = routes[-1][0] if routes else None
+                    # Every call is charged to the global limits. Distinct
+                    # malformed replies may rotate twice before consuming one
+                    # of the two substantive authoring opportunities.
+                    if test_first_format_misses > previous_misses and skipped_formats < 2:
+                        skipped_formats += 1
                     if (
                         test_first_witness or not after_provider or launch_budget < 3
                         or budget.model_requests_remaining() < 3 or budget.remaining() < 75
