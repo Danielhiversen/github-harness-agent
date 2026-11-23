@@ -2359,6 +2359,8 @@ class _RegressionRepair:
     stock_origin: bool = False
     private_symbol: tuple[str, str] | None = None
     retry_fragment_choices: bool = False
+    fragment_format_retries: int = 0
+    retry_fragment_format: bool = False
     retries: int = 0
     retry_note: str = ""
     retry_named: bool = False
@@ -2466,7 +2468,7 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="",
                   len(snapshot.lines))
 
     choices = choice_limit if repair.retry_fragment_choices and choice_limit >= 2 else 0
-    if (not repair.retries or choices) and fragment:
+    if (not repair.retries or choices or repair.retry_fragment_format) and fragment:
         first, last = fragment.first, fragment.last
         local = "\n".join(snapshot.lines[max(snapshot.first_body_line - 1, first - 6):first - 1])
         following = "\n".join(snapshot.lines[last:last + 4])
@@ -2532,13 +2534,16 @@ def _private_case_outcome(goal, after, runs, commands):
     return "unconfirmed"
 
 
-def _retry_private_method(repair, target, editor, note, *, checked=False):
-    if not repair.private_symbol or repair.retries >= 2 or not editor.configured_model:
+def _retry_private_method(repair, target, editor, note, *, checked=False, fragment_format=False):
+    same_fragment = fragment_format and repair.fragment_format_retries < 2
+    if not repair.private_symbol or (not same_fragment and repair.retries - repair.fragment_format_retries >= 2) or not editor.configured_model:
         return None
     model = editor.route, editor.configured_model
     if model in repair.excluded_models:
         return None
     return replace(repair, retries=repair.retries + 1, retry_target=target, retry_note=note,
+                   fragment_format_retries=repair.fragment_format_retries + int(same_fragment),
+                   retry_fragment_format=same_fragment, retry_fragment_choices=False,
                    stalled_edits=repair.stalled_edits + int(checked), excluded_models=(*repair.excluded_models, model))
 
 
@@ -6326,9 +6331,15 @@ def solve(executor, task, archive, budget, version):
                         not named_definitions,
                     )
                 elif repair is not None and repair.private_symbol:
+                    fragment_format = bool(line_retry and line_retry.statement_fragment)
+                    if fragment_format:
+                        raw = completion.content if isinstance(completion.content, str) else ""
+                        _LOG.info("Private fragment reply malformed: characters=%d lines=%d fences=%d",
+                                  len(raw), len(raw.splitlines()), raw.count("```"))
                     _LOG.info("Private method repair outcome: malformed, attempt=%d", repair.retries + 1)
                     regression_repair = _retry_private_method(
                         repair, target, editor, "Previous proposal could not be applied. Use this tentative checkout.",
+                        fragment_format=fragment_format,
                     )
                 _LOG.info(
                     "Review edit could not be applied for %s: %s",

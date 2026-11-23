@@ -417,6 +417,11 @@ def test_statement_fragment_uses_exact_suite_and_declines_scattered_or_stale_cha
     edited = prepare_line_range_edit(tentative, snapshot.symbol)
     selected = isolate_statement_fragment(snapshot, edited)
     assert selected.accepted == ("        item_3 = 3",)
+    fenced = "```python\nitem_3 = 8\n```"
+    assert apply_statement_fragment("Here is the fix:\n" + fenced + "\nDone.", tentative, edited, selected)[PATH] == updates.replace("item_3 = -3", "item_3 = 8")
+    for extra in ("return 5", "other.py", "X" * 241, fenced):
+        with pytest.raises(ValueError):
+            apply_statement_fragment(extra + "\n" + fenced, tentative, edited, selected)
     result = apply_statement_fragment(
         "```python\nif item_1:\n    item_3 = 8\nelse:\n    item_3 = -3\n```", tentative, edited, selected,
     )

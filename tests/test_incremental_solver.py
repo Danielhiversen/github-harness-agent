@@ -1387,15 +1387,18 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 private_models.append((reply.route, reply.configured_model))
                 return reply
             if fragment_case and "Synthesize only the replacement Python statements" in prompt:
-                assert not private_models and "test_keep_helper" in prompt and "test_first" in prompt
+                assert "test_keep_helper" in prompt and "test_first" in prompt
+                assert tuple(private_models) == kwargs.get("exclude", ())
                 assert "Accepted fragment:\n        return self.read() - 2" in prompt
                 assert "Tentative fragment to replace:\n        return self.read() + 2" in prompt
                 assert "context_0 = " not in prompt and "context_30 = " in prompt
                 assert "def dispatch(self, legacy=False):" in prompt and "def unrelated" not in prompt
                 reply = super().complete(**{**kwargs, "max_output_tokens": 3072})
-                reply.route, reply.configured_model = "private-free-0", "private-model-0"
+                reply.route, reply.configured_model = f"private-free-{len(private_models)}", f"private-model-{len(private_models)}"
                 private_models.append((reply.route, reply.configured_model))
                 reply.content = "return self.read() + (-2 if legacy else 2)" if fragment_case == "success" else "def foreign(): pass"
+                if fragment_case == "malformed" and len(private_models) == 2:
+                    reply.content = "Here is the corrected fragment:\n```python\nreturn self.read() + (-2 if legacy else 2)\n```"
                 return reply
             if private_case and "Private regression repair. The numbered tentative method" in prompt:
                 assert "test_first" in prompt and "test_keep_helper" in prompt
@@ -1669,7 +1672,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                            for rec in caplog.records)
                 return
             assert bool(planning_calls) == bool(private_plan)
-            assert len(private_models) == (1 if fragment_case == "success" else 3)
+            assert len(private_models) == (1 if fragment_case == "success" else 2 if fragment_case == "malformed" else 3)
             assert b"(-2 if legacy else 2)" in result.patch
             if fragment_case:
                 telemetry = [rec.getMessage() for rec in caplog.records if rec.msg.startswith("Private statement selection:")]
@@ -1677,8 +1680,9 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 assert "fragment_old_rows=1 fragment_new_rows=1" in telemetry[0]
                 assert all("self.read" not in line and "test_keep_helper" not in line for line in telemetry)
                 if fragment_case == "malformed":
-                    assert any("mode=full-method reason=retry-full-method" in line for line in telemetry)
-            if fragment_case == "success":
+                    assert len(telemetry) == 2 and all("mode=fragment" in line for line in telemetry)
+                    assert "Private fragment reply malformed: characters=" in caplog.text
+            if fragment_case in {"success", "malformed"}:
                 assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
                 return
             outcomes = [r.getMessage() for r in caplog.records if r.msg.startswith("Private method repair outcome")]
@@ -6266,3 +6270,14 @@ def test_private_fragment_choices_reject_ambiguous_or_unscoped_options(response)
 
 def test_private_repair_of_blank_to_multiline_hunk(solver_case, caplog):
     _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-private", caplog, fragment_case="blank")
+
+def test_private_fragment_format_failover_has_finite_scope_and_excludes_old_models():
+    from types import SimpleNamespace
+    from github_harness_agent.review_solver import _RegressionRepair, _retry_private_method
+    repair = _RegressionRepair((0, "original"), {}, {}, set(), set(), private_symbol=("calc.py", "run"))
+    for i in range(3):
+        model = SimpleNamespace(route=f"route-{i}", configured_model=f"model-{i}")
+        repair = _retry_private_method(repair, (0, "control"), model, "", fragment_format=True)
+        assert repair.retry_fragment_format == (i < 2)
+        assert repair.excluded_models[-1] == (model.route, model.configured_model)
+        assert _retry_private_method(repair, (0, "control"), model, "", fragment_format=True) is None

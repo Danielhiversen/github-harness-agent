@@ -605,11 +605,23 @@ def apply_statement_fragment(reply, sources, snapshot, fragment):
     """Splice one standalone statement suite and verify surrounding AST equivalence."""
     if not isinstance(reply, str) or len(reply.encode()) > 4096:
         raise ValueError("Expected a bounded Python statement fragment")
-    if fragment.literal and reply.strip() == "RESTORE_ACCEPTED_BLANK":
+    text = reply.replace("\r\n", "\n").strip("\n")
+    if "```" in text:
+        fences = list(re.finditer(r"(?m)^[ \t]*```[^\n]*$", text))
+        if len(fences) != 2 or text.count("```") != 2:
+            raise ValueError("Expected one bounded Python fragment fence")
+        opening, closing = fences
+        if opening[0].strip().lower() not in {"```", "```python", "```py"} or closing[0].strip() != "```":
+            raise ValueError("Expected one Python fragment fence")
+        outside = (text[:opening.start()] + "\n" + text[closing.end():]).strip()
+        if (len(outside) > 240 or len(outside.splitlines()) > 4 or ".py" in outside
+                or any(row and not re.fullmatch(r"[A-Za-z][A-Za-z0-9 ,.'’!?:-]*", row)
+                       for row in outside.splitlines())
+                or re.search(r"(?im)^ *(?:return|def|class|import|raise|pass|assert|if|else|while|for|from)\b", outside)):
+            raise ValueError("Unexpected text outside Python fragment fence")
+        text = text[opening.end()+1:closing.start()].rstrip("\n")
+    if fragment.literal and text.strip() == "RESTORE_ACCEPTED_BLANK":
         return _apply_literal_hunk([], sources, snapshot, fragment, restore_blank=True)
-    text = reply.strip("\n")
-    if fence := re.fullmatch(r"```(?:python|py)?[ \t]*\n(.*?)\n```", text, re.S):
-        text = fence[1]
     text = textwrap.dedent(text)
     rows = text.splitlines()
     if not rows or len(rows) > 18 or any(_INVALID_LINE.search(row) for row in rows):
