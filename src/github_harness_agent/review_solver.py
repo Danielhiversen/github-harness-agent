@@ -2123,6 +2123,7 @@ class _LineRetry:
     caller_context: str = ""
     checked_caller_attempts: tuple[str, ...] = ()
     statement_fragment: StatementFragment | None = None
+    fragment_choices: int = 0
     raw_context: str = ""
 
     @property
@@ -2357,6 +2358,7 @@ class _RegressionRepair:
     attempts: int = 0
     stock_origin: bool = False
     private_symbol: tuple[str, str] | None = None
+    retry_fragment_choices: bool = False
     retries: int = 0
     retry_note: str = ""
     retry_named: bool = False
@@ -2410,7 +2412,30 @@ def _private_changed_method(current, tentative):
     return None
 
 
-def _private_method_retry(current, repair, target, review, origin_diagnostic=""):
+def _private_fragment_choices(response, source, snapshot, retry):
+    if not isinstance(response, str) or len(response.encode()) > 12 * 1024:
+        raise ValueError("Expected a bounded array of private fragment options")
+    try:
+        options = json.loads(response)
+    except (ValueError, RecursionError):
+        raise ValueError("Expected a JSON array of private fragment options") from None
+    if not isinstance(options, list) or not 2 <= len(options) <= retry.fragment_choices:
+        raise ValueError("Unexpected number of private fragment options")
+    candidates = []
+    signatures = set()
+    for option in options:
+        if not isinstance(option, str):
+            raise ValueError("Each private fragment option must be source text")
+        candidate = apply_statement_fragment(option, source, snapshot, retry.statement_fragment)
+        signature = ast.dump(ast.parse(candidate[snapshot.symbol[0]]))
+        if signature in signatures:
+            raise ValueError("Private fragment options must contain distinct changes")
+        signatures.add(signature)
+        candidates.append(candidate)
+    return candidates
+
+
+def _private_method_retry(current, repair, target, review, origin_diagnostic="", choice_limit=0):
     snapshot = prepare_line_range_edit(repair.sources, repair.private_symbol)
     if snapshot is None:
         _LOG.info("Private statement selection: mode=unavailable reason=tentative-snapshot-unavailable")
@@ -2440,7 +2465,8 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="")
                   len(fragment.accepted) if fragment else 0, fragment.last - fragment.first + 1 if fragment else 0,
                   len(snapshot.lines))
 
-    if not repair.retries and fragment:
+    choices = choice_limit if repair.retry_fragment_choices and choice_limit >= 2 else 0
+    if (not repair.retries or choices) and fragment:
         first, last = fragment.first, fragment.last
         local = "\n".join(snapshot.lines[max(snapshot.first_body_line - 1, first - 6):first - 1])
         following = "\n".join(snapshot.lines[last:last + 4])
@@ -2458,10 +2484,18 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="")
             + "\nTentative fragment to replace:\n" + "\n".join(snapshot.lines[first - 1:last])
             + "\nFollowing context:\n" + excerpt(following, 450)
         )
+        if choices:
+            prompt += (
+                f'\nInstead of a single fragment, return a JSON array of 2 to {choices} distinct replacement '
+                'strings. Each is an independent solution against exactly the same tentative fragment. '
+                'Use this array as the entire reply.'
+            )
         if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": prompt}]) <= 6200:
             log_selection("literal-hunk" if fragment.literal else "fragment", selection.reason)
+            if choices:
+                _LOG.info("Requesting up to %d independent private fragment options", choices)
             return _LineRetry(None, snapshot, allowed_rows=frozenset(range(first, last + 1)),
-                              prompt=prompt, checkout=repair.sources, statement_fragment=fragment)
+                              prompt=prompt, checkout=repair.sources, statement_fragment=fragment, fragment_choices=choices)
     reason = "retry-full-method" if repair.retries else "fragment-prompt-limit" if fragment else selection.reason
     delta = "\n".join(difflib.unified_diff(
         accepted.lines, snapshot.lines, fromfile="accepted method", tofile="tentative method", n=1, lineterm="",
@@ -5303,7 +5337,9 @@ def solve(executor, task, archive, budget, version):
                     ):
                         line_retry = None
                     if repair is not None and repair.private_symbol and target in repair.introduced:
-                        line_retry = _private_method_retry(current, repair, target, review, failures.get(repair.origin, ""))
+                        choice_limit = min(3, max_proposals - submitted - 1,
+                                           (budget.commands_remaining() - len(commands) - 6) // max(1, len(commands)))
+                        line_retry = _private_method_retry(current, repair, target, review, failures.get(repair.origin, ""), choice_limit)
                     if (
                         production_regression and repair is None and target in operator
                         and not (current is resumed_operator_checkout and line_retry is not None)
@@ -6055,6 +6091,7 @@ def solve(executor, task, archive, budget, version):
                     source = {new_path: test_draft}
                 try:
                     candidate = native_candidate
+                    alternative_candidates = []
                     if raw_nested is not None:
                         candidate = apply_scoped_raw_definition(completion.content, source, raw_symbol)
                     if target == _TEST_GOAL:
@@ -6092,7 +6129,12 @@ def solve(executor, task, archive, budget, version):
                             raise ValueError("The pytest edit did not change the draft.")
                     if candidate is None and active_line_snapshot is not None:
                         if scoped_line and line_retry.statement_fragment:
-                            candidate = apply_statement_fragment(completion.content, source, active_line_snapshot, line_retry.statement_fragment)
+                            if line_retry.fragment_choices:
+                                candidate, *alternative_candidates = _private_fragment_choices(
+                                    completion.content, source, active_line_snapshot, line_retry,
+                                )
+                            else:
+                                candidate = apply_statement_fragment(completion.content, source, active_line_snapshot, line_retry.statement_fragment)
                         elif scoped_line and (line_retry.alternatives or line_retry.complete_single_method):
                             candidate = apply_offered_line_reply(
                                 completion.content, source, (line_retry.snapshot, *line_retry.alternatives), block_pattern=_BLOCK,
@@ -6231,6 +6273,19 @@ def solve(executor, task, archive, budget, version):
                             if repair is not None and repair.dependency_seed else {}
                         ),
                     )
+                for alternative in alternative_candidates:
+                    if (not after or submitted >= max_proposals - 1 or budget.remaining() < 30
+                            or budget.commands_remaining() < 2 * len(commands) + 4):
+                        break
+                    next_patch = patch_for(original, alternative)
+                    if len(next_patch) > executor.limits.patch_bytes:
+                        continue
+                    submitted += 1
+                    candidate, proposed = alternative, next_patch
+                    after_runs, static_runs = {}, {}
+                    after = review_evidence(executor, task, archive, budget, proposed, commands,
+                                            pytest_runs=after_runs, static_runs=static_runs)
+                    _LOG.info("Verified another independent private fragment option; remaining checks=%d", len(after))
             except _PrivateCheckOutputExceeded as error:
                 budget.remaining()
                 regression_repair = _retry_stock_repair(
@@ -6693,6 +6748,9 @@ def solve(executor, task, archive, budget, version):
                         reason += " Observed pytest failure: " + excerpt(observed, 300)
                     regression_repair = _retry_private_method(repair, target, editor, reason, checked=True)
                     if regression_repair:
+                        regression_repair = replace(regression_repair, retry_fragment_choices=bool(
+                            line_retry and line_retry.statement_fragment and not line_retry.fragment_choices
+                        ))
                         continue
                 if not improved or introduced or pending_static:
                     if improved and (repair.stock_origin or repair.attempts == 0):

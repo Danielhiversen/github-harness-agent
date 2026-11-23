@@ -1270,7 +1270,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
         with operator.open("a") as stream:
             stream.write("    assert Reader().dispatch(True) == -3\n")
     caller_rows = 1
-    if fragment_case == "literal":
+    if fragment_case in {"literal", "choices"}:
         header = "        if False:\n"
         tentative_header = "        choose = True\n        enabled = choose\n        if enabled:\n"
         wide_body = "".join(f"            context_{i} = {i}\n" for i in range(32))
@@ -1354,13 +1354,21 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 reply.role = "planning"
                 reply.content = json.dumps({"strategy": strategy})
                 return reply
-            if fragment_case == "literal" and "replacement lines for the exact tentative hunk" in prompt:
+            if fragment_case in {"literal", "choices"} and "replacement lines for the exact tentative hunk" in prompt:
                 assert "Accepted fragment:\n" + header.rstrip() in prompt
                 assert "Tentative fragment to replace:\n" + tentative_header.rstrip() in prompt
                 assert "legacy=False" in prompt and "test_keep_helper" in prompt and "test_first" in prompt
                 assert "context_31" not in prompt and "def unrelated" not in prompt
                 reply = super().complete(**{**kwargs, "max_output_tokens": 3072})
-                reply.content = "if not legacy:"
+                if fragment_case == "choices":
+                    reply.route, reply.configured_model = f"private{len(private_models)}", f"editor{len(private_models)}"
+                    if private_models:
+                        assert tuple(private_models) == kwargs["exclude"] and "JSON array" in prompt
+                        reply.content = json.dumps(["if False:", "if not legacy:"])
+                    else:
+                        reply.content = "if bool(legacy):"
+                else:
+                    reply.content = "if not legacy:"
                 private_models.append((reply.route, reply.configured_model))
                 return reply
             if fragment_case and "Synthesize only the replacement Python statements" in prompt:
@@ -1523,7 +1531,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                             if failover.endswith("-multistage"):
                                 assert "Checkpoint assertion at line 4: assert first() == 1" in prompt
                                 assert "Pinned ancestor assertion at line 3: assert second() == 2" in prompt
-                    if fragment_case == "literal":
+                    if fragment_case in {"literal", "choices"}:
                         reply.content = edit(SOURCE, header, tentative_header)
                     elif semantic:
                         if len(line_attempts) == 1:
@@ -1632,8 +1640,8 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
         assert "def unrelated" not in first_request and "withheld-operator-source" not in first_request
         assert "Observed pytest failure:" in first_request
         if private_case:
-            if fragment_case == "literal":
-                assert len(private_models) == 1 and b"+        if not legacy:" in result.patch
+            if fragment_case in {"literal", "choices"}:
+                assert len(private_models) == (2 if fragment_case == "choices" else 1) and b"+        if not legacy:" in result.patch
                 assert b"choose = True" not in result.patch
                 assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
                 assert any("mode=literal-hunk reason=single-literal-hunk hunks=1 changed_old=1 changed_new=3" in rec.getMessage()
@@ -6208,3 +6216,29 @@ def test_private_method_synthesizes_only_the_changed_statement(solver_case, capl
 
 def test_private_repair_replaces_literal_header_of_wide_suite(solver_case, caplog):
     _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-private", caplog, fragment_case="literal")
+
+
+def test_private_fragment_choices_verify_independent_options(solver_case, caplog):
+    _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-private", caplog, fragment_case="choices")
+    assert "Verified another independent private fragment option; remaining checks=0" in caplog.text
+
+
+@pytest.mark.parametrize("response", [
+    '["return 1", "return 1  # equivalent"]', '["return 1"]',
+    '["return 1", "return 2", "return 3"]', '{"alternatives": ["return 1", "return 2"]}',
+    '["return 1", "def foreign(): pass"]',
+])
+def test_private_fragment_choices_reject_ambiguous_or_unscoped_options(response):
+    from github_harness_agent.review_solver import _private_fragment_choices, _LineRetry
+    from github_harness_agent.review_line_ranges import prepare_line_range_edit, select_statement_fragment
+
+    key = ("example.py", "calculate")
+    original = {key[0]: "def calculate():\n    return 0\n"}
+    tentative = {key[0]: "def calculate():\n    return 4\n"}
+    before = prepare_line_range_edit(original, key)
+    snapshot = prepare_line_range_edit(tentative, key)
+    selected = select_statement_fragment(before, snapshot).fragment
+    retry = _LineRetry(None, snapshot, statement_fragment=selected, fragment_choices=2)
+    with pytest.raises(ValueError):
+        _private_fragment_choices(response, tentative, snapshot, retry)
+    assert tentative[key[0]] == "def calculate():\n    return 4\n"
