@@ -2944,8 +2944,8 @@ def _pinned_restore_budget(budget, *, dependency_seed):
 
 
 class _InteractiveBudget(_GuardBudget):
-    def __init__(self, budget, turns, tools):
-        super().__init__(budget, wall_seconds=420, reserve=_INTERACTIVE_RESERVE_SECONDS)
+    def __init__(self, budget, turns, tools, *, wall_seconds=420):
+        super().__init__(budget, wall_seconds=wall_seconds, reserve=_INTERACTIVE_RESERVE_SECONDS)
         self.limits = replace(budget.limits, rollout_requests=turns)
         self.turns_left = turns
         self.tools_left = tools
@@ -4142,6 +4142,99 @@ def solve(executor, task, archive, budget, version):
             save_verified_progress(patch, note, editor)
         return True
 
+    def interactive_operator_repair(repair, control, probe):
+        origin = repair.origin
+        if origin == control or any(number >= len(task.pull_checks) for number, _ in (origin, control)):
+            return None
+        focused = tuple(_operator_diagnostic_replay(commands[number], node) for number, node in (origin, control))
+        if not all(focused):
+            return None
+        goals = tuple((index, case[1]) for index, case in enumerate((origin, control)))
+        path, name = repair.private_symbol
+        reviewed = {path: repair.sources[path]}
+        if not _protected(new_path, task, new_test=True):
+            reviewed[new_path] = ""
+        seed = patch_for(original, {**current, path: reviewed[path]})
+        if not seed or len(seed) > executor.limits.patch_bytes:
+            return None
+        checked = {}
+        probe_count = 0
+
+        def verify_draft(updates):
+            nonlocal probe_count
+            if path not in updates:
+                return "Make an exact production edit before requesting the operator probe."
+            proposed = patch_for(original, {**current, path: updates[path]})
+            if len(proposed) > executor.limits.patch_bytes:
+                return "The candidate exceeds the patch limit."
+            if proposed not in checked:
+                if probe_count == 2 or probe.remaining() < 12:
+                    return "The focused operator probe budget is exhausted."
+                probe_count += 1
+                runs = {}
+                try:
+                    after = review_evidence(
+                        executor, task, archive, probe, proposed, focused, pytest_runs=runs,
+                    )
+                except Cancelled:
+                    raise
+                except (ExecutionError, OSError, ValueError):
+                    budget.remaining()
+                    return "The pair could not be independently verified."
+                checked[proposed] = tuple(_private_case_outcome(goal, after, runs, focused) for goal in goals)
+            target_status, control_status = checked[proposed]
+            return f"Independent verifier: requested target {target_status}; previously passing control {control_status}."
+
+        instructions = (
+            "Repair a reviewed production method in the isolated coding workspace. "
+            "The supplied draft passes the requested target and fails the previously passing control. "
+            "Use run to read source and run offline repository tests. Apply changes using edit_file only. "
+            'Use run with argv ["verify_review"] after an edit to obtain pass/fail status for both '
+            "independent operator cases, without access to their sources. Keep both behaviors working.\n"
+            f"Reviewed method: {path}::{name}\n"
+            f"Editable paths: {json.dumps(list(reviewed))}\n"
+            + "Requested behavior (quoted): " + excerpt(" ".join(body for _, _, body in review.feedback), 850) + "\n"
+            + (excerpt(repair.retry_note.split(" Observed pytest failure:", 1)[0], 220) + "\n"
+               if repair.retry_note else "")
+        )
+        draft = DraftCheckpoint(_CHECKPOINT, task.base_sha, seed, guidance=_GUIDANCE)
+        interactive_task = replace(
+            task, instructions=instructions, checkpoints={_CHECKPOINT: draft}, pull_checks=(),
+            save_checkpoint=None, save_solver_recovery=None, review_recovery=None, repair_failure=(),
+            context=None, test_update=None, require_new_tests=False,
+        )
+        try:
+            _, _, editor = executor._rollout(
+                interactive_task, archive, probe, SYSTEM_PROMPT, "coding", clarification=False,
+                checkpoint_key=_CHECKPOINT, checkpoint_guidance=_GUIDANCE, scoped_sources=reviewed,
+                scoped_verify=verify_draft,
+            )
+            if not editor or not editor.configured_model or reviewed[path] == repair.sources[path]:
+                return None
+            candidate = {**current, path: reviewed[path]}
+            proposed = patch_for(original, candidate)
+            if len(proposed) > executor.limits.patch_bytes:
+                return None
+            runs = {}
+            after = review_evidence(executor, task, archive, budget, proposed, commands, pytest_runs=runs)
+            confirmed = all(
+                _private_case_outcome(goal, after, runs, commands) == "passed"
+                or (_same_pytest_selection(pytest_runs.get(goal[0]), runs.get(goal[0]))
+                    and not runs[goal[0]].failed and not runs[goal[0]].deselected)
+                for goal in (origin, control)
+            )
+            if after or not confirmed:
+                _LOG.info("Interactive operator edit did not pass the complete check set")
+                return None
+            _LOG.info("Interactive operator edit independently passed both cases and all production checks")
+            return candidate, proposed, after, runs, editor, reviewed.get(new_path)
+        except Cancelled:
+            raise
+        except (ExecutionError, ProviderExhausted, ValueError, OSError) as error:
+            _LOG.info("Interactive operator repair ended with %s", type(error).__name__)
+            budget.remaining()
+            return None
+
     def interactive_stock_gain(target, symbol, probe):
         reviewed = {
             path: current[path]
@@ -4575,6 +4668,7 @@ def solve(executor, task, archive, budget, version):
     interactive_misses = Counter()
     unlocalized_plans = set()
     interactive_attempted = False
+    interactive_operator_attempted = False
     stock_hedge = None
     hedge_used = False
     hedge_pair = set()
@@ -5118,6 +5212,39 @@ def solve(executor, task, archive, budget, version):
             launch_budget = min(
                 max_proposals - submitted, budget.model_requests_remaining()
             )
+            if (
+                not interactive_operator_attempted and not pending and retired is None
+                and regression_repair is not None and regression_repair.private_symbol
+                and regression_repair.stalled_edits >= 2 and repair_target is not None
+                and executor.verification_runner is not executor.runner
+                and all(getattr(runner, "network", None) == "none"
+                        for runner in (executor.runner, executor.verification_runner))
+                and (getattr(executor.runner, "image", None) is None
+                     or executor.runner.image != getattr(executor.verification_runner, "image", None))
+                and launch_budget >= 5 + int(needs_tests)
+                and budget.commands_remaining() >= 3 * len(commands) + 12
+                and budget.remaining() >= _INTERACTIVE_RESERVE_SECONDS + 75
+                and (budget.limits.rollout_requests or 6) >= 5
+            ):
+                interactive_operator_attempted = True
+                before = budget.model_requests_remaining()
+                turns = min(budget.limits.rollout_requests or 6, 6, launch_budget - int(needs_tests))
+                tools = min(12, budget.commands_remaining() - 3 * len(commands))
+                _LOG.info("Trying isolated interactive operator repair after checked proposals")
+                checked = interactive_operator_repair(
+                    regression_repair, repair_target, _InteractiveBudget(budget, turns, tools, wall_seconds=240),
+                )
+                submitted += before - budget.model_requests_remaining()
+                if checked is not None:
+                    current, patch, failures, pytest_runs, actor, authored = checked
+                    regression_repair = None
+                    start_new_draft(repair_target)
+                    save_verified_progress(patch, "", actor)
+                    if authored:
+                        test_draft = authored
+                        test_diagnostic = "Continue from this offline test draft and verify all requested behavior."
+                    continue
+                launch_budget = min(max_proposals - submitted, budget.model_requests_remaining())
             if (
                 not test_first_attempted and current is resumed_operator_checkout and needs_tests
                 and len(operator) == 1 and not other_checks and not pending and not private

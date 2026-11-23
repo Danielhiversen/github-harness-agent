@@ -1218,7 +1218,7 @@ def test_testfirst_function_recovers_malformed_module(solver_case, caplog, monke
     assert "hidden operator assertion" not in caplog.text
 
 
-def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve, private_plan=None, fragment_case=None, dynamic_facts=False):
+def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve, private_plan=None, fragment_case=None, dynamic_facts=False, interactive=False):
     task, _, runner, checkpoints = solver_case
     raw_mode = failover in {"raw", "raw-restored"}
     long_checkpoint = failover.startswith("checkpoint-")
@@ -1359,10 +1359,51 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
     line_attempts = []
     native_attempts = []
     raw_attempts = []
+    interactive_turns = []
 
     class Gateway(FreeGateway):
         def complete(self, **kwargs):
             prompt = kwargs["messages"][-1]["content"]
+            if interactive and any("Repair a reviewed production method in the isolated coding workspace" in (item.get("content") or "")
+                                   for item in kwargs["messages"] if item["role"] == "user"):
+                messages = str(kwargs["messages"])
+                assert str(operator) not in messages and "withheld-operator-source" not in messages
+                first, second = "        if True:\n", "        if not legacy:\n"
+                stage = len(interactive_turns)
+                interactive_turns.append(stage)
+
+                def call(name, arguments, num):
+                    return {
+                        "id": f"stage-{stage}-{num}", "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(arguments)},
+                    }
+
+                def change(old, new):
+                    return call("edit_file", {"path": SOURCE, "old_text": old, "new_text": new}, 0)
+
+                probe = call("run", {"argv": ["verify_review"]}, 1)
+                if stage == 0:
+                    calls = (call("run", {"argv": ["cat", SOURCE]}, 0),)
+                elif stage == 1:
+                    assert "if enabled:" in messages and "context_31" in messages
+                    calls = (change(tentative_header, first), probe)
+                elif stage == 2:
+                    assert "Independent verifier: requested target passed; previously passing control failed." in messages
+                    calls = (change(first, second), probe)
+                elif stage == 3:
+                    assert "Independent verifier: requested target passed; previously passing control passed." in messages
+                    calls = (
+                        call("edit_file", {"path": NEW_TEST, "new_text": early_case}, 0),
+                        call("run", {"argv": [sys.executable, "-m", "pytest", "-q", NEW_TEST]}, 1),
+                    )
+                else:
+                    assert "1 passed" in messages
+                    calls = ()
+                return SimpleNamespace(
+                    content=None if calls else "Completed.", tool_calls=calls, role="coding",
+                    route="fixture-interactive", model="fixture-interactive", configured_model="fixture-interactive",
+                    usage={},
+                )
             if kwargs["role"] == "planning" and private_plan:
                 assert len(private_models) == 2 and not planning_calls and not kwargs["tools"]
                 assert "test_first" in prompt and "test_keep_helper" in prompt and "test_dispatch_observable" in prompt
@@ -1679,7 +1720,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 gateway = Gateway("anchor", early_case, "caller", "invalid", "undo", "repaired")
                 requests = 8 if private_plan else 7
                 if fragment_case == "history":
-                    requests = 9
+                    requests = 15 if interactive else 9
                     gateway = Gateway("anchor", early_case, "caller", "discarded", "options", "strategy", "final", TEST)
                 if private_plan == "success":
                     gateway = Gateway("anchor", early_case, "caller", "invalid", "undo", "strategy", "repaired")
@@ -1689,12 +1730,16 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
     else:
         gateway = Gateway(malformed, malformed, *(["Numbered response expected."] * numbered_replies), *raw_reply, TEST)
         requests = 3 + numbered_replies + (failover in {"malformed", "native", "raw"}) + len(raw_reply)
+    verifier = FixtureRunner(independent)
+    if interactive:
+        runner.network = verifier.network = "none"
     executor = PlainExecutor(
         runner, gateway, Limits(
             model_requests=requests,
             concurrent_probes=1,
+            commands=120 if interactive else Limits().commands,
         ),
-        verification_runner=FixtureRunner(independent),
+        verification_runner=verifier,
     )
     budget = _Budget(executor.limits, lambda: False, task)
     with caplog.at_level("INFO", logger="github_harness_agent.review_solver"):
@@ -1728,9 +1773,13 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                            for rec in caplog.records)
                 return
             if fragment_case in {"literal", "literal-wide", "choices", "mixed-fences", "history", "spontaneous-fences"}:
-                private_count = 3 if fragment_case == "history" else 2 if fragment_case in {"choices", "mixed-fences"} else 1
+                private_count = (2 if interactive else 3) if fragment_case == "history" else 2 if fragment_case in {"choices", "mixed-fences"} else 1
                 assert len(private_models) == private_count and b"+        if not legacy:" in result.patch
                 assert b"choose = True" not in result.patch
+                if interactive:
+                    assert interactive_turns == [0, 1, 2, 3, 4]
+                    assert "Interactive operator edit independently passed both cases" in caplog.text
+                    assert any(check.command == ("verify-regression-counterexample",) for check in result.checks)
                 assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
                 assert any("mode=literal-hunk reason=single-literal-hunk hunks=1 changed_old=1 changed_new=3" in rec.getMessage()
                            for rec in caplog.records)
@@ -6541,4 +6590,11 @@ def test_only_an_assertion_with_another_operator_case_passing_certifies_partial_
     )
     assert not _is_partial_operator_counterexample(
         failures, {**checked, 0: replace(checked[0], deselected=1)}, commands, 2,
+    )
+
+
+def test_interactive_operator_repair_receives_only_verifier_outcomes(solver_case, caplog):
+    _exercise_numbered_review(
+        solver_case, "checkpoint-caller-after-testfirst-private", caplog,
+        fragment_case="history", interactive=True,
     )

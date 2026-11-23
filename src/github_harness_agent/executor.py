@@ -997,6 +997,7 @@ class PlainExecutor:
         seed_draft=None,
         scoped_sources=None,
         scoped_action_counts=None,
+        scoped_verify=None,
     ):
         with self.runner.workspace(
             archive, budget.remaining, budget.cancelled
@@ -1167,6 +1168,15 @@ class PlainExecutor:
             scoped_pacing = "inspect" if scoped_production else "ordinary"
             inspection_turns = 0
             scoped_retried = False
+
+            def captured_exact_edits():
+                updates = self._capture_scoped_sources(
+                    workspace, budget, initial_tree, scoped_sources, text_only=True,
+                )
+                if any(path not in scoped_edits or scoped_edits[path][0] != source
+                       for path, source in updates.items()):
+                    raise _CandidateOutputError("Apply scoped source updates through edit_file.")
+                return updates
 
             def valid_recovery_test(path, content):
                 return (
@@ -1471,6 +1481,15 @@ class PlainExecutor:
                         else:
                             argv = self._tool_argv(tool)
                             action = json.dumps(argv)
+                            if scoped_verify is not None and argv == ("verify_review",):
+                                try:
+                                    self._stage_rollout(workspace, budget, artifacts)
+                                    output = scoped_verify(captured_exact_edits())
+                                except _CandidateOutputError:
+                                    output = "Could not verify this draft. Use edit_file for the scoped source updates."
+                                messages.append({"role": "tool", "tool_call_id": tool["id"], "content": output})
+                                trajectory.append(f"[ACTION] verify_review\n[OBSERVATION] {output}")
+                                continue
                             checked_command = check_label(argv, task.checks)
                             if checked_command:
                                 if artifact_index is None:
@@ -1772,11 +1791,14 @@ class PlainExecutor:
                 if patch and not clarification:
                     self._check_patch_paths(workspace, task, budget, baseline)
                 if scoped_sources is not None:
-                    updated = self._capture_scoped_sources(
-                        workspace, budget, initial_tree, scoped_sources,
-                        text_only=scoped_stop is not None,
+                    updated = (
+                        captured_exact_edits() if scoped_verify is not None else
+                        self._capture_scoped_sources(
+                            workspace, budget, initial_tree, scoped_sources,
+                            text_only=scoped_stop is not None,
+                        )
                     )
-                    if scoped_stop is not None:
+                    if scoped_stop is not None or (scoped_verify is not None and updated):
                         production = {
                             path for path in updated
                             if not _protected(path, task, new_test=False)
@@ -1787,19 +1809,22 @@ class PlainExecutor:
                         ):
                             if isinstance(scoped_stop, _RequestBudgetExceeded):
                                 budget.reject(scoped_stop, last, latest=True)
-                            raise scoped_stop
+                            if scoped_stop is not None:
+                                raise scoped_stop
+                            raise _CandidateOutputError("Interactive review needs an attributed production edit.")
                         _, _, actor = max(
                             (scoped_edits[path] for path in production),
                             key=lambda entry: entry[1],
                         )
                         budget.remaining()
-                        logging.getLogger(__name__).info(
-                            "Harvesting attributed edits in %d scoped production file(s) after %s",
-                            len(production),
-                            "provider exhaustion"
-                            if isinstance(scoped_stop, ProviderExhausted)
-                            else "the model request limit",
-                        )
+                        if scoped_stop is not None:
+                            logging.getLogger(__name__).info(
+                                "Harvesting attributed edits in %d scoped production file(s) after %s",
+                                len(production),
+                                "provider exhaustion"
+                                if isinstance(scoped_stop, ProviderExhausted)
+                                else "the model request limit",
+                            )
                     scoped_sources.update(updated)
             except (CommandOutputExceeded, _CandidateOutputError) as error:
                 budget.reject(error, actor or last)
