@@ -4246,7 +4246,7 @@ def solve(executor, task, archive, budget, version):
     test_first_attempted = False
     test_first_witness = None
 
-    def author_red_regression(routes, after_provider):
+    def author_red_regression(routes, after_provider, runnable_drafts):
         # Only public repository context is provided. The independent operator
         # check and its diagnostic play no part in composing this test.
         public = {path: current[path] for path in paths}
@@ -4277,6 +4277,14 @@ def solve(executor, task, archive, budget, version):
             + "\nRepository setup examples:\n" + excerpt(examples, 3200)
             + ("\nProduction call and response handling:\n" + protocol if protocol else "")
         )
+        if runnable_drafts:
+            previous, outcomes = next(reversed(runnable_drafts.items()))
+            prompt += (
+                "\nPrevious authored test (quoted):\n" + excerpt(previous, 4000)
+                + "\nMeasured executions: " + ", ".join(outcomes)
+                + ". Strengthen the scenario and assertions so the missing behavior is observable. "
+                "Preserve relevant passing checks. Return the complete revised module."
+            )
         messages = [{"role": "system", "content": _SYSTEM_PREFIX + _SYSTEM_SUFFIX},
                     {"role": "user", "content": prompt}]
         remaining = budget.remaining()
@@ -4292,9 +4300,16 @@ def solve(executor, task, archive, budget, version):
         if not source or not _one_test_draft(source):
             _LOG.info("Test-first authoring rejected test module format")
             return None
-        return prove_red_regression(source)
+        if source in runnable_drafts:
+            _LOG.info("Test-first author repeated a previously measured green test")
+            return None
+        outcomes = []
+        witness = prove_red_regression(source, outcomes=outcomes)
+        if not witness and len(outcomes) == 2 and any(item.endswith(" passed") for item in outcomes):
+            runnable_drafts[source] = tuple(outcomes)
+        return witness
 
-    def prove_red_regression(source):
+    def prove_red_regression(source, *, outcomes=None):
         if _complete_test_module(source, new_path, min(8192, executor.limits.patch_bytes)) != source or not _one_test_draft(source):
             return None
         proof = _GuardBudget(budget, wall_seconds=45)
@@ -4316,6 +4331,9 @@ def solve(executor, task, archive, budget, version):
             if not run or len(run.failed) != 1:
                 outcome = "green" if run and run.passed == 1 and not failed and not run.deselected else "incomplete or setup error"
                 _LOG.info("Test-first %s verification: %s", stage, outcome)
+                if outcome == "green" and outcomes is not None:
+                    outcomes.append(stage + " passed")
+                    continue
                 return None
             observed = next(_focused_test_assertions(new_path, source, run, failed), None)
             if observed is None:
@@ -4323,7 +4341,9 @@ def solve(executor, task, archive, budget, version):
                 return None
             _LOG.info("Test-first %s verification: red at a verified test assertion", stage)
             assertions.append(observed)
-        if assertions[0][0] != assertions[1][0]:
+            if outcomes is not None:
+                outcomes.append(f"{stage} failed by assertion at line {observed[1]}")
+        if len(assertions) != 2 or assertions[0][0] != assertions[1][0]:
             _LOG.info("Test-first verification rejected mismatched collected cases")
             return None
         rows = source.splitlines()
@@ -4620,12 +4640,15 @@ def solve(executor, task, archive, budget, version):
                 test_first_attempted = True
                 routes = []
                 after_provider = None
-                for attempt in (1, 2):
-                    _LOG.info("Requesting test-first regression authoring, attempt %d of 2", attempt)
+                runnable_drafts = {}
+                for attempt in (1, 2, 3):
+                    if attempt == 3 and not runnable_drafts:
+                        break
+                    _LOG.info("Requesting test-first regression authoring, attempt %d", attempt)
                     submitted += 1
                     launch_budget -= 1
                     try:
-                        test_first_witness = author_red_regression(routes, after_provider)
+                        test_first_witness = author_red_regression(routes, after_provider, runnable_drafts)
                         after_provider = routes[-1][0] if routes else None
                     except Cancelled:
                         raise
