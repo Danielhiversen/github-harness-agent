@@ -1141,12 +1141,13 @@ def test_pinned_setup_failures_recover_using_an_authored_function_and_only_neede
     assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
 
 
-@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long", "checkpoint-caller", "checkpoint-caller-block"))
+@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long", "checkpoint-caller", "checkpoint-caller-block", "checkpoint-caller-after-format", "checkpoint-caller-after-rejection", "checkpoint-caller-after-exhaustion"))
 def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, failover, caplog):
     task, _, runner, checkpoints = solver_case
     raw_mode = failover in {"raw", "raw-restored"}
     long_checkpoint = failover.startswith("checkpoint-")
     caller_edit = failover.startswith("checkpoint-caller")
+    caller_retry = failover.startswith("checkpoint-caller-after-")
     operator = Path(task.pull_checks[0][-1])
     with operator.open("a") as stream:
         stream.write("# withheld-operator-source " + "x" * review_recovery.MAX_OPERATOR_SOURCE + "\n")
@@ -1264,6 +1265,38 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
             prompt = self.prompts[-1]
             digest = re.search(r'"snapshot":"([0-9a-f]{64})"', prompt)[1]
             target = re.search(r"(?m)^(\d+) \| ( +)return -1$", prompt)
+            if caller_retry:
+                first_attempt = not line_attempts
+                reply.route = "numbered-free-a" if first_attempt else "numbered-free-b"
+                reply.configured_model = "small-code-model" if first_attempt else "alternate-code-model"
+                if first_attempt:
+                    assert target and "::Reader.dispatch with snapshot" in prompt
+                    row = int(target[1]) if failover.endswith("rejection") else 9999
+                    reply.content = json.dumps({"snapshot": digest, "edits": [
+                        {"start": row, "end": row, "lines": [target[2] + "return -3"]},
+                    ]})
+                else:
+                    assert "Work only on the direct caller" in prompt
+                    assert "Edit only fixture_calc.py::Reader.dispatch" in prompt
+                    assert "def local_result" not in prompt and line_attempts[0][0] not in prompt
+                    previous_model = ("numbered-free-a", "small-code-model")
+                    if failover.endswith("exhaustion") and len(line_attempts) == 1:
+                        assert previous_model in kwargs["exclude"]
+                        line_attempts.append((digest, kwargs["exclude"], kwargs.get("after_provider")))
+                        raise ProviderExhausted(None, {"gateway": "all eligible models excluded"})
+                    if failover.endswith("exhaustion"):
+                        assert previous_model not in kwargs.get("exclude", ())
+                        reply.route, reply.configured_model = previous_model
+                    else:
+                        assert previous_model in kwargs["exclude"]
+                    assert "Observed pytest failure:" in prompt
+                    if not failover.endswith("rejection"):
+                        assert "could not be applied" in prompt
+                    else:
+                        assert "did not improve verification" in prompt and "additional failing check" in prompt
+                    reply.content = edit(SOURCE, "        return self.read() - 2\n", "        return self.read() + 2\n")
+                line_attempts.append((digest, kwargs.get("exclude", ()), kwargs.get("after_provider")))
+                return reply
             if caller_edit:
                 assert "Choose exactly one numbered definition" in prompt
                 caller = re.search(r'::Reader.dispatch with snapshot "([0-9a-f]{64})"', prompt)
@@ -1295,8 +1328,9 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         "```python\ndef local_result():\n    return 1\n```",
     ) if failover == "raw" else ()
     if long_checkpoint:
-        gateway = Gateway("Numbered response expected.", TEST)
-        requests = 2
+        replies = ("Numbered response expected.",) * (3 if failover.endswith("exhaustion") else 2 if caller_retry else 1) + (TEST,)
+        gateway = Gateway(*replies)
+        requests = len(replies)
     elif failover == "raw-restored":
         gateway = Gateway("def local_result():\n    return 1\n", TEST)
         requests = 2
@@ -1315,12 +1349,14 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         result = solve(executor, task, archive, budget, "fixture")
 
     if long_checkpoint:
-        [offered] = [record.getMessage() for record in caplog.records if record.msg.startswith("Requesting checkpoint method edit")]
+        offered, *remaining_offers = [record.getMessage() for record in caplog.records if record.msg.startswith("Requesting checkpoint method edit")]
         assert "anchor Reader.read (" in offered
         assert ("direct callers offered (1): Reader.dispatch (body rows=1)" if caller_edit else "direct callers offered (0): none") in offered
         assert "self.read()" not in offered and "return" not in offered
-        [first_request, _] = gateway.prompts
-        assert len(line_attempts) == 1 and not native_attempts and not raw_attempts
+        repeats = 2 if failover.endswith("exhaustion") else int(caller_retry)
+        assert remaining_offers == ["Requesting checkpoint method edit: direct caller only Reader.dispatch (body rows=1)"] * repeats
+        first_request = gateway.prompts[0]
+        assert len(line_attempts) == 1 + repeats and not native_attempts and not raw_attempts
         assert len(re.findall(r"(?m)^\d+ \|", first_request)) > 110
         assert "Reviewed dispatch" in first_request and "return local_result()" in first_request
         assert "def unrelated" not in first_request and "withheld-operator-source" not in first_request

@@ -2062,6 +2062,9 @@ class _LineRetry:
     native_attempted: bool = False
     alternatives: tuple[LineRangeSnapshot, ...] = ()
     checkpoint_method_edit: bool = False
+    checkpoint_context: str = ""
+    direct_caller_only: bool = False
+    caller_routes_reopened: bool = False
 
 
 @dataclass(frozen=True)
@@ -2144,7 +2147,7 @@ def _review_anchored_line_retry(review, sources, path, node, diagnostic, *, whol
                 if choices:
                     retry = replace(
                         retry, prompt=choice_instruction + text + LINE_RANGE_ENDING,
-                        native_prompt=choice_instruction + text, alternatives=tuple(choices),
+                        native_prompt=choice_instruction + text, alternatives=tuple(choices), checkpoint_context=heading,
                     )
             return retry
     window = prepare_window_line_range_edit(sources, symbol, ((max(1, anchor - 5), anchor + 9),))
@@ -3845,7 +3848,7 @@ def solve(executor, task, archive, budget, version):
     anchored_line_attempted = set()
     raw_nested_attempts = {}
 
-    def retry_numbered_route(target, line_retry, editor, *, malformed=False):
+    def retry_numbered_route(target, line_retry, editor, *, malformed=False, after=None):
         if (
             line_retry is None
             or line_retry.checkout is not current
@@ -3855,11 +3858,37 @@ def solve(executor, task, archive, budget, version):
         ):
             return
         model = editor.route, editor.configured_model
-        if model not in line_retry.excluded_models:
-            line_retries[target] = replace(
-                line_retry, excluded_models=(*line_retry.excluded_models, model),
-                native_ready=line_retry.native_ready or malformed,
-            )
+        if model in line_retry.excluded_models:
+            return
+        excluded = (*line_retry.excluded_models, model)
+        if line_retry.checkpoint_context and len(line_retry.alternatives) == 1:
+            caller, = line_retry.alternatives
+            visible = frozenset(range(1, len(caller.lines) + 1))
+            allowed = frozenset(range(caller.first_body_line, len(caller.lines) + 1))
+            if malformed:
+                result = "The previous proposal could not be applied to the selected definition."
+            else:
+                result = "The previous proposal did not improve verification."
+                if after is not None:
+                    added = len(after.keys() - failures.keys())
+                    if added:
+                        result += f" It introduced {added} additional failing check(s)."
+                    observed = after.get(target, "").partition("\nObserved pytest failure: ")[2]
+                    if observed:
+                        result += "\nObserved pytest failure on the previous proposal: " + excerpt(observed, 350)
+            context = line_retry.checkpoint_context + result + "\nWork only on the direct caller shown below.\n"
+            text = context + line_range_prompt(caller, visible_rows=visible) + LINE_RANGE_ENDING
+            native = context + line_range_prompt(caller, visible_rows=visible, native=True)
+            if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": text}]) <= RETRY_MESSAGE_BYTES:
+                line_retries[target] = replace(
+                    line_retry, snapshot=caller, allowed_rows=allowed, prompt=text, native_prompt=native,
+                    alternatives=(), checkpoint_context="", direct_caller_only=True, excluded_models=excluded,
+                    native_ready=False, native_attempted=False,
+                )
+                return
+        line_retries[target] = replace(
+            line_retry, excluded_models=excluded, native_ready=line_retry.native_ready or malformed,
+        )
 
     def queue_review_anchored_retry(target):
         number, node = target
@@ -5167,7 +5196,12 @@ def solve(executor, task, archive, budget, version):
                         if line_retry and not scoped_line else last_routes.get(target)
                     )
                     advice_source = "planning" if planner_input is not None else "guided" if advice is not None else None
-                    if line_retry is not None and line_retry.checkpoint_method_edit:
+                    if line_retry is not None and line_retry.direct_caller_only:
+                        _LOG.info(
+                            "Requesting checkpoint method edit: direct caller only %s (body rows=%d)",
+                            line_retry.snapshot.symbol[1], len(line_retry.allowed_rows),
+                        )
+                    elif line_retry is not None and line_retry.checkpoint_method_edit:
                         caller_rows = ", ".join(
                             f"{candidate.symbol[1]} (body rows={len(candidate.lines) - candidate.first_body_line + 1})"
                             for candidate in line_retry.alternatives
@@ -5289,6 +5323,11 @@ def solve(executor, task, archive, budget, version):
                         # A runnable proposal can use its verification details even
                         # when all other configured models are unavailable.
                         helper_bad_model = ()
+                elif (line_retry is not None and line_retry.direct_caller_only and snapshot is current
+                      and line_retry.excluded_models and not line_retry.caller_routes_reopened):
+                    # The scope changed. Once alternatives are exhausted, let a
+                    # previously used free route see the caller-only prompt.
+                    line_retries[target] = replace(line_retry, excluded_models=(), caller_routes_reopened=True)
                 elif line_followup is not None:
                     line_retries[target] = line_followup
                 elif line_retry is not None:
@@ -5400,7 +5439,7 @@ def solve(executor, task, archive, budget, version):
                         if candidate == source:
                             raise ValueError("The pytest edit did not change the draft.")
                     if candidate is None and active_line_snapshot is not None:
-                        if scoped_line and line_retry.alternatives:
+                        if scoped_line and (line_retry.alternatives or line_retry.direct_caller_only):
                             candidate = apply_offered_line_reply(
                                 completion.content, source, (line_retry.snapshot, *line_retry.alternatives), block_pattern=_BLOCK,
                             )
@@ -6140,8 +6179,8 @@ def solve(executor, task, archive, budget, version):
                     notes[target] = "The scoped helper replacement did not improve the verified checks."
                     continue
                 count_model_failure(rotation_key, snapshot, editor)
-                if after.keys() == failures.keys():
-                    retry_numbered_route(target, line_retry, editor)
+                if after.keys() == failures.keys() or (line_retry and line_retry.checkpoint_context):
+                    retry_numbered_route(target, line_retry, editor, after=after)
                 if fresh_stock:
                     interactive_misses[target] += 1
                 if snapshot is current and (
