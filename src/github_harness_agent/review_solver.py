@@ -10,6 +10,7 @@ import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
+import functools
 from math import isfinite
 from textwrap import dedent
 
@@ -682,6 +683,44 @@ def _test_detail(output, node):
     return next((line for line in output.splitlines() if node in line), node)
 
 
+def _unpublished_case_detail(output, node, detailed):
+    """Use terminal assertion messages and literal operands, without quoting verifier source."""
+    sections = _PYTEST_SECTION.split(output)
+    footer = dict(zip(sections[1::2], sections[2::2], strict=True)).get("short test summary info", "")
+    summary = next((
+        line.partition(" - ")[2] for line in footer.splitlines()
+        if (match := _TEST_RESULT.match(line)) and match[2] == node and " - " in line
+    ), "")
+    messages = []
+    for line in (*detailed.splitlines(), summary):
+        # Only pytest's reported exception, crash line, or rewritten expression.
+        # The source line ("> assert ...") and captured test output are excluded.
+        reason = re.sub(r"^(?:E[ \t]+|\S[^\n]*?\.py:[1-9][0-9]*: )", "", line).strip()
+        if reason.startswith("AssertionError: assert "):
+            reason = reason.removeprefix("AssertionError: ")
+        if reason.startswith("AssertionError: ") and not reason.endswith(("...", "…")):
+            messages.append(excerpt(reason, 350))
+        elif reason.startswith("assert ") and len(reason) <= 160 and _scalar_assertion(reason[7:]):
+            messages.append(reason)
+    return node + ("\nObserved pytest failure: " + "; ".join(dict.fromkeys(messages))[:500] if messages else "")
+
+
+def _operator_diagnostic_replay(command, node):
+    selection = node.partition("::")[2]
+    if not selection or len(selection) > 300:
+        return None
+    allowed = []
+    for arg in command:
+        path = arg.partition("::")[0]
+        if not path.startswith(review_recovery.OPERATOR_CHECK_ROOT + "/"):
+            continue
+        if _trusted_operator_node(node, (arg,), {path: {selection.partition("[")[0]}}):
+            allowed.append(path + "::" + selection)
+    if len(allowed) != 1:
+        return None
+    return focused_pytest((command,), allowed, verbose=True)
+
+
 def _pytest_reason_kind(reason):
     if not reason:
         return ""
@@ -1146,6 +1185,7 @@ def evidence(
     private_proposal=False,
     test_check_labels=None,
     check_results=None,
+    visible_operator_cases=None,
 ):
     with executor.verification_runner.workspace(
         archive, budget.remaining, budget.cancelled
@@ -1198,6 +1238,7 @@ def evidence(
                     detail, kind = _generic_verifier_failure(command, outcome.returncode, output)
                     if kind:
                         categories.add(kind)
+                replayed = False
                 for node in nodes or [
                     f"check {number + 1} (exit {outcome.returncode})"
                 ]:
@@ -1207,6 +1248,23 @@ def evidence(
                         if not nodes
                         else (line_details.get(node) or _test_detail(output, node))
                     )
+                    if (nodes and visible_operator_cases is not None and command in task.pull_checks
+                            and not _trusted_operator_node(node, command, visible_operator_cases)):
+                        failures[key] = _unpublished_case_detail(output, node, failures[key])
+                        if failures[key] == node and not replayed and (replay := _operator_diagnostic_replay(command, node)):
+                            replayed = True
+                            budget.claim("command", budget.limits.commands)
+                            try:
+                                repeated = executor._command(ws, budget, replay, checked=False)
+                            except CommandOutputExceeded:
+                                pass
+                            else:
+                                report = _combined(repeated)
+                                # A rerun only supplies diagnostics. It cannot turn the
+                                # configured command's failure into a verification pass.
+                                if repeated.returncode == 1 and _TEST_RESULT.findall(report) == [("FAILED", node)]:
+                                    failures[key] = _unpublished_case_detail(report, node, _test_detail(report, node))
+
                     if nodes and test_check_labels is not None and (kind := _named_test_diagnostic_kind(failures[key])):
                         categories.add(kind)
                 if test_check_labels is not None:
@@ -1706,6 +1764,8 @@ def _proposal_messages(
         if stock_fixture is None
         else stock_fixture
     )
+    if diagnostic.startswith(target[1] + "\nObserved pytest failure:") or diagnostic == target[1]:
+        fixture = ""
     if preserved_stock_fixture:
         fixture += (
             "\nThis unpublished implementation already passes the following tracked repository case. "
@@ -2524,9 +2584,10 @@ def solve(executor, task, archive, budget, version):
     commands = tuple(dict.fromkeys((*task.pull_checks, *task.checks)))
     assertions = operator_assertions(fixtures, review_recovery.OPERATOR_CHECK_ROOT)
     operator_cases = _operator_case_names(fixtures)
+    review_evidence = functools.partial(evidence, visible_operator_cases=operator_cases)
     patch = patch_for(original, current)
     pytest_runs = {}
-    failures = evidence(executor, task, archive, budget, patch, commands, pytest_runs=pytest_runs)
+    failures = review_evidence(executor, task, archive, budget, patch, commands, pytest_runs=pytest_runs)
     resumed_verified_checkout = (
         current if (
             production_regression and restored_checkpoint and draft.key == _CHECKPOINT
@@ -2805,7 +2866,7 @@ def solve(executor, task, archive, budget, version):
         runs, static_runs = {}, {}
         unused_import_checks = set()
         try:
-            checked = evidence(
+            checked = review_evidence(
                 executor,
                 task,
                 archive,
@@ -2927,7 +2988,7 @@ def solve(executor, task, archive, budget, version):
         runs, static_runs = {}, {}
         unused_import_checks = set()
         try:
-            checked = evidence(
+            checked = review_evidence(
                 executor, task, archive, probe_budget, restored_patch, commands,
                 pytest_runs=runs, static_runs=static_runs,
                 **({"unused_import_checks": unused_import_checks} if dependency_seed else {}),
@@ -2973,7 +3034,7 @@ def solve(executor, task, archive, budget, version):
         if not proposal or len(proposal) > executor.limits.patch_bytes:
             return None
         runs = {}
-        checked = evidence(
+        checked = review_evidence(
             executor, task, archive, probe_budget, proposal, commands, pytest_runs=runs
         )
         if (
@@ -3000,7 +3061,7 @@ def solve(executor, task, archive, budget, version):
             return False, ""
         focus = _GuardBudget(probe, wall_seconds=_STOCK_HUNK_SECONDS, reserve=0)
         runs = {}
-        checked = evidence(
+        checked = review_evidence(
             executor, task, archive, focus, proposal, (focused,), pytest_runs=runs
         )
         run = runs.get(0)
@@ -3062,7 +3123,7 @@ def solve(executor, task, archive, budget, version):
             if not passed:
                 return None, advisory
             runs = {}
-            checked = evidence(
+            checked = review_evidence(
                 executor, task, archive, probe, proposal, commands, pytest_runs=runs
             )
             if checked or any(
@@ -3123,7 +3184,7 @@ def solve(executor, task, archive, budget, version):
             return None
         operator_failures = {key for key in failures if key[0] < len(task.pull_checks)}
         runs = {}
-        checked = evidence(
+        checked = review_evidence(
             executor, task, archive, probe, proposal, commands, pytest_runs=runs
         )
         if (
@@ -3701,7 +3762,7 @@ def solve(executor, task, archive, budget, version):
                     probe_budget, wall_seconds=_STOCK_HUNK_SECONDS, reserve=0
                 )
                 focused_runs = {}
-                errors = evidence(
+                errors = review_evidence(
                     executor,
                     task,
                     archive,
@@ -3962,7 +4023,7 @@ def solve(executor, task, archive, budget, version):
 
         old_runs = {}
         try:
-            old_failures = evidence(
+            old_failures = review_evidence(
                 executor, task, task.regression_archive, probe, projected,
                 (focused_generated,), pytest_runs=old_runs, on_staged=check_test_bytes,
             )
@@ -4004,7 +4065,7 @@ def solve(executor, task, archive, budget, version):
                 (archive, patch_for(original, {**current, new_path: source})),
             ):
                 runs = {}
-                if evidence(
+                if review_evidence(
                     executor, task, archive_revision, proof, changes,
                     (focused_generated,), pytest_runs=runs,
                 ) or not (
@@ -5359,7 +5420,7 @@ def solve(executor, task, archive, budget, version):
                     and has_runnable_test(new_path, candidate[new_path].encode())
                 ):
                     fast_runs, fast_checks = {}, []
-                    after = evidence(
+                    after = review_evidence(
                         executor, task, archive, budget, proposed, (focused_generated,),
                         pytest_runs=fast_runs, test_check_labels=test_check_labels,
                         check_results=fast_checks,
@@ -5385,7 +5446,7 @@ def solve(executor, task, archive, budget, version):
                         except AttemptRejected as rejection:
                             focused_rejection = rejection
                 if not after:
-                    after = evidence(
+                    after = review_evidence(
                         executor,
                         task,
                         archive,

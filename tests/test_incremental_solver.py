@@ -40,6 +40,7 @@ from github_harness_agent.review_solver import (
     _GUIDANCE,
     _generic_verifier_failure,
     _rejected_attempt,
+    _unpublished_case_detail,
     _line_failure_details,
     _operator_function_messages,
     apply_blocks,
@@ -515,6 +516,46 @@ def test_evidence_pairs_line_traceback_locations_with_each_pytest_node(solver_ca
     assert "test_acceptance.py:7: assert -2 == 2" in by_test["test_second"]
     assert "assert -2 == 2" not in by_test["test_first"]
     assert "assert -1 == 1" not in by_test["test_second"]
+
+
+def test_verifier_only_details_exclude_source_and_captured_summary_lookalikes():
+    node = "protected.py::test_minimum"
+    output = (
+        f"----- Captured stdout call -----\nFAILED {node} - AssertionError: unrelated output\n"
+        f"===== short test summary info =====\nFAILED {node} - AssertionError: assert hidden_predicate()"
+    )
+    confirmed = _unpublished_case_detail(output, node, "> assert hidden_predicate()\nE    assert 0 >= 2")
+    assert confirmed == node + "\nObserved pytest failure: assert 0 >= 2"
+    assert _unpublished_case_detail(output, node, "") == node
+
+
+@pytest.mark.parametrize("trace", ("short", "line", "no"))
+def test_verifier_only_assertion_reaches_production_editor_without_source(solver_case, monkeypatch, trace):
+    task, archive, runner, _ = solver_case
+    acceptance = Path(task.pull_checks[0][-1])
+    visible = "def unrelated_visible_helper(): return 12345678\ndef test_visible(): assert True\n"
+    acceptance.write_text(
+        visible + "from fixture_calc import first\n"
+        "def test_private():\n"
+        "    private_input_sentinel = first()\n"
+        "    assert private_input_sentinel >= 1, 'observed coverage below minimum'\n"
+    )
+    monkeypatch.setattr(
+        "github_harness_agent.review_solver.operator_acceptance_context",
+        lambda *_: "Visible sources\n" + json.dumps({acceptance.name: visible}),
+    )
+    cmd = (*task.pull_checks[0][:-1], f"--tb={trace}", str(acceptance))
+    task = replace(task, require_new_tests=False, pull_checks=(cmd,))
+    gateway = FreeGateway(FIRST)
+    independent = runner.path / "verifier"
+    independent.mkdir()
+    executor = PlainExecutor(runner, gateway, Limits(model_requests=1, concurrent_probes=1),
+                             verification_runner=FixtureRunner(independent))
+    result = solve(executor, task, archive, _Budget(executor.limits, lambda: False, task), "fixture")
+    assert result is not None and result.checks
+    [prompt] = gateway.prompts
+    assert "Observed pytest failure: AssertionError: observed coverage below minimum" in prompt, prompt.partition("Failure details:")[2].partition("Imported API declarations:")[0]
+    assert "private_input_sentinel" not in prompt and "unrelated_visible_helper" not in prompt
 
 
 def test_line_traceback_does_not_guess_when_a_location_is_missing():
