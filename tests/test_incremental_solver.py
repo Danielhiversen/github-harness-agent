@@ -1214,7 +1214,7 @@ def test_testfirst_function_recovers_malformed_module(solver_case, caplog, monke
     assert "hidden operator assertion" not in caplog.text
 
 
-def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve, private_plan=None, fragment_case=None):
+def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve, private_plan=None, fragment_case=None, dynamic_facts=False):
     task, _, runner, checkpoints = solver_case
     raw_mode = failover in {"raw", "raw-restored"}
     long_checkpoint = failover.startswith("checkpoint-")
@@ -1269,6 +1269,14 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
         production = production.replace("def dispatch(self):", "def dispatch(self, legacy=False):")
         with operator.open("a") as stream:
             stream.write("    assert Reader().dispatch(True) == -3\n")
+    if dynamic_facts:
+        text = operator.read_text().replace(
+            "assert first() == 1", "assert first() == 1, f'target-observed={first()} expected={1}'"
+        ).replace(
+            "assert Reader().dispatch(True) == -3",
+            "assert Reader().dispatch(True) == -3, f'control-observed={Reader().dispatch(True)} expected={-3}'"
+        )
+        operator.write_text(text)
     caller_rows = 1
     if fragment_case == "blank":
         header = " " * 12 + "\n"
@@ -1370,6 +1378,10 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 private_models.append((reply.route, reply.configured_model))
                 return reply
             if fragment_case in {"literal", "choices", "mixed-fences"} and "replacement lines for the exact tentative hunk" in prompt:
+                if dynamic_facts:
+                    assert "target-observed=-3 expected=1" in prompt
+                    assert "control-observed=1 expected=-3" in prompt
+                    assert "f'control-observed=" not in prompt and "assert Reader().dispatch" not in prompt
                 assert "Accepted fragment:\n" + header.rstrip() in prompt
                 assert "Tentative fragment to replace:\n" + tentative_header.rstrip() in prompt
                 assert "legacy=False" in prompt and "test_keep_helper" in prompt and "test_first" in prompt
@@ -6243,6 +6255,17 @@ def test_private_method_synthesizes_only_the_changed_statement(solver_case, capl
 
 def test_private_repair_replaces_literal_header_of_wide_suite(solver_case, caplog):
     _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-private", caplog, fragment_case="literal")
+
+
+def test_visible_control_and_hidden_target_report_dynamic_facts_to_each_fragment(solver_case, caplog, monkeypatch):
+    from github_harness_agent import review_solver
+
+    monkeypatch.setattr(review_solver, "operator_acceptance_context", lambda *args:
+                        "fixture\n" + json.dumps({"test_acceptance.py": "def test_keep_helper(): pass\n"}))
+    _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-private", caplog,
+                              fragment_case="choices", dynamic_facts=True)
+    assert "target_fact_bytes=" in caplog.text and "control_fact_bytes=" in caplog.text
+    assert "target-observed=" not in caplog.text and "control-observed=" not in caplog.text
 
 
 def test_private_fragment_choices_verify_independent_options(solver_case, caplog):

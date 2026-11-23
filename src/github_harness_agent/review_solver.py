@@ -1295,10 +1295,12 @@ def evidence(
                         if not nodes
                         else (line_details.get(node) or _test_detail(output, node))
                     )
-                    if (nodes and visible_operator_cases is not None and command in task.pull_checks
-                            and not _trusted_operator_node(node, command, visible_operator_cases)):
-                        failures[key] = _unpublished_case_detail(output, node, failures[key])
-                        if failures[key] == node and not replayed and (replay := _operator_diagnostic_replay(command, node)):
+                    if nodes and visible_operator_cases is not None and command in task.pull_checks:
+                        visible = _trusted_operator_node(node, command, visible_operator_cases)
+                        facts = _unpublished_case_detail(output, node, failures[key])
+                        if facts == node and not replayed and (not visible or failures[key] == node or
+                                _named_test_diagnostic_kind(failures[key]) in {"", "AssertionError"}) and (
+                                replay := _operator_diagnostic_replay(command, node)):
                             replayed = True
                             budget.claim("command", budget.limits.commands)
                             try:
@@ -1310,7 +1312,11 @@ def evidence(
                                 # A rerun only supplies diagnostics. It cannot turn the
                                 # configured command's failure into a verification pass.
                                 if repeated.returncode == 1 and _TEST_RESULT.findall(report) == [("FAILED", node)]:
-                                    failures[key] = _unpublished_case_detail(report, node, _test_detail(report, node))
+                                    facts = _unpublished_case_detail(report, node, _test_detail(report, node))
+                        if not visible:
+                            failures[key] = facts
+                        elif facts != node:
+                            failures[key] += facts[len(node):]
 
                     if nodes and test_check_labels is not None and (kind := _named_test_diagnostic_kind(failures[key])):
                         categories.add(kind)
@@ -2482,12 +2488,14 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="",
     visible = frozenset(range(1, len(snapshot.lines) + 1))
     allowed = frozenset(range(snapshot.first_body_line, len(snapshot.lines) + 1))
     observed = repair.failures[target].partition("\nObserved pytest failure: ")[2]
+    baseline_observed = origin_diagnostic.partition("\nObserved pytest failure: ")[2]
     context = (
         "Private regression repair. The numbered tentative method fixed "
         + ", ".join(excerpt(node, 120) for _, node in sorted(repair.gained))
         + ". Preserve that gain while correcting " + excerpt(target[1], 160) + ".\n"
         + "Requested behavior (quoted): " + excerpt(" ".join(body for _, _, body in review.feedback), 600) + "\n"
         + ("Observed pytest failure: " + excerpt(observed, 450) + "\n" if observed else "")
+        + ("Accepted target failure: " + excerpt(baseline_observed, 350) + "\n" if baseline_observed else "")
         + (excerpt(repair.retry_note, 450) + "\n" if repair.retry_note else "")
     )
     selection = select_statement_fragment(accepted, snapshot)
@@ -2495,19 +2503,18 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="",
 
     def log_selection(mode, reason):
         _LOG.info("Private statement selection: mode=%s reason=%s hunks=%d changed_old=%d changed_new=%d "
-                  "fragment_old_rows=%d fragment_new_rows=%d method_rows=%d limit=12",
+                  "fragment_old_rows=%d fragment_new_rows=%d method_rows=%d limit=12 target_fact_bytes=%d control_fact_bytes=%d",
                   mode, reason, selection.hunks, selection.old_rows, selection.new_rows,
                   len(fragment.accepted) if fragment else 0, fragment.last - fragment.first + 1 if fragment else 0,
-                  len(snapshot.lines))
+                  len(snapshot.lines), len(baseline_observed.encode()), len(observed.encode()))
 
     choices = choice_limit if repair.retry_fragment_choices and choice_limit >= 2 else 0
     if (not repair.retries or choices or repair.retry_fragment_format) and fragment:
         first, last = fragment.first, fragment.last
         local = "\n".join(snapshot.lines[max(snapshot.first_body_line - 1, first - 6):first - 1])
         following = "\n".join(snapshot.lines[last:last + 4])
-        baseline_observed = origin_diagnostic.partition("\nObserved pytest failure: ")[2]
         prompt = (
-            context + ("Accepted target failure: " + excerpt(baseline_observed, 350) + "\n" if baseline_observed else "")
+            context
             + ("Synthesize only the replacement lines for the exact tentative hunk. The surrounding suite is read-only. "
                if fragment.literal else "Synthesize only the replacement Python statements for the tentative fragment. ")
             + "The accepted version passed the control but failed the target. The tentative version passed "
