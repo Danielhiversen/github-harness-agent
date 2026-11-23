@@ -593,3 +593,35 @@ def test_literal_hunk_can_restore_verified_else_attachment_without_reverting_beh
     with pytest.raises(ValueError, match="exterior Python syntax"):
         apply_statement_fragment("elif not active: value = 7", extra, extra_snapshot, fragment)
     assert apply_statement_fragment("RESTORE_ACCEPTED_BLANK", {PATH: tentative}, new, fragment)[PATH] == accepted
+
+
+
+def test_literal_window_counts_changes_and_caps_comment_and_blank_allowance():
+    from github_harness_agent.review_line_ranges import apply_statement_fragment, select_statement_fragment
+
+    prefix = "class Selector:\n    def choose(self, flagged):\n        value = 0\n"
+    suffix = "".join(f"            value += {i}\n" for i in range(25)) + "        return value\n"
+    old = prefix + "        if False:\n" + suffix
+    current = prefix + "        apply = True\n        select = apply\n        if select:\n" + suffix
+    key = (PATH, "Selector.choose")
+    original = prepare_line_range_edit({PATH: old}, key)
+    snapshot = prepare_line_range_edit({PATH: current}, key)
+    fragment = select_statement_fragment(original, snapshot).fragment
+    assert fragment.literal and fragment.last-fragment.first == 2
+    # Three removed rows and 21 new substantive rows. Four decoration rows cost no additional change budget.
+    setup = ["criteria = [flagged]"] + [f"criteria.append({i} >= 0)" for i in range(19)]
+    rows = [*setup, "# The final decision uses every criterion.", "", "# Choose from this input.", "", "if all(criteria):"]
+    result = apply_statement_fragment("\n".join(rows), {PATH: current}, snapshot, fragment)
+    assert result[PATH] == prefix + "".join("        "+line+"\n" if line else "\n" for line in rows) + suffix
+    namespace = {}
+    exec(result[PATH], namespace)
+    assert namespace["Selector"]().choose(True) == sum(range(25))
+    assert namespace["Selector"]().choose(False) == 0
+    for addition in ("criteria.append(True)", "# fifth decoration"):
+        with pytest.raises(ValueError, match="changed-row limit"):
+            apply_statement_fragment("\n".join([addition, *rows]), {PATH: current}, snapshot, fragment)
+    with pytest.raises(ValueError, match=r"submitted=33, max=32"):
+        apply_statement_fragment("\n".join(["# filler"]*8 + rows), {PATH: current}, snapshot, fragment)
+    data = ['text = """', '# string content', '# string content', '# string content', '"""', *setup, "if all(criteria):"]
+    with pytest.raises(ValueError, match="changed-row limit"):
+        apply_statement_fragment("\n".join(data), {PATH: current}, snapshot, fragment)

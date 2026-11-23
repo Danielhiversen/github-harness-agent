@@ -45,6 +45,14 @@ NATIVE_LINE_RANGE_TOOL = {
 }
 
 _FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
+_LITERAL_REPLY_ROWS = 32
+_LITERAL_CHANGED_ROWS = 24
+_LITERAL_DECORATION_ALLOWANCE = 4
+LITERAL_SIZE_GUIDANCE = (
+    f"Use at most {_LITERAL_CHANGED_ROWS} changed old and new rows combined. Matching context is free. "
+    f"Up to {_LITERAL_DECORATION_ALLOWANCE} changed blank or comment-only rows may be additional. "
+    f"Return at most {_LITERAL_REPLY_ROWS} physical rows and 4096 UTF-8 bytes. "
+)
 _MAX_EDITS = 6
 _MAX_FILE = 256 * 1024
 _MAX_DEFINITION = 16 * 1024
@@ -603,7 +611,7 @@ def _exterior_mismatch(actual, permitted):
 def _apply_literal_hunk(rows, sources, snapshot, fragment, *, restore_blank=False):
     first, last = fragment.first, fragment.last
     if not (snapshot.first_body_line <= first <= last <= len(snapshot.lines)
-            and max(last-first+1, len(fragment.accepted)) <= 6 and len(rows) <= 12):
+            and max(last-first+1, len(fragment.accepted)) <= 6):
         raise ValueError("Literal hunk exceeds its body window")
     if restore_blank:
         if any(line.strip() for line in fragment.accepted):
@@ -620,7 +628,7 @@ def _apply_literal_hunk(rows, sources, snapshot, fragment, *, restore_blank=Fals
         inserted = [indent + row if row else row for row in rows]
     edit = {"start": first, "end": last, "lines": inserted}
     revised = apply_line_range_edit(json.dumps({"snapshot": snapshot.digest, "edits": [edit]}),
-                                    sources, snapshot, allowed_rows=frozenset(range(first, last+1)))
+                                    sources, snapshot, allowed_rows=frozenset(range(first, last+1)), literal_window=True)
     updated = prepare_line_range_edit(revised, snapshot.symbol)
     after = first + len(inserted) - 1
     if (updated is None or updated.lines[:first-1] != snapshot.lines[:first-1]
@@ -662,7 +670,9 @@ def apply_statement_fragment(reply, sources, snapshot, fragment):
         return _apply_literal_hunk([], sources, snapshot, fragment, restore_blank=True)
     text = textwrap.dedent(text)
     rows = text.splitlines()
-    if not rows or len(rows) > 18 or any(_INVALID_LINE.search(row) for row in rows):
+    if fragment.literal and len(rows) > _LITERAL_REPLY_ROWS:
+        raise ScopedRangeRejection(f"Literal replacement row limit exceeded (submitted={len(rows)}, max={_LITERAL_REPLY_ROWS})")
+    if not rows or (not fragment.literal and len(rows) > 18) or any(_INVALID_LINE.search(row) for row in rows):
         raise ValueError("Expected one small Python statement fragment")
     if fragment.literal:
         return _apply_literal_hunk(rows, sources, snapshot, fragment)
@@ -833,7 +843,24 @@ def _edits(response, snapshot, indent, *, absolute_offset=None):
     return edits
 
 
-def apply_line_range_edit(response, sources, snapshot, *, allowed_rows=None, full_method=False):
+def _literal_decoration_rows(source_rows, start, end):
+    """Identify actual blank and comment-only rows, excluding data inside multiline tokens."""
+    candidates = {n for n in range(start, end + 1)
+                  if not source_rows[n-1].strip() or source_rows[n-1].lstrip().startswith("#")}
+    if not candidates:
+        return set()
+    try:
+        for token in tokenize.generate_tokens(io.StringIO("\n".join(source_rows)).readline):
+            if token.start[0] == token.end[0]:
+                continue
+            if token.type not in (tokenize.NL, tokenize.NEWLINE):
+                candidates.difference_update(range(token.start[0], token.end[0] + 1))
+    except (IndentationError, tokenize.TokenError):
+        return set()
+    return candidates
+
+
+def apply_line_range_edit(response, sources, snapshot, *, allowed_rows=None, full_method=False, literal_window=False):
     """Validate a proposal and return an independent source mapping."""
     if not isinstance(snapshot, LineRangeSnapshot) or not _valid_symbol(
         snapshot.symbol
@@ -855,12 +882,19 @@ def apply_line_range_edit(response, sources, snapshot, *, allowed_rows=None, ful
         )
         if outside:
             raise ScopedRangeRejection(f"Edit crosses shown scoped edit windows (outside rows={outside}, ranges={len(edits)})")
-        changed_old = changed_new = changed_ranges = 0
+        changed_old = changed_new = changed_ranges = decoration = 0
         for start, end, lines in edits:
             old = snapshot.lines[start - 1:end]
             if tuple(lines) == old:
                 continue
             changed_ranges += 1
+            old_decoration = new_decoration = set()
+            if (literal_window and len(edits) == 1 and end-start < 6
+                    and allowed_rows == frozenset(range(start, end+1))
+                    and len(old) + len(lines) > _LITERAL_CHANGED_ROWS):
+                tentative = (*snapshot.lines[:start-1], *lines, *snapshot.lines[end:])
+                old_decoration = _literal_decoration_rows(snapshot.lines, start, end)
+                new_decoration = _literal_decoration_rows(tentative, start, start + len(lines) - 1)
             # Strip matching ends first so repeated context is never mistaken for
             # changed lines by the sequence matcher's popular-line heuristic.
             common = min(len(old), len(lines))
@@ -872,9 +906,14 @@ def apply_line_range_edit(response, sources, snapshot, *, allowed_rows=None, ful
                 if operation != "equal":
                     changed_old += j - i
                     changed_new += n - k
+                    offset = start + prefix
+                    decoration += len(old_decoration.intersection(range(offset+i, offset+j)))
+                    decoration += len(new_decoration.intersection(range(offset+k, offset+n)))
         max_ranges, max_changed = (_MAX_EDITS, 48) if complete else (3, 24)
         if changed_ranges > max_ranges:
             raise ScopedRangeRejection(f"Scoped edit range limit exceeded (changed ranges={changed_ranges}, max={max_ranges})")
+        if literal_window:
+            max_changed = _LITERAL_CHANGED_ROWS + min(decoration, _LITERAL_DECORATION_ALLOWANCE)
         if changed_old + changed_new > max_changed:
             raise ScopedRangeRejection(f"Scoped edit changed-row limit exceeded (old={changed_old}, new={changed_new}, max={max_changed})")
     rows = scope.rows.copy()

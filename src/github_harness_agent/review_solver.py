@@ -92,6 +92,7 @@ from .review_mock_replay import (
 )
 from .review_line_ranges import (
     LINE_RANGE_ENDING,
+    LITERAL_SIZE_GUIDANCE,
     PLAIN_METHOD_ENDING,
     NATIVE_LINE_RANGE_TOOL,
     LineRangeSnapshot,
@@ -2503,7 +2504,7 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="",
 
     def log_selection(mode, reason):
         _LOG.info("Private statement selection: mode=%s reason=%s hunks=%d changed_old=%d changed_new=%d "
-                  "fragment_old_rows=%d fragment_new_rows=%d method_rows=%d limit=12 target_fact_bytes=%d control_fact_bytes=%d",
+                  "fragment_old_rows=%d fragment_new_rows=%d method_rows=%d suite_selection_limit=12 target_fact_bytes=%d control_fact_bytes=%d",
                   mode, reason, selection.hunks, selection.old_rows, selection.new_rows,
                   len(fragment.accepted) if fragment else 0, fragment.last - fragment.first + 1 if fragment else 0,
                   len(snapshot.lines), len(baseline_observed.encode()), len(observed.encode()))
@@ -2515,7 +2516,7 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="",
         following = "\n".join(snapshot.lines[last:last + 4])
         prompt = (
             context
-            + ("Synthesize only the replacement lines for the exact tentative hunk. The surrounding suite is read-only. "
+            + ("Synthesize only the replacement lines for the exact tentative hunk. The surrounding suite is read-only. " + LITERAL_SIZE_GUIDANCE
                if fragment.literal else "Synthesize only the replacement Python statements for the tentative fragment. ")
             + "The accepted version passed the control but failed the target. The tentative version passed "
             "the target but failed the control. Return only a Python fragment with its own relative indentation.\n"

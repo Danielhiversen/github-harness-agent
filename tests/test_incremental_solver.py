@@ -1285,7 +1285,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
         body = "        offset = (\n            0\n" + parts + header + "            + 0\n        )\n        return self.read() - 2 + offset\n"
         production = production.replace("        return self.read() - 2\n", body)
         caller_rows = len(body.splitlines())
-    elif fragment_case in {"literal", "choices", "mixed-fences"}:
+    elif fragment_case in {"literal", "literal-wide", "choices", "mixed-fences"}:
         header = "        if False:\n"
         tentative_header = "        choose = True\n        enabled = choose\n        if enabled:\n"
         wide_body = "".join(f"            context_{i} = {i}\n" for i in range(32))
@@ -1377,7 +1377,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 reply.content = "+ (0 if legacy else 4)"
                 private_models.append((reply.route, reply.configured_model))
                 return reply
-            if fragment_case in {"literal", "choices", "mixed-fences"} and "replacement lines for the exact tentative hunk" in prompt:
+            if fragment_case in {"literal", "literal-wide", "choices", "mixed-fences"} and "replacement lines for the exact tentative hunk" in prompt:
                 if dynamic_facts:
                     assert "target-observed=-3 expected=1" in prompt
                     assert "control-observed=1 expected=-3" in prompt
@@ -1397,7 +1397,12 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                     else:
                         reply.content = "if bool(legacy):"
                 else:
-                    reply.content = "if not legacy:"
+                    if fragment_case == "literal-wide":
+                        assert "24 changed old and new rows" in prompt and "32 physical rows" in prompt
+                        conditions = ["flags = [legacy]"] + ["flags.append(legacy)" for _ in range(12)]
+                        reply.content = "\n".join([*conditions, "legacy = any(flags)", "if not legacy:"])
+                    else:
+                        reply.content = "if not legacy:"
                 private_models.append((reply.route, reply.configured_model))
                 return reply
             if fragment_case and "Synthesize only the replacement Python statements" in prompt:
@@ -1563,7 +1568,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                             if failover.endswith("-multistage"):
                                 assert "Checkpoint assertion at line 4: assert first() == 1" in prompt
                                 assert "Pinned ancestor assertion at line 3: assert second() == 2" in prompt
-                    if fragment_case in {"literal", "choices", "mixed-fences", "blank"}:
+                    if fragment_case in {"literal", "literal-wide", "choices", "mixed-fences", "blank"}:
                         reply.content = edit(SOURCE, header, tentative_header)
                     elif semantic:
                         if len(line_attempts) == 1:
@@ -1678,7 +1683,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 assert any("mode=literal-hunk reason=single-literal-hunk hunks=1 changed_old=1 changed_new=3" in rec.getMessage()
                            for rec in caplog.records)
                 return
-            if fragment_case in {"literal", "choices", "mixed-fences"}:
+            if fragment_case in {"literal", "literal-wide", "choices", "mixed-fences"}:
                 assert len(private_models) == (2 if fragment_case in {"choices", "mixed-fences"} else 1) and b"+        if not legacy:" in result.patch
                 assert b"choose = True" not in result.patch
                 assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
@@ -6326,3 +6331,7 @@ def test_scoped_fragment_option_wrappers_keep_one_valid_candidate(reply):
     snapshot = prepare_line_range_edit(source, key)
     retry = _LineRetry(None, snapshot, statement_fragment=StatementFragment(2, 2, ("    return -1",)), fragment_choices=3)
     assert _private_fragment_choices(reply, source, snapshot, retry) == [{key[0]: "def calculate():\n    return 1\n"}]
+
+
+def test_private_literal_editor_accepts_fifteen_line_repair(solver_case, caplog):
+    _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-private", caplog, fragment_case="literal-wide")
