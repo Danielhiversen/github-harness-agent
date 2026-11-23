@@ -850,7 +850,9 @@ def test_helper_prompt_quotes_only_reviewed_production_protocol():
         "    def __init__(self, client): self.client = client\n"
         "    def collect(self, cursor):\n"
         "        result = self.client.page(cursor, limit=8)\n"
-        "        records = result['records']\n"
+        # Place real consumers outside the eight-line neighborhood.
+        + "        pass\n" * 12
+        + "        records = result['records']\n"
         "        if len(records) >= 8:\n"
         "            return result['next']\n"
         "        return None\n"
@@ -863,7 +865,7 @@ def test_helper_prompt_quotes_only_reviewed_production_protocol():
     review = SimpleNamespace(feedback=(("ingest.py", 6, "Exercise the page limit and records."),))
     prompt = _operator_function_messages(helper, review, sources, NEW_TEST, "")[-1]["content"]
     section = prompt.partition("Production call and response handling (quoted):")[2]
-    assert "ingest.py:4 (Reader.collect)" in section
+    assert "ingest.py (Reader.collect)" in section
     assert "self.client.page(cursor, limit=8)" in section
     assert "if len(records) >= 8:" in section and "result['next']" in section
     assert "secret" not in section and "unrelated" not in section

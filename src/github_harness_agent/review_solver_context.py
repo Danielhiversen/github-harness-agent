@@ -598,6 +598,55 @@ def _reviewed_modules(sources):
     return modules
 
 
+def _protocol_result_uses(method, lines):
+    """Map assigned calls to later statements consuming their result in this lexical scope."""
+    statements = []
+    remaining = list(method.body)
+    while remaining:
+        node = remaining.pop()
+        if isinstance(node, (*_FUNCTION, ast.ClassDef, ast.Lambda)):
+            continue
+        if isinstance(node, ast.stmt):
+            statements.append(node)
+        remaining.extend(ast.iter_child_nodes(node))
+    origins = {}
+    uses = {}
+    for node in sorted(statements, key=lambda item: (item.lineno, item.col_offset)):
+        value = getattr(node, "value", None)
+        target = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        elif isinstance(node, ast.AnnAssign):
+            target = node.target
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            value, target = node.iter, node.target
+        elif isinstance(node, (ast.If, ast.While)):
+            value = node.test
+        if value is None or not isinstance(value, ast.expr):
+            continue
+        read = {item.id for item in ast.walk(value) if isinstance(item, ast.Name)}
+        parents = {origins[name] for name in read if name in origins}
+        if parents:
+            text = "\n".join(lines[node.lineno - 1:value.end_lineno])
+            if 0 < len(text.encode()) <= 320:
+                for origin, distance in parents:
+                    uses[origin].append((distance, node.lineno, text))
+        if target is None:
+            continue
+        assigned = _shape_targets(target)
+        for name in assigned:
+            origins.pop(name, None)
+        call = value.value if isinstance(value, ast.Await) else value
+        if isinstance(call, ast.Call) and len(assigned) == 1 and (not parents or isinstance(node, _ASSIGNMENT)):
+            uses[call] = []
+            origins[assigned[0]] = (call, 0)
+        elif len(parents) == 1:
+            origin, distance = next(iter(parents))
+            if distance == 0:
+                origins.update({name: (origin, 1) for name in assigned})
+    return uses
+
+
 def production_protocol_example(preview, sources, query, *, max_bytes=1150):
     """Quote a dependency call and nearby handling from a helper's production entry point."""
     try:
@@ -646,6 +695,7 @@ def production_protocol_example(preview, sources, query, *, max_bytes=1150):
                 if not isinstance(method, _FUNCTION):
                     continue
                 parameters = _fixture_arguments(method) - {"self", "cls"}
+                consumed = _protocol_result_uses(method, lines)
                 for call in ast.walk(method):
                     if not isinstance(call, ast.Call) or not (name := _dotted_name(call.func)):
                         continue
@@ -661,10 +711,24 @@ def production_protocol_example(preview, sources, query, *, max_bytes=1150):
                     snippet = f"{path}:{call.lineno} ({scope})\n" + "\n".join(
                         lines[call.lineno - 1:end]
                     )
+                    usages = consumed.get(call)
+                    traced = 0
+                    if usages:
+                        fragments = [(call.lineno, "\n".join(lines[call.lineno - 1:call.end_lineno]))]
+                        header = f"{path} ({scope}), production lines:\n"
+                        size = len(header.encode()) + len(fragments[0][1].encode()) + 12
+                        for _, line, text in sorted(usages):
+                            extra = len(text.encode()) + 12
+                            if size + extra <= max_bytes and traced < 6:
+                                fragments.append((line, text))
+                                size += extra
+                                traced += 1
+                        if traced:
+                            snippet = header + "\n".join(f"{line}: {text}" for line, text in sorted(fragments))
                     if len(snippet.encode()) > max_bytes:
                         continue
                     tokens = set(re.findall(r"[a-z]{3,}", snippet.casefold()))
-                    rank = (len(query & tokens), len(parts), -call.lineno)
+                    rank = (bool(traced), parts[0] == "self" and len(parts) >= 3, len(query & tokens), traced, -call.lineno)
                     if best_rank is None or rank > best_rank:
                         best_rank, best = rank, snippet
     return best
