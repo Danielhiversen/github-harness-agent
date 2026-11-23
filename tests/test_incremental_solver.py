@@ -705,6 +705,43 @@ TEST = (
 )
 
 
+def test_single_pinned_production_review_fixes_all_checks_before_authoring_regression(solver_case):
+    task, archive, runner, _ = solver_case
+    body = (
+        "Correct the first and second results and cover both values in one scenario.\n\n"
+        "Update production code and add a new regression test.\n"
+        f"Verify regression against: {task.base_sha}"
+    )
+    review = plan_recovery([{
+        "key": "comment:1", "author": "trusted-reviewer", "thread": "review", "reply_to": 1,
+        "path": SOURCE, "line": 2, "body": body,
+    }], 0, "")
+    assert review is not None and not review.test_only
+    task = replace(
+        task, inline_review_threads=1, review_recovery=review,
+        regression_base=task.base_sha, regression_archive=archive, regression_edit_path=SOURCE,
+    )
+    gateway = FreeGateway(FIRST, SECOND, TEST)
+    independent = runner.path / "production-regression-verifier"
+    independent.mkdir()
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=3, concurrent_probes=1),
+        verification_runner=FixtureRunner(independent),
+    )
+    result = solve(executor, task, archive, _Budget(executor.limits, lambda: False, task), "fixture")
+
+    first, second, proof = gateway.prompts
+    assert "test_first" in first and "test_second" in second
+    assert f"Editable checkout paths (use these exact names): {SOURCE}" in first
+    assert "Correct the first and second results" in first and "Correct the first and second results" in proof
+    assert "passes here and fails on the pinned ancestor" in proof
+    assert "-    return -1" in proof and "+    return 1" in proof
+    assert "def first():\n    return 1" in proof.partition("Optional tracked pytest")[2]
+    assert b"+    return 1\n" in result.patch and b"+    return 2\n" in result.patch
+    assert f"+++ b/{NEW_TEST}".encode() in result.patch
+    assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
+
+
 def test_solver_continues_a_compound_assertion_before_checkpointing(solver_case):
     task, archive, runner, checkpoints = solver_case
     Path(task.pull_checks[0][-1]).write_text(TEST)

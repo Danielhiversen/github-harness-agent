@@ -6,7 +6,9 @@ from github_harness_agent.executor import ExecutionError, LimitExceeded, Limits,
 from github_harness_agent.rebase import BOT_IDENTITY, git
 from github_harness_agent.review_solver import patch_for
 from github_harness_agent.review_recovery import ReviewRecovery
-from github_harness_agent.test_updates import authorized_regression_base, regression_assertion_report
+from github_harness_agent.test_updates import (
+    authorized_regression_base, authorized_regression_request, regression_assertion_report, requests_new_tests,
+)
 from test_executor import FixtureRunner
 
 
@@ -32,6 +34,20 @@ def test_regression_directive_requires_unquoted_authorized_inline_test_only_feed
         authorized_regression_base([{**item, "body": request + "Verify regression against: main"}])
 
 
+def test_mixed_regression_must_explicitly_authorize_a_reviewed_production_file():
+    sha = "b" * 40
+    command = "Update production code and add a new regression test."
+    assert requests_new_tests(command)
+    item = {
+        "key": "comment:1:revision", "author": "maintainer", "thread": "thread", "reply_to": 1,
+        "path": "src/value.py", "body": f"{command}\nVerify regression against: {sha}",
+    }
+    assert authorized_regression_request([item]) == (sha, "src/value.py")
+    assert authorized_regression_request([{**item, "body": "> " + item["body"]}]) == (None, None)
+    with pytest.raises(ValueError, match="production"):
+        authorized_regression_request([{**item, "path": "tests/test_existing.py"}])
+
+
 @pytest.mark.parametrize(
     "report",
     (
@@ -50,6 +66,60 @@ def commit(path, message):
     git(path, "add", "-A")
     git(path, "-c", f"user.name={name}", "-c", f"user.email={email}", "commit", "-qm", message)
     return git(path, "rev-parse", "HEAD").decode().strip()
+
+
+@pytest.mark.parametrize("case", ("current", "rebased", "tracked_test", "other_source", "test_only"))
+def test_mixed_pinned_regression_only_overlays_new_tests_on_original_production(tmp_path, case):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    git(checkout, "init", "-q")
+    path, other_path, existing = "fixture_value.py", "other.py", "tests/test_existing.py"
+    before = "def answer():\n    return 1\n"
+    stock = "def test_smoke():\n    assert True\n"
+    (checkout / "tests").mkdir()
+    (checkout / path).write_text(before)
+    (checkout / other_path).write_text("value = 1\n")
+    (checkout / existing).write_text(stock)
+    parent = commit(checkout, "parent")
+    (checkout / "origin.txt").write_text("original PR head\n")
+    origin = commit(checkout, "origin")
+    base = origin
+    if case == "rebased":
+        git(checkout, "checkout", "--detach", parent)
+        (checkout / "target.txt").write_text("synthetic rebased target\n")
+        base = commit(checkout, "rebased")
+    new_path = "tests/test_review_regressions.py"
+    test_source = "from fixture_value import answer\n\ndef test_answer():\n    assert answer() == 2\n"
+    original = {path: before, new_path: ""}
+    patched = {path: before.replace("return 1", "return 2"), new_path: test_source}
+    if case == "tracked_test":
+        original[existing], patched[existing] = stock, stock.replace("True", "1 == 1")
+    if case == "other_source":
+        original[other_path], patched[other_path] = "value = 1\n", "value = 2\n"
+    patch = patch_for(original, patched)
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    runner = FixtureRunner(sandbox)
+    task = TaskSnapshot(
+        "org/fixture", base, "Add regression coverage.",
+        ((sys.executable, "-m", "pytest", "-q", existing),),
+        require_new_tests=True, regression_base=parent if case == "test_only" else origin,
+        regression_head=None if case == "test_only" else origin,
+        regression_edit_path=None if case == "test_only" else path,
+    )
+    executor = PlainExecutor(runner, None)
+    if case in {"tracked_test", "other_source", "test_only"}:
+        with pytest.raises(ExecutionError, match="out-of-scope path"):
+            executor.verify_patch(task, checkout, patch)
+        return
+    result = executor.verify_patch(task, checkout, patch)
+    assert result.patch == patch
+    assert any(check.command[0] == "verify-regression" and not check.returncode for check in result.checks)
+    historical = runner.workspaces[-1]
+    assert (historical / path).read_text() == before
+    assert (historical / existing).read_text() == stock
+    assert (historical / new_path).read_text() == test_source
+    assert not git(checkout, "status", "--porcelain")
 
 
 @pytest.mark.parametrize("case", ("mock-change", "same", "genuine", "budget", "probe-error"))

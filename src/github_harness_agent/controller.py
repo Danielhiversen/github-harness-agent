@@ -40,7 +40,7 @@ from .rebase import (
 )
 from .review_recovery import plan_recovery
 from .reviews import ReviewItem, collect_reviews, map_feedback, reply_to_review
-from .test_updates import authorized_regression_base, authorized_test_update, requests_new_tests
+from .test_updates import authorized_regression_request, authorized_test_update, requests_new_tests
 from .store import LeaseLost
 from .task_context import build_task_context, github_history, review_source_context
 
@@ -559,13 +559,14 @@ class Controller:
                     )
 
                 def needs_new_tests():
-                    return stage == "repair" and any(
-                        requests_new_tests(item["body"])
-                        for item in data.get("feedback", ())
+                    return stage == "repair" and (
+                        bool(regression_edit_path) or any(
+                            requests_new_tests(item["body"]) for item in data.get("feedback", ())
+                        )
                     )
 
                 try:
-                    regression_base = authorized_regression_base(
+                    regression_base, regression_edit_path = authorized_regression_request(
                         data.get("feedback", ()) if stage == "repair" else ()
                     )
                 except ValueError as error:
@@ -579,6 +580,7 @@ class Controller:
                         (needs_new_tests() and not prepared.get("verified_new_tests"))
                         or prepared.get("pull_checks", []) != pull_checks
                         or prepared.get("regression_base") != regression_base
+                        or prepared.get("regression_edit_path") != regression_edit_path
                     )
                     and publisher.branch_head(repo, branch) == origin
                 ):
@@ -773,6 +775,8 @@ class Controller:
                         if stage == "repair"
                         else None,
                         regression_base=regression_base,
+                        regression_edit_path=regression_edit_path,
+                        regression_head=origin if regression_edit_path else None,
                     )
 
                     try:
@@ -885,6 +889,7 @@ class Controller:
                         "verified_new_tests": task.require_new_tests,
                         "pull_checks": pull_checks,
                         **({"regression_base": regression_base} if regression_base else {}),
+                        **({"regression_edit_path": regression_edit_path} if regression_edit_path else {}),
                         "refinement": dataclasses.asdict(result.refinement)
                         if result.refinement
                         else None,
@@ -930,6 +935,8 @@ class Controller:
                         pull_checks=tuple(map(tuple, pull_checks)),
                         verify_base_first=bool(regression_base),
                         regression_base=regression_base,
+                        regression_edit_path=regression_edit_path,
+                        regression_head=origin if regression_edit_path else None,
                     )
 
                     try:

@@ -173,6 +173,10 @@ class _TestOnlyPatchError(_ProtectedPatchError):
     repair_feedback = "Restore production code and existing tests. Add only new test files."
 
 
+class _RegressionScopeError(_ProtectedPatchError):
+    repair_feedback = "Change only the reviewed production file and add new regression tests."
+
+
 class _VerificationRejected(ExecutionError):
     """A trusted check ran and rejected the candidate."""
 
@@ -211,6 +215,8 @@ class TaskSnapshot:
     retry_after_provider: str | None = None
     regression_base: str | None = None
     regression_archive: bytes | None = field(default=None, repr=False, compare=False)
+    regression_edit_path: str | None = None
+    regression_head: str | None = None
 
 
 @dataclass(frozen=True)
@@ -611,11 +617,19 @@ class PlainExecutor:
         sha = task.regression_base
         if sha is None:
             return task
-        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha) or sha == task.base_sha:
-            raise ExecutionError("Regression verification requires a full SHA for a strict ancestor")
+        mixed = task.regression_edit_path is not None
+        if mixed and _protected(task.regression_edit_path, task, new_test=False):
+            raise ExecutionError("Regression verification requires an unprotected reviewed production file")
+        head = (task.regression_head or task.base_sha) if mixed else task.base_sha
+        full_sha = r"[0-9a-f]{40}|[0-9a-f]{64}"
+        if (
+            not re.fullmatch(full_sha, sha) or not re.fullmatch(full_sha, head)
+            or (not mixed and sha == head)
+        ):
+            raise ExecutionError("Regression verification requires a full SHA for an authorized revision or ancestor")
         for args, expected in (
             (("cat-file", "-t", sha), b"commit\n"),
-            (("merge-base", "--is-ancestor", sha, task.base_sha), b""),
+            (("merge-base", "--is-ancestor", sha, head), b""),
         ):
             result = run_process(
                 ("git", "--no-replace-objects", *args),
@@ -1879,6 +1893,11 @@ class PlainExecutor:
             )
             if new_tests_only and not new_test:
                 raise _TestOnlyPatchError(f"Test-only review patch changes an out-of-scope path: {path}")
+            if task.regression_edit_path and not new_test and not (
+                path == task.regression_edit_path and status == b"M"
+                and mode in {b"100644", b"100755"} and fields[0] == b":" + mode
+            ):
+                raise _RegressionScopeError(f"Pinned regression patch changes an out-of-scope path: {path}")
             amended_test = (
                 status == b"M"
                 and fields[0] == b":100644"
@@ -1943,7 +1962,8 @@ class PlainExecutor:
     ):
         command = ("verify-regression", task.regression_base)
         report = f".git/gha-regression-{uuid4().hex}.xml"
-        pytest = focused_pytest(task.checks, new_tests, report, verbose=True)
+        selectors = tuple(path for path in new_tests if path.endswith(".py"))
+        pytest = focused_pytest(task.checks, selectors, report, verbose=True)
         if not (pytest and green_report and task.regression_archive):
             return CheckEvidence(command, 1, "Run the new tests with the configured pytest launcher before checking the ancestor.")
         budget.claim("command", budget.limits.commands)
@@ -2017,7 +2037,8 @@ class PlainExecutor:
                 new_tests, amended_test = self._check_patch_paths(
                     workspace, task, budget, baseline_tree,
                     new_tests_only=bool(
-                        task.regression_base or (task.review_recovery and task.review_recovery.test_only)
+                        (task.regression_base and not task.regression_edit_path)
+                        or (task.review_recovery and task.review_recovery.test_only)
                     ),
                 )
             except (_CandidateOutputError, CommandOutputExceeded) as error:
@@ -2069,6 +2090,8 @@ class PlainExecutor:
         green_report = b""
         green_sources = ()
         green_output = ""
+        historical_patch = patch
+        historical_tests = tuple(new_tests) if task.regression_edit_path else new_python_tests
         if (new_tests or selections) and trusted_passed:
             with self.verification_runner.workspace(
                 archive, budget.remaining, budget.cancelled
@@ -2100,11 +2123,17 @@ class PlainExecutor:
                     )
                     with focused_workspace as selected:
                         if regression_green:
-                            self._stage_baseline(selected, budget)
+                            tree = self._stage_baseline(selected, budget)
                             self._git(
                                 selected, budget, "apply", "--index", "--binary", data=patch,
                             )
-                            green_sources = self._regression_sources(selected, budget, selectors)
+                            if task.regression_edit_path:
+                                historical_patch = self._git(
+                                    selected, budget, "--literal-pathspecs", "diff", "--cached",
+                                    "--binary", "--no-ext-diff", "--full-index", tree, "--",
+                                    *historical_tests, cap=self.limits.patch_bytes,
+                                ).stdout
+                            green_sources = self._regression_sources(selected, budget, historical_tests)
                         check = self._run_checks(selected, budget, (focused,))[0]
                         if check.returncode == 0:
                             result = self._command(selected, budget, ("cat", report), checked=False)
@@ -2120,7 +2149,7 @@ class PlainExecutor:
                     checks.append(check)
         if task.regression_base and not any(check.returncode for check in checks):
             regression = self._verify_test_regression(
-                task, archive, budget, patch, new_python_tests, green_report, green_sources, green_output
+                task, archive, budget, historical_patch, historical_tests, green_report, green_sources, green_output
             )
             checks.append(regression)
             if regression.returncode:

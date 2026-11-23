@@ -1273,8 +1273,9 @@ def _test_authoring_messages(
         dict.fromkeys(" ".join(body.split()) for _, _, body in review.feedback)
     )
     names, setup = ("", "") if review.test_only else _regression_context(fixtures)
+    prioritize_requirements = review.test_only or bool(ancestor_evidence)
     requirements = "\n".join(
-        f"- {excerpt(body, 900 if review.test_only else 320)}" for body in behaviors if body
+        f"- {excerpt(body, 900 if prioritize_requirements else 320)}" for body in behaviors if body
     )
     test_query = words(" ".join([*behaviors, names, setup, note]))
     sources = {path: content for path, content in current.items() if path != new_path}
@@ -1335,15 +1336,15 @@ def _test_authoring_messages(
     scenarios = (
         "Keep the observations of one reviewer-described scenario together in one test execution. "
         "Use separate cases for distinct requested scenarios. "
-        if review.test_only and ancestor_evidence else
+        if ancestor_evidence else
         "Use two or three focused cases when enough, and cover every distinct requested fixture. "
     )
     request = (
         "Selected failure: new regression tests\n"
-        + (TEST_ONLY_REQUIREMENTS + requirements + "\n" if review.test_only else "")
+        + (TEST_ONLY_REQUIREMENTS + requirements + "\n" if prioritize_requirements else "")
         + (TEST_ANCESTOR_EVIDENCE + ancestor_evidence + "\n" if ancestor_evidence else "")
         + setup_guidance
-        + ("\n" if review.test_only else "")
+        + ("\n" if prioritize_requirements else "")
         + f"Edit only {new_path}. "
         + (
             TEST_REPAIR_GUIDANCE
@@ -1360,7 +1361,7 @@ def _test_authoring_messages(
             "Avoid copying its cases or reproducing its inventory in the repository tests."
             if not review.test_only else ""
         )
-        + (TEST_REVIEW_BEHAVIORS + requirements if not review.test_only else "")
+        + (TEST_REVIEW_BEHAVIORS + requirements if not prioritize_requirements else "")
         + (REVIEWED_TEST_HELPERS + "".join(reviewed_helpers) if reviewed_helpers else "")
         + (OPERATOR_API_CONTRACT + operator_contract + "\n" if operator_contract else "")
         + (
@@ -2129,9 +2130,17 @@ def _private_repair_context(current, repair):
 
 def solve(executor, task, archive, budget, version):
     review = task.review_recovery
+    pinned_ancestor = bool(task.regression_base and task.regression_archive)
+    production_regression = bool(
+        pinned_ancestor and task.regression_edit_path and task.pull_checks
+        and task.inline_review_threads == 1
+    )
     if not (
         review
-        and (review.test_only or (task.pull_checks and task.inline_review_threads >= 2))
+        and (
+            review.test_only or production_regression
+            or (task.pull_checks and task.inline_review_threads >= 2)
+        )
         and task.save_checkpoint
     ):
         return None
@@ -2139,7 +2148,9 @@ def solve(executor, task, archive, budget, version):
     if not paths or len(paths) > 3 or any(not path.endswith(".py") for path in paths):
         return None
     new_path = "tests/test_review_regressions.py"
-    if review.test_only and not (
+    if production_regression and (review.test_only or paths != [task.regression_edit_path]):
+        return None
+    if (review.test_only or production_regression) and not (
         task.inline_review_threads == 1 and task.require_new_tests and task.verify_base_first
         and task.test_update is None and focused_pytest(task.checks, (new_path,))
     ):
@@ -2165,7 +2176,7 @@ def solve(executor, task, archive, budget, version):
         ):
             return None
         if task.require_new_tests:
-            if review.test_only:
+            if review.test_only or production_regression:
                 candidates = (
                     new_path,
                     *(f"tests/test_review_regressions_{index}.py" for index in range(2, 33)),
@@ -2247,15 +2258,6 @@ def solve(executor, task, archive, budget, version):
     failures = evidence(executor, task, archive, budget, patch, commands, pytest_runs=pytest_runs)
     if review.test_only and failures:
         raise ExecutionError("Required checks failed on the unchanged baseline for the test-only review")
-    pinned_ancestor = bool(review.test_only and task.regression_base and task.regression_archive)
-    ancestor_delta = (
-        reviewed_ancestor_delta(
-            task.regression_archive,
-            {path: current[path] for path in paths if not _protected(path, task, new_test=False)},
-            review.feedback,
-        )
-        if pinned_ancestor else ""
-    )
     notes = {}
     rejected = {}
     last_routes = {}
@@ -3557,7 +3559,8 @@ def solve(executor, task, archive, budget, version):
     test_rejection = None
     test_ancestor_feedback = ""
     fixture_requests = (
-        explicit_fixture_requests(review.feedback) if task.inline_review_threads >= 2 else ()
+        explicit_fixture_requests(review.feedback)
+        if production_regression or task.inline_review_threads >= 2 else ()
     )
     known_fixture_omissions = {}
     test_case_runs = {}
@@ -3576,6 +3579,8 @@ def solve(executor, task, archive, budget, version):
     test_tool_attempts = set()
     test_line_attempts = set()
     repository_example = None
+    ancestor_delta = ""
+    repository_checkout = None
     extended_context = ""
     repository_usage = ""
     repository_models = ""
@@ -4111,7 +4116,8 @@ def solve(executor, task, archive, budget, version):
                         if revision != test_format_revision:
                             test_format_revision = revision
                             test_format_failures = 0
-                        if repository_example is None:
+                        if repository_example is None or (pinned_ancestor and repository_checkout is not current):
+                            repository_checkout = current
                             reviewed_sources = {path: current[path] for path in paths}
                             repository_example, repository_usage = repository_pytest_context(
                                 task.regression_archive or archive,
@@ -4123,12 +4129,16 @@ def solve(executor, task, archive, budget, version):
                                     path: text for path, text in reviewed_sources.items()
                                     if not _protected(path, task, new_test=False)
                                 }
+                                reviewed_feedback = _draft_review(review, original, current).feedback
+                                ancestor_delta = reviewed_ancestor_delta(
+                                    task.regression_archive, public_sources, reviewed_feedback,
+                                )
                                 extended_context = extended_pytest_context(
-                                    task.regression_archive, public_sources, review.feedback,
+                                    task.regression_archive, public_sources, reviewed_feedback,
                                 )
                                 prior_setup = prior_generated_fixture_context(
                                     archive, task.regression_archive, new_path, public_sources,
-                                )
+                                ) if review.test_only else ""
                                 if prior_setup and len(prior_setup.encode()) <= 850:
                                     repository_example = prior_setup
                                 elif prior_setup:

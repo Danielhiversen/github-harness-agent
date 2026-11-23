@@ -60,6 +60,23 @@ def test_recovery_needs_repeated_rejections_and_distinct_review_threads():
     assert plan_recovery(items, 3, "unfinished checks") is not None
 
 
+def test_explicit_production_regression_uses_focused_recovery_on_first_attempt():
+    directive = "Update production code and add a new regression test."
+    verification = f"Verify regression against: {'a' * 40}"
+    item = {
+        **feedback()[0],
+        "key": "comment:1",
+        "author": "trusted-reviewer",
+        "body": f"Correct the reviewed result.\n\n{directive}\n{verification}",
+    }
+
+    recovery = plan_recovery([item], 0, "")
+    assert recovery is not None and not recovery.test_only
+    assert plan_recovery([{**item, "body": directive}], 0, "") is None
+    assert plan_recovery([{**item, "body": f"> {directive}\n{verification}"}], 0, "") is None
+    assert plan_recovery([{**item, "key": "review:1"}], 0, "") is None
+
+
 def test_explicit_test_only_module_uses_focused_recovery_on_first_attempt():
     item = {
         **feedback()[0],

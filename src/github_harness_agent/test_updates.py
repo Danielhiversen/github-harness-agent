@@ -140,7 +140,7 @@ def fixture_request_sentences(body: str):
 
 def requests_new_tests(body: str) -> bool:
     """Recognize an affirmative, direct request in a human review item."""
-    return any(fixture_request_sentences(body)) or any(
+    return requests_regression_production(body) or any(fixture_request_sentences(body)) or any(
         _ADD_TESTS.match(sentence) and not _CONDITIONAL.search(sentence)
         for sentence in _review_sentences(body)
     )
@@ -152,17 +152,28 @@ def requests_test_only_module(body: str) -> bool:
     )
 
 
-def authorized_regression_base(feedback: Iterable[Mapping]) -> str | None:
-    """Read an immutable baseline from authorized inline test-only feedback."""
+def requests_regression_production(body: str) -> bool:
+    return any(
+        re.fullmatch(r"(?:please\s+)?update production code and add a new regression test[.!]?", sentence, re.I)
+        for sentence in _review_sentences(body)
+    )
+
+
+def authorized_regression_request(feedback: Iterable[Mapping]) -> tuple[str | None, str | None]:
+    """Return the pinned revision and the explicitly authorized production path, if any."""
     items = tuple(feedback)
     revisions = set()
+    edit_path = None
     directive = "Verify regression against:"
     for item in items:
         if not (
             item.get("key", "").startswith("comment:")
             and item.get("author") and item.get("path") and item.get("thread") and item.get("reply_to")
-            and requests_test_only_module(item["body"])
         ):
+            continue
+        mixed = requests_regression_production(item["body"])
+        test_only = requests_test_only_module(item["body"])
+        if not (mixed or test_only):
             continue
         body = _HTML_COMMENT.sub(" ", item["body"])
         for line in _review_prose(body):
@@ -170,10 +181,25 @@ def authorized_regression_base(feedback: Iterable[Mapping]) -> str | None:
                 sha = line.strip().removeprefix(directive).strip().lower()
                 if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
                     raise ValueError("Verify regression against requires a full commit SHA")
+                if mixed:
+                    path = item["path"]
+                    parts = PurePosixPath(path).parts
+                    if (
+                        test_only or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_./-]{0,251}\.py", path)
+                        or any(part in {"..", ".git", ".github", "tests", "test", "__tests__"} for part in parts)
+                        or str(PurePosixPath(path)) != path
+                        or parts[-1].startswith("test_") or parts[-1].endswith("_test.py")
+                    ):
+                        raise ValueError("A mixed regression review must authorize one reviewed Python production file")
+                    edit_path = path
                 revisions.add(sha)
     if revisions and (len(items) != 1 or len(revisions) != 1):
-        raise ValueError("Use one regression verification SHA in a standalone test-only review")
-    return next(iter(revisions), None)
+        raise ValueError("Use one regression verification SHA in a standalone inline review")
+    return next(iter(revisions), None), edit_path
+
+
+def authorized_regression_base(feedback: Iterable[Mapping]) -> str | None:
+    return authorized_regression_request(feedback)[0]
 
 
 def focused_pytest(checks, selectors, report=None, *, verbose=False):
