@@ -115,6 +115,7 @@ from .review_solver_context import (
     imported_model_declarations,
     operator_api_contract,
     operator_test_assembly,
+    production_protocol_example,
     prior_generated_fixture_context,
     prior_generated_test_seed,
     repository_pytest_context,
@@ -1364,6 +1365,12 @@ def _operator_function_messages(
         {"role": "user", "content": request},
     ]
 
+    if protocol := production_protocol_example(projection.preview, production, query):
+        messages[-1]["content"] = request + "\n\nProduction call and response handling (quoted):\n" + protocol
+        if wire_size(messages) <= 12 * 1024:
+            request = messages[-1]["content"]
+        else:
+            messages[-1]["content"] = request
     if prior_function:
         for limit in (6000, 3000, 1200, 600):
             messages[-1]["content"] = request + "\n\nPrevious function (quoted):\n" + excerpt(prior_function, limit)

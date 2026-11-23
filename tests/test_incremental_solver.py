@@ -838,6 +838,41 @@ def test_single_pinned_production_review_fixes_all_checks_before_authoring_regre
     assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
 
 
+def test_helper_prompt_quotes_only_reviewed_production_protocol():
+    helper = SimpleNamespace(preview=(
+        "from ingest import Reader as Stream\n"
+        "from tests.storage import Private\n"
+        "def reader(client):\n    return Stream(client)\n"
+        "def ignored():\n    return Private()\n"
+    ))
+    code = (
+        "class Reader:\n"
+        "    def __init__(self, client): self.client = client\n"
+        "    def collect(self, cursor):\n"
+        "        result = self.client.page(cursor, limit=8)\n"
+        "        records = result['records']\n"
+        "        if len(records) >= 8:\n"
+        "            return result['next']\n"
+        "        return None\n"
+    )
+    sources = {
+        "ingest.py": code,
+        "tests/storage.py": code.replace("Reader", "Private").replace("records", "secret"),
+        "other.py": code.replace("records", "unrelated"),
+    }
+    review = SimpleNamespace(feedback=(("ingest.py", 6, "Exercise the page limit and records."),))
+    prompt = _operator_function_messages(helper, review, sources, NEW_TEST, "")[-1]["content"]
+    section = prompt.partition("Production call and response handling (quoted):")[2]
+    assert "ingest.py:4 (Reader.collect)" in section
+    assert "self.client.page(cursor, limit=8)" in section
+    assert "if len(records) >= 8:" in section and "result['next']" in section
+    assert "secret" not in section and "unrelated" not in section
+    # A helper argument shadowing an import cannot identify the production class.
+    helper.preview = "from ingest import Reader\ndef make(Reader):\n    return Reader()"
+    prompt = _operator_function_messages(helper, review, sources, NEW_TEST, "")[-1]["content"]
+    assert "Production call and response handling" not in prompt
+
+
 @pytest.mark.parametrize("bulky", (False, True))
 def test_helper_authoring_prioritizes_reviewed_api_and_fits_prior_case(bulky):
     review = SimpleNamespace(feedback=(("domain.py", 70, "Exercise the requested partition limit."),))
