@@ -1214,7 +1214,7 @@ def test_testfirst_function_recovers_malformed_module(solver_case, caplog, monke
     assert "hidden operator assertion" not in caplog.text
 
 
-def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve, private_plan=None):
+def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve, private_plan=None, fragment_case=None):
     task, _, runner, checkpoints = solver_case
     raw_mode = failover in {"raw", "raw-restored"}
     long_checkpoint = failover.startswith("checkpoint-")
@@ -1270,6 +1270,10 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
         with operator.open("a") as stream:
             stream.write("    assert Reader().dispatch(True) == -3\n")
     caller_rows = 1
+    if fragment_case:
+        padding = "".join(f"        context_{i} = {i}\n" for i in range(32))
+        production = production.replace("        return self.read() - 2\n", padding + "        return self.read() - 2\n")
+        caller_rows += 32
     if wider:
         before_body = ["        deltas = (", *(["            0,"] * 16), "        )", "        return self.read() - 2 + sum(deltas)"]
         after_body = ["        deltas = (", *(["            1,", "            -1,"] * 8), "        )", "        return self.read() + 2 + sum(deltas)"]
@@ -1342,6 +1346,17 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 reply = super().complete(**{**kwargs, "role": "coding", "max_output_tokens": 3072})
                 reply.role = "planning"
                 reply.content = json.dumps({"strategy": strategy})
+                return reply
+            if fragment_case and "Synthesize only the replacement Python statements" in prompt:
+                assert not private_models and "test_keep_helper" in prompt and "test_first" in prompt
+                assert "Accepted fragment:\n        return self.read() - 2" in prompt
+                assert "Tentative fragment to replace:\n        return self.read() + 2" in prompt
+                assert "context_0 = " not in prompt and "context_30 = " in prompt
+                assert "def dispatch(self, legacy=False):" in prompt and "def unrelated" not in prompt
+                reply = super().complete(**{**kwargs, "max_output_tokens": 3072})
+                reply.route, reply.configured_model = "private-free-0", "private-model-0"
+                private_models.append((reply.route, reply.configured_model))
+                reply.content = "return self.read() + (-2 if legacy else 2)" if fragment_case == "success" else "def foreign(): pass"
                 return reply
             if private_case and "Private regression repair. The numbered tentative method" in prompt:
                 assert "test_first" in prompt and "test_keep_helper" in prompt
@@ -1600,7 +1615,11 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
         assert "Observed pytest failure:" in first_request
         if private_case:
             assert bool(planning_calls) == bool(private_plan)
-            assert len(private_models) == 3 and b"(-2 if legacy else 2)" in result.patch
+            assert len(private_models) == (1 if fragment_case == "success" else 3)
+            assert b"(-2 if legacy else 2)" in result.patch
+            if fragment_case == "success":
+                assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
+                return
             outcomes = [r.getMessage() for r in caplog.records if r.msg.startswith("Private method repair outcome")]
             assert len(outcomes) == 3 and "malformed, attempt=1" in outcomes[0]
             assert "target=failed, control=passed" in outcomes[1]
@@ -6148,3 +6167,8 @@ def test_plain_method_reply_allowance_scales_and_skips_oversized_methods():
             assert 2048 < allowance <= 6144
         else:
             assert request is None
+
+
+@pytest.mark.parametrize("response", ("success", "malformed"))
+def test_private_method_synthesizes_only_the_changed_statement(solver_case, caplog, response):
+    _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-private", caplog, fragment_case=response)

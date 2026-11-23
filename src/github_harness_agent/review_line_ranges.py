@@ -5,6 +5,7 @@ import difflib
 import hashlib
 import json
 import re
+import textwrap
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
@@ -401,6 +402,98 @@ def _exact_search_hunks(text, path, original, block_pattern):
         hunks.append((start, old, new))
         remaining = remaining[block.end():].lstrip("\n")
     return hunks
+
+
+@dataclass(frozen=True)
+class StatementFragment:
+    first: int
+    last: int
+    accepted: tuple[str, ...]
+
+
+def _covering_statements(tree, first, last):
+    options = []
+    for owner in ast.walk(tree):
+        for _, suite in ast.iter_fields(owner):
+            if not isinstance(suite, list) or not suite or not all(isinstance(item, ast.stmt) for item in suite):
+                continue
+            starts = [min([item.lineno, *(d.lineno for d in getattr(item, "decorator_list", ()))]) for item in suite]
+            selected = [i for i, item in enumerate(suite) if starts[i] <= last and item.end_lineno >= first]
+            if not selected:
+                continue
+            low, high = selected[0], selected[-1]
+            a, b = starts[low], suite[high].end_lineno
+            if a <= first <= last <= b:
+                options.append((b - a, a, b, suite, low, high))
+    return min(options, key=lambda item: item[0]) if options else None
+
+
+def isolate_statement_fragment(accepted, tentative):
+    """Map one small contiguous change to complete statements in the tentative body."""
+    if accepted.symbol != tentative.symbol or len(tentative.lines) < 24:
+        return None
+    changes = [op for op in difflib.SequenceMatcher(None, accepted.lines, tentative.lines, autojunk=False).get_opcodes()
+               if op[0] != "equal"]
+    if not changes or any(nxt[3] - prev[4] > 2 for prev, nxt in zip(changes, changes[1:])):
+        return None
+    _, old_first, _, new_first, _ = changes[0]
+    _, _, old_end, _, new_end = changes[-1]
+    if min(old_first + 1, new_first + 1) < max(accepted.first_body_line, tentative.first_body_line):
+        return None
+    first, last = new_first + 1, new_end
+    if first > last:  # A deletion needs a surviving statement at its boundary.
+        first = last = min(first, len(tentative.lines))
+    try:
+        tree = ast.parse(textwrap.dedent("\n".join(tentative.lines)))
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    covering = _covering_statements(tree, first, last)
+    if not covering:
+        return None
+    _, a, b, _, _, _ = covering
+    start, end = old_first - (new_first - a + 1), old_end + (b - new_end)
+    if (a < tentative.first_body_line or start < accepted.first_body_line - 1
+            or max(b - a + 1, end - start) > 12 or end > len(accepted.lines)):
+        return None
+    return StatementFragment(a, b, accepted.lines[start:end])
+
+
+def apply_statement_fragment(reply, sources, snapshot, fragment):
+    """Splice one standalone statement suite and verify surrounding AST equivalence."""
+    if not isinstance(reply, str) or len(reply.encode()) > 4096:
+        raise ValueError("Expected a bounded Python statement fragment")
+    text = reply.strip("\n")
+    if fence := re.fullmatch(r"```(?:python|py)?[ \t]*\n(.*?)\n```", text, re.S):
+        text = fence[1]
+    text = textwrap.dedent(text)
+    rows = text.splitlines()
+    if not rows or len(rows) > 18 or any(_INVALID_LINE.search(row) for row in rows):
+        raise ValueError("Expected one small Python statement fragment")
+    try:
+        replacement = ast.parse(text).body
+        expected = ast.parse(textwrap.dedent("\n".join(snapshot.lines)))
+    except (SyntaxError, ValueError, RecursionError):
+        raise ValueError("Malformed Python statement fragment") from None
+    if not replacement or isinstance(replacement[0], (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        raise ValueError("Expected body statements only")
+    covering = _covering_statements(expected, fragment.first, fragment.last)
+    if not covering or covering[1:3] != (fragment.first, fragment.last):
+        raise ValueError("Fragment no longer identifies the selected suite")
+    _, _, _, suite, low, high = covering
+    suite[low:high + 1] = replacement
+    indent = re.match(r"[ \t]*", snapshot.lines[fragment.first - 1])[0]
+    inserted = [indent + row if row else row for row in rows]
+    record = {"start": fragment.first, "end": fragment.last, "lines": inserted}
+    revised = apply_line_range_edit(json.dumps({"snapshot": snapshot.digest, "edits": [record]}),
+                                    sources, snapshot, allowed_rows=frozenset(range(fragment.first, fragment.last + 1)))
+    updated = prepare_line_range_edit(revised, snapshot.symbol)
+    try:
+        actual = ast.parse(textwrap.dedent("\n".join(updated.lines))) if updated else None
+    except (SyntaxError, ValueError, RecursionError):
+        actual = None
+    if actual is None or ast.dump(actual) != ast.dump(expected):
+        raise ValueError("Fragment changed surrounding Python syntax")
+    return revised
 
 
 def apply_offered_line_reply(response, sources, snapshots, *, block_pattern, full_method=False):

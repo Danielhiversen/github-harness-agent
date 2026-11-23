@@ -406,3 +406,25 @@ def test_scoped_blocks_apply_atomically_against_original_method():
         with pytest.raises(ValueError):
             apply(first + "\n" + suffix)
     assert "inserted" not in sources[PATH]
+
+
+def test_statement_fragment_uses_exact_suite_and_declines_scattered_or_stale_changes():
+    from github_harness_agent.review_line_ranges import apply_statement_fragment, isolate_statement_fragment
+
+    sources, snapshot, _ = _long_body()
+    updates = sources[PATH].replace("item_3 = 3", "item_3 = -3")
+    tentative = {PATH: updates}
+    edited = prepare_line_range_edit(tentative, snapshot.symbol)
+    selected = isolate_statement_fragment(snapshot, edited)
+    assert selected.accepted == ("        item_3 = 3",)
+    result = apply_statement_fragment(
+        "```python\nif item_1:\n    item_3 = 8\nelse:\n    item_3 = -3\n```", tentative, edited, selected,
+    )
+    assert result[PATH] == updates.replace("        item_3 = -3", "        if item_1:\n            item_3 = 8\n        else:\n            item_3 = -3")
+    scattered = prepare_line_range_edit({PATH: updates.replace("item_31 = 31", "item_31 = -31")}, snapshot.symbol)
+    assert isolate_statement_fragment(snapshot, scattered) is None
+    with pytest.raises(ValueError, match="snapshot"):
+        apply_statement_fragment("item_3 = 8", sources, edited, selected)
+    for invalid in ("if item_1:", "def other_method(): return 8", 'item_3 = """unterminated', "pass\n"*19):
+        with pytest.raises(ValueError):
+            apply_statement_fragment(invalid, tentative, edited, selected)

@@ -96,6 +96,9 @@ from .review_line_ranges import (
     NATIVE_LINE_RANGE_TOOL,
     LineRangeSnapshot,
     ScopedRangeRejection,
+    StatementFragment,
+    isolate_statement_fragment,
+    apply_statement_fragment,
     full_method_native_tool,
     apply_line_range_edit,
     apply_native_line_range_edit,
@@ -2118,6 +2121,7 @@ class _LineRetry:
     caller_routes_reopened: bool = False
     caller_context: str = ""
     checked_caller_attempts: tuple[str, ...] = ()
+    statement_fragment: StatementFragment | None = None
     raw_context: str = ""
 
     @property
@@ -2405,7 +2409,7 @@ def _private_changed_method(current, tentative):
     return None
 
 
-def _private_method_retry(current, repair, target, review):
+def _private_method_retry(current, repair, target, review, origin_diagnostic=""):
     snapshot = prepare_line_range_edit(repair.sources, repair.private_symbol)
     if snapshot is None:
         return None
@@ -2423,6 +2427,25 @@ def _private_method_retry(current, repair, target, review):
         + ("Observed pytest failure: " + excerpt(observed, 450) + "\n" if observed else "")
         + (excerpt(repair.retry_note, 450) + "\n" if repair.retry_note else "")
     )
+    if not repair.retries and (fragment := isolate_statement_fragment(accepted, snapshot)):
+        first, last = fragment.first, fragment.last
+        local = "\n".join(snapshot.lines[max(snapshot.first_body_line - 1, first - 6):first - 1])
+        following = "\n".join(snapshot.lines[last:last + 4])
+        baseline_observed = origin_diagnostic.partition("\nObserved pytest failure: ")[2]
+        prompt = (
+            context + ("Accepted target failure: " + excerpt(baseline_observed, 350) + "\n" if baseline_observed else "")
+            + "Synthesize only the replacement Python statements for the tentative fragment. "
+            "The accepted version passed the control but failed the target. The tentative version passed "
+            "the target but failed the control. Return only a Python fragment with its own relative indentation.\n"
+            + "Method signature:\n" + "\n".join(snapshot.lines[:snapshot.first_body_line - 1])
+            + "\nPreceding context:\n" + excerpt(local, 700)
+            + "\nAccepted fragment:\n" + ("\n".join(fragment.accepted) or "(empty)")
+            + "\nTentative fragment to replace:\n" + "\n".join(snapshot.lines[first - 1:last])
+            + "\nFollowing context:\n" + excerpt(following, 450)
+        )
+        if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": prompt}]) <= 6200:
+            return _LineRetry(None, snapshot, allowed_rows=frozenset(range(first, last + 1)),
+                              prompt=prompt, checkout=repair.sources, statement_fragment=fragment)
     delta = "\n".join(difflib.unified_diff(
         accepted.lines, snapshot.lines, fromfile="accepted method", tofile="tentative method", n=1, lineterm="",
     ))
@@ -5261,7 +5284,7 @@ def solve(executor, task, archive, budget, version):
                     ):
                         line_retry = None
                     if repair is not None and repair.private_symbol and target in repair.introduced:
-                        line_retry = _private_method_retry(current, repair, target, review)
+                        line_retry = _private_method_retry(current, repair, target, review, failures.get(repair.origin, ""))
                     if (
                         production_regression and repair is None and target in operator
                         and not (current is resumed_operator_checkout and line_retry is not None)
@@ -6049,7 +6072,9 @@ def solve(executor, task, archive, budget, version):
                         if candidate == source:
                             raise ValueError("The pytest edit did not change the draft.")
                     if candidate is None and active_line_snapshot is not None:
-                        if scoped_line and (line_retry.alternatives or line_retry.complete_single_method):
+                        if scoped_line and line_retry.statement_fragment:
+                            candidate = apply_statement_fragment(completion.content, source, active_line_snapshot, line_retry.statement_fragment)
+                        elif scoped_line and (line_retry.alternatives or line_retry.complete_single_method):
                             candidate = apply_offered_line_reply(
                                 completion.content, source, (line_retry.snapshot, *line_retry.alternatives), block_pattern=_BLOCK,
                                 full_method=line_retry.complete_single_method,
