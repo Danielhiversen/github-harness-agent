@@ -113,6 +113,11 @@ def focused_check_excerpt(command, diagnostic, sources, *, max_chars=2800):
 
 
 _NATIVE_TEST_FRAME = re.compile(r'^File "([^"\n]{1,512}\.py)", line ([1-9][0-9]{0,6})(?:, in .*)?$')
+_TEST_MISSING_NAME = re.compile(
+    r"^(?:E\s+|[^\n]{1,512}\.py:[1-9][0-9]{0,6}:\s*|(?:FAILED|ERROR) \S+ - )?"
+    r"NameError:\s+name (['\"])([^\W\d]\w{0,100})\1 is not defined\b"
+)
+_NAME_ERROR_CRASH_FRAME = re.compile(r":\s*NameError(?:\s|:|$)")
 _ARGUMENT_TYPEERROR = re.compile(
     r"^(?:E\s+|[^\n]{1,512}\.py:[1-9][0-9]{0,6}:\s*)?"
     r"TypeError:\s+([A-Za-z_]\w{0,100})(?:\.([A-Za-z_]\w{0,100}))?\(\) "
@@ -165,6 +170,66 @@ def test_failure_focus(sources, diagnostic, *, max_bytes=660):
                 if context.strip() and len(focus.encode()) <= max_bytes:
                     return focus
     return ""
+
+
+def test_name_error_bindings(path, draft, diagnostic, *, max_bytes=600):
+    """Quote exact existing bindings for a NameError in the generated draft."""
+    details = diagnostic.splitlines()
+    missing = {
+        match[2] for line in details if (match := _TEST_MISSING_NAME.match(line.lstrip()))
+    }
+    if len(missing) != 1:
+        return ""
+    name = missing.pop()
+    locations = []
+    for line in details:
+        if frame := _NATIVE_TEST_FRAME.fullmatch(line.lstrip()):
+            locations.append((frame[1], int(frame[2]), True))
+        else:
+            locations.extend(
+                (file, row, bool(_NAME_ERROR_CRASH_FRAME.search(line)))
+                for file, row in check_locations(("pytest",), line)
+            )
+    if not locations:
+        return ""
+    raw_path, row, crash = locations[-1]
+    if not crash or raw_path.removeprefix("/work/").removeprefix("./") != path:
+        return ""
+    lines = draft.splitlines()
+    if row > len(lines):
+        return ""
+    try:
+        module = ast.parse(draft)
+    except (SyntaxError, ValueError, RecursionError):
+        return ""
+
+    enclosing = [
+        node.body for _, node in _symbols(module.body, nested=True)
+        if isinstance(node, _FUNCTION) and node.lineno <= row <= node.end_lineno
+    ]
+    heading = f"Current draft bindings for missing name {name!r} (quoted source):"
+    remaining = max_bytes - len(heading.encode()) - 1
+    selected = []
+    for statements in (*reversed(enclosing), module.body):
+        for node in statements:
+            if not isinstance(node, (*_IMPORT, *_ASSIGNMENT, *_FUNCTION, ast.ClassDef)):
+                continue
+            aliases = (
+                {alias.name.rsplit(".", 1)[-1] for alias in node.names}
+                if isinstance(node, _IMPORT) else set()
+            )
+            if name not in _bindings(node) | aliases:
+                continue
+            end = (
+                max(node.lineno, _start(node.body[0]) - 1)
+                if isinstance(node, (*_FUNCTION, ast.ClassDef)) else node.end_lineno
+            )
+            snippet = "\n".join(lines[_start(node) - 1:end])
+            size = len(snippet.encode()) + 1
+            if snippet and snippet not in selected and size <= remaining:
+                selected.append(snippet)
+                remaining -= size
+    return "\n".join((heading, *selected)) if selected else ""
 
 
 def _tracked_python(snapshot, path):

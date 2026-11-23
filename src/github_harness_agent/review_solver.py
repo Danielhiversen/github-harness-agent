@@ -121,6 +121,7 @@ from .review_solver_context import (
     stock_missing_count_after_reorder,
     stock_pytest_excerpt,
     test_failure_focus,
+    test_name_error_bindings,
 )
 from .review_stock_collection import stock_collection
 from .task_context import (
@@ -975,6 +976,7 @@ def _test_line_messages(snapshot, note, current, *, repository_usage=""):
     path, _ = snapshot.symbol
     production = {name: code for name, code in current.items() if name != path}
     failure_source = test_failure_focus(production, note)
+    bindings = test_name_error_bindings(path, current[path], note)
     failure_source = (
         TEST_VERIFICATION_SOURCE + excerpt(failure_source, 750) + "\n" if failure_source else ""
     )
@@ -986,6 +988,7 @@ def _test_line_messages(snapshot, note, current, *, repository_usage=""):
                 excerpt(note, 1300) + "\n"
                 "Repair the failing test setup or call and keep the tested behavior and assertions. "
                 "Use the sample JSON structure with your actual replacement lines.\n"
+                + (bindings + "\n" if bindings else "")
                 + failure_source
                 + (REPOSITORY_PYTEST_USAGE + excerpt(repository_usage, 820) + "\n" if repository_usage else "")
                 + line_range_prompt(snapshot) + LINE_RANGE_ENDING
@@ -1313,6 +1316,8 @@ def _test_authoring_messages(
     if reviewed_helpers:
         system = system.replace(_SYSTEM_SUFFIX, _TEST_HELPER_SYSTEM_SUFFIX, 1)
     draft = current[new_path]
+    bindings = test_name_error_bindings(new_path, draft, note) if repair_failed_tests else ""
+    verification_note = f"{bindings}\n{note}" if bindings else note
     definition_guidance = ""
     if allow_test_module and repair_failed_tests and draft:
         definition_guidance = (
@@ -1376,7 +1381,7 @@ def _test_authoring_messages(
         + (REPOSITORY_PYTEST_USAGE + repository_usage + "\n" if repository_usage else "")
         + (TEST_ONLY_CONTEXT if review.test_only else f"\nOperator test names: {names}\n")
         + (
-            TEST_VERIFICATION_FEEDBACK + excerpt(note, 1600) + "\n"
+            TEST_VERIFICATION_FEEDBACK + excerpt(verification_note, 1600) + "\n"
             if note
             else ""
         )

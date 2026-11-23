@@ -782,6 +782,71 @@ def test_named_prompt_advertises_only_visible_nested_definitions_in_reviewed_met
     assert f"{path}::Reader.decode.normalize" not in search
 
 
+def test_name_error_repair_preserves_exact_draft_import_in_compact_and_numbered_prompts():
+    path = "src/example/formatting.py"
+    new_path = "tests/test_review_regressions.py"
+    declaration = "from example.formatting import Formatter as TestFormatter"
+    draft = (
+        declaration + "\nfrom unrelated import OtherFormatter\n\n"
+        "def test_formatter():\n"
+        "    assert Formatter().ready()\n"
+    )
+    node = f"{new_path}::test_formatter"
+    note = (
+        f"Selected failing case: {node}\n{new_path}:5: NameError\n"
+        ">       assert Formatter().ready()\n"
+        "E       NameError: name 'Formatter' is not defined"
+    )
+    source = "class Formatter:\n    def ready(self):\n        return True\n"
+    current = {path: source, new_path: draft}
+    review = ReviewRecovery(feedback=((path, 1, "Verify the formatter is ready."),), previous_failure="")
+    messages = _proposal_messages(
+        (-1, "new regression tests"), current, {}, True, note, review, {}, [], new_path,
+        allow_test_module=True, repository_example="Fixture example.\n" * 170, repair_failed_tests=True,
+    )
+    compact = compact_focused_review(messages, max_bytes=3000)
+    assert compact is not None
+    snapshot = review_solver.prepare_line_range_edit({new_path: draft}, (new_path, "test_formatter"))
+    numbered = review_solver._test_line_messages(snapshot, note, current)
+
+    for variant in (messages, compact, numbered):
+        prompt = variant[-1]["content"]
+        label = "Current draft bindings for missing name 'Formatter' (quoted source):"
+        assert label in prompt
+        binding_hint = prompt.partition(label)[2]
+        assert declaration in binding_hint[:250]
+        assert "OtherFormatter" not in binding_hint[:250]
+
+
+def test_name_error_context_requires_a_matching_generated_file_traceback():
+    draft = "from example.formatting import Formatter as TestFormatter\n"
+    note = (
+        "tests/test_draft.py:1: in test_caller\n"
+        "src/example.py:17: NameError\nE       NameError: name 'Formatter' is not defined"
+    )
+    assert not review_solver_context.test_name_error_bindings("tests/test_draft.py", draft, note)
+    assert not review_solver_context.test_name_error_bindings(
+        "tests/test_draft.py", draft, note.replace("src/example.py:17: NameError\n", ""),
+    )
+
+
+def test_name_error_context_shows_exact_definition_in_a_lexical_parent():
+    path = "tests/test_draft.py"
+    draft = (
+        "def test_builder():\n"
+        "    def build(value):\n"
+        "        return value\n"
+        "    def run():\n"
+        "        global build\n"
+        "        return build(1)\n"
+        "    assert run() == 1\n"
+    )
+    note = f"{path}:6: NameError\nE       NameError: name 'build' is not defined"
+    hint = review_solver_context.test_name_error_bindings(path, draft, note)
+    assert "    def build(value):" in hint
+    assert "return value" not in hint
+
+
 def test_test_only_requirements_survive_compaction_without_operator_inventory():
     path = "src/example/formatting.py"
     new_path = "tests/test_review_regressions.py"
