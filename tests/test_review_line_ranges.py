@@ -381,3 +381,28 @@ def test_sole_method_text_rejects_foreign_invalid_or_oversize_replies(reply):
     snapshot = prepare_line_range_edit(sources, (PATH, "Queue.unrelated"))
     with pytest.raises(ValueError):
         apply_offered_line_reply(reply, sources, (snapshot,), block_pattern=_BLOCK, full_method=True)
+
+
+def test_scoped_blocks_apply_atomically_against_original_method():
+    from github_harness_agent.review_solver import _BLOCK
+
+    sources, snap, _ = _long_body()
+    def block(old, new, path=""):
+        return f"{path + chr(10) if path else ''}<<<<<<< SEARCH\n{old}\n=======\n{new}\n>>>>>>> REPLACE"
+    a = "        item_0 = 0"
+    b = "        item_1 = 1"
+    c = "        item_2 = 2"
+    first = block(a, a + "\n        inserted = 1", PATH)
+    last = block(c, c + "0")
+    def apply(reply):
+        return apply_offered_line_reply(reply, sources, (snap,), block_pattern=_BLOCK, full_method=True)
+    reply = last + "\n\n" + first
+    assert apply(reply)[PATH] == sources[PATH].replace(a, a + "\n        inserted = 1").replace(c, c + "0")
+    for suffix in (
+        block(a + "\n" + b, a + "\n" + b + "0"), block("        inserted = 1", b),
+        block(b, c, "other.py"), block("        return 88", b), block(b, "         invalid +"),
+        "prose", "<<<<<<< SEARCH", block(b, b + "\n" + "\n".join(["        pass"] * 49)),
+    ):
+        with pytest.raises(ValueError):
+            apply(first + "\n" + suffix)
+    assert "inserted" not in sources[PATH]

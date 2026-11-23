@@ -110,6 +110,7 @@ from .review_planner import (
     localized_retry_symbol,
     pinned_counter_location,
     request_coding_advice,
+    private_method_planning_assist,
     pinned_stock_restore_seed,
 )
 from .review_recovery import operator_acceptance_context
@@ -220,7 +221,7 @@ _LINE_RANGE_SYSTEM = (
 )
 _SINGLE_METHOD_ENDING = (
     "Return one edit. For this sole method you may omit snapshot from the JSON. "
-    "Alternatively return one exact SEARCH/REPLACE block, or the complete Python method with its "
+    "Alternatively return up to six nonoverlapping exact SEARCH/REPLACE blocks for this method, or its complete Python definition with its "
     "exact header and a small body change. The same scope and changed-row limits apply."
 )
 _BLOCK = re.compile(
@@ -1006,6 +1007,32 @@ def _focused_test_assertions(path, source, run, failures):
 
 def _focused_test_body_assertion(path, source, run, failures):
     return next(_focused_test_assertions(path, source, run, failures), None) is not None
+
+
+def _focused_runtime_hint(path, source, run, failures):
+    """Identify a runtime failure in the authored case without quoting exception data."""
+    if not run or run.passed or run.deselected or len(run.failed) != 1 or run.named_cases != run.failed:
+        return ""
+    node, = run.failed
+    function = node.removeprefix("/work/").removeprefix("./").removeprefix(path + "::")
+    if not re.fullmatch(r"test_\w+", function):
+        return ""
+    method = next((item for item in ast.parse(source).body if isinstance(item, ast.FunctionDef)
+                   and item.name == function), None)
+    if method is None:
+        return ""
+    detail = failures.get((0, node), "")
+    kind = _named_test_diagnostic_kind(detail)
+    if kind not in {"AttributeError", "IndexError", "KeyError", "NameError", "TypeError", "ValueError"}:
+        return ""
+    rows = source.splitlines()
+    for raw in detail.splitlines():
+        frame = _PYTEST_GENERIC_FRAME.fullmatch(raw.strip())
+        if frame and frame[1].removeprefix("/work/").removeprefix("./") == path:
+            row = int(frame[2])
+            if method.lineno < row <= method.end_lineno:
+                return f"{kind} at authored line {row}: {excerpt(rows[row - 1].strip(), 250)}"
+    return ""
 
 
 def _scalar_assertion(expression):
@@ -1880,7 +1907,10 @@ def _coding_completion(
     native_test_path=None,
     native_line_retry=None,
     raw_python=False,
+    plan_private_method=False,
 ):
+    if plan_private_method:
+        messages = private_method_planning_assist(executor, budget, messages, line_snapshot, RETRY_MESSAGE_BYTES)
     fresh_advice = None
     if planner_input is not None:
         fresh_advice = request_coding_advice(executor, budget, messages, *planner_input)
@@ -2401,14 +2431,14 @@ def _private_case_outcome(goal, after, runs, commands):
     return "unconfirmed"
 
 
-def _retry_private_method(repair, target, editor, note):
+def _retry_private_method(repair, target, editor, note, *, checked=False):
     if not repair.private_symbol or repair.retries >= 2 or not editor.configured_model:
         return None
     model = editor.route, editor.configured_model
     if model in repair.excluded_models:
         return None
     return replace(repair, retries=repair.retries + 1, retry_target=target, retry_note=note,
-                   excluded_models=(*repair.excluded_models, model))
+                   stalled_edits=repair.stalled_edits + int(checked), excluded_models=(*repair.excluded_models, model))
 
 
 def _retry_stock_repair(repair, target, note, named_definitions, *, checked=False):
@@ -4103,6 +4133,7 @@ def solve(executor, task, archive, budget, version):
         return None
 
     planning_attempts = {}
+    planned_private_methods = set()
     retry_advice = {}
     line_retries = {}
     line_routes = {}
@@ -4358,9 +4389,10 @@ def solve(executor, task, archive, budget, version):
     test_first_attempted = False
     test_first_witness = None
     test_first_format_misses = 0
+    test_first_runtime = None
 
     def author_red_regression(routes, after_provider, runnable_drafts):
-        nonlocal test_first_format_misses
+        nonlocal test_first_format_misses, test_first_runtime
         # Only repository context and approved setup helpers are offered. The
         # independent operator scenario and its diagnostic are kept out.
         public = {path: current[path] for path in paths}
@@ -4408,7 +4440,9 @@ def solve(executor, task, archive, budget, version):
                 {path: public[path] for path in public if not _protected(path, task, new_test=False)},
             )
             if assembly:
-                scoped = _operator_function_messages(assembly, review, public, new_path, "", test_first=True)
+                previous, feedback = test_first_runtime or ("", "")
+                scoped = _operator_function_messages(assembly, review, public, new_path, "", test_first=True,
+                                                     prior_function=previous, feedback=feedback)
                 if wire_size(scoped) <= 12 * 1024:
                     messages = scoped
                     _LOG.info("Requesting a test-first function using approved setup helpers")
@@ -4442,12 +4476,15 @@ def solve(executor, task, archive, budget, version):
             _LOG.info("Test-first author repeated a previously measured green test")
             return None
         outcomes = []
-        witness = prove_red_regression(source, outcomes=outcomes)
+        runtime = []
+        witness = prove_red_regression(source, outcomes=outcomes, runtime=runtime if assembly else None)
+        if assembly and runtime:
+            test_first_runtime = (result.content, runtime[0] + "\nCorrect the setup or API usage and retain the requested behavioral assertions.")
         if not witness and len(outcomes) == 2 and any(item.endswith(" passed") for item in outcomes):
             runnable_drafts[source] = tuple(outcomes)
         return witness
 
-    def prove_red_regression(source, *, outcomes=None):
+    def prove_red_regression(source, *, outcomes=None, runtime=None):
         if _complete_test_module(source, new_path, min(8192, executor.limits.patch_bytes)) != source or not _one_test_draft(source):
             return None
         proof = _GuardBudget(budget, wall_seconds=45)
@@ -4476,6 +4513,9 @@ def solve(executor, task, archive, budget, version):
             observed = next(_focused_test_assertions(new_path, source, run, failed), None)
             if observed is None:
                 _LOG.info("Test-first %s verification: failure outside test assertion", stage)
+                if runtime is not None and (hint := _focused_runtime_hint(new_path, source, run, failed)):
+                    runtime.append(stage + " execution: " + hint)
+                    _LOG.info("Test-first function reached a correctable runtime failure in its authored body")
                 return None
             _LOG.info("Test-first %s verification: red at a verified test assertion", stage)
             assertions.append(observed)
@@ -4780,7 +4820,7 @@ def solve(executor, task, archive, budget, version):
                 after_provider = None
                 runnable_drafts = {}
                 for attempt in (1, 2, 3):
-                    if attempt == 3 and not runnable_drafts:
+                    if attempt == 3 and not runnable_drafts and not test_first_runtime:
                         break
                     _LOG.info("Requesting test-first regression authoring, attempt %d", attempt)
                     submitted += 1
@@ -5657,6 +5697,15 @@ def solve(executor, task, archive, budget, version):
                             messages = augmented
                             if native_line and line_retry:
                                 line_retry = replace(line_retry, native_prompt=hint + line_retry.native_prompt)
+                    plan_private_method = bool(
+                        repair and repair.private_symbol and repair.stalled_edits and repair.excluded_models
+                        and scoped_line and line_retry.complete_single_method and not native_line
+                        and launch_budget >= 3 and budget.remaining() >= 90
+                        and (target, line_retry.snapshot.digest) not in planned_private_methods
+                    )
+                    if plan_private_method:
+                        planned_private_methods.add((target, line_retry.snapshot.digest))
+                        _LOG.info("Requesting behavioral planning advice for a verified private method")
                     planner_input = None
                     if plan:
                         fixture = stock_fixture or _fixture_excerpt(
@@ -5734,6 +5783,7 @@ def solve(executor, task, archive, budget, version):
                         scoped_line=scoped_line,
                         native_test_path=new_path if native_test else None,
                         native_line_retry=line_retry if native_line else None,
+                        plan_private_method=plan_private_method,
                     )
                     pending[future] = (
                         target,
@@ -5766,7 +5816,7 @@ def solve(executor, task, archive, budget, version):
                         stock_hedge = _StockHedge(
                             future, launched_at + _STOCK_HEDGE_DELAY, messages, route, exclude
                         )
-                    cost = 2 if native or native_test or native_line or planner_input is not None else 1
+                    cost = 2 if native or native_test or native_line or planner_input is not None or plan_private_method else 1
                     submitted += cost
                     launch_budget -= cost
             if not pending:
@@ -6545,7 +6595,7 @@ def solve(executor, task, archive, budget, version):
                     reason = f"Last discarded edit: original target {gained_status}; previously passing control {control_status}."
                     if observed:
                         reason += " Observed pytest failure: " + excerpt(observed, 300)
-                    regression_repair = _retry_private_method(repair, target, editor, reason)
+                    regression_repair = _retry_private_method(repair, target, editor, reason, checked=True)
                     if regression_repair:
                         continue
                 if not improved or introduced or pending_static:

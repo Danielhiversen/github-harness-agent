@@ -7,6 +7,7 @@ from github_harness_agent.review_planner import (
     _advice,
     apply_coding_advice,
     request_coding_advice,
+    private_method_planning_assist,
 )
 
 
@@ -256,3 +257,20 @@ def test_private_operator_source_localizes_a_large_selected_method():
         )
         == ""
     )
+
+
+def test_private_plan_rejects_code_and_preserves_numbered_editor_when_budget_is_low():
+    snapshot = SimpleNamespace(symbol=("demo.py", "Reader.read"), lines=("    def read(self):", "        return 3"))
+    messages = [{"role": "user", "content": "Measured outcome. Edit only demo.py::Reader.read using numbered lines"}]
+    calls = []
+
+    def complete(*args, **kwargs):
+        calls.append(args[1])
+        return SimpleNamespace(content=json.dumps({"strategy": "```python\nreturn 4\n```"}))
+
+    budget = SimpleNamespace(remaining=lambda: 95, model_requests_remaining=lambda: 3, complete=complete)
+    executor = SimpleNamespace(gateway=object())
+    assert private_method_planning_assist(executor, budget, messages, snapshot, 1000) is messages
+    budget.model_requests_remaining = lambda: 1
+    assert private_method_planning_assist(executor, budget, messages, snapshot, 1000) is messages
+    assert calls == ["planning"]

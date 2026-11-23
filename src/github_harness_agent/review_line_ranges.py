@@ -371,6 +371,37 @@ def _complete_method_edits(text, snapshot):
     return edits
 
 
+def _exact_search_hunks(text, path, original, block_pattern):
+    """Resolve each SEARCH against the same unchanged file before applying edits."""
+    remaining = text + "\n"
+    haystack = "\n" + "\n".join(original) + "\n"
+    hunks = []
+    while remaining:
+        if len(hunks) == 6:
+            raise ValueError("At most six scoped SEARCH/REPLACE blocks are supported")
+        if remaining.startswith("<<<<<<< SEARCH\n"):
+            remaining = path + "\n" + remaining
+        block = block_pattern.match(remaining)
+        if not block or any(row.startswith(("<<<<<<<", "=======", ">>>>>>>"))
+                            for row in (block[2] + block[3]).splitlines()):
+            raise ValueError("Malformed scoped SEARCH/REPLACE block")
+        if block[1] != path:
+            raise ValueError("Scoped SEARCH/REPLACE block names a different file")
+        old, new = block[2].splitlines(), block[3].splitlines()
+        if not old:
+            raise ValueError("The SEARCH must contain an exact old source line")
+        needle = "\n" + "\n".join(old) + "\n"
+        match = haystack.find(needle)
+        if match < 0 or haystack.find(needle, match + 1) >= 0:
+            raise ValueError("The SEARCH must match exactly one location in the current file")
+        start = haystack.count("\n", 0, match)
+        if any(start < prev + len(rows) and prev < start + len(old) for prev, rows, _ in hunks):
+            raise ValueError("Scoped SEARCH ranges overlap")
+        hunks.append((start, old, new))
+        remaining = remaining[block.end():].lstrip("\n")
+    return hunks
+
+
 def apply_offered_line_reply(response, sources, snapshots, *, block_pattern, full_method=False):
     """Bind a textual free-model edit to one of the actually offered full definitions."""
     if not isinstance(response, str) or not 0 < len(response.encode()) <= _MAX_REPLY:
@@ -410,50 +441,42 @@ def apply_offered_line_reply(response, sources, snapshots, *, block_pattern, ful
         edits = _complete_method_edits(text, selected)
     else:
         if text.startswith(("diff --git ", "--- ")):
-            start, old, new = _single_hunk(text, path, original)
+            hunks = [_single_hunk(text, path, original)]
         else:
-            if text.startswith("<<<<<<< SEARCH\n"):
-                text = path + "\n" + text
-            block = block_pattern.fullmatch(text + "\n")
-            if not block or block[1] != path or any(
-                row.startswith(("<<<<<<<", "=======", ">>>>>>>")) for row in (block[2] + block[3]).splitlines()
-            ):
-                raise ValueError("Expected one exact SEARCH/REPLACE block for the offered file")
-            old, new = block[2].splitlines(), block[3].splitlines()
+            hunks = _exact_search_hunks(text, path, original, block_pattern)
+        selected = None
+        edits = []
+        for start, old, new in hunks:
+            common = min(len(old), len(new))
+            prefix = next((i for i in range(common) if old[i] != new[i]), common)
+            suffix = next((i for i in range(common - prefix) if old[-1 - i] != new[-1 - i]), common - prefix)
+            start += prefix
+            old, new = old[prefix:len(old) - suffix], new[prefix:len(new) - suffix]
+            if not old and not new:
+                raise ValueError("The alternate format did not change the checkout")
+            # Bind insertions to a real on-snapshot preceding row, just like the native format.
             if not old:
-                raise ValueError("The SEARCH must contain an exact old source line")
-            haystack = "\n" + "\n".join(original) + "\n"
-            needle = "\n" + "\n".join(old) + "\n"
-            match = haystack.find(needle)
-            if match < 0 or haystack.find(needle, match + 1) >= 0:
-                raise ValueError("The SEARCH must match exactly one location in the current file")
-            start = haystack.count("\n", 0, match)
-        common = min(len(old), len(new))
-        prefix = next((i for i in range(common) if old[i] != new[i]), common)
-        suffix = next((i for i in range(common - prefix) if old[-1 - i] != new[-1 - i]), common - prefix)
-        start += prefix
-        old, new = old[prefix:len(old) - suffix], new[prefix:len(new) - suffix]
-        if not old and not new:
-            raise ValueError("The alternate format did not change the checkout")
-        # Bind insertions to a real on-snapshot preceding row, just like the native format.
-        if not old:
-            if start < 1:
-                raise ValueError("Insertions need an existing body row as their anchor")
-            start -= 1
-            old = [original[start]]
-            new = old + new
-        matches = []
-        for snapshot in snapshots:
-            scope = _scope(sources[path], snapshot.symbol[1])
-            if scope is None:
-                continue
-            first = start + 1 - scope.start
-            last = first + len(old) - 1
-            if snapshot.first_body_line <= first <= last <= len(snapshot.lines):
-                matches.append((snapshot, [{"start": first, "end": last, "lines": new}]))
-        if len(matches) != 1:
-            raise ValueError("The change must lie in the body of exactly one offered definition")
-        selected, edits = matches[0]
+                if start < 1:
+                    raise ValueError("Insertions need an existing body row as their anchor")
+                start -= 1
+                old = [original[start]]
+                new = old + new
+            matches = []
+            for snapshot in snapshots:
+                scope = _scope(sources[path], snapshot.symbol[1])
+                if scope is None:
+                    continue
+                first = start + 1 - scope.start
+                last = first + len(old) - 1
+                if snapshot.first_body_line <= first <= last <= len(snapshot.lines):
+                    matches.append((snapshot, {"start": first, "end": last, "lines": new}))
+            if len(matches) != 1:
+                raise ValueError("The change must lie in the body of exactly one offered definition")
+            owner, edit = matches[0]
+            if selected is not None and selected != owner:
+                raise ValueError("Scoped edits must change only one offered definition")
+            selected = owner
+            edits.append(edit)
     normalized = json.dumps({"snapshot": selected.digest, "edits": edits})
     allowed = frozenset(range(selected.first_body_line, len(selected.lines) + 1))
     return apply_line_range_edit(normalized, sources, selected, allowed_rows=allowed, full_method=full_method and len(snapshots) == 1)

@@ -919,7 +919,10 @@ def test_helper_prompt_quotes_only_reviewed_production_protocol():
     assert "tests/storage" not in inferred
     helper.preview = "from ingest import Reader\ndef make(Reader):\n    return Reader()"
     prompt = _operator_function_messages(helper, review, sources, NEW_TEST, "")[-1]["content"]
-    assert "Production call and response handling" not in prompt
+    assert not production_protocol_example(helper.preview, sources, {"records"})
+    anchored = prompt.partition("Production call and response handling (quoted):")[2]
+    assert "ingest.py (Reader.collect)" in anchored
+    assert "secret" not in anchored and "unrelated" not in anchored
 
 
 @pytest.mark.parametrize("bulky", (False, True))
@@ -1181,7 +1184,22 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
     _exercise_numbered_review(solver_case, failover, caplog)
 
 
-def test_testfirst_function_recovers_malformed_module(solver_case, caplog, monkeypatch):
+def test_runtime_repair_requires_single_completed_case_and_its_own_frame():
+    from github_harness_agent.review_solver import _focused_runtime_hint, _PytestRun
+
+    path = "tests/test_demo.py"
+    source = "def test_value():\n    assert read(missing=True)\n"
+    node = path + "::test_value"
+    run = _PytestRun(0, frozenset({node}), 0, frozenset({node}))
+    report = {(0, node): path + ":2: TypeError\nE   TypeError: private runtime payload"}
+    assert _focused_runtime_hint(path, source, run, report) == "TypeError at authored line 2: assert read(missing=True)"
+    assert not _focused_runtime_hint(path, source, replace(run, named_cases=None), report)
+    assert not _focused_runtime_hint(path, source, run, {(0, node): "tests/conftest.py:1: TypeError"})
+    assert not _focused_runtime_hint(path, source, run, {(0, node): path + ":2: AssertionError"})
+
+
+@pytest.mark.parametrize("runtime", (False, True))
+def test_testfirst_function_recovers_malformed_module(solver_case, caplog, monkeypatch, runtime):
     from github_harness_agent import review_solver
 
     setup = (
@@ -1191,12 +1209,12 @@ def test_testfirst_function_recovers_malformed_module(solver_case, caplog, monke
     )
     monkeypatch.setattr(review_solver, "operator_acceptance_context",
                         lambda *_: "fixture\n" + json.dumps({"operator/test_setup.py": setup}))
-    _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-function", caplog)
+    _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-" + ("runtime-" if runtime else "") + "function", caplog)
     assert "Requesting a test-first function using approved setup helpers" in caplog.text
     assert "hidden operator assertion" not in caplog.text
 
 
-def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve):
+def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve, private_plan=None):
     task, _, runner, checkpoints = solver_case
     raw_mode = failover in {"raw", "raw-restored"}
     long_checkpoint = failover.startswith("checkpoint-")
@@ -1208,6 +1226,8 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
     early_case = "def test_dispatch_observable():\n    from fixture_calc import first\n    assert first() == 1\n"
     private_case = failover.endswith("-private")
     private_models = []
+    planning_calls = []
+    strategy = "Keep legacy reads on the old path and apply the correction to ordinary reads."
     early_routes = []
     retain_early = failover.endswith(("-testfirst", "-alternate", "-multistage", "-timeout", "-private", "-strengthen", "-function"))
     if failover.endswith("-multistage"):
@@ -1310,6 +1330,19 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
     class Gateway(FreeGateway):
         def complete(self, **kwargs):
             prompt = kwargs["messages"][-1]["content"]
+            if kwargs["role"] == "planning" and private_plan:
+                assert len(private_models) == 2 and not planning_calls and not kwargs["tools"]
+                assert "test_first" in prompt and "test_keep_helper" in prompt and "test_dispatch_observable" in prompt
+                assert "original target failed; previously passing control passed" in prompt
+                assert "-        return self.read() - 2" in prompt and "+        return self.read() + 2" in prompt
+                assert "def dispatch(self, legacy=False):" in prompt and "withheld-operator-source" not in prompt
+                planning_calls.append(True)
+                if private_plan == "unavailable":
+                    raise ProviderExhausted(None)
+                reply = super().complete(**{**kwargs, "role": "coding", "max_output_tokens": 3072})
+                reply.role = "planning"
+                reply.content = json.dumps({"strategy": strategy})
+                return reply
             if private_case and "Private regression repair. The numbered tentative method" in prompt:
                 assert "test_first" in prompt and "test_keep_helper" in prompt
                 assert "test_dispatch_observable" in prompt and "return self.read() + 2" in prompt
@@ -1317,6 +1350,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 assert "-        return self.read() - 2" in prompt and "+        return self.read() + 2" in prompt
                 if len(private_models) == 2:
                     assert "original target failed; previously passing control passed" in prompt
+                    assert (strategy in prompt) == (private_plan == "success")
                 assert "withheld-operator-source" not in prompt
                 assert tuple(private_models) == kwargs.get("exclude", ())
                 reply = super().complete(**{**kwargs, "max_output_tokens": 3072})
@@ -1330,14 +1364,21 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 )
                 return reply
             if failover.endswith("-function") and prompt.startswith("Write one original regression"):
-                assert early_routes == [("free-first", "model-first")]
+                assert early_routes[0] == ("free-first", "model-first")
+                if len(early_routes) == 2:
+                    assert "TypeError at authored line" in prompt and "assert observe(first, mistake=True)" in prompt
+                    assert "Previous function (quoted)" in prompt
                 assert tuple(early_routes) == kwargs["exclude"]
                 assert "def observe(function)" in prompt and "hidden operator assertion" not in prompt
                 assert "pinned ancestor should fail" in prompt
                 reply = super().complete(**{**kwargs, "max_output_tokens": 3072})
                 reply.route, reply.configured_model = "free-second", "model-second"
+                if len(early_routes) == 2:
+                    reply.route, reply.configured_model = "free-third", "model-third"
                 early_routes.append((reply.route, reply.configured_model))
                 reply.content = "def test_dispatch_observable():\n    assert observe(first) == 1\n"
+                if failover.endswith("-runtime-function") and len(early_routes) == 2:
+                    reply.content = reply.content.replace("observe(first)", "observe(first, mistake=True)")
                 return reply
             if prompt.startswith("Test-first regression"):
                 assert testfirst and len(line_attempts) == 1
@@ -1506,12 +1547,14 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
         if testfirst:
             gateway = Gateway("numbered", early_case, *(("second author",) if not failover.endswith(("-testfirst", "-multistage", "-unavailable")) else ()), "numbered", TEST)
             requests = 5
-            if failover.endswith("-strengthen"):
+            if failover.endswith(("-strengthen", "-runtime-function")):
                 gateway = Gateway("anchor", "malformed", "green smoke", "real regression", "caller", TEST)
                 requests = 6
             if private_case:
                 gateway = Gateway("anchor", early_case, "caller", "invalid", "undo", "repaired")
-                requests = 7
+                requests = 8 if private_plan else 7
+                if private_plan == "success":
+                    gateway = Gateway("anchor", early_case, "caller", "invalid", "undo", "strategy", "repaired")
     elif failover == "raw-restored":
         gateway = Gateway("def local_result():\n    return 1\n", TEST)
         requests = 2
@@ -1537,7 +1580,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
         repeats = 2 if semantic or failover.endswith("exhaustion") else int(caller_retry)
         assert remaining_offers == [f"Requesting checkpoint method edit: direct caller only Reader.dispatch (body rows={caller_rows})"] * repeats
         if testfirst:
-            assert len(early_routes) == (3 if failover.endswith("-strengthen") else 1 if failover.endswith(("-testfirst", "-multistage", "-unavailable", "-private")) else 2)
+            assert len(early_routes) == (3 if failover.endswith(("-strengthen", "-runtime-function")) else 1 if failover.endswith(("-testfirst", "-multistage", "-unavailable", "-private")) else 2)
             assert any(prompt.startswith("Test-first regression") for prompt in gateway.prompts)
             assert (b"test_dispatch_observable" in result.patch) == retain_early
         first_request = gateway.prompts[0]
@@ -1547,6 +1590,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
         assert "def unrelated" not in first_request and "withheld-operator-source" not in first_request
         assert "Observed pytest failure:" in first_request
         if private_case:
+            assert bool(planning_calls) == bool(private_plan)
             assert len(private_models) == 3 and b"(-2 if legacy else 2)" in result.patch
             outcomes = [r.getMessage() for r in caplog.records if r.msg.startswith("Private method repair outcome")]
             assert len(outcomes) == 3 and "malformed, attempt=1" in outcomes[0]
@@ -6072,3 +6116,8 @@ def test_private_tradeoff_requires_fresh_evidence_after_restart(solver_case, cap
         return result
 
     _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-private", caplog, run_solver=exercise)
+
+
+@pytest.mark.parametrize("outcome", ("success", "unavailable"))
+def test_private_method_uses_free_behavioral_plan_after_failed_repair(solver_case, caplog, outcome):
+    _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-private", caplog, private_plan=outcome)
