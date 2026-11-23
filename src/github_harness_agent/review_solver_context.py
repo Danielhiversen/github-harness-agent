@@ -649,6 +649,11 @@ def _protocol_result_uses(method, lines):
 
 def direct_caller_names(module, qualified):
     """Resolve unshadowed module calls and same-class instance calls in the reviewed file."""
+    return tuple(name for name, _ in direct_caller_sites(module, qualified))
+
+
+def direct_caller_sites(module, qualified):
+    """Return each caller and the source spans of its resolved calls."""
     owner, _, name = qualified.rpartition(".")
     if owner:
         classes = [n for n in module.body if isinstance(n, ast.ClassDef) and n.name == owner]
@@ -679,15 +684,17 @@ def direct_caller_names(module, qualified):
             target = shadow = name
         if shadow in _rebound_names(fn):
             continue
+        sites = []
         nodes = list(fn.body)
         while nodes:
             node = nodes.pop()
             if isinstance(node, (*_FUNCTION, ast.ClassDef, ast.Lambda, ast.comprehension)):
                 continue
             if isinstance(node, ast.Call) and _dotted_name(node.func) == target:
-                callers.append(f"{owner}.{fn.name}" if owner else fn.name)
-                break
+                sites.append((node.lineno, node.end_lineno))
             nodes.extend(ast.iter_child_nodes(node))
+        if sites:
+            callers.append((f"{owner}.{fn.name}" if owner else fn.name, tuple(sorted(sites))))
     return tuple(callers)
 
 

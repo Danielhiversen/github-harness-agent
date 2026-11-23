@@ -134,6 +134,7 @@ from .review_solver_context import (
     operator_test_assembly,
     production_protocol_example,
     direct_caller_names,
+    direct_caller_sites,
     prior_generated_fixture_context,
     prior_generated_test_seed,
     repository_pytest_context,
@@ -2479,6 +2480,26 @@ def _private_fragment_choices(response, source, snapshot, retry):
     return candidates
 
 
+def _private_direct_call_context(sources, symbol):
+    path, name = symbol
+    source = sources[path]
+    try:
+        callers = direct_caller_sites(ast.parse(source), name)
+    except (SyntaxError, ValueError, RecursionError):
+        return ""
+    lines = source.splitlines()
+    excerpts = []
+    for caller, sites in callers:
+        for first, last in sites[:2 - len(excerpts)]:
+            rows = lines[max(0, first - 2):min(last + 1, first + 5)]
+            excerpts.append(f"{caller}, line {first}:\n" + excerpt("\n".join(rows), 450))
+        if len(excerpts) == 2:
+            break
+    if not excerpts:
+        return ""
+    return "\nDirect call sites in the tentative file (read-only):\n" + "\n".join(excerpts) + "\n"
+
+
 def _private_method_retry(current, repair, target, review, origin_diagnostic="", choice_limit=0):
     snapshot = prepare_line_range_edit(repair.sources, repair.private_symbol)
     if snapshot is None:
@@ -2525,7 +2546,8 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="",
     def fits(prompt, limit):
         return wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": prompt}]) <= limit
 
-    if (not repair.retries or choices or repair.retry_fragment_format) and fragment:
+    exhausted_literal = bool(fragment and fragment.literal and len(repair.literal_observations) >= 2)
+    if fragment and not exhausted_literal and (not repair.retries or choices or repair.retry_fragment_format):
         first, last = fragment.first, fragment.last
         visible_first = max(snapshot.first_body_line, first - 5)
         local = "\n".join(snapshot.lines[visible_first - 1:first - 1])
@@ -2567,22 +2589,34 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="",
             return _LineRetry(None, snapshot, allowed_rows=frozenset(range(first, last + 1)),
                               prompt=with_observations(prompt, 6200), checkout=repair.sources,
                               statement_fragment=fragment, fragment_choices=choices)
-    reason = "retry-full-method" if repair.retries else "fragment-prompt-limit" if fragment else selection.reason
+    if exhausted_literal:
+        reason = "checked-literal-exhaustion"
+        context += (
+            "The checked literal replacements were rejected. Use the whole tentative method to make a "
+            "coordinated edit where needed, using the observed outcomes below. Preserve both behaviors.\n"
+        )
+    else:
+        reason = "retry-full-method" if repair.retries else "fragment-prompt-limit" if fragment else selection.reason
+    calls = _private_direct_call_context(repair.sources, snapshot.symbol) if exhausted_literal else ""
     delta = "\n".join(difflib.unified_diff(
         accepted.lines, snapshot.lines, fromfile="accepted method", tofile="tentative method", n=1, lineterm="",
     ))
     numbered = line_range_prompt(snapshot, visible_rows=visible, full_method=True) + _SINGLE_METHOD_ENDING
     for allowance in (1800, 900, 400, 0):
         evidence = "\nVerified change that fixed the target and broke the control (quoted diff):\n" + excerpt(delta, allowance) + "\n" if allowance else ""
-        prompt = context + evidence + numbered
-        if fits(prompt, RETRY_MESSAGE_BYTES):
+        base_prompt = context + evidence + numbered
+        if fits(base_prompt, RETRY_MESSAGE_BYTES):
+            prompt = with_observations(context + evidence, RETRY_MESSAGE_BYTES, numbered)
+            if exhausted_literal and allowance and prompt == base_prompt:
+                continue
             log_selection("full-method", reason)
+            if calls and fits(calls + prompt, RETRY_MESSAGE_BYTES):
+                prompt = calls + prompt
             return _LineRetry(None, snapshot, allowed_rows=allowed,
-                              prompt=with_observations(context + evidence, RETRY_MESSAGE_BYTES, numbered),
-                              checkout=repair.sources,
-                              checkpoint_method_edit=True,
+                              prompt=prompt, checkout=repair.sources, checkpoint_method_edit=True,
                               raw_context=(with_observations(context + evidence, RETRY_MESSAGE_BYTES)
-                                           if repair.retries and repair.retries > repair.stalled_edits else ""))
+                                           if repair.retries and repair.retries > repair.stalled_edits
+                                           and not exhausted_literal else ""))
     log_selection("unavailable", "full-method-prompt-limit")
     return None
 

@@ -38,6 +38,8 @@ from github_harness_agent.task_context import compact_focused_review, wire_size
 from github_harness_agent.review_solver import (
     LINE_RANGE_ENDING,
     _GUIDANCE,
+    _RegressionRepair,
+    _private_method_retry,
     _generic_verifier_failure,
     _rejected_attempt,
     _unpublished_case_detail,
@@ -6370,3 +6372,57 @@ def test_scoped_fragment_option_wrappers_keep_one_valid_candidate(reply):
 
 def test_private_literal_editor_accepts_fifteen_line_repair(solver_case, caplog):
     _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-private", caplog, fragment_case="literal-wide")
+
+
+def test_repeated_checked_literal_replacements_open_the_method_with_direct_call_context():
+    path = "queue.py"
+    suite = "".join(f"        total += {i}\n" for i in range(30))
+    accepted = {path: (
+        "def collect(enabled):\n"
+        "    total = 0\n"
+        "    if False:\n"
+        + suite
+        + "    return total\n\n"
+        "def dispatch(mode):\n"
+        "    collected = collect(mode == 'full')\n"
+        "    return min(collected, 50)\n\n"
+        "def unrelated(collect):\n"
+        "    return collect('unrelated')\n"
+    )}
+    tentative = {path: accepted[path].replace(
+        "    if False:", "    allow = True\n    active = allow\n    if active:"
+    )}
+    origin, control = (0, "test_new_behavior"), (1, "test_old_behavior")
+    review = SimpleNamespace(feedback=((path, 3, "Preserve both modes."),))
+    origin_diagnostic = "test failed\nObserved pytest failure: target got 0"
+    repair = _RegressionRepair(
+        origin, tentative, {control: "test failed\nObserved pytest failure: control got 50"},
+        {origin}, {control}, private_symbol=(path, "collect"),
+    )
+
+    literal = _private_method_retry(accepted, repair, control, review, origin_diagnostic)
+    assert literal.statement_fragment.literal
+    assert len(literal.allowed_rows) == 3
+    assert "collected = collect" not in literal.prompt
+
+    checked = replace(
+        repair, retries=1, retry_fragment_choices=True,
+        literal_observations=("Replacement A: target failed, control passed.",),
+    )
+    alternatives = _private_method_retry(accepted, checked, control, review, origin_diagnostic, choice_limit=2)
+    assert alternatives.fragment_choices == 2
+
+    exhausted = replace(
+        checked, retries=2, stalled_edits=2, retry_fragment_format=True,
+        literal_observations=(*checked.literal_observations, "Replacement B: target passed, control failed."),
+    )
+    broader = _private_method_retry(accepted, exhausted, control, review, origin_diagnostic, choice_limit=2)
+    assert broader.complete_single_method
+    assert broader.statement_fragment is None
+    assert 2 in broader.allowed_rows and len(broader.allowed_rows) > 30
+    for evidence in ("Replacement A:", "Replacement B:", "control got 50", "target got 0"):
+        assert evidence in broader.prompt
+    assert "Direct call sites in the tentative file (read-only)" in broader.prompt
+    assert "collected = collect(mode == 'full')" in broader.prompt
+    assert "return min(collected, 50)" in broader.prompt
+    assert "unrelated" not in broader.prompt
