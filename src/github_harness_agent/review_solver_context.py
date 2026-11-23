@@ -602,14 +602,14 @@ def _mock_bindings(body):
     return bindings
 
 
-def _mock_payload(node, bindings, depth=0):
-    if depth >= 3:
+def _mock_payload(node, bindings, depth=0, *, max_depth=3):
+    if depth >= max_depth:
         return "..."
     if isinstance(node, ast.Name):
         node = bindings.get(node.id)
     if isinstance(node, ast.Dict):
         entries = [
-            f"{key.value!r}: {_mock_payload(value, bindings, depth + 1)}"
+            f"{key.value!r}: {_mock_payload(value, bindings, depth + 1, max_depth=max_depth)}"
             for key, value in zip(node.keys[:5], node.values[:5])
             if isinstance(key, ast.Constant) and isinstance(key.value, str)
             and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,47}", key.value)
@@ -618,7 +618,7 @@ def _mock_payload(node, bindings, depth=0):
             entries.append("...")
         return "{" + ", ".join(entries) + "}"
     if isinstance(node, (ast.Tuple, ast.List)):
-        first = _mock_payload(node.elts[0], bindings, depth + 1) if node.elts else ""
+        first = _mock_payload(node.elts[0], bindings, depth + 1, max_depth=max_depth) if node.elts else ""
         if len(node.elts) > 1 and first != "...":
             first += ", ..."
         return f"[{first}]" if isinstance(node, ast.List) else f"({first},)" if first else "()"
@@ -748,8 +748,74 @@ def _usage_relevance(symbol, query_words):
     return len(_words(symbol.replace("_", " ")) & query_words)
 
 
+def _temporary_path(node):
+    parts = []
+    while isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div) and len(parts) < 3:
+        part = node.right
+        if not (
+            isinstance(part, ast.Constant) and isinstance(part.value, str)
+            and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,47}", part.value)
+        ):
+            return ""
+        parts.append(repr(part.value))
+        node = node.left
+    if parts and isinstance(node, ast.Name) and node.id == "tmp_path":
+        return " / ".join(("tmp_path", *reversed(parts)))
+    return ""
+
+
+def _temporary_file_shapes(setup, module_bindings, imports, fixture_names):
+    if "tmp_path" in fixture_names:
+        return
+    for fixture in sorted(setup, key=lambda item: item.lineno):
+        arguments = _fixture_arguments(fixture)
+        rebound = set(_rebound_names(fixture))
+        if "tmp_path" not in arguments or "tmp_path" in rebound:
+            continue
+        bound = arguments | rebound
+        for call, _, _ in _mock_actions(fixture.body):
+            if not isinstance(call.func, ast.Attribute) or call.func.attr not in ("write_text", "write_bytes"):
+                continue
+            bindings = {
+                **{name: item for name, item in module_bindings.items() if name not in bound},
+                **_mock_bindings([item for item in fixture.body if item.lineno < call.lineno]),
+            }
+            receiver = call.func.value
+            location = bindings.get(receiver.id) if isinstance(receiver, ast.Name) else receiver
+            if not (path := _temporary_path(location)):
+                continue
+            used_imports = set()
+
+            def render_args(expression, depth):
+                return ", ".join((
+                    *(render(item, depth) for item in expression.args),
+                    *(f"{kw.arg}={render(kw.value, depth)}" if kw.arg else "**..." for kw in expression.keywords),
+                ))
+
+            def render(item, depth):
+                value = bindings.get(item.id, item) if isinstance(item, ast.Name) else item
+                if depth and isinstance(value, ast.Call):
+                    name = _dotted_name(value.func)
+                    root = name.split(".", 1)[0]
+                    if root in imports and root not in bound:
+                        used_imports.add(imports[root])
+                        return f"{name}({render_args(value, depth - 1)})"
+                shape = _mock_payload(value, bindings, max_depth=5)
+                return _shape_operand(item) if shape == "..." else shape
+
+            target = receiver.id if isinstance(receiver, ast.Name) else f"({path})"
+            write = f"{target}.{call.func.attr}({render_args(call, 2)})"
+            if len(write.encode()) <= 300:
+                yield (
+                    f"# Module-local fixture {fixture.name}({', '.join(sorted(arguments))})",
+                    *(ast.unparse(item) for item in sorted(used_imports, key=lambda item: item.lineno)),
+                    *((f"{target} = {path}",) if isinstance(receiver, ast.Name) else ()),
+                    write,
+                )
+
+
 def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usage_bytes=820):
-    """Return a small example plus bounded tracked API and mock setup shapes."""
+    """Return a small example plus bounded tracked API and fixture setup shapes."""
     modules = _reviewed_modules(sources)
     if not any(modules.values()):
         return "", ""
@@ -757,8 +823,8 @@ def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usag
     query_words = _words(query.replace("_", " "))
     example = ""
     shapes = []
-    mock_usage = ()
-    mock_rank = (-1, False)
+    setup_usage = ()
+    setup_rank = (-1, False)
 
     try:
         with tarfile.open(fileobj=BytesIO(archive), mode="r:") as snapshot:
@@ -816,15 +882,22 @@ def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usag
                             setup = _local_fixture_setup(node, fixtures)
                             if setup is not None:
                                 mock_rows = _mock_setup_shapes(node, setup, module_bindings, patches, fixtures.keys())
-                                matched = _usage_relevance(" ".join((symbol, node.name, *mock_rows)), query_words)
-                                rank = matched, "." in symbol
-                                context = (f"# {path}::{node.name} tracked mock setup and API usage", *mock_rows, *invocation)
-                                if (
-                                    mock_rows and rank > mock_rank
-                                    and len("\n".join(context).encode()) + 1 <= usage_bytes
-                                ):
-                                    mock_rank = rank
-                                    mock_usage = context
+                                file_rows = tuple(_temporary_file_shapes(setup, module_bindings, imports, fixtures.keys()))
+                                variants = [
+                                    *(("mock and temporary-file", (*mock_rows, *rows)) for rows in file_rows if mock_rows),
+                                    ("mock", mock_rows),
+                                    *(("temporary-file", rows) for rows in file_rows),
+                                ]
+                                for kind, rows in variants:
+                                    matched = _usage_relevance(" ".join((symbol, node.name, *rows)), query_words)
+                                    rank = matched, "." in symbol
+                                    context = (f"# {path}::{node.name} tracked {kind} setup and API usage", *rows, *invocation)
+                                    if (
+                                        rows and rank > setup_rank
+                                        and len("\n".join(context).encode()) + 1 <= usage_bytes
+                                    ):
+                                        setup_rank = rank
+                                        setup_usage = context
                     if example or node in members:
                         continue
                     if not any(
@@ -856,9 +929,9 @@ def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usag
                             return example, ""
     except (tarfile.TarError, OSError, EOFError):
         pass
-    usage = ["\n".join(mock_usage)] if mock_usage else []
-    shown = set(mock_usage)
-    if mock_usage:
+    usage = ["\n".join(setup_usage)] if setup_usage else []
+    shown = set(setup_usage)
+    if setup_usage:
         usage_bytes -= len(usage[0].encode()) + 1
     for _, _, path, rows in sorted(shapes, key=lambda item: item[:2], reverse=True):
         additions = [row for row in rows if row not in shown]

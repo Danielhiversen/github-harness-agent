@@ -870,7 +870,7 @@ def _failed_test_line_snapshot(path, draft, diagnostic, run):
     return None
 
 
-def _test_line_messages(snapshot, note, current):
+def _test_line_messages(snapshot, note, current, *, repository_usage=""):
     path, _ = snapshot.symbol
     production = {name: code for name, code in current.items() if name != path}
     failure_source = test_failure_focus(production, note)
@@ -886,6 +886,7 @@ def _test_line_messages(snapshot, note, current):
                 "Repair the failing test setup or call and keep the tested behavior and assertions. "
                 "Use the sample JSON structure with your actual replacement lines.\n"
                 + failure_source
+                + (REPOSITORY_PYTEST_USAGE + excerpt(repository_usage, 820) + "\n" if repository_usage else "")
                 + line_range_prompt(snapshot) + LINE_RANGE_ENDING
             ),
         },
@@ -4243,7 +4244,9 @@ def solve(executor, task, archive, budget, version):
                         ),
                     )
                     if test_line_snapshot is not None:
-                        messages = _test_line_messages(test_line_snapshot, note, source)
+                        messages = _test_line_messages(
+                            test_line_snapshot, note, source, repository_usage=repository_usage,
+                        )
                     elif scoped_line:
                         messages = [
                             {"role": "system", "content": _LINE_RANGE_SYSTEM},

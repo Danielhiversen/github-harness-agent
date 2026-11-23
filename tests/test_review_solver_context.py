@@ -412,6 +412,71 @@ def test_repository_usage_keeps_patch_object_targets_and_variable_payload_shapes
     assert "assert_called_once" not in usage
 
 
+@pytest.mark.parametrize("with_factory", (False, True))
+def test_oversized_temporary_file_fixture_keeps_shape_in_numbered_retry(with_factory):
+    archive = BytesIO()
+    path = "src/example/configuration.py"
+    new_path = "tests/test_regression.py"
+    factory_import = "from example.samples import make_spec\n" if with_factory else ""
+    data = (
+        "make_spec(profile='private test profile')"
+        if with_factory else "{'records': [{'meta': {'channel': 'private test profile'}}], 'version': 1}"
+    )
+    source = (
+        "import json\n"
+        "import pytest\nfrom unittest.mock import patch\n"
+        + factory_import
+        + "from example.configuration import load_config\n"
+        "def test_small_helper():\n"
+        "    assert load_config(None) is not None\n"
+        "@pytest.fixture\n"
+        "def config_path(tmp_path):\n"
+        + "    # setup details too large for the complete example\n" * 30
+        + f"    payload = {data}\n"
+        "    path = tmp_path / 'config.json'\n"
+        "    path.write_text(json.dumps(payload), encoding='utf-8')\n"
+        "    return path\n"
+        "def test_file_configuration(config_path):\n"
+        "    with patch('example.configuration.send', return_value={'messages': []}):\n"
+        "        result = load_config(config_path)\n"
+        "    assert result == 'hidden expected result'\n"
+    )
+    with tarfile.open(fileobj=archive, mode="w") as snapshot:
+        raw = source.encode()
+        entry = tarfile.TarInfo("tests/test_configuration.py")
+        entry.size = len(raw)
+        snapshot.addfile(entry, BytesIO(raw))
+    production = {path: "def load_config(path):\n    return path.read_text()\n"}
+    example, usage = review_solver_context.repository_pytest_context(
+        archive.getvalue(), production, "load config records", usage_bytes=650,
+    )
+    assert "test_small_helper" in example
+    assert "def config_path" not in example
+    assert "fixture config_path(tmp_path)" in usage
+    assert "path = tmp_path / 'config.json'" in usage
+    payload = "make_spec(profile=...)" if with_factory else "{'records': [{'meta': {'channel': ...}}], 'version': ...}"
+    assert f"path.write_text(json.dumps({payload}), encoding=...)" in usage
+    assert "result = load_config(config_path)" in usage
+    assert "example.configuration.send" in usage and "'messages'" in usage
+    assert "private test profile" not in usage and "hidden expected result" not in usage
+    assert len(usage.encode()) <= 650
+
+    draft = "def test_config(tmp_path):\n    assert tmp_path.read_text()\n"
+    case = f"{new_path}::test_config"
+    note = f"Selected failing case: {case}\n{path}:2: ValueError: expected file schema"
+    run = review_solver._PytestRun(0, frozenset({case}), 0, frozenset({case}))
+    snapshot = review_solver._failed_test_line_snapshot(new_path, draft, note, run)
+    messages = review_solver._test_line_messages(
+        snapshot, note, {**production, new_path: draft}, repository_usage=usage,
+    )
+    prompt = messages[-1]["content"]
+    assert "ValueError: expected file schema" in prompt
+    assert "return path.read_text()" in prompt
+    assert "path.write_text(json.dumps(" in prompt
+    assert "result = load_config(config_path)" in prompt
+    assert prompt.endswith(review_solver.LINE_RANGE_ENDING)
+
+
 def test_test_repair_prioritizes_the_missing_fixture_and_setup_frame():
     path = "src/example/formatting.py"
     new_path = "tests/test_review_regressions.py"
