@@ -428,3 +428,29 @@ def test_statement_fragment_uses_exact_suite_and_declines_scattered_or_stale_cha
     for invalid in ("if item_1:", "def other_method(): return 8", 'item_3 = """unterminated', "pass\n"*19):
         with pytest.raises(ValueError):
             apply_statement_fragment(invalid, tentative, edited, selected)
+
+
+def test_complete_method_accepts_seven_small_disjoint_edits_with_original_limits():
+    from github_harness_agent.review_solver import _BLOCK
+
+    sources, snapshot, _ = _long_body()
+    lines = list(snapshot.lines)
+    records = []
+    for i in range(0, 14, 2):
+        row = lines.index(f"        item_{i} = {i}")
+        lines[row] += " + 1"
+        records.append(_edit(row + 1, row + 1, lines[row]))
+
+    def apply(reply):
+        return apply_offered_line_reply(reply, sources, (snapshot,), block_pattern=_BLOCK, full_method=True)
+
+    method = "\n".join(lines)
+    result = apply(method)
+    assert result[PATH] == sources[PATH].replace("\n".join(snapshot.lines), method)
+    with pytest.raises(ValueError, match="range count outside parser limit"):
+        apply(json.dumps({"edits": records}))
+    with pytest.raises(ValueError):
+        apply(method + "\n    def unrelated(self):\n        return 123")
+    oversized = [line + " + 1" if "item_" in line and "=" in line else line for line in lines]
+    with pytest.raises(ValueError, match="changed-row limit"):
+        apply("\n".join(oversized))

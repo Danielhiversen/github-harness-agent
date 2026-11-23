@@ -357,10 +357,21 @@ def _complete_method_edits(text, snapshot):
         raise ValueError("Complete method must preserve the exact header and decorators")
     old = snapshot.lines[body:]
     new = rows[body:]
+    changes = [span[1:] for span in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
+               if span[0] != "equal"]
+    # A complete definition has no hand-authored range boundaries. Join the
+    # nearest anchored changes to avoid quoting unnecessary unchanged context.
+    if len(changes) > _MAX_EDITS:
+        bridges = sorted(range(1, len(changes)), key=lambda i: changes[i][0] - changes[i - 1][1])
+        merge_at = set(bridges[:len(changes) - _MAX_EDITS])
+        groups = []
+        for index, (i, j, k, n) in enumerate(changes):
+            if index in merge_at:
+                i, _, k, _ = groups.pop()
+            groups.append((i, j, k, n))
+        changes = groups
     edits = []
-    for op, i, j, k, n in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
-        if op == "equal":
-            continue
+    for i, j, k, n in changes:
         replacement = new[k:n]
         if i == j:
             if i:
