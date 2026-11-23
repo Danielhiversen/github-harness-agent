@@ -2424,15 +2424,17 @@ def _private_changed_method(current, tentative):
     return None
 
 
-def _fragment_option_texts(response, limit):
-    if not isinstance(response, str) or len(response.encode()) > 12 * 1024:
+def _fragment_option_texts(response, limit, *, fences_only=False):
+    max_bytes = 4096 if fences_only else 12 * 1024
+    if not isinstance(response, str) or len(response.encode()) > max_bytes:
         raise ValueError("Expected a bounded private fragment response")
     text = response.strip().replace("\r\n", "\n")
-    if text.startswith("["):
+    if not fences_only and text.startswith("["):
         json_text = text
     else:
         blocks = list(re.finditer(r"(?ms)^```(json|python|py)[ \t]*\n(.*?)^```[ \t]*(?=\n|$)", text, re.I))
-        if not 1 <= len(blocks) <= limit or text.count("```") != 2 * len(blocks):
+        minimum = 2 if fences_only else 1
+        if not minimum <= len(blocks) <= limit or text.count("```") != 2 * len(blocks):
             raise ValueError("Expected a JSON array or separate labeled Python fences")
         ends = [0, *(block.end() for block in blocks)]
         starts = [*(block.start() for block in blocks), len(text)]
@@ -2444,7 +2446,7 @@ def _fragment_option_texts(response, limit):
             raise ValueError("Unexpected text outside private fragment options")
         if all(block[1].lower() in {"python", "py"} for block in blocks):
             return [block[2] for block in blocks]
-        if len(blocks) != 1 or blocks[0][1].lower() != "json":
+        if fences_only or len(blocks) != 1 or blocks[0][1].lower() != "json":
             raise ValueError("Mixed private fragment option formats")
         json_text = blocks[0][2]
     try:
@@ -2457,7 +2459,7 @@ def _fragment_option_texts(response, limit):
 
 
 def _private_fragment_choices(response, source, snapshot, retry):
-    options = _fragment_option_texts(response, retry.fragment_choices)
+    options = _fragment_option_texts(response, retry.fragment_choices or 3, fences_only=not retry.fragment_choices)
     candidates = []
     signatures = set()
     for option in options:
@@ -6336,7 +6338,11 @@ def solve(executor, task, archive, budget, version):
                             raise ValueError("The pytest edit did not change the draft.")
                     if candidate is None and active_line_snapshot is not None:
                         if scoped_line and line_retry.statement_fragment:
-                            if line_retry.fragment_choices:
+                            fenced_alternatives = (
+                                line_retry.statement_fragment.literal and isinstance(completion.content, str)
+                                and completion.content.count("```") > 2
+                            )
+                            if line_retry.fragment_choices or fenced_alternatives:
                                 candidate, *alternative_candidates = _private_fragment_choices(
                                     completion.content, source, active_line_snapshot, line_retry,
                                 )

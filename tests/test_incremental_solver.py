@@ -1292,7 +1292,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
         body = "        offset = (\n            0\n" + parts + header + "            + 0\n        )\n        return self.read() - 2 + offset\n"
         production = production.replace("        return self.read() - 2\n", body)
         caller_rows = len(body.splitlines())
-    elif fragment_case in {"literal", "literal-wide", "choices", "mixed-fences", "history"}:
+    elif fragment_case in {"literal", "literal-wide", "choices", "mixed-fences", "history", "spontaneous-fences"}:
         header = "        if False:\n"
         tentative_header = "        choose = True\n        enabled = choose\n        if enabled:\n"
         wide_body = "".join(f"            context_{i} = {i}\n" for i in range(32))
@@ -1384,7 +1384,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 reply.content = "+ (0 if legacy else 4)"
                 private_models.append((reply.route, reply.configured_model))
                 return reply
-            if fragment_case in {"literal", "literal-wide", "choices", "mixed-fences", "history"} and "replacement lines for the exact tentative hunk" in prompt:
+            if fragment_case in {"literal", "literal-wide", "choices", "mixed-fences", "history", "spontaneous-fences"} and "replacement lines for the exact tentative hunk" in prompt:
                 if dynamic_facts:
                     assert "target-observed=-3 expected=1" in prompt
                     assert "control-observed=1 expected=-3" in prompt
@@ -1412,7 +1412,14 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                     else:
                         reply.content = "if bool(legacy):"
                 else:
-                    if fragment_case == "literal-wide":
+                    if fragment_case == "spontaneous-fences":
+                        assert "JSON array" not in prompt
+                        reply.content = (
+                            "Two alternatives for the same hunk:\n"
+                            "Option 1:\n```python\nif False:\n```\n"
+                            "Option 2:\n```py\nif not legacy:\n```"
+                        )
+                    elif fragment_case == "literal-wide":
                         assert "24 changed old and new rows" in prompt and "32 physical rows" in prompt
                         conditions = ["flags = [legacy]"] + ["flags.append(legacy)" for _ in range(12)]
                         reply.content = "\n".join([*conditions, "legacy = any(flags)", "if not legacy:"])
@@ -1599,7 +1606,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                             if failover.endswith("-multistage"):
                                 assert "Checkpoint assertion at line 4: assert first() == 1" in prompt
                                 assert "Pinned ancestor assertion at line 3: assert second() == 2" in prompt
-                    if fragment_case in {"literal", "literal-wide", "choices", "mixed-fences", "blank", "history"}:
+                    if fragment_case in {"literal", "literal-wide", "choices", "mixed-fences", "blank", "history", "spontaneous-fences"}:
                         reply.content = edit(SOURCE, header, tentative_header)
                     elif semantic:
                         if len(line_attempts) == 1:
@@ -1720,7 +1727,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 assert any("mode=literal-hunk reason=single-literal-hunk hunks=1 changed_old=1 changed_new=3" in rec.getMessage()
                            for rec in caplog.records)
                 return
-            if fragment_case in {"literal", "literal-wide", "choices", "mixed-fences", "history"}:
+            if fragment_case in {"literal", "literal-wide", "choices", "mixed-fences", "history", "spontaneous-fences"}:
                 private_count = 3 if fragment_case == "history" else 2 if fragment_case in {"choices", "mixed-fences"} else 1
                 assert len(private_models) == private_count and b"+        if not legacy:" in result.patch
                 assert b"choose = True" not in result.patch
@@ -6361,6 +6368,37 @@ def test_visible_control_and_hidden_target_report_dynamic_facts_to_each_fragment
 def test_private_fragment_choices_verify_independent_options(solver_case, caplog):
     _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-private", caplog, fragment_case="choices")
     assert "Verified another independent private fragment option; remaining checks=0" in caplog.text
+
+
+def test_initial_literal_hunk_checks_independent_fenced_alternatives(solver_case, caplog):
+    _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-private", caplog,
+                              fragment_case="spontaneous-fences")
+    assert "Verified another independent private fragment option; remaining checks=0" in caplog.text
+
+
+@pytest.mark.parametrize("reply", [
+    '```python\nif False:\n```\n```json\n["if True:"]\n```',
+    '```python\nif False:\n```\n```py\nother.py\n```',
+    '```python\nif False:\n```\n```py\n@@ -1 +1 @@\n```',
+    '```python\nif False:\n```\nUse other.py before continuing.\n```py\nif True:\n```',
+    '```python\nif False:\n```\nReplace the entire method.\n```py\nif True:\n```',
+    ('```python\nif False:\n```\n' * 4).strip(),
+    '```python\nif False:  #' + ('x' * 4096) + '\n```\n```py\nif True:\n```',
+])
+def test_initial_literal_hunk_rejects_ambiguous_or_oversized_option_wrappers(reply):
+    from github_harness_agent.review_line_ranges import prepare_line_range_edit, select_statement_fragment
+    from github_harness_agent.review_solver import _LineRetry, _private_fragment_choices
+
+    key = ("example.py", "calculate")
+    body = "        work()\n" * 20 + "        return 1\n    return 0\n"
+    accepted = {key[0]: "def calculate():\n    if False:\n" + body}
+    tentative = {key[0]: "def calculate():\n    enabled = True\n    if enabled:\n" + body}
+    snapshot = prepare_line_range_edit(tentative, key)
+    fragment = select_statement_fragment(prepare_line_range_edit(accepted, key), snapshot).fragment
+    retry = _LineRetry(None, snapshot, statement_fragment=fragment)
+    assert fragment.literal
+    with pytest.raises(ValueError):
+        _private_fragment_choices(reply, tentative, snapshot, retry)
 
 
 def test_private_literal_history_keeps_each_verified_option(solver_case, caplog):
