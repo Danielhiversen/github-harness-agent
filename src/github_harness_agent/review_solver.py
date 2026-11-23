@@ -85,8 +85,10 @@ from .review_mock_replay import (
 )
 from .review_line_ranges import (
     LINE_RANGE_ENDING,
+    NATIVE_LINE_RANGE_TOOL,
     LineRangeSnapshot,
     apply_line_range_edit,
+    apply_native_line_range_edit,
     line_range_prompt,
     prepare_line_range_edit,
     prepare_loop_line_range_edit,
@@ -1641,6 +1643,7 @@ def _coding_completion(
     line_snapshot=None,
     scoped_line=False,
     native_test_path=None,
+    native_line_retry=None,
 ):
     fresh_advice = None
     if planner_input is not None:
@@ -1677,9 +1680,13 @@ def _coding_completion(
             {**messages[0], "content": messages[0]["content"] + "\n" + CAUSAL_EDIT_GUIDANCE},
             *messages[1:],
         ]
-    if native_source is not None or native_test_path is not None:
+    if native_source is not None or native_test_path is not None or native_line_retry is not None:
         focused = compact_focused_review(messages, max_bytes=12 * 1024) or messages
-        if native_test_path is not None:
+        if native_line_retry is not None:
+            request = native_line_retry.native_prompt
+            tool = NATIVE_LINE_RANGE_TOOL
+            instruction = "Call replace_python_line_ranges exactly once with the numbered edits."
+        elif native_test_path is not None:
             request = focused[-1]["content"].removesuffix(TEST_MODULE_REPLY_ENDING)
             tool = _TEST_MODULE_TOOL
             instruction = (
@@ -1722,8 +1729,14 @@ def _coding_completion(
                 after_provider=route,
                 max_output_tokens=3072 if native_test_path is not None else 2048,
                 retry_oversize=False,
+                **({"exclude": exclude} if native_line_retry is not None else {}),
             )
-            if native_test_path is None:
+            if native_line_retry is not None:
+                candidate = apply_native_line_range_edit(
+                    completion.tool_calls, native_line_retry.checkout, native_line_retry.snapshot,
+                    allowed_rows=native_line_retry.allowed_rows,
+                )
+            elif native_test_path is None:
                 candidate = apply_native_definition(completion.tool_calls, native_source)
             else:
                 candidate = _apply_native_test_module(
@@ -1817,6 +1830,9 @@ class _LineRetry:
     prompt: str = ""
     checkout: dict[str, str] | None = None
     excluded_models: tuple[tuple[str, str], ...] = ()
+    native_prompt: str = ""
+    native_ready: bool = False
+    native_attempted: bool = False
 
 
 def _review_anchored_line_retry(review, sources, path, node, diagnostic):
@@ -1850,7 +1866,10 @@ def _review_anchored_line_retry(review, sources, path, node, diagnostic):
     def bounded_retry(snapshot, visible, allowed):
         prompt = heading + line_range_prompt(snapshot, visible_rows=visible) + LINE_RANGE_ENDING
         if wire_size([{"role": "user", "content": prompt}]) <= 7500:
-            return _LineRetry(None, snapshot, allowed, prompt, checkout=sources)
+            native_prompt = heading + line_range_prompt(snapshot, visible_rows=visible, native=True)
+            return _LineRetry(
+                None, snapshot, allowed, prompt, checkout=sources, native_prompt=native_prompt,
+            )
         return None
 
     if len(snapshot.lines) <= 90:
@@ -3510,7 +3529,7 @@ def solve(executor, task, archive, budget, version):
     iteration_attempted = set()
     anchored_line_attempted = set()
 
-    def retry_numbered_route(target, line_retry, editor):
+    def retry_numbered_route(target, line_retry, editor, *, malformed=False):
         if (
             line_retry is None
             or line_retry.checkout is not current
@@ -3523,6 +3542,7 @@ def solve(executor, task, archive, budget, version):
         if model not in line_retry.excluded_models:
             line_retries[target] = replace(
                 line_retry, excluded_models=(*line_retry.excluded_models, model),
+                native_ready=line_retry.native_ready or malformed,
             )
 
     def queue_review_anchored_retry(target):
@@ -4181,6 +4201,12 @@ def solve(executor, task, archive, budget, version):
                     scoped_line = (
                         line_retry is not None and line_retry.allowed_rows is not None
                     )
+                    native_line = (
+                        scoped_line and line_retry.native_ready and not line_retry.native_attempted
+                        and launch_budget >= 2
+                    )
+                    if native_line:
+                        line_retry = replace(line_retry, native_attempted=True)
                     advice = (
                         line_retry.advice
                         if line_retry
@@ -4562,6 +4588,7 @@ def solve(executor, task, archive, budget, version):
                         line_snapshot=line_retry.snapshot if line_retry else None,
                         scoped_line=scoped_line,
                         native_test_path=new_path if native_test else None,
+                        native_line_retry=line_retry if native_line else None,
                     )
                     pending[future] = (
                         target,
@@ -4593,7 +4620,7 @@ def solve(executor, task, archive, budget, version):
                         stock_hedge = _StockHedge(
                             future, launched_at + _STOCK_HEDGE_DELAY, messages, route, exclude
                         )
-                    cost = 2 if native or native_test or planner_input is not None else 1
+                    cost = 2 if native or native_test or native_line or planner_input is not None else 1
                     submitted += cost
                     launch_budget -= cost
             if not pending:
@@ -4875,7 +4902,7 @@ def solve(executor, task, archive, budget, version):
                 if line_followup is not None and snapshot is current:
                     line_retries[target] = line_followup
                 notes[target] = str(error)[:400]
-                retry_numbered_route(target, line_retry, editor)
+                retry_numbered_route(target, line_retry, editor, malformed=True)
                 if repair is not None and repair.stock_origin:
                     regression_repair = _retry_stock_repair(
                         repair,

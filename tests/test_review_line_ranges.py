@@ -4,6 +4,7 @@ import pytest
 
 from github_harness_agent.review_line_ranges import (
     apply_line_range_edit,
+    apply_native_line_range_edit,
     line_range_prompt,
     prepare_line_range_edit,
 )
@@ -40,6 +41,33 @@ def _reply(snapshot, *edits):
 
 def _edit(start, end, *lines):
     return {"start": start, "end": end, "lines": list(lines)}
+
+
+def test_native_line_ranges_use_only_the_pending_snapshot_and_displayed_rows():
+    sources = {PATH: SOURCE}
+    snapshot = _prepare(sources)
+    arguments = json.dumps({"edits": [_edit(7, 7, "        return result + 2")]})
+    function = {"name": "replace_python_line_ranges", "arguments": arguments}
+    call = {"type": "function", "function": function}
+    rows = frozenset({7})
+
+    revised = apply_native_line_range_edit((call,), sources, snapshot, allowed_rows=rows)
+    assert revised[PATH] == SOURCE.replace("return result + 1", "return result + 2")
+    invalid = (
+        (),
+        (call, call),
+        ({**call, "function": {**function, "name": "replace_python_definition"}},),
+        ({**call, "function": {**function, "arguments": arguments[:-1] + ', "path": "other.py"}'}},),
+        ({**call, "function": {**function, "arguments": arguments[:-1] + ', "edits": []}'}},),
+        ({**call, "function": {**function, "arguments": arguments[:-1] + ', "snapshot": "fake"}'}},),
+    )
+    for calls in invalid:
+        with pytest.raises(ValueError):
+            apply_native_line_range_edit(calls, sources, snapshot, allowed_rows=rows)
+    with pytest.raises(ValueError, match="shown scoped edit windows"):
+        apply_native_line_range_edit((call,), sources, snapshot, allowed_rows=frozenset({6}))
+    with pytest.raises(ValueError, match="does not match"):
+        apply_native_line_range_edit((call,), revised, snapshot, allowed_rows=rows)
 
 
 def test_method_relative_ranges_update_only_localized_body():

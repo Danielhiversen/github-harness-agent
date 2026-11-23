@@ -10,6 +10,34 @@ from pathlib import PurePosixPath
 from .review_definitions import _symbols, _unique_object
 
 LINE_RANGE_ENDING = "Respond with the single line-range JSON object only."
+_NATIVE_TOOL_NAME = "replace_python_line_ranges"
+NATIVE_LINE_RANGE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": _NATIVE_TOOL_NAME,
+        "description": "Edit only the displayed numbered rows of the current function body.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "edits": {
+                    "type": "array", "minItems": 1, "maxItems": 3,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "start": {"type": "integer", "minimum": 1},
+                            "end": {"type": "integer", "minimum": 1},
+                            "lines": {"type": "array", "maxItems": 24, "items": {"type": "string"}},
+                        },
+                        "required": ["start", "end", "lines"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["edits"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 _FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
 _MAX_EDITS = 6
@@ -190,7 +218,7 @@ def prepare_loop_line_range_edit(sources, symbol, body_line, variable, caller_li
     return snapshot, visible, allowed
 
 
-def line_range_prompt(snapshot, *, visible_rows=None):
+def line_range_prompt(snapshot, *, visible_rows=None, native=False):
     """Render the editor contract and exact line numbering for this snapshot."""
     path, qualified = snapshot.symbol
     first = snapshot.first_body_line
@@ -205,19 +233,45 @@ def line_range_prompt(snapshot, *, visible_rows=None):
         "Do not span gaps between shown rows. Limit old and replacement lines to 24 in total.\n"
         if visible_rows is not None else ""
     )
+    instruction = (
+        "Supply only the edits field in the tool arguments, with exact indentation.\n"
+        if native else "Use this JSON format. Supply the changed lines with their indentation.\n"
+    )
+    example = '{"edits":[' if native else f'{{"snapshot":"{snapshot.digest}","edits":['
     return (
         f"Edit only {path}::{qualified} using numbered lines from this exact current definition.\n"
-        "Use this JSON format. Supply the changed lines with their indentation.\n"
-        f'{{"snapshot":"{snapshot.digest}","edits":['
-        f'{{"start":{first},"end":{first},"lines":[{example_line}]}}'
-        "]}\n"
-        f"Use one to {_MAX_EDITS} non-overlapping, inclusive ranges within lines "
+        + instruction + example
+        + f'{{"start":{first},"end":{first},"lines":[{example_line}]}}'
+        + "]}\n"
+        + f"Use one to {3 if native else _MAX_EDITS} non-overlapping, inclusive ranges within lines "
         f"{snapshot.first_body_line} through {len(snapshot.lines)}. Numbers refer to the unedited definition. "
         "Preserve exact indentation. Use an empty lines array to delete a range. To insert, "
         "replace an anchor line with itself and the inserted lines in their desired order.\n"
         "Do not include numbering, newline characters, or other output in replacement strings.\n"
         f"{sparse}Exact current definition (quoted data):\n{numbered}\n"
     )
+
+
+def apply_native_line_range_edit(calls, sources, snapshot, *, allowed_rows):
+    """Bind a single edits-only tool response to trusted numbered source."""
+    try:
+        if not isinstance(snapshot, LineRangeSnapshot) or not allowed_rows or len(calls) != 1:
+            raise ValueError
+        call = calls[0]
+        function = call["function"]
+        arguments = function["arguments"]
+        if (
+            call["type"] != "function" or function["name"] != _NATIVE_TOOL_NAME
+            or not isinstance(arguments, str) or len(arguments.encode()) > _MAX_REPLY
+        ):
+            raise ValueError
+        payload = json.loads(arguments, object_pairs_hook=_unique_object)
+        if type(payload) is not dict or payload.keys() != {"edits"}:
+            raise ValueError
+    except (IndexError, KeyError, TypeError, ValueError, RecursionError):
+        raise ValueError("Expected one numbered editing tool call with edits only") from None
+    response = json.dumps({"snapshot": snapshot.digest, "edits": payload["edits"]}, ensure_ascii=False)
+    return apply_line_range_edit(response, sources, snapshot, allowed_rows=allowed_rows)
 
 
 def _edits(response, snapshot, indent):

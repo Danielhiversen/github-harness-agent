@@ -754,9 +754,9 @@ def test_single_pinned_production_review_fixes_all_checks_before_authoring_regre
     assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
 
 
-@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress"))
+@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native"))
 def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, failover):
-    task, _, runner, _ = solver_case
+    task, _, runner, checkpoints = solver_case
     operator = Path(task.pull_checks[0][-1])
     with operator.open("a") as stream:
         stream.write("# withheld-operator-source " + "x" * review_recovery.MAX_OPERATOR_SOURCE + "\n")
@@ -798,9 +798,35 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
     )
 
     line_attempts = []
+    native_attempts = []
 
     class Gateway(FreeGateway):
         def complete(self, **kwargs):
+            if kwargs["tools"]:
+                tool, = kwargs["tools"]
+                schema = tool["function"]
+                assert schema["name"] == "replace_python_line_ranges"
+                assert schema["parameters"]["required"] == ["edits"]
+                assert set(schema["parameters"]["properties"]) == {"edits"}
+                prompt = kwargs["messages"][-1]["content"]
+                assert '"snapshot"' not in prompt and "def local_result():" in prompt
+                native_attempts.append((kwargs["exclude"], kwargs["after_provider"]))
+                if failover == "malformed":
+                    raise ProviderExhausted(None, {"fixture": "no native coding route"})
+                assert failover == "native"
+                reply = super().complete(**{**kwargs, "tools": (), "max_output_tokens": 3072})
+                target = re.search(r"(?m)^(\d+) \| ( +)return -1$", prompt)
+                row = int(target[1])
+                reply.route = "numbered-native-b"
+                reply.configured_model = "native-code-model"
+                reply.content = ""
+                reply.tool_calls = ({
+                    "type": "function",
+                    "function": {"name": schema["name"], "arguments": json.dumps({
+                        "edits": [{"start": row, "end": row, "lines": [target[2] + "return 1"]}],
+                    })},
+                },)
+                return reply
             if kwargs.get("max_output_tokens") != 2048:
                 return super().complete(**kwargs)
             reply = super().complete(**{**kwargs, "max_output_tokens": 3072})
@@ -812,7 +838,7 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
             reply.route = "numbered-free-a" if first_route else "numbered-free-b"
             reply.configured_model = "small-code-model" if first_route else "alternate-code-model"
             line_attempts.append((digest, kwargs.get("exclude", ()), kwargs.get("after_provider")))
-            if first_route and failover == "malformed":
+            if first_route and failover in {"malformed", "native"}:
                 reply.content = '{"unexpected":"format","edits":[]}'
             else:
                 value = -3 if first_route and failover == "no_progress" else 1
@@ -828,17 +854,29 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
     independent = runner.path / "mixed-numbered-verifier"
     independent.mkdir()
     executor = PlainExecutor(
-        runner, gateway, Limits(model_requests=3 + numbered_replies, concurrent_probes=1),
+        runner, gateway, Limits(
+            model_requests=3 + numbered_replies + (failover in {"malformed", "native"}),
+            concurrent_probes=1,
+        ),
         verification_runner=FixtureRunner(independent),
     )
-    result = solve(executor, task, archive, _Budget(executor.limits, lambda: False, task), "fixture")
+    budget = _Budget(executor.limits, lambda: False, task)
+    result = solve(executor, task, archive, budget, "fixture")
 
     numbered = gateway.prompts[2]
-    assert len(line_attempts) == numbered_replies
-    if failover != "none":
+    assert len(line_attempts) == (1 if failover == "native" else numbered_replies)
+    excluded = (("numbered-free-a", "small-code-model"),)
+    if failover in {"malformed", "native"}:
+        assert native_attempts == [(excluded, "numbered-free-a")]
+    else:
+        assert native_attempts == []
+    if failover in {"malformed", "no_progress"}:
         assert line_attempts[0][0] == line_attempts[1][0]
-        assert line_attempts[1][1] == (("numbered-free-a", "small-code-model"),)
+        assert line_attempts[1][1] == excluded
         assert line_attempts[1][2] == "numbered-free-a"
+    if failover == "native":
+        assert any(route.route == "numbered-native-b" for route in budget.routes)
+        assert any(check.last_editor == ("numbered-native-b", "native-code-model") for check in checkpoints)
     assert "Correct the dispatch result" in numbered and "assert -1 == 1" in numbered
     assert f"{SOURCE}::Reader.read" in numbered and "def local_result():" in numbered
     assert "def unrelated" not in numbered and "withheld-operator-source" not in numbered
