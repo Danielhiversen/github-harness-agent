@@ -1791,3 +1791,56 @@ def test_regression_coverage_distinguishes_verified_partial_checkpoint(tmp_path,
         checks = rejected.value.checks
         assert checks[-2].command[0] == "verify-regression" and checks[-2].returncode == 0
         assert checks[-1].command == ("verify-regression-counterexample",) and checks[-1].returncode == 1
+
+
+@pytest.mark.parametrize("assert_order", [False, True])
+def test_rebased_regression_uses_original_counterexample_checkout(fixture, assert_order):
+    from github_harness_agent.executor import _VerificationRejected
+    from github_harness_agent.review_solver import patch_for
+
+    task, checkout, runner = fixture
+
+    def commit(message):
+        subprocess.run(["git", "add", "."], cwd=checkout, check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-qm", message],
+            cwd=checkout, check=True,
+        )
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
+
+    path, test_path = "scheduler.py", "test_regression.py"
+    old = "def schedule():\n    return ['left']\n"
+    partial = "def schedule():\n    return ['left', 'right', 'child']\n"
+    (checkout / path).write_text(old)
+    (checkout / "test_stock.py").write_text("def test_stock(): pass\n")
+    original_base = commit("initial scheduler")
+    # The new base touches the same line, so the original counterexample patch
+    # cannot be applied to the rebased checkout.
+    rebased = "def schedule():\n    return list(('left',))\n"
+    (checkout / path).write_text(rebased)
+    latest = commit("update upstream implementation")
+    task = replace(
+        task, base_sha=latest, checks=((sys.executable, "-m", "pytest", "test_stock.py"),),
+        require_new_tests=True, regression_base=original_base, regression_edit_path=path,
+    )
+    authored = (
+        "from scheduler import schedule\n\n"
+        "def test_schedule():\n"
+        "    issued = schedule()\n"
+        "    assert set(issued) == {'left', 'right', 'child'}\n"
+    )
+    if assert_order:
+        authored += "    assert issued.index('child') < issued.index('right')\n"
+    candidate = patch_for(
+        {path: rebased, test_path: ""},
+        {path: "def schedule():\n    return list(('left', 'child', 'right'))\n", test_path: authored},
+    )
+    proof = (original_base, patch_for({path: old}, {path: partial}))
+    executor = PlainExecutor(runner, ScriptedGateway(None))
+    if assert_order:
+        verified = executor.verify_patch(task, checkout, candidate, regression_counterexample=proof)
+        assert verified.checks[-1].command == ("verify-regression-counterexample",)
+        assert verified.checks[-1].returncode == 0
+    else:
+        with pytest.raises(_VerificationRejected, match="also pass on the verified partial checkpoint"):
+            executor.verify_patch(task, checkout, candidate, regression_counterexample=proof)

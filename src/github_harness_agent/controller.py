@@ -894,6 +894,11 @@ class Controller:
                         if result.refinement
                         else None,
                     }
+                    if counterexample := getattr(result, "regression_counterexample", None):
+                        data["prepared"]["regression_counterexample"] = {
+                            "base": parent,
+                            "patch": base64.b64encode(counterexample).decode("ascii"),
+                        }
                     data.pop("draft_checkpoints", None)
                     store.save(job)
                 prepared = data["prepared"]
@@ -939,12 +944,19 @@ class Controller:
                         regression_head=origin if regression_edit_path else None,
                     )
 
+                    proof = prepared.get("regression_counterexample")
+                    verification_options = {}
+                    if proof is not None:
+                        verification_options["regression_counterexample"] = (
+                            proof["base"], base64.b64decode(proof["patch"], validate=True),
+                        )
                     try:
                         verified = self.executor.verify_patch(
                             verify_task,
                             path,
                             patch,
                             cancelled=cancelled,
+                            **verification_options,
                         )
                     except ExecutionError as error:
                         store.check(job)

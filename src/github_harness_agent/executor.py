@@ -308,6 +308,7 @@ class ExecutionResult:
     usage: dict[str, int]
     patch_digest: str
     refinement: RefinementEvidence | None = None
+    regression_counterexample: bytes | None = field(default=None, repr=False)
 
 
 class _Budget:
@@ -323,6 +324,7 @@ class _Budget:
         self.routes: list[RouteEvidence] = []
         self.task = task
         self.regression_counterexample: bytes | None = None
+        self.regression_counterexample_archive: bytes | None = None
         self._calls = Counter()
         self._lock = Lock()
         self._message_limit = MESSAGE_BYTES
@@ -570,10 +572,24 @@ class PlainExecutor:
         checkout: Path,
         patch: bytes,
         cancelled: Callable[[], bool] = lambda: False,
+        *,
+        regression_counterexample: tuple[str, bytes] | None = None,
     ) -> ExecutionResult:
         budget = _Budget(self.limits, cancelled, task)
         archive = self._archive(task, checkout, budget)
         task = self._pin_regression(task, checkout, budget)
+        if regression_counterexample is not None:
+            sha, production_patch = regression_counterexample
+            if (
+                not task.regression_edit_path or not task.regression_base
+                or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha)
+                or not 0 < len(production_patch) <= self.limits.patch_bytes
+            ):
+                raise ExecutionError("The saved regression counterexample is invalid")
+            budget.regression_counterexample = production_patch
+            budget.regression_counterexample_archive = self._checkout_archive(
+                checkout, budget, sha, "Verified partial checkpoint base", no_replace=True,
+            )
         return self._verify(task, archive, budget, patch)
 
     def _archive(self, task, checkout, budget):
@@ -2180,7 +2196,8 @@ class PlainExecutor:
             checks.append(regression)
             if not regression.returncode and budget.regression_counterexample is not None:
                 regression = self._verify_test_regression(
-                    task, archive, budget, historical_patch, historical_tests, green_report, green_sources, green_output,
+                    task, budget.regression_counterexample_archive or archive, budget,
+                    historical_patch, historical_tests, green_report, green_sources, green_output,
                     counterexample=budget.regression_counterexample,
                 )
                 checks.append(regression)
@@ -2229,6 +2246,7 @@ class PlainExecutor:
             usage,
             hashlib.sha256(patch).hexdigest(),
             refinement,
+            regression_counterexample=budget.regression_counterexample,
         )
 
 
