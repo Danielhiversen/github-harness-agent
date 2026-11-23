@@ -3640,6 +3640,57 @@ def test_single_test_only_review_adds_an_independent_module(solver_case, monkeyp
     assert not checkpoints
 
 
+@pytest.mark.parametrize("alternatives_exhausted", (False, True))
+def test_test_authoring_rotates_after_repeated_checked_failure_and_reopens_routes(
+    solver_case, alternatives_exhausted,
+):
+    task, archive, runner, _ = solver_case
+    fixed = BASE_SOURCE.replace("return -1", "return 1").replace("return -2", "return 2")
+    draft = DraftCheckpoint(
+        "harness2/base", task.base_sha,
+        patch_for({SOURCE: BASE_SOURCE}, {SOURCE: fixed}),
+        guidance=_GUIDANCE, last_editor=("fixture", "fixture/coder"),
+    )
+    task = replace(task, checkpoints={draft.key: draft})
+    cheap = ("stand-in-free", "stand-in/free")
+    exclusions = []
+    passing = "\n\ndef test_keep_existing_success():\n    assert second() == 2\n"
+    partial = TEST.replace("(1, 2)", "(0, 0)") + passing
+    final = TEST + passing
+
+    class Gateway(FreeGateway):
+        def complete(self, **kwargs):
+            excluded = kwargs.get("exclude", ())
+            exclusions.append(excluded)
+            if len(exclusions) == 3:
+                assert excluded == (cheap,)
+                assert kwargs["after_provider"] == cheap[0]
+                if alternatives_exhausted:
+                    raise ProviderExhausted(None, {"fixture": "all eligible models excluded"})
+                reply = super().complete(**kwargs)
+                reply.route, reply.configured_model = "alternate-free", "alternate/free"
+                return reply
+            return super().complete(**kwargs)
+
+    bad = (
+        "from fixture_calc import missing_a\n\n"
+        "def test_results():\n    assert missing_a() == 1\n"
+    )
+    proposals = (bad, bad.replace("missing_a", "missing_b"))
+    if not alternatives_exhausted:
+        proposals += (partial,)
+    gateway = Gateway(*proposals, final)
+    executor = PlainExecutor(runner, gateway, Limits(model_requests=4, concurrent_probes=1))
+    result = solve(executor, task, archive, _Budget(executor.limits, lambda: False, task), "fixture")
+
+    assert exclusions == [(), (), (cheap,), ()]
+    if not alternatives_exhausted:
+        assert "def test_keep_existing_success():" in gateway.prompts[-1]
+    assert b"def test_keep_existing_success():" in result.patch
+    assert all(check.returncode == 0 for check in result.checks)
+    assert any(NEW_TEST in check.command for check in result.checks)
+
+
 @pytest.mark.parametrize(
     "tool_reply", ("valid", "extra", "duplicate", "unavailable", "empty", "failing_test"),
 )
@@ -3658,8 +3709,13 @@ def test_solver_recovers_malformed_new_test_replies_with_one_scoped_tool(solver_
         def complete(self, **kwargs):
             tools = kwargs["tools"]
             calls.append(bool(tools))
+            if len(calls) > 2:
+                assert kwargs["exclude"] == (("stand-in-free", "stand-in/free"),)
             if not tools:
-                return super().complete(**kwargs)
+                reply = super().complete(**kwargs)
+                if len(calls) > 2:
+                    reply.route, reply.configured_model = "text-free", "fixture-text"
+                return reply
             schema, = tools
             name = schema["function"]["name"]
             assert set(schema["function"]["parameters"]["properties"]) == {"code"}

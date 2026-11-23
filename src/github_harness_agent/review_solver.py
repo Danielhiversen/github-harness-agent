@@ -1732,7 +1732,10 @@ def _coding_completion(
                 after_provider=route,
                 max_output_tokens=3072 if native_test_path is not None else 2048,
                 retry_oversize=False,
-                **({"exclude": exclude} if native_line_retry is not None else {}),
+                **(
+                    {"exclude": exclude}
+                    if native_line_retry is not None or native_test_path is not None else {}
+                ),
             )
             if native_line_retry is not None:
                 candidate = apply_native_line_range_edit(
@@ -3731,6 +3734,7 @@ def solve(executor, task, archive, budget, version):
         test_checkout_digest = hashlib.sha256(patch).digest()
     test_format_revision = None
     test_format_failures = 0
+    test_model_failures = Counter()
     test_tool_attempts = set()
     test_line_attempts = set()
     repository_example = None
@@ -3740,6 +3744,13 @@ def solve(executor, task, archive, budget, version):
     repository_usage = ""
     repository_models = ""
     attempted_seed_cases = set()
+
+    def count_test_model_failure(snapshot, editor, categories):
+        if snapshot is current and test_model_failures is not None and editor.configured_model:
+            pair = editor.route, editor.configured_model
+            kind = tuple(sorted(categories)) or ("verification",)
+            key = pair, kind
+            test_model_failures[key] = min(test_model_failures[key] + 1, _MODEL_FAILURE_THRESHOLD)
 
     def retain_test_seed(candidate, runs):
         nonlocal test_seed
@@ -4316,6 +4327,7 @@ def solve(executor, task, archive, budget, version):
                             test_checkout_snapshot = current
                             test_checkout_digest = hashlib.sha256(patch).digest()
                             test_case_runs = {}
+                            test_model_failures = Counter()
                         revision = (test_checkout_digest, hashlib.sha256(test_draft.encode()).digest())
                         if revision != test_format_revision:
                             test_format_revision = revision
@@ -4641,6 +4653,11 @@ def solve(executor, task, archive, budget, version):
                                 model for model, count in counts.items()
                                 if count >= _MODEL_FAILURE_THRESHOLD
                             )
+                    if target == _TEST_GOAL and test_model_failures:
+                        exclude = tuple(dict.fromkeys(
+                            pair for (pair, _), count in test_model_failures.items()
+                            if count >= _MODEL_FAILURE_THRESHOLD
+                        ))
                     if line_retry is not None and line_retry.excluded_models:
                         exclude = tuple(dict.fromkeys((*exclude, *line_retry.excluded_models)))
                     route = (
@@ -4750,7 +4767,10 @@ def solve(executor, task, archive, budget, version):
             except ProviderExhausted as error:
                 if paired and hedge_pair:
                     continue
-                if line_followup is not None:
+                if target == _TEST_GOAL and rotated and snapshot is current:
+                    # Try the configured routes again when the alternatives are exhausted.
+                    test_model_failures = None
+                elif line_followup is not None:
                     line_retries[target] = line_followup
                 elif line_retry is not None:
                     _LOG.info("Numbered review edit format had no available coding route")
@@ -4859,6 +4879,7 @@ def solve(executor, task, archive, budget, version):
                     if target == _TEST_GOAL:
                         if snapshot is current:
                             test_format_failures += 1
+                            count_test_model_failure(snapshot, editor, ("edit format",))
                         raw = completion.content or ""
                         _LOG.info(
                             "New pytest module reply via %s did not parse "
@@ -5077,6 +5098,20 @@ def solve(executor, task, archive, budget, version):
                 )
                 previous_run = test_case_runs.get("focused")
                 candidate_run = next_case_runs.get("focused")
+                if snapshot is current:
+                    previous_passed = previous_run.passed if previous_run else 0
+                    improved = candidate_run and (
+                        candidate_run.passed > previous_passed
+                        or (
+                            test_draft and candidate_run.passed == previous_passed
+                            and candidate_run.assertion_reached
+                            and not (previous_run and previous_run.assertion_reached)
+                        )
+                    )
+                    if improved and not lost_test:
+                        test_model_failures = Counter()
+                    elif result is None:
+                        count_test_model_failure(snapshot, editor, test_check_labels)
                 if (
                     pinned_ancestor and allow_test_module and test_checkout_snapshot is current
                     and previous_run and previous_run.assertion_reached and focused_rejection is not None
