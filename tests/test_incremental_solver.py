@@ -705,8 +705,15 @@ TEST = (
 )
 
 
-def test_single_pinned_production_review_fixes_all_checks_before_authoring_regression(solver_case):
+@pytest.mark.parametrize("oversized", (False, True), ids=("quoted", "oversized"))
+def test_single_pinned_production_review_fixes_all_checks_before_authoring_regression(
+    solver_case, oversized,
+):
     task, archive, runner, _ = solver_case
+    if oversized:
+        acceptance = Path(task.pull_checks[0][-1])
+        with acceptance.open("a") as stream:
+            stream.write("# withheld-operator-source " + "x" * review_recovery.MAX_OPERATOR_SOURCE + "\n")
     body = (
         "Correct the first and second results and cover both values in one scenario.\n\n"
         "Update production code and add a new regression test.\n"
@@ -730,8 +737,12 @@ def test_single_pinned_production_review_fixes_all_checks_before_authoring_regre
     )
     result = solve(executor, task, archive, _Budget(executor.limits, lambda: False, task), "fixture")
 
+    assert result is not None
     first, second, proof = gateway.prompts
     assert "test_first" in first and "test_second" in second
+    if oversized:
+        assert "withheld-operator-source" not in "\n".join(gateway.prompts)
+        assert "Operator test names: \n" in proof
     assert f"Editable checkout paths (use these exact names): {SOURCE}" in first
     assert "Correct the first and second results" in first and "Correct the first and second results" in proof
     assert "passes here and fails on the pinned ancestor" in proof
@@ -739,6 +750,7 @@ def test_single_pinned_production_review_fixes_all_checks_before_authoring_regre
     assert "def first():\n    return 1" in proof.partition("Optional tracked pytest")[2]
     assert b"+    return 1\n" in result.patch and b"+    return 2\n" in result.patch
     assert f"+++ b/{NEW_TEST}".encode() in result.patch
+    assert any(check.command == task.pull_checks[0] and check.returncode == 0 for check in result.checks)
     assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
 
 

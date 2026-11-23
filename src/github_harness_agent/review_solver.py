@@ -2163,7 +2163,7 @@ def solve(executor, task, archive, budget, version):
                 ws, budget, argv, cap=cap, checked=False
             ),
         )
-        if not context and not review.test_only:
+        if not context and not (review.test_only or production_regression):
             return None
         fixtures = json.loads(context.split("\n", 1)[1]) if context else {}
         original = {
