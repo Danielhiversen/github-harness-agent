@@ -2442,7 +2442,8 @@ def solve(executor, task, archive, budget, version):
         current = original.copy()
         draft = None if review.test_only else task.checkpoints.get(_CHECKPOINT)
         actor = None
-        if draft and draft.guidance == _GUIDANCE and draft.base_sha == task.base_sha:
+        restored_checkpoint = bool(draft and draft.guidance == _GUIDANCE and draft.base_sha == task.base_sha)
+        if restored_checkpoint:
             executor._git(ws, budget, "apply", "--index", data=draft.patch)
             executor._check_patch_paths(ws, task, budget, tree)
             for path in current:
@@ -2498,6 +2499,12 @@ def solve(executor, task, archive, budget, version):
     patch = patch_for(original, current)
     pytest_runs = {}
     failures = evidence(executor, task, archive, budget, patch, commands, pytest_runs=pytest_runs)
+    resumed_verified_checkout = (
+        current if (
+            production_regression and restored_checkpoint and draft.key == _CHECKPOINT
+            and patch and patch == draft.patch and not failures and not current[new_path]
+        ) else None
+    )
     if review.test_only and failures:
         raise ExecutionError("Required checks failed on the unchanged baseline for the test-only review")
     notes = {}
@@ -4641,6 +4648,7 @@ def solve(executor, task, archive, budget, version):
                             and (helper_attempts == 0 or helper_attempts == 1 and helper_bad_model)
                             and (
                                 prior_test_source and test_draft == prior_test_source
+                                or current is resumed_verified_checkout and not test_draft and not test_case_runs
                                 or test_setup_failures >= 2
                                 and not ((run := test_case_runs.get("focused")) and run.passed)
                             )

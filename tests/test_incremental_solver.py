@@ -837,9 +837,13 @@ def test_single_pinned_production_review_fixes_all_checks_before_authoring_regre
     assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
 
 
-@pytest.mark.parametrize("alternate", (False, True))
+@pytest.mark.parametrize(
+    ("alternate", "resumed"),
+    ((False, False), (True, False), (False, True)),
+    ids=("setup-recovery", "alternate", "resumed-production"),
+)
 def test_pinned_setup_failures_recover_using_an_authored_function_and_only_needed_helpers(
-    solver_case, alternate, caplog,
+    solver_case, alternate, resumed, caplog,
 ):
     task, archive, runner, _ = solver_case
     test_path = NEW_TEST
@@ -876,6 +880,13 @@ def test_pinned_setup_failures_recover_using_an_authored_function_and_only_neede
             (SOURCE, 2, "Correct both results and test them in one scenario using offline fixture setup."),
         )),
     )
+    if resumed:
+        production = BASE_SOURCE.replace("return -1", "return 1").replace("return -2", "return 2")
+        checkpoint = DraftCheckpoint(
+            "harness2/base", task.base_sha, patch_for({SOURCE: BASE_SOURCE}, {SOURCE: production}),
+            guidance=_GUIDANCE, last_editor=("previous-free", "previous/free"),
+        )
+        task = replace(task, checkpoints={checkpoint.key: checkpoint})
     missing = "def test_missing(missing_setup):\n    assert missing_setup\n"
     still_missing = missing.replace("missing_setup", "other_setup")
     authored = (
@@ -900,18 +911,21 @@ def test_pinned_setup_failures_recover_using_an_authored_function_and_only_neede
                     result.configured_model = "alternate/free"
             return result
 
-    proposals = (FIRST, SECOND, missing, edit(test_path, missing, still_missing))
-    gateway = Gateway(*proposals, *(("invalid prose",) if alternate else ()), authored)
+    ordinary = () if resumed else (FIRST, SECOND, missing, edit(test_path, missing, still_missing))
+    proposals = (*ordinary, *(("invalid prose",) if alternate else ()), authored)
+    gateway = Gateway(*proposals)
     independent = runner.path / "operator-helper-verifier"
     independent.mkdir()
     executor = PlainExecutor(
-        runner, gateway, Limits(model_requests=6 if alternate else 5, concurrent_probes=1),
+        runner, gateway, Limits(model_requests=len(proposals), concurrent_probes=1),
         verification_runner=FixtureRunner(independent),
     )
     with caplog.at_level("INFO", logger="github_harness_agent.review_solver"):
         result = solve(executor, task, archive, _Budget(executor.limits, lambda: False, task), "fixture")
 
     assert len(projections) == 1 + int(alternate)
+    if resumed:
+        assert gateway.prompts == projections
     if alternate:
         assert "Started new pytest authoring from the verified predecessor seed" in caplog.text
         assert f"+++ b/{NEW_TEST}\n".encode() not in result.patch
