@@ -1,7 +1,9 @@
 """Select compact Python source excerpts for a single review concern."""
 
 import ast
+import builtins
 import re
+import symtable
 import tarfile
 from collections import Counter
 from dataclasses import dataclass
@@ -851,6 +853,146 @@ def _complete_pytest_nodes(body, node, setup):
             return sorted(selected, key=lambda item: item.lineno)
         selected.update(extra)
     return ()
+
+
+_PRIOR_SETUP_IMPORTS = {
+    "collections", "dataclasses", "datetime", "decimal", "enum", "functools", "io",
+    "json", "math", "pathlib", "pytest", "re", "textwrap", "types", "typing",
+    "unittest.mock", "yaml",
+}
+_PRIOR_SETUP_FIXTURES = {"tmp_path", "tmp_path_factory", "monkeypatch", "request", "capsys", "capfd"}
+_PRIOR_SENSITIVE = {"credential", "credentials", "environ", "getenv", "operator",
+                    "password", "secret", "secrets", "token", "apikey"}
+
+
+def _prior_sensitive(spelling):
+    words = _words((spelling or "").replace("_", " "))
+    return bool(words & _PRIOR_SENSITIVE or {"api", "key"} <= words)
+
+
+def _prior_setup_import(node, modules):
+    if isinstance(node, ast.Import):
+        names = [item.name for item in node.names]
+    elif not node.level and node.module and all(item.name != "*" for item in node.names):
+        names = [node.module] if node.module in modules else [
+            f"{node.module}.{item.name}" for item in node.names
+        ]
+    else:
+        return False
+    return all(name in modules and not _prior_sensitive(name) for name in names) and not any(
+        _prior_sensitive(item.name) or _prior_sensitive(item.asname) for item in node.names
+    )
+
+
+def _prior_setup_source(items, fixtures, modules):
+    available = _PRIOR_SETUP_FIXTURES | {name for name, fixture in fixtures.items() if fixture in items}
+    fixture_nodes = set(fixtures.values())
+    for item in items:
+        if isinstance(item, _IMPORT):
+            if not _prior_setup_import(item, modules):
+                return ""
+            continue
+        if not isinstance(item, _FUNCTION) or (item in fixture_nodes and _fixture_arguments(item) - available):
+            return ""
+        for node in ast.walk(item):
+            spelling = (
+                getattr(node, "id", "") or getattr(node, "attr", "")
+                or getattr(node, "name", "") or getattr(node, "arg", "")
+            )
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if re.search(r"(?m)^\s*assert\b", node.value):
+                    return ""
+                spelling = node.value
+            if (
+                isinstance(node, (ast.Assert, ast.Global, *_IMPORT))
+                or (isinstance(node, _FUNCTION) and node.name.startswith("test_"))
+                or (spelling or "").startswith("assert")
+                or spelling in {"raises", "fail", "eval", "exec", "__import__"}
+                or _prior_sensitive(spelling)
+            ):
+                return ""
+    source = "\n\n".join(ast.unparse(item) for item in items)
+    try:
+        module = symtable.symtable(source, "<prior pytest setup>", "exec")
+    except (SyntaxError, ValueError, RecursionError):
+        return ""
+    globals_in_source = set(vars(builtins)) | {
+        symbol.get_name() for symbol in module.get_symbols()
+        if symbol.is_assigned() or symbol.is_imported()
+    }
+    pending = [module]
+    while pending:
+        table = pending.pop()
+        if any(
+            symbol.is_referenced() and symbol.is_global() and symbol.get_name() not in globals_in_source
+            for symbol in table.get_symbols()
+        ):
+            return ""
+        pending.extend(table.get_children())
+    return source
+
+
+def prior_generated_fixture_context(archive, ancestor_archive, new_path, sources, *, max_bytes=1700):
+    """Quote setup only from the immediate generated sibling added after the ancestor."""
+    match = re.fullmatch(r"tests/test_review_regressions_([1-9]\d?)\.py", new_path)
+    if not match or not 2 <= int(match[1]) <= 32:
+        return ""
+    previous = int(match[1]) - 1
+    suffix = f"_{previous}" if previous > 1 else ""
+    path = f"tests/test_review_regressions{suffix}.py"
+    try:
+        with tarfile.open(fileobj=BytesIO(ancestor_archive), mode="r:") as ancestor:
+            if path in ancestor.getnames():
+                return ""
+        with tarfile.open(fileobj=BytesIO(archive), mode="r:") as snapshot:
+            tracked = _tracked_python(snapshot, path)
+    except (tarfile.TarError, OSError, EOFError):
+        return ""
+    if tracked is None:
+        return ""
+    _, body = tracked
+    imports, _ = _reviewed_imports(body, {})
+    fixtures, fixture_nodes, _ = _module_pytest_fixtures(body, imports)
+    factories = {
+        item.name: item for item in body if isinstance(item, _FUNCTION)
+        and (
+            re.match(r"^_?(?:make|build|create|prepare|setup|sample|fake|fixture|write|seed|mock)_", item.name)
+            or (
+                "tmp_path" in _fixture_arguments(item)
+                and any(isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                        and call.func.attr in {"write_text", "write_bytes"} for call in ast.walk(item))
+            )
+        )
+        and any(isinstance(statement, ast.Return) for statement in item.body)
+    }
+    members = [node for item in body if isinstance(item, ast.ClassDef) and item.name.startswith("Test")
+               for node in item.body]
+    seeds = set()
+    for node in (*body, *members):
+        if not isinstance(node, _FUNCTION) or not node.name.startswith("test_"):
+            continue
+        seeds.update(_local_fixture_setup(node, fixtures) or ())
+        bound = set(_rebound_names(node)) | _fixture_arguments(node)
+        seeds.update(
+            factories[name] for call in ast.walk(node) if isinstance(call, ast.Call)
+            and (name := _dotted_name(call.func)) in factories and name not in bound
+        )
+    heading = (
+        f"# Prior generated pytest setup from {path}. Adapt it to the current review.\n"
+        "# Keep the new module self-contained for the pinned ancestor comparison.\n"
+    )
+    modules = _PRIOR_SETUP_IMPORTS | _reviewed_modules(sources).keys()
+    kept = set()
+    result = ""
+    for item in sorted(seeds, key=lambda node: node.lineno)[:32]:
+        dependencies = _local_fixture_setup(item, fixtures) if item in fixture_nodes else ()
+        if dependencies is None or not (selected := _complete_pytest_nodes(body, item, dependencies)):
+            continue
+        candidates = sorted(kept.union(selected), key=lambda node: node.lineno)
+        if (source := _prior_setup_source(candidates, fixtures, modules)) and len((heading + source).encode()) <= max_bytes:
+            kept.update(selected)
+            result = heading + source
+    return result
 
 
 def _invoked_anchored_apis(node, setup, imports, fixtures, preferred_apis):

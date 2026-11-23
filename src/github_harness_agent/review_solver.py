@@ -107,6 +107,7 @@ from .review_solver_context import (
     focused_source_excerpt,
     imported_model_declarations,
     operator_api_contract,
+    prior_generated_fixture_context,
     repository_pytest_context,
     stock_assertion_progress,
     stock_assertion_failure_line,
@@ -4118,12 +4119,17 @@ def solve(executor, task, archive, budget, version):
                             )
                             repository_models = imported_model_declarations(archive, reviewed_sources)
                             if pinned_ancestor:
+                                public_sources = {
+                                    path: text for path, text in reviewed_sources.items()
+                                    if not _protected(path, task, new_test=False)
+                                }
                                 extended_context = extended_pytest_context(
-                                    task.regression_archive,
-                                    {path: text for path, text in reviewed_sources.items()
-                                     if not _protected(path, task, new_test=False)},
-                                    review.feedback,
+                                    task.regression_archive, public_sources, review.feedback,
                                 )
+                                prior_setup = prior_generated_fixture_context(
+                                    archive, task.regression_archive, new_path, public_sources,
+                                )
+                                extended_context = "\n\n".join(filter(None, (extended_context, prior_setup)))
                         allow_test_module = bool(
                             original[new_path] == current[new_path] == ""
                             and not _protected(new_path, task, new_test=True)

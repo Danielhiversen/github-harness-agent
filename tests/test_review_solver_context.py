@@ -477,6 +477,79 @@ def test_oversized_temporary_file_fixture_keeps_shape_in_numbered_retry(with_fac
     assert prompt.endswith(review_solver.LINE_RANGE_ENDING)
 
 
+def test_prior_generated_fixture_context_quotes_only_complete_predecessor_setup():
+    prior_path = "tests/test_review_regressions_2.py"
+    new_path = "tests/test_review_regressions_3.py"
+    previous = (
+        "import json\n"
+        "import os\n"
+        "import pytest\n"
+        "def make_configuration(directory):\n"
+        "    path = directory / 'test.json'\n"
+        "    path.write_text(json.dumps({'kind': 'synthetic'}))\n"
+        "    return path\n"
+        "@pytest.fixture\n"
+        "def configured_path(tmp_path):\n"
+        "    return make_configuration(tmp_path)\n"
+        "@pytest.fixture\n"
+        "def side_effect_path(tmp_path):\n"
+        "    assert test_only_marker\n"
+        "    return tmp_path\n"
+        "@pytest.fixture\n"
+        "def environment_value():\n"
+        "    return os.environ['SECRET_TOKEN']\n"
+        "@pytest.fixture\n"
+        "def missing_dependency():\n"
+        "    return unknown_prior_helper()\n"
+        "def make_unused_configuration():\n"
+        "    return 'unused setup'\n"
+        "def manifest(tmp_path, value):\n"
+        "    path = tmp_path / 'manifest.json'\n"
+        "    path.write_text(json.dumps(value))\n"
+        "    return path\n"
+        "def test_prior(tmp_path, configured_path, side_effect_path, environment_value, missing_dependency):\n"
+        "    manifest(tmp_path, {})\n"
+        "    assert configured_path.name == 'old assertion result'\n"
+    )
+
+    def archive(files):
+        buffer = BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as snapshot:
+            for path, source in files.items():
+                digest = source.encode()
+                entry = tarfile.TarInfo(path)
+                entry.size = len(digest)
+                snapshot.addfile(entry, BytesIO(digest))
+        return buffer.getvalue()
+
+    earlier_path = "tests/test_review_regressions.py"
+    current = archive({earlier_path: previous.replace("test.json", "earlier.json"), prior_path: previous})
+    ancestor = archive({})
+    context = review_solver_context.prior_generated_fixture_context(current, ancestor, new_path, {})
+
+    assert prior_path in context
+    assert "prior" in context.lower() and "self-contained" in context
+    assert "import json" in context and "import pytest" in context
+    assert "def make_configuration(directory):" in context
+    assert "def configured_path(tmp_path):" in context
+    assert "path.write_text(json.dumps({'kind': 'synthetic'}))" in context
+    assert "return make_configuration(tmp_path)" in context
+    assert "def manifest(tmp_path, value):" in context
+    assert all(text not in context for text in (
+        "earlier.json", "import os", "SECRET_TOKEN", "def test_prior", "assert",
+        "side_effect_path", "missing_dependency", "make_unused_configuration",
+    ))
+    assert review_solver_context.prior_generated_fixture_context(
+        current, archive({prior_path: previous}), new_path, {},
+    ) == ""
+    assert review_solver_context.prior_generated_fixture_context(
+        archive({earlier_path: previous}), ancestor, new_path, {},
+    ) == ""
+    assert review_solver_context.prior_generated_fixture_context(
+        current, ancestor, new_path, {}, max_bytes=230,
+    ) == ""
+
+
 def test_test_repair_prioritizes_the_missing_fixture_and_setup_frame():
     path = "src/example/formatting.py"
     new_path = "tests/test_review_regressions.py"
