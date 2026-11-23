@@ -95,6 +95,8 @@ from .review_line_ranges import (
     apply_native_line_range_edit,
     line_range_prompt,
     prepare_line_range_edit,
+    select_line_snapshot,
+    selectable_line_tool,
     prepare_loop_line_range_edit,
     prepare_window_line_range_edit,
 )
@@ -117,6 +119,7 @@ from .review_solver_context import (
     operator_api_contract,
     operator_test_assembly,
     production_protocol_example,
+    direct_caller_names,
     prior_generated_fixture_context,
     prior_generated_test_seed,
     repository_pytest_context,
@@ -1902,7 +1905,10 @@ def _coding_completion(
         focused = compact_focused_review(messages, max_bytes=12 * 1024) or messages
         if native_line_retry is not None:
             request = native_line_retry.native_prompt
-            tool = NATIVE_LINE_RANGE_TOOL
+            tool = (
+                selectable_line_tool((native_line_retry.snapshot, *native_line_retry.alternatives))
+                if native_line_retry.alternatives else NATIVE_LINE_RANGE_TOOL
+            )
             instruction = "Call replace_python_line_ranges exactly once with the numbered edits."
         elif native_test_path is not None:
             request = focused[-1]["content"].removesuffix(TEST_MODULE_REPLY_ENDING)
@@ -1955,7 +1961,7 @@ def _coding_completion(
             if native_line_retry is not None:
                 candidate = apply_native_line_range_edit(
                     completion.tool_calls, native_line_retry.checkout, native_line_retry.snapshot,
-                    allowed_rows=native_line_retry.allowed_rows,
+                    allowed_rows=native_line_retry.allowed_rows, alternatives=native_line_retry.alternatives,
                 )
             elif native_test_path is None:
                 candidate = apply_native_definition(completion.tool_calls, native_source)
@@ -2054,6 +2060,7 @@ class _LineRetry:
     native_prompt: str = ""
     native_ready: bool = False
     native_attempted: bool = False
+    alternatives: tuple[LineRangeSnapshot, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2107,6 +2114,36 @@ def _review_anchored_line_retry(review, sources, path, node, diagnostic, *, whol
         visible = frozenset(range(1, len(snapshot.lines) + 1))
         allowed = frozenset(range(snapshot.first_body_line, len(snapshot.lines) + 1))
         if retry := bounded_retry(snapshot, visible, allowed, limit=RETRY_MESSAGE_BYTES if whole_method else 7500):
+            if whole_method:
+                # Each alternative is independently bound to the same current file.
+                # The original 24-line change limit applies to the selected body.
+                choices = []
+                choice_instruction = (
+                    "Choose exactly one numbered definition below. Reply with that definition's snapshot hash "
+                    "and edits to its body only. Row numbers restart for each definition.\n"
+                )
+                text = retry.prompt.removesuffix(LINE_RANGE_ENDING)
+                for name in direct_caller_names(tree, symbol[1]):
+                    caller = prepare_line_range_edit(sources, (path, name))
+                    if caller is None:
+                        continue
+                    rows = "\n".join(f"{i} | {row}" for i, row in enumerate(caller.lines, 1))
+                    option = (
+                        f"\nAlternatively edit direct caller {path}::{name} with snapshot "
+                        f'"{caller.digest}". Eligible body rows {caller.first_body_line}–{len(caller.lines)}.\n'
+                        f"{rows}\n"
+                    )
+                    trial = choice_instruction + text + option + LINE_RANGE_ENDING
+                    if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": trial}]) <= RETRY_MESSAGE_BYTES:
+                        choices.append(caller)
+                        text += option
+                    if len(choices) == 2:
+                        break
+                if choices:
+                    retry = replace(
+                        retry, prompt=choice_instruction + text + LINE_RANGE_ENDING,
+                        native_prompt=choice_instruction + text, alternatives=tuple(choices),
+                    )
             return retry
     window = prepare_window_line_range_edit(sources, symbol, ((max(1, anchor - 5), anchor + 9),))
     return bounded_retry(*window) if window else None
@@ -5351,9 +5388,15 @@ def solve(executor, task, archive, budget, version):
                         if candidate == source:
                             raise ValueError("The pytest edit did not change the draft.")
                     if candidate is None and active_line_snapshot is not None:
+                        allowed = line_retry.allowed_rows if scoped_line else None
+                        if scoped_line and line_retry.alternatives:
+                            active_line_snapshot = select_line_snapshot(
+                                completion.content, (line_retry.snapshot, *line_retry.alternatives),
+                            )
+                            if active_line_snapshot is not line_retry.snapshot:
+                                allowed = frozenset(range(active_line_snapshot.first_body_line, len(active_line_snapshot.lines) + 1))
                         candidate = apply_line_range_edit(
-                            completion.content, source, active_line_snapshot,
-                            allowed_rows=line_retry.allowed_rows if scoped_line else None,
+                            completion.content, source, active_line_snapshot, allowed_rows=allowed,
                         )
                     if candidate is None:
                         candidate = (

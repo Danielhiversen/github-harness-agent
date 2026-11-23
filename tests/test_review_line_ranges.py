@@ -6,6 +6,8 @@ from github_harness_agent.review_line_ranges import (
     apply_line_range_edit,
     apply_native_line_range_edit,
     line_range_prompt,
+    select_line_snapshot,
+    selectable_line_tool,
     prepare_line_range_edit,
 )
 
@@ -185,3 +187,24 @@ def test_accepts_one_complete_json_fence_without_other_response_text():
         for ambiguous in ("proposal:\n" + fenced, fenced + "\n" + fenced, fenced[:-1]):
             with pytest.raises(ValueError):
                 apply_line_range_edit(ambiguous, sources, snapshot)
+
+def test_selected_snapshot_rejects_unoffered_hash_and_duplicate_json_keys():
+    snapshot = _prepare({PATH: SOURCE})
+    for response in (
+        '{"snapshot":"unoffered","edits":[]}',
+        f'{{"snapshot":"unoffered","snapshot":"{snapshot.digest}","edits":[]}}',
+    ):
+        with pytest.raises(ValueError):
+            select_line_snapshot(response, (snapshot,))
+
+def test_native_selection_binds_alternate_body_to_offered_hash():
+    sources = {PATH: SOURCE}
+    initial = _prepare(sources)
+    alternate = prepare_line_range_edit(sources, (PATH, "Queue.unrelated"))
+    field = selectable_line_tool((initial, alternate))["function"]["parameters"]
+    assert field["required"] == ["snapshot", "edits"]
+    assert field["properties"]["snapshot"]["enum"] == [initial.digest, alternate.digest]
+    arguments = _reply(alternate, _edit(2, 2, "        return 10"))
+    calls = ({"type": "function", "function": {"name": "replace_python_line_ranges", "arguments": arguments}},)
+    revised = apply_native_line_range_edit(calls, sources, initial, allowed_rows=frozenset({6}), alternatives=(alternate,))
+    assert revised[PATH] == SOURCE.replace("return 9", "return 10")

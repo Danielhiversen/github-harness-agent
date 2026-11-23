@@ -1141,11 +1141,12 @@ def test_pinned_setup_failures_recover_using_an_authored_function_and_only_neede
     assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
 
 
-@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long"))
+@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long", "checkpoint-caller"))
 def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, failover):
     task, _, runner, checkpoints = solver_case
     raw_mode = failover in {"raw", "raw-restored"}
-    long_checkpoint = failover == "checkpoint-long"
+    long_checkpoint = failover in {"checkpoint-long", "checkpoint-caller"}
+    caller_edit = failover == "checkpoint-caller"
     operator = Path(task.pull_checks[0][-1])
     with operator.open("a") as stream:
         stream.write("# withheld-operator-source " + "x" * review_recovery.MAX_OPERATOR_SOURCE + "\n")
@@ -1164,6 +1165,13 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         "def second():\n"
         "    return 2\n"
     )
+    if caller_edit:
+        production = production.replace(
+            "    def unrelated(self):",
+            "    def dispatch(self):\n        return self.read() - 2\n\n    def unrelated(self):",
+        ).replace("return Reader().read()", "return Reader().dispatch()")
+        with operator.open("a") as stream:
+            stream.write("def test_keep_helper():\n    from fixture_calc import Reader\n    assert Reader().read() == -1\n")
     if long_checkpoint:
         production = production.replace("    return 2\n", "    return -2\n")
     archive = BytesIO()
@@ -1198,7 +1206,8 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         # The only failing operator case has no passing sibling in its
         # invocation. The verified control runs under a separate command.
         check = task.pull_checks[0]
-        checks = tuple((*check[:-1], check[-1] + "::" + case) for case in ("test_first", "test_second"))
+        cases = ("test_first", "test_second", "test_keep_helper") if caller_edit else ("test_first", "test_second")
+        checks = tuple((*check[:-1], check[-1] + "::" + case) for case in cases)
         task = replace(task, checkpoints={draft.key: draft}, pull_checks=checks)
     if failover == "raw-restored":
         from github_harness_agent import review_solver
@@ -1255,6 +1264,12 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
             prompt = self.prompts[-1]
             digest = re.search(r'"snapshot":"([0-9a-f]{64})"', prompt)[1]
             target = re.search(r"(?m)^(\d+) \| ( +)return -1$", prompt)
+            if caller_edit:
+                assert "Choose exactly one numbered definition" in prompt
+                caller = re.search(r'::Reader.dispatch with snapshot "([0-9a-f]{64})"', prompt)
+                assert caller and digest != caller[1]
+                digest = caller[1]
+                target = re.search(r"(?m)^(\d+) \| ( +)return self.read\(\) - 2$", prompt[caller.end():])
             row = int(target[1])
             first_route = not line_attempts
             reply.route = "numbered-free-a" if first_route else "numbered-free-b"
@@ -1266,7 +1281,7 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
                 value = -3 if first_route and failover == "no_progress" else 1
                 reply.content = json.dumps({
                     "snapshot": digest,
-                    "edits": [{"start": row, "end": row, "lines": [target[2] + f"return {value}"]}],
+                    "edits": [{"start": row, "end": row, "lines": [target[2] + ("return self.read() + 2" if caller_edit else f"return {value}")]}],
                 })
             return reply
 
@@ -1303,7 +1318,11 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         assert "Reviewed dispatch" in first_request and "return local_result()" in first_request
         assert "def unrelated" not in first_request and "withheld-operator-source" not in first_request
         assert "Observed pytest failure:" in first_request
-        assert b"+            return 1" in result.patch and b"+    return 2" in result.patch
+        if caller_edit:
+            assert b"+        return self.read() + 2" in result.patch and b"-            return -1" not in result.patch
+        else:
+            assert b"+            return 1" in result.patch
+        assert b"+    return 2" in result.patch
         assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
         return
     if failover == "raw-restored":

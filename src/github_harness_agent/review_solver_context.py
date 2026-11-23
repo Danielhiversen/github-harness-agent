@@ -647,6 +647,50 @@ def _protocol_result_uses(method, lines):
     return uses
 
 
+def direct_caller_names(module, qualified):
+    """Resolve unshadowed module calls and same-class instance calls in the reviewed file."""
+    owner, _, name = qualified.rpartition(".")
+    if owner:
+        classes = [n for n in module.body if isinstance(n, ast.ClassDef) and n.name == owner]
+        if len(classes) != 1:
+            return ()
+        declarations = classes[0].body
+        if any(
+            isinstance(item, ast.Attribute) and _dotted_name(item) == "self." + name
+            and isinstance(item.ctx, (ast.Store, ast.Del))
+            for fn in declarations if isinstance(fn, _FUNCTION) for item in ast.walk(fn)
+        ):
+            return ()
+    else:
+        declarations = module.body
+    callers = []
+    for fn in declarations:
+        if not isinstance(fn, _FUNCTION) or fn.name == name:
+            continue
+        arguments = [*fn.args.posonlyargs, *fn.args.args]
+        if owner:
+            if not arguments or arguments[0].arg != "self" or fn.decorator_list:
+                continue
+            target = "self." + name
+            shadow = "self"
+        else:
+            if name in _fixture_arguments(fn):
+                continue
+            target = shadow = name
+        if shadow in _rebound_names(fn):
+            continue
+        nodes = list(fn.body)
+        while nodes:
+            node = nodes.pop()
+            if isinstance(node, (*_FUNCTION, ast.ClassDef, ast.Lambda, ast.comprehension)):
+                continue
+            if isinstance(node, ast.Call) and _dotted_name(node.func) == target:
+                callers.append(f"{owner}.{fn.name}" if owner else fn.name)
+                break
+            nodes.extend(ast.iter_child_nodes(node))
+    return tuple(callers)
+
+
 def production_protocol_example(preview, sources, query, *, max_bytes=1150):
     """Quote a dependency call and nearby handling from a helper's production entry point."""
     try:

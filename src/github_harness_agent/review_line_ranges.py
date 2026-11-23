@@ -252,7 +252,16 @@ def line_range_prompt(snapshot, *, visible_rows=None, native=False):
     )
 
 
-def apply_native_line_range_edit(calls, sources, snapshot, *, allowed_rows):
+def selectable_line_tool(snapshots):
+    function = NATIVE_LINE_RANGE_TOOL["function"]
+    schema = function["parameters"]
+    properties = {**schema["properties"], "snapshot": {"type": "string", "enum": [s.digest for s in snapshots]}}
+    return {"type": "function", "function": {
+        **function, "parameters": {**schema, "properties": properties, "required": ["snapshot", "edits"]},
+    }}
+
+
+def apply_native_line_range_edit(calls, sources, snapshot, *, allowed_rows, alternatives=()):
     """Bind a single edits-only tool response to trusted numbered source."""
     try:
         if not isinstance(snapshot, LineRangeSnapshot) or not allowed_rows or len(calls) != 1:
@@ -266,7 +275,12 @@ def apply_native_line_range_edit(calls, sources, snapshot, *, allowed_rows):
         ):
             raise ValueError
         payload = json.loads(arguments, object_pairs_hook=_unique_object)
-        if type(payload) is not dict or payload.keys() != {"edits"}:
+        if alternatives:
+            selected = select_line_snapshot(arguments, (snapshot, *alternatives))
+            if selected is not snapshot:
+                allowed_rows = frozenset(range(selected.first_body_line, len(selected.lines) + 1))
+            snapshot = selected
+        elif type(payload) is not dict or payload.keys() != {"edits"}:
             raise ValueError
     except (IndexError, KeyError, TypeError, ValueError, RecursionError):
         raise ValueError("Expected one numbered editing tool call with edits only") from None
@@ -274,7 +288,7 @@ def apply_native_line_range_edit(calls, sources, snapshot, *, allowed_rows):
     return apply_line_range_edit(response, sources, snapshot, allowed_rows=allowed_rows)
 
 
-def _edits(response, snapshot, indent):
+def _line_payload(response):
     if (
         not isinstance(response, str)
         or not response.strip()
@@ -290,6 +304,19 @@ def _edits(response, snapshot, indent):
         raise ValueError("Expected one exact JSON line-range edit object") from None
     if type(payload) is not dict or payload.keys() != {"snapshot", "edits"}:
         raise ValueError("Expected snapshot and edits only")
+    return payload
+
+
+def select_line_snapshot(response, snapshots):
+    digest = _line_payload(response)["snapshot"]
+    for snapshot in snapshots:
+        if digest == snapshot.digest:
+            return snapshot
+    raise ValueError("The reply must identify exactly one offered line-range snapshot")
+
+
+def _edits(response, snapshot, indent):
+    payload = _line_payload(response)
     if payload["snapshot"] != snapshot.digest:
         raise ValueError("Line-range response does not identify this snapshot")
     records = payload["edits"]

@@ -8,6 +8,7 @@ from io import BytesIO
 import pytest
 
 from github_harness_agent.review_solver_context import (
+    direct_caller_names,
     focused_check_excerpt,
     focused_source_excerpt,
     stock_pytest_excerpt,
@@ -1810,3 +1811,26 @@ def test_stock_later_assertion_progress_requires_unambiguous_straight_line_suite
         )
         is expected
     )
+
+def test_direct_caller_candidates_require_a_bound_receiver_and_unshadowed_definition():
+    import ast
+
+    tree = ast.parse("""
+def evaluate(): return 1
+def correct(): return evaluate()
+def shadow(evaluate): return evaluate()
+class Primary:
+    def target(self): return 0
+    def valid(self): return self.target()
+    def indirect(self): return self.valid()
+    def other(self, obj): return obj.target()
+    def reassigned(self, other):
+        self = other
+        return self.target()
+class Secondary:
+    def wrong(self): return self.target()
+""")
+    assert direct_caller_names(tree, "Primary.target") == ("Primary.valid",)
+    assert direct_caller_names(tree, "evaluate") == ("correct",)
+    tree.body[-2].body += ast.parse("def swap(self, new): self.target = new").body
+    assert direct_caller_names(tree, "Primary.target") == ()
