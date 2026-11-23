@@ -754,6 +754,82 @@ def test_single_pinned_production_review_fixes_all_checks_before_authoring_regre
     assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
 
 
+def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case):
+    task, _, runner, _ = solver_case
+    operator = Path(task.pull_checks[0][-1])
+    with operator.open("a") as stream:
+        stream.write("# withheld-operator-source " + "x" * review_recovery.MAX_OPERATOR_SOURCE + "\n")
+    production = (
+        "class Reader:\n"
+        "    def read(self):\n"
+        "        # Reviewed dispatch stays in this method.\n"
+        + "        # Keep surrounding setup.\n" * 12
+        + "        def local_result():\n"
+        "            return -1\n"
+        "        return local_result()\n\n"
+        "    def unrelated(self):\n"
+        "        return 999\n\n"
+        "def first():\n"
+        "    return Reader().read()\n\n"
+        "def second():\n"
+        "    return 2\n"
+    )
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as tar:
+        for path, body in ((SOURCE, production), ("tests/test_existing.py", "def test_existing(): pass\n")):
+            data = body.encode()
+            item = tarfile.TarInfo(path)
+            item.size = len(data)
+            tar.addfile(item, BytesIO(data))
+    archive = archive.getvalue()
+    body = (
+        "Correct the dispatch result without changing the other reviewed value.\n\n"
+        "Update production code and add a new regression test.\n"
+        f"Verify regression against: {task.base_sha}"
+    )
+    review = plan_recovery([{
+        "key": "comment:1", "author": "trusted-reviewer", "thread": "review", "reply_to": 1,
+        "path": SOURCE, "line": 3, "body": body,
+    }], 0, "")
+    task = replace(
+        task, inline_review_threads=1, review_recovery=review, regression_base=task.base_sha,
+        regression_archive=archive, regression_edit_path=SOURCE,
+    )
+
+    class Gateway(FreeGateway):
+        def complete(self, **kwargs):
+            if kwargs.get("max_output_tokens") != 2048:
+                return super().complete(**kwargs)
+            reply = super().complete(**{**kwargs, "max_output_tokens": 3072})
+            prompt = self.prompts[-1]
+            digest = re.search(r'"snapshot":"([0-9a-f]{64})"', prompt)[1]
+            target = re.search(r"(?m)^(\d+) \| ( +)return -1$", prompt)
+            row = int(target[1])
+            reply.content = json.dumps({
+                "snapshot": digest,
+                "edits": [{"start": row, "end": row, "lines": [target[2] + "return 1"]}],
+            })
+            return reply
+
+    malformed = edit(SOURCE, "    missing_anchor()\n", "    return 1\n")
+    gateway = Gateway(malformed, malformed, "Numbered response expected.", TEST)
+    independent = runner.path / "mixed-numbered-verifier"
+    independent.mkdir()
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=4, concurrent_probes=1),
+        verification_runner=FixtureRunner(independent),
+    )
+    result = solve(executor, task, archive, _Budget(executor.limits, lambda: False, task), "fixture")
+
+    numbered = gateway.prompts[2]
+    assert "Correct the dispatch result" in numbered and "assert -1 == 1" in numbered
+    assert f"{SOURCE}::Reader.read" in numbered and "def local_result():" in numbered
+    assert "def unrelated" not in numbered and "withheld-operator-source" not in numbered
+    assert b"+            return 1" in result.patch and b"+++ b/tests/test_review_regressions.py" in result.patch
+    assert any(check.command == task.pull_checks[0] and check.returncode == 0 for check in result.checks)
+    assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
+
+
 def test_solver_continues_a_compound_assertion_before_checkpointing(solver_case):
     task, archive, runner, checkpoints = solver_case
     Path(task.pull_checks[0][-1]).write_text(TEST)

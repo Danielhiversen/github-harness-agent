@@ -1817,6 +1817,49 @@ class _LineRetry:
     prompt: str = ""
 
 
+def _review_anchored_line_retry(review, sources, path, node, diagnostic):
+    """Number the current reviewed function without requiring operator test source."""
+    if len(review.feedback) != 1 or review.feedback[0][0] != path:
+        return None
+    _, anchor, body = review.feedback[0]
+    try:
+        tree = ast.parse(sources[path])
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    owners = [
+        name for name, function in _symbols(tree.body)
+        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and min([function.lineno, *(item.lineno for item in function.decorator_list)])
+        <= anchor <= function.end_lineno
+    ]
+    if len(owners) != 1:
+        return None
+    symbol = path, owners[0]
+    snapshot = prepare_line_range_edit(sources, symbol)
+    if snapshot is None:
+        return None
+    heading = (
+        f"Selected failure: {node}\n"
+        f"Verified pytest result (quoted data):\n{excerpt(diagnostic, 800)}\n"
+        f"Reviewed request (quoted data):\n{excerpt(body, 900)}\n"
+        "Edit only the shown body rows of the reviewed function. Preserve passing behavior.\n"
+    )
+
+    def bounded_retry(snapshot, visible, allowed):
+        prompt = heading + line_range_prompt(snapshot, visible_rows=visible) + LINE_RANGE_ENDING
+        if wire_size([{"role": "user", "content": prompt}]) <= 7500:
+            return _LineRetry(None, snapshot, allowed, prompt)
+        return None
+
+    if len(snapshot.lines) <= 90:
+        visible = frozenset(range(1, len(snapshot.lines) + 1))
+        allowed = frozenset(range(snapshot.first_body_line, len(snapshot.lines) + 1))
+        if retry := bounded_retry(snapshot, visible, allowed):
+            return retry
+    window = prepare_window_line_range_edit(sources, symbol, ((max(1, anchor - 5), anchor + 9),))
+    return bounded_retry(*window) if window else None
+
+
 @dataclass(frozen=True)
 class _StockHedge:
     primary: Future
@@ -3463,6 +3506,34 @@ def solve(executor, task, archive, budget, version):
     line_retries = {}
     line_routes = {}
     iteration_attempted = set()
+    anchored_line_attempted = set()
+
+    def queue_review_anchored_retry(target):
+        number, node = target
+        run = pytest_runs.get(number)
+        if (
+            not production_regression
+            or malformed.get(target, 0) < RECOVERY_MODE_THRESHOLD
+            or not 0 <= number < len(task.pull_checks)
+            or target not in failures
+            or executor.verification_runner is executor.runner
+            or run is None or node not in run.failed
+            or commands[number] != task.pull_checks[number]
+            or not _named_operator_cases({target}, commands)
+            or _protected(task.regression_edit_path, task, new_test=False)
+        ):
+            return
+        revision = target, hashlib.sha256(patch).digest()
+        if revision in anchored_line_attempted:
+            return
+        anchored_line_attempted.add(revision)
+        retry = _review_anchored_line_retry(
+            _draft_review(review, original, current), current, task.regression_edit_path,
+            node, failures[target],
+        )
+        if retry is not None:
+            continuations.pop(target, None)
+            line_retries[target] = retry
 
     def queue_iteration_retry(target, snapshot):
         number, node = target
@@ -4082,6 +4153,8 @@ def solve(executor, task, archive, budget, version):
                     repair = regression_repair if target == repair_target else None
                     if repair is None and target in operator and malformed.get(target):
                         queue_iteration_retry(target, current)
+                        if target not in line_retries:
+                            queue_review_anchored_retry(target)
                     line_retry = line_retries.pop(target, None)
                     scoped_line = (
                         line_retry is not None and line_retry.allowed_rows is not None
