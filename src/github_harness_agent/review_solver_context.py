@@ -950,7 +950,7 @@ def _prior_setup_import(node, modules):
     )
 
 
-def _prior_setup_source(items, fixtures, modules):
+def _prior_setup_source(items, fixtures, modules, *, sample=None, reference_helpers=False):
     available = _PRIOR_SETUP_FIXTURES | {name for name, fixture in fixtures.items() if fixture in items}
     fixture_nodes = set(fixtures.values())
     for item in items:
@@ -958,9 +958,19 @@ def _prior_setup_source(items, fixtures, modules):
             if not _prior_setup_import(item, modules):
                 return ""
             continue
-        if not isinstance(item, _FUNCTION) or (item in fixture_nodes and _fixture_arguments(item) - available):
+        if not isinstance(item, _FUNCTION) or (
+            (item in fixture_nodes or item is sample) and _fixture_arguments(item) - available
+        ):
             return ""
+        borrowed = reference_helpers and item is not sample
+        token_arguments = {
+            node.arg for node in ast.walk(item) if isinstance(node, ast.arg)
+            and "token" in _words(node.arg.replace("_", " "))
+            and not (_words(node.arg.replace("_", " ")) & (_PRIOR_SENSITIVE - {"token"}))
+        } if borrowed else set()
         for node in ast.walk(item):
+            if borrowed and isinstance(node, _IMPORT) and _prior_setup_import(node, modules):
+                continue
             spelling = (
                 getattr(node, "id", "") or getattr(node, "attr", "")
                 or getattr(node, "name", "") or getattr(node, "arg", "")
@@ -969,12 +979,20 @@ def _prior_setup_source(items, fixtures, modules):
                 if re.search(r"(?m)^\s*assert\b", node.value):
                     return ""
                 spelling = node.value
+            inert_fixture_keyword = (
+                borrowed and isinstance(node, ast.keyword)
+                and isinstance(node.value, ast.Constant) and node.value.value == "fixture"
+            )
             if (
-                isinstance(node, (ast.Assert, ast.Global, *_IMPORT))
-                or (isinstance(node, _FUNCTION) and node.name.startswith("test_"))
-                or (spelling or "").startswith("assert")
+                isinstance(node, (ast.Global, *_IMPORT))
+                or (item is not sample and (isinstance(node, ast.Assert) or (spelling or "").startswith("assert")))
+                or (isinstance(node, _FUNCTION) and node is not sample and node.name.startswith("test_"))
                 or spelling in {"raises", "fail", "eval", "exec", "__import__"}
-                or _prior_sensitive(spelling)
+                or (
+                    _prior_sensitive(spelling) and not inert_fixture_keyword and not (
+                        isinstance(node, (ast.arg, ast.Name)) and spelling in token_arguments
+                    )
+                )
             ):
                 return ""
     source = "\n\n".join(ast.unparse(item) for item in items)
@@ -998,13 +1016,116 @@ def _prior_setup_source(items, fixtures, modules):
     return source
 
 
-def prior_generated_fixture_context(
-    archive, ancestor_archive, new_path, sources, *, max_bytes=1700, require_identical=False,
-):
-    """Quote setup from the immediate generated sibling under the selected ancestor policy."""
+def _prior_reference_modules(archive, ancestor_archive, roots, imports):
+    names = set()
+    for node in imports:
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif not node.level and node.module:
+            names.add(node.module)
+            names.update(f"{node.module}.{alias.name}" for alias in node.names)
+    candidates = {
+        name for name in names - _PRIOR_SETUP_IMPORTS
+        if name.split(".", 1)[0] in roots and not _prior_sensitive(name)
+        and all(part.isidentifier() for part in name.split("."))
+    }
+    if len(candidates) > 24:
+        return set()
+    try:
+        with (
+            tarfile.open(fileobj=BytesIO(archive), mode="r:") as current,
+            tarfile.open(fileobj=BytesIO(ancestor_archive), mode="r:") as ancestor,
+        ):
+            allowed = set(_PRIOR_SETUP_IMPORTS)
+            for name in candidates:
+                module = name.replace(".", "/")
+                if any(
+                    _tracked_python(current, path) is not None and _tracked_python(ancestor, path) is not None
+                    for prefix in ("", "src/")
+                    for path in (f"{prefix}{module}.py", f"{prefix}{module}/__init__.py")
+                ):
+                    allowed.add(name)
+            return allowed
+    except (tarfile.TarError, OSError, EOFError):
+        return set()
+
+
+def _prior_reference_header(body, fixture_nodes, modules):
+    """Accept only inert declarations and known pytest fixture registration on import."""
+    for item in body:
+        if isinstance(item, _IMPORT):
+            if not _prior_setup_import(item, modules):
+                return False
+        elif isinstance(item, _FUNCTION):
+            if item.type_params:
+                return False
+            if item.decorator_list and (item not in fixture_nodes or len(item.decorator_list) != 1):
+                return False
+            decorator = item.decorator_list[0] if item.decorator_list else None
+            if isinstance(decorator, ast.Call) and (
+                decorator.args or any(not isinstance(keyword.value, ast.Constant) for keyword in decorator.keywords)
+            ):
+                return False
+            for expression in (*item.args.defaults, *item.args.kw_defaults):
+                if expression is not None and not isinstance(expression, ast.Constant):
+                    return False
+            if any(
+                isinstance(node, ast.Call)
+                for expression in (item.args, item.returns) if expression is not None
+                for node in ast.walk(expression)
+            ):
+                return False
+        elif not (isinstance(item, ast.Expr) and isinstance(item.value, ast.Constant)):
+            return False
+        if _bindings(item) & {"pytest_plugins", "__file__", "__spec__", "__package__"}:
+            return False
+    return True
+
+
+def _prior_reference_seed(archive, ancestor_archive, path, body, items, test, fixtures, fixture_nodes, modules):
+    definitions = sorted(item.name for item in items if isinstance(item, _FUNCTION) and item is not test)
+    if not definitions:
+        return ""
+    imports = {
+        item for item in body if isinstance(item, _IMPORT)
+    } | {
+        node for item in items for node in ast.walk(item) if isinstance(node, _IMPORT)
+    }
+    roots = {name.split(".", 1)[0] for name in modules}
+    allowed = _prior_reference_modules(archive, ancestor_archive, roots, imports)
+    if not _prior_reference_header(body, fixture_nodes, allowed) or not _prior_setup_source(
+        items, fixtures, allowed, sample=test, reference_helpers=True,
+    ):
+        return ""
+    used = _references((test,), include_attributes=False)
+    borrowed_names = {"_gha_find_spec", "_GhaPriorPath", "_gha_prior_spec"}
+    if borrowed_names & (used | set(_rebound_names(test))):
+        return ""
+    stem = PurePosixPath(path).stem
+    filename = PurePosixPath(path).name
+    header = (
+        "# These named fixtures are in the unchanged sibling present on both revisions.\n"
+        "# Keep the sibling check when adapting their setup to the new test.\n"
+        "from importlib.util import find_spec as _gha_find_spec\n"
+        "from pathlib import Path as _GhaPriorPath\n"
+        f"_gha_prior_spec = _gha_find_spec({stem!r})\n"
+        "if (_gha_prior_spec is None or _gha_prior_spec.origin is None\n"
+        "        or _GhaPriorPath(_gha_prior_spec.origin).resolve()\n"
+        f"        != _GhaPriorPath(__file__).with_name({filename!r}).resolve()):\n"
+        "    raise ImportError('Expected the pinned sibling pytest module')\n"
+        f"from {stem} import {', '.join(definitions)}"
+    )
+    return "\n\n".join((
+        header,
+        *(ast.unparse(item) for item in items if isinstance(item, _IMPORT) and _bindings(item) & used),
+        ast.unparse(test),
+    ))
+
+
+def _prior_generated_module(archive, ancestor_archive, new_path, require_identical):
     match = re.fullmatch(r"tests/test_review_regressions_([1-9]\d?)\.py", new_path)
     if not match or not 2 <= int(match[1]) <= 32:
-        return ""
+        return None
     previous = int(match[1]) - 1
     suffix = f"_{previous}" if previous > 1 else ""
     path = f"tests/test_review_regressions{suffix}.py"
@@ -1013,19 +1134,28 @@ def prior_generated_fixture_context(
             if require_identical:
                 pinned = _tracked_python(ancestor, path)
                 if pinned is None:
-                    return ""
+                    return None
             elif path in ancestor.getnames():
-                return ""
+                return None
         with tarfile.open(fileobj=BytesIO(archive), mode="r:") as snapshot:
             tracked = _tracked_python(snapshot, path)
     except (tarfile.TarError, OSError, EOFError):
-        return ""
+        return None
     if tracked is None:
-        return ""
+        return None
     # The decoded UTF-8 lines retain every newline and all whitespace.
     if require_identical and tracked[0] != pinned[0]:
+        return None
+    return path, tracked[1]
+
+
+def prior_generated_fixture_context(
+    archive, ancestor_archive, new_path, sources, *, max_bytes=1700, require_identical=False,
+):
+    """Quote setup from the immediate generated sibling under the selected ancestor policy."""
+    if not (previous := _prior_generated_module(archive, ancestor_archive, new_path, require_identical)):
         return ""
-    _, body = tracked
+    path, body = previous
     imports, _ = _reviewed_imports(body, {})
     fixtures, fixture_nodes, _ = _module_pytest_fixtures(body, imports)
     factories = {
@@ -1068,6 +1198,51 @@ def prior_generated_fixture_context(
             kept.update(selected)
             result = heading + source
     return result
+
+
+def prior_generated_test_seed(archive, ancestor_archive, new_path, sources, query, *, max_bytes=2500):
+    """Project one related, self-contained test from the unchanged predecessor for verification."""
+    if not (previous := _prior_generated_module(archive, ancestor_archive, new_path, True)):
+        return None
+    path, body = previous
+    modules = _reviewed_modules(sources)
+    imports, reviewed = _reviewed_imports(body, modules)
+    fixtures, fixture_nodes, autouse = _module_pytest_fixtures(body, imports)
+    query_words = _words(query.replace("_", " "))
+    best, rank = None, (0, 0)
+    borrowed = []
+    for test in body:
+        if (
+            not isinstance(test, ast.FunctionDef) or not test.name.startswith("test_")
+            or test.decorator_list or not any(isinstance(node, ast.Assert) for node in ast.walk(test))
+        ):
+            continue
+        bound = set(_rebound_names(test)) | _fixture_arguments(test)
+        calls = {
+            name for node in ast.walk(test) if isinstance(node, ast.Call)
+            and (name := _dotted_name(node.func)) in reviewed and name.split(".", 1)[0] not in bound
+        }
+        calls.update(symbol for symbol, rows in _usage_shapes(test, reviewed) if rows[-1].endswith(")"))
+        matches = _usage_relevance(" ".join((test.name, *sorted(calls))), query_words)
+        if not calls or not matches or (matches, len(calls)) <= rank:
+            continue
+        setup = _local_fixture_setup(test, fixtures, autouse=autouse)
+        if setup is None or not (items := _complete_pytest_nodes(body, test, setup)):
+            continue
+        source = _prior_setup_source(items, fixtures, _PRIOR_SETUP_IMPORTS | modules.keys(), sample=test)
+        if source and len(source.encode()) < max_bytes:
+            best, rank = (path, test.name, source + "\n"), (matches, len(calls))
+        elif not source:
+            borrowed.append(((matches, len(calls)), items, test))
+    for candidate_rank, items, test in sorted(borrowed, key=lambda item: item[0], reverse=True)[:4]:
+        if candidate_rank <= rank:
+            break
+        source = _prior_reference_seed(
+            archive, ancestor_archive, path, body, items, test, fixtures, fixture_nodes, modules,
+        )
+        if source and len(source.encode()) < max_bytes:
+            return path, test.name, source + "\n"
+    return best
 
 
 def _invoked_anchored_apis(node, setup, imports, fixtures, preferred_apis):

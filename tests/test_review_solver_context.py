@@ -1,4 +1,7 @@
 import ast
+import os
+import subprocess
+import sys
 import tarfile
 from io import BytesIO
 
@@ -562,6 +565,8 @@ def test_mixed_context_requires_identical_regular_predecessor(case):
         "    return tmp_path / 'sample.json'\n"
         "def test_prior(sample_path):\n"
         "    assert load(sample_path) == 'old result'\n"
+        "def test_schema(sample_path):\n"
+        "    assert load(sample_path) == 'schema result'\n"
     )
 
     def archive(source, *, link=False):
@@ -586,6 +591,7 @@ def test_mixed_context_requires_identical_regular_predecessor(case):
     context = review_solver_context.prior_generated_fixture_context(
         head, ancestor, new_path, production, require_identical=True,
     )
+    seed = review_solver_context.prior_generated_test_seed(head, ancestor, new_path, production, "load schema")
 
     if case == "identical":
         assert "def sample_path(tmp_path):" in context
@@ -594,8 +600,109 @@ def test_mixed_context_requires_identical_regular_predecessor(case):
             ancestor, production, exclude_generated=True,
         )
         assert normal == ("", "")
+        assert seed[:2] == (prior_path, "test_schema")
+        assert "def sample_path(tmp_path):" in seed[2]
+        assert "def test_prior" not in seed[2]
     else:
-        assert context == ""
+        assert context == "" and seed is None
+
+
+@pytest.mark.parametrize(
+    "mode", (
+        "safe", "placeholder", "other-value", "computed-value", "placeholder-in-sample",
+        "dynamic", "missing", "secret", "active-header",
+    ),
+)
+def test_prior_seed_can_reference_pinned_fixtures_without_quoting_restricted_setup(mode, tmp_path):
+    path = "tests/test_review_regressions.py"
+    new_path = "tests/test_review_regressions_2.py"
+    previous = (
+        "import pytest\n"
+        "from example.configuration import load\n"
+        "@pytest.fixture\n"
+        "def sample_path(tmp_path):\n"
+        "    return tmp_path / 'example.json'\n"
+        "@pytest.fixture\n"
+        "def offline_client(sample_path, monkeypatch):\n"
+        "    from example.backend import Client\n"
+        "    def fetch(self, token):\n"
+        "        return sample_path\n"
+        "    monkeypatch.setattr(Client, 'fetch', fetch)\n"
+        "    return Client()\n"
+        "def test_schema(offline_client):\n"
+        "    assert load(offline_client) == 'schema value'\n"
+    )
+    if mode == "dynamic":
+        previous = previous.replace("from example.backend import Client", "Client = __import__('example.backend').Client")
+    elif mode == "secret":
+        previous = previous.replace("load(offline_client)", "load(offline_client, token='private value')")
+    elif mode == "placeholder-in-sample":
+        previous = previous.replace("load(offline_client)", "load(offline_client, token='fixture')")
+    elif mode in {"placeholder", "other-value", "computed-value"}:
+        value = {
+            "placeholder": "'fixture'",
+            "other-value": "'fixture-opaque'",
+            "computed-value": "'fix' + 'ture'",
+        }[mode]
+        previous = previous.replace(
+            "    def fetch(self, token):\n"
+            "        return sample_path\n"
+            "    monkeypatch.setattr(Client, 'fetch', fetch)\n",
+            "    monkeypatch.setattr(Client, 'fetch', lambda self, token: sample_path)\n",
+        ).replace("Client()\n", f"Client(token={value})\n")
+    elif mode == "active-header":
+        previous += "\nload(None)\n"
+    production = {"src/example/configuration.py": (
+        "def load(client):\n"
+        "    return 'schema value' if client.fetch('synthetic').name == 'example.json' else None\n"
+    )}
+    buffer = BytesIO()
+    files = {path: previous, **production}
+    if mode != "missing":
+        files["src/example/backend.py"] = (
+            "class Client:\n"
+            "    def __init__(self, token=None):\n"
+            "        pass\n"
+            "    def fetch(self, token):\n"
+            "        raise RuntimeError('Unpatched client')\n"
+        )
+    with tarfile.open(fileobj=buffer, mode="w") as snapshot:
+        for name, source in files.items():
+            data = source.encode()
+            entry = tarfile.TarInfo(name)
+            entry.size = len(data)
+            snapshot.addfile(entry, BytesIO(data))
+    archive = buffer.getvalue()
+    seed = review_solver_context.prior_generated_test_seed(archive, archive, new_path, production, "load schema")
+    if mode in {"safe", "placeholder"}:
+        assert seed[:2] == (path, "test_schema")
+        assert "from test_review_regressions import offline_client, sample_path" in seed[2]
+        assert "with_name('test_review_regressions.py')" in seed[2]
+        assert "def test_schema(offline_client):" in seed[2]
+        assert all(item not in seed[2] for item in ("def offline_client", "def fetch", "token", "example.backend"))
+        for filename, source in {**files, new_path: seed[2]}.items():
+            file = tmp_path / filename
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text(source)
+        launcher = (sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider")
+        environment = {**os.environ, "PYTHONPATH": str(tmp_path / "src")}
+        verified = subprocess.run(
+            (*launcher, new_path), cwd=tmp_path, env=environment,
+            capture_output=True, text=True, timeout=15,
+        )
+        assert verified.returncode == 0, verified.stdout + verified.stderr
+
+        shadow = tmp_path / "src" / "test_review_regressions.py"
+        shadow.write_text("raise RuntimeError('Stale sibling executed')\n")
+        rejected = subprocess.run(
+            (*launcher, "--import-mode=importlib", new_path), cwd=tmp_path, env=environment,
+            capture_output=True, text=True, timeout=15,
+        )
+        assert rejected.returncode != 0
+        assert "Expected the pinned sibling pytest module" in rejected.stdout
+        assert "Stale sibling executed" not in rejected.stdout + rejected.stderr
+    else:
+        assert seed is None
 
 
 def test_test_repair_prioritizes_the_missing_fixture_and_setup_frame():

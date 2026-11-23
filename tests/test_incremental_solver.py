@@ -707,8 +707,8 @@ TEST = (
 
 @pytest.mark.parametrize(
     ("oversized", "committed_setup"),
-    ((False, False), (True, False), (False, True)),
-    ids=("quoted", "oversized", "committed-setup"),
+    ((False, False), (True, False), (False, True), (False, "retry")),
+    ids=("quoted", "oversized", "committed-setup", "prior-green-seed"),
 )
 def test_single_pinned_production_review_fixes_all_checks_before_authoring_regression(
     solver_case, oversized, committed_setup,
@@ -724,9 +724,11 @@ def test_single_pinned_production_review_fixes_all_checks_before_authoring_regre
         previous = (
             b"import pytest\n"
             b"from fixture_calc import first\n"
+            b"def make_config(tmp_path):\n"
+            b"    return tmp_path / 'sample.json'\n"
             b"@pytest.fixture\n"
             b"def sample_config(tmp_path):\n"
-            b"    return tmp_path / 'sample.json'\n"
+            b"    return make_config(tmp_path)\n"
             b"def test_previous(sample_config):\n"
             b"    assert first() in {-1, 1}, 'old assertion marker'\n"
         )
@@ -750,17 +752,30 @@ def test_single_pinned_production_review_fixes_all_checks_before_authoring_regre
         task, inline_review_threads=1, review_recovery=review,
         regression_base=task.base_sha, regression_archive=archive, regression_edit_path=SOURCE,
     )
-    gateway = FreeGateway(FIRST, SECOND, TEST)
+    proposals = (TEST,)
+    if committed_setup == "retry":
+        missing = "def test_missing(missing_setup):\n    assert missing_setup\n"
+        still_missing = missing.replace("missing_setup", "other_setup")
+        unchanged = previous.decode()
+        corrected = unchanged.replace("import first\n", "import first, second\n").replace(
+            "assert first() in {-1, 1}, 'old assertion marker'",
+            "assert (first(), second()) == (1, 2)",
+        )
+        proposals = (
+            missing, edit(test_path, missing, still_missing),
+            edit(test_path, still_missing, unchanged), edit(test_path, unchanged, corrected),
+        )
+    gateway = FreeGateway(FIRST, SECOND, *proposals)
     independent = runner.path / "production-regression-verifier"
     independent.mkdir()
     executor = PlainExecutor(
-        runner, gateway, Limits(model_requests=3, concurrent_probes=1),
+        runner, gateway, Limits(model_requests=2 + len(proposals), concurrent_probes=1),
         verification_runner=FixtureRunner(independent),
     )
     result = solve(executor, task, archive, _Budget(executor.limits, lambda: False, task), "fixture")
 
     assert result is not None
-    first, second, proof = gateway.prompts
+    first, second, proof, *retries = gateway.prompts
     assert "test_first" in first and "test_second" in second
     if oversized:
         assert "withheld-operator-source" not in "\n".join(gateway.prompts)
@@ -773,6 +788,14 @@ def test_single_pinned_production_review_fixes_all_checks_before_authoring_regre
     if committed_setup:
         assert "def sample_config(tmp_path):" in proof
         assert "def test_previous" not in proof and "old assertion marker" not in proof
+    if committed_setup == "retry":
+        assert "Prior test seed passed on both revisions" not in retries[0]
+        assert "Prior test seed passed on both revisions" in retries[1]
+        assert "def test_previous(sample_config):" in retries[1]
+        assert "def make_config(tmp_path):" in retries[1]
+        assert "The new tests also pass on the ancestor" in retries[2]
+        assert b"old assertion marker" not in result.patch
+        assert f"+++ b/{NEW_TEST}\n".encode() not in result.patch
     assert b"+    return 1\n" in result.patch and b"+    return 2\n" in result.patch
     assert f"+++ b/{test_path}".encode() in result.patch
     assert any(check.command == task.pull_checks[0] and check.returncode == 0 for check in result.checks)

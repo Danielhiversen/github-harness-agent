@@ -113,6 +113,7 @@ from .review_solver_context import (
     imported_model_declarations,
     operator_api_contract,
     prior_generated_fixture_context,
+    prior_generated_test_seed,
     repository_pytest_context,
     stock_assertion_progress,
     stock_assertion_failure_line,
@@ -150,6 +151,11 @@ _LOG = logging.getLogger(__name__)
 _CHECKPOINT = "harness2/base"
 _GUIDANCE = "Progress verified against operator review checks, version 1"
 _TEST_GOAL = (-1, "new regression tests")
+_PRIOR_SEED_SETUP_ERRORS = {
+    "fixture not found", "setup error", "collection error", "ValueError",
+    "KeyError", "FileNotFoundError", "TypeError", "ImportError", "ModuleNotFoundError",
+    "NameError", "AttributeError",
+}
 _TEST_MODULE_TOOL_NAME = "submit_pytest_module"
 _TEST_MODULE_TOOL = {
     "type": "function",
@@ -3739,6 +3745,9 @@ def solve(executor, task, archive, budget, version):
         test_checkout_digest = hashlib.sha256(patch).digest()
     test_format_revision = None
     test_format_failures = 0
+    test_setup_failures = 0
+    prior_test_attempted = False
+    prior_test_example = ""
     test_model_failures = Counter()
     test_tool_attempts = set()
     test_line_attempts = set()
@@ -3749,6 +3758,44 @@ def solve(executor, task, archive, budget, version):
     repository_usage = ""
     repository_models = ""
     attempted_seed_cases = set()
+
+    def verified_prior_example():
+        if budget.commands_remaining() < len(commands) + 6 or budget.remaining() < 35:
+            return ""
+        previous = prior_generated_test_seed(
+            archive, task.regression_archive, new_path,
+            {path: current[path] for path in paths if not _protected(path, task, new_test=False)},
+            " ".join(body for _, _, body in review.feedback),
+        )
+        if previous is None:
+            return ""
+        path, name, source = previous
+        projected = patch_for({new_path: ""}, {new_path: source})
+        proof = _GuardBudget(budget, wall_seconds=25)
+        try:
+            for archive_revision, changes in (
+                (task.regression_archive, projected),
+                (archive, patch_for(original, {**current, new_path: source})),
+            ):
+                runs = {}
+                if evidence(
+                    executor, task, archive_revision, proof, changes,
+                    (focused_generated,), pytest_runs=runs,
+                ) or not (
+                    (run := runs.get(0)) and run.passed == 1
+                    and _covers_generated_seed(run, new_path, (name,))
+                ):
+                    return ""
+        except Cancelled:
+            raise
+        except (ExecutionError, LimitExceeded):
+            budget.remaining()
+            return ""
+        return (
+            f"# Prior test seed passed on both revisions. Source: {path}.\n"
+            "# Reuse its setup in a self-contained new module and assert the requested behavior "
+            "that differs on the pinned ancestor.\n" + source
+        )
 
     def count_test_model_failure(snapshot, editor, categories):
         if snapshot is current and test_model_failures is not None and editor.configured_model:
@@ -4332,6 +4379,9 @@ def solve(executor, task, archive, budget, version):
                             test_checkout_snapshot = current
                             test_checkout_digest = hashlib.sha256(patch).digest()
                             test_case_runs = {}
+                            test_setup_failures = 0
+                            prior_test_attempted = False
+                            prior_test_example = ""
                             test_model_failures = Counter()
                         revision = (test_checkout_digest, hashlib.sha256(test_draft.encode()).digest())
                         if revision != test_format_revision:
@@ -4371,6 +4421,12 @@ def solve(executor, task, archive, budget, version):
                             and not _protected(new_path, task, new_test=True)
                             and (not test_draft or test_diagnostic)
                         )
+                        if (
+                            production_regression and allow_test_module and focused_generated
+                            and test_setup_failures >= 2 and not prior_test_attempted
+                        ):
+                            prior_test_attempted = True
+                            prior_test_example = verified_prior_example()
                         native_test = (
                             allow_test_module
                             and test_format_failures >= 2
@@ -4598,7 +4654,7 @@ def solve(executor, task, archive, budget, version):
                         mock_detail=mock_detail,
                         parameter_focus=parameter_focus,
                         allow_test_module=allow_test_module,
-                        repository_example=repository_example or "",
+                        repository_example=prior_test_example or repository_example or "",
                         repository_usage=repository_usage,
                         repair_failed_tests=target == _TEST_GOAL and bool(test_draft and test_diagnostic),
                         prefer_test_module=bool(
@@ -5103,6 +5159,19 @@ def solve(executor, task, archive, budget, version):
                 )
                 previous_run = test_case_runs.get("focused")
                 candidate_run = next_case_runs.get("focused")
+                if (
+                    production_regression and allow_test_module and snapshot is current
+                    and focused_rejection is not None
+                    and not (candidate_run and (candidate_run.assertion_reached or candidate_run.passed))
+                    and any(
+                        kind in _PRIOR_SEED_SETUP_ERRORS
+                        for label in test_check_labels if label.startswith("pytest/")
+                        for kind in label.partition(": ")[2].split(", ")
+                    )
+                ):
+                    test_setup_failures += 1
+                elif candidate_run and (candidate_run.assertion_reached or candidate_run.passed):
+                    test_setup_failures = 0
                 if snapshot is current:
                     previous_passed = previous_run.passed if previous_run else 0
                     improved = candidate_run and (
