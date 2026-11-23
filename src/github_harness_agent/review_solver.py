@@ -4805,6 +4805,11 @@ def solve(executor, task, archive, budget, version):
                                 continue
                             if pinned_ancestor and check.command == ("verify-regression", task.regression_base):
                                 next_ancestor_feedback = excerpt(check.output, 420)
+                                test_check_labels.add(
+                                    "ancestor/tests passed on both revisions"
+                                    if "The new tests also pass on the ancestor." in check.output
+                                    else "ancestor/no verified assertion failure"
+                                )
                                 continue
                             nodes = [node for _, node in _TEST_RESULT.findall(check.output)]
                             categories = set()

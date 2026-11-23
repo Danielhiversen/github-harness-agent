@@ -5,6 +5,7 @@ import pytest
 from github_harness_agent.executor import ExecutionError, LimitExceeded, Limits, PlainExecutor, TaskSnapshot
 from github_harness_agent.rebase import BOT_IDENTITY, git
 from github_harness_agent.review_solver import patch_for
+from github_harness_agent.review_recovery import ReviewRecovery
 from github_harness_agent.test_updates import authorized_regression_base, regression_assertion_report
 from test_executor import FixtureRunner
 
@@ -49,6 +50,69 @@ def commit(path, message):
     git(path, "add", "-A")
     git(path, "-c", f"user.name={name}", "-c", f"user.email={email}", "commit", "-qm", message)
     return git(path, "rev-parse", "HEAD").decode().strip()
+
+
+@pytest.mark.parametrize("case", ("mock-change", "same", "genuine", "budget", "probe-error"))
+def test_regression_callback_advice_is_private_and_advisory(tmp_path, monkeypatch, case):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    git(checkout, "init", "-q")
+    source = checkout / "fixture_value.py"
+    old = "def dispatch(callback):\n    return callback([1234567, 2])\n"
+    source.write_text(old)
+    (checkout / "tests").mkdir()
+    (checkout / "tests" / "test_existing.py").write_text("def test_smoke():\n    assert True\n")
+    ancestor = commit(checkout, "old")
+    source.write_text(old.replace("1234567", "7654321") if case != "same" else old + "\n# Current\n")
+    base = commit(checkout, "current")
+    new_path = "tests/test_review_regressions.py"
+    callback = "batch[0]" if case == "genuine" else "len(batch)"
+    apply = "Mock(side_effect=fake)" if case == "mock-change" else "fake"
+    expected = 7654321 if case == "genuine" else 2
+    wanted = (
+        "from unittest.mock import Mock\nfrom fixture_value import dispatch\n"
+        "def test_dispatch():\n"
+        "    def fake(batch):\n"
+        f"        return {callback}\n"
+        f"    assert dispatch({apply}) == {expected}\n"
+    )
+    patch = patch_for({new_path: ""}, {new_path: wanted})
+    sandbox = tmp_path / "verifier"
+    sandbox.mkdir()
+    runner = FixtureRunner(sandbox)
+    command = (sys.executable, "-m", "pytest", "-q", "tests/test_existing.py")
+    task = TaskSnapshot(
+        "org/fixture", base, "Add a regression test.", (command,),
+        require_new_tests=True, regression_base=ancestor,
+        review_recovery=ReviewRecovery(((source.name, 1, "Add a regression test."),), "", test_only=True),
+    )
+    executor = PlainExecutor(runner, None, Limits(commands=2) if case == "budget" else Limits())
+    if case == "probe-error":
+        from github_harness_agent import review_mock_replay
+
+        def broken(*args):
+            raise RuntimeError("private trace error")
+
+        monkeypatch.setattr(review_mock_replay, "passing_callback_hint", broken)
+    if case == "genuine":
+        result = executor.verify_patch(task, checkout, patch)
+        assert all(check.returncode == 0 for check in result.checks)
+        assert len(runner.workspaces) == 4
+        return
+    with pytest.raises(ExecutionError, match="named assertion") as error:
+        executor.verify_patch(task, checkout, patch)
+    detail = str(error.value)
+    if case in {"budget", "probe-error"}:
+        assert "callback" not in detail and "private trace error" not in detail
+        assert len(runner.workspaces) == 4
+        return
+    assert "fake" in detail
+    assert "1234567" not in detail and "7654321" not in detail and "def fake" not in detail
+    if case == "mock-change":
+        assert "arguments first differed at call 1" in detail
+    else:
+        assert "callback observations match" in detail
+    assert len(runner.workspaces) == 6
 
 
 @pytest.mark.parametrize(

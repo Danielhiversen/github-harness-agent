@@ -8,6 +8,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+from secrets import token_hex
 from types import SimpleNamespace
 
 from . import review_counter_trace, review_mock_probe
@@ -130,6 +131,8 @@ def _readout(
     expected,
     paths,
     failure_line,
+    *,
+    callback_key=None,
 ):
     deadline = time.monotonic() + _REPLAY_SECONDS
 
@@ -149,26 +152,31 @@ def _readout(
             tree = executor._stage_baseline(ws, bounded)
             if patch:
                 executor._git(ws, bounded, "apply", "--index", data=patch)
-                executor._check_patch_paths(ws, task, bounded, tree)
-                test_path = node.split("::", 1)[0]
-                unchanged = executor._git(
-                    ws,
-                    bounded,
-                    "diff",
-                    "--cached",
-                    "--quiet",
-                    tree,
-                    "--",
-                    test_path,
-                    checked=False,
-                )
-                if unchanged.returncode:
-                    return None
+                if callback_key is not None:
+                    executor._check_patch_paths(ws, task, bounded, tree, new_tests_only=True)
+                else:
+                    executor._check_patch_paths(ws, task, bounded, tree)
+                    test_path = node.split("::", 1)[0]
+                    unchanged = executor._git(
+                        ws,
+                        bounded,
+                        "diff",
+                        "--cached",
+                        "--quiet",
+                        tree,
+                        "--",
+                        test_path,
+                        checked=False,
+                    )
+                    if unchanged.returncode:
+                        return None
             timeout = remaining()
             budget.claim("command", budget.limits.commands)
             program = inspect.getsource(review_mock_probe)
             parameters, cap = (node,), review_mock_probe.REPORT_BYTES
-            if paths:
+            if callback_key is not None:
+                parameters = (node, json.dumps(paths), "null", json.dumps(callback_key))
+            elif paths:
                 counter_source = inspect.getsource(review_counter_trace)
                 program = (
                     "_counter_module = {'__name__': '_stock_counter_probe'}\n"
@@ -189,6 +197,8 @@ def _readout(
         return None
     if result.returncode != expected or result.stderr:
         return None
+    if callback_key is not None:
+        return review_mock_probe.decode_callbacks(result.stdout)
     if not paths:
         traces = review_mock_probe.decode_traces(result.stdout)
         return (traces, None) if traces is not None else None
@@ -641,3 +651,58 @@ def mock_call_diagnostic(
     text = "\n".join(filter(None, (counter, _differences(baseline[0], candidate[0]))))
     site, loop = counter_caller_site(counter), counter_loop_reuse(counter)
     return _ReplayDiagnostic(text, site, loop) if site or loop else text
+
+
+def passing_callback_hint(executor, task, archive, budget, command, patch, new_tests, green, red):
+    """Optionally explain matching test outcomes using bounded callback observations."""
+    from .review_solver import _parse_complete_pytest
+
+    try:
+        before, after = (_parse_complete_pytest(0, output) for output in (red, green))
+        if not before or not after or not before.named_cases or before.named_cases != after.named_cases:
+            return ""
+        node = next((
+            name for name in sorted(before.named_cases)
+            if len(name) <= 130 and _STOCK_NODE.fullmatch(name)
+            and name.partition("::")[0] in new_tests
+        ), None)
+        interpreter = _interpreter(command)
+        reserve = len(set((*task.checks, *task.pull_checks))) + 2
+        if (
+            not node or not interpreter or budget.commands_remaining() < reserve + 2
+            or budget.remaining() < _PLANNING_RESERVE + 2 * _REPLAY_SECONDS
+        ):
+            return ""
+        test_path = node.partition("::")[0]
+        paths = tuple(path for path in _counter_paths(
+            task, executor.verification_runner, None, test_path
+        ) if path not in new_tests)
+        if not paths:
+            return ""
+        if PurePosixPath(interpreter[0]).name == "uv":
+            interpreter = ("env", "UV_OFFLINE=1", *interpreter)
+        key = token_hex(16)
+        replays = (
+            _readout(executor, task, tree, budget, interpreter, node, patch, 0, paths, None,
+                     callback_key=key)
+            for tree in (task.regression_archive, archive)
+        )
+        if (baseline := next(replays)) is None or (candidate := next(replays)) is None:
+            return ""
+    except Cancelled:
+        raise
+    except (ExecutionError, OSError, ValueError, RecursionError):
+        return ""
+    label = f"{PurePosixPath(test_path).name}::{node.rsplit('::', 1)[-1]}"
+    for name in sorted(baseline.keys() | candidate.keys()):
+        old_count, old_args = baseline.get(name, (0, ()))
+        new_count, new_args = candidate.get(name, (0, ()))
+        if old_count != new_count:
+            return f"In {label}, callback {name} ran {old_count} times on the ancestor and {new_count} times on the candidate."
+        for call, (old, new) in enumerate(zip(old_args, new_args, strict=True), 1):
+            if old is not None and new is not None and old != new:
+                return f"In {label}, callback {name} ran {new_count} times on both revisions and its numeric arguments first differed at call {call}."
+    if baseline:
+        names = ", ".join(sorted(baseline)[:2])
+        return f"In {label}, sampled callback observations match for {names}. Adjust the fixture to exercise the changed code."
+    return f"In {label}, no reviewed callback calls were observed. Adjust the fixture to exercise the changed code."

@@ -1,5 +1,6 @@
 """Run one selected pytest case and serialize a bounded mock trace."""
 
+import hashlib
 import inspect
 import json
 import math
@@ -136,7 +137,86 @@ def decode_traces(output):
     return traces
 
 
-def _run_pytest(node, counter_paths=(), failure_line=None):
+def _numeric_shape(value, depth=0):
+    if _number(value):
+        return value
+    if type(value) not in (list, tuple) or depth >= _MAX_DEPTH or len(value) > _MAX_ITEMS:
+        return None
+    items = [_numeric_shape(item, depth + 1) for item in value]
+    return [type(value).__name__, *items] if None not in items else None
+
+
+class _CallbackTrace:
+    """Keep only bounded call counts and keyed numeric fingerprints."""
+
+    def __init__(self, node, paths, key):
+        test = node.partition("::")[0]
+        self.test_paths = {test, str(Path(test).resolve())}
+        self.callers = set(paths) | {str(Path(path).resolve()) for path in paths}
+        self.mock_path = sys.modules["unittest.mock"].__file__
+        self.key = bytes.fromhex(key)
+        self.codes = {}
+        self.stats = {}
+        self.complete = self.overflow = False
+
+    def observe(self, frame, test_code):
+        code = frame.f_code
+        if (
+            self.overflow or code is test_code or code.co_filename not in self.test_paths
+            or not _identifier(code.co_name)
+        ):
+            return
+        caller = frame.f_back
+        for _ in range(8):
+            if caller is None or caller.f_code.co_filename != self.mock_path:
+                break
+            caller = caller.f_back
+        if caller is None or caller.f_code.co_filename not in self.callers:
+            return
+        if self.codes.setdefault(code.co_name, code) is not code or len(self.codes) > _MAX_MOCKS:
+            self.overflow = True
+            return
+        stat = self.stats.setdefault(code.co_name, [0, []])
+        stat[0] += 1
+        if len(stat[1]) >= _MAX_CALLS:
+            return
+        count = code.co_argcount + code.co_kwonlyargcount
+        count += bool(code.co_flags & inspect.CO_VARARGS) + bool(code.co_flags & inspect.CO_VARKEYWORDS)
+        arguments = (
+            [_numeric_shape(frame.f_locals.get(name)) for name in code.co_varnames[:count]]
+            if count <= _MAX_ITEMS else [None]
+        )
+        digest = None
+        if None not in arguments:
+            numeric = json.dumps(arguments, separators=(",", ":"), allow_nan=False).encode()
+            digest = hashlib.blake2s(numeric, key=self.key, digest_size=8).hexdigest()
+        stat[1].append(digest)
+
+
+def decode_callbacks(output):
+    if len(output) > REPORT_BYTES:
+        return None
+    try:
+        stats = json.loads(output)
+    except (ValueError, RecursionError):
+        return None
+    if type(stats) is not dict or len(stats) > _MAX_MOCKS:
+        return None
+    for name, info in stats.items():
+        if (
+            not _identifier(name) or type(info) is not list or len(info) != 2
+            or type(info[0]) is not int or not 1 <= info[0] <= 100_000
+            or type(info[1]) is not list or len(info[1]) != min(info[0], _MAX_CALLS)
+            or not all(
+                digest is None or (type(digest) is str and re.fullmatch(r"[a-f0-9]{16}", digest))
+                for digest in info[1]
+            )
+        ):
+            return None
+    return stats
+
+
+def _run_pytest(node, counter_paths=(), failure_line=None, callbacks=None):
     import pytest
 
     path = Path(node.split("::", 1)[0]).resolve()
@@ -182,8 +262,13 @@ def _run_pytest(node, counter_paths=(), failure_line=None):
                     self.traces = None
                     sys.setprofile(None)
                 elif event == "return" and frame.f_code is code:
-                    self.traces = _locals_trace(frame)
+                    if callbacks is None:
+                        self.traces = _locals_trace(frame)
+                    else:
+                        callbacks.complete = not callbacks.overflow
                     sys.setprofile(None)
+                elif callbacks is not None and event == "call":
+                    callbacks.observe(frame, code)
 
             tracer = (
                 counter.tracer(code)
@@ -232,11 +317,17 @@ def _run_pytest(node, counter_paths=(), failure_line=None):
     return 4, None, None
 
 
-def _main(node, counter_paths=(), failure_line=None):
+def _main(node, counter_paths=(), failure_line=None, callback_key=None):
     # Keep all test output, even native stdout/stderr, out of the report stream.
     with os.fdopen(os.dup(1), "w") as report, open(os.devnull, "wb") as sink:
         os.dup2(sink.fileno(), 1)
         os.dup2(sink.fileno(), 2)
+        if callback_key is not None:
+            callbacks = _CallbackTrace(node, counter_paths, callback_key)
+            status, _, _ = _run_pytest(node, callbacks=callbacks)
+            if status == 0 and callbacks.complete:
+                report.write(json.dumps(callbacks.stats, separators=(",", ":")))
+            return status
         status, traces, counter = _run_pytest(node, counter_paths, failure_line)
         if traces is not None or counter is not None:
             data, cap = traces, REPORT_BYTES

@@ -1938,7 +1938,9 @@ class PlainExecutor:
             for path in paths
         )
 
-    def _verify_test_regression(self, task, budget, patch, new_tests, green_report, green_sources):
+    def _verify_test_regression(
+        self, task, archive, budget, patch, new_tests, green_report, green_sources, green_output
+    ):
         command = ("verify-regression", task.regression_base)
         report = f".git/gha-regression-{uuid4().hex}.xml"
         pytest = focused_pytest(task.checks, new_tests, report, verbose=True)
@@ -1966,6 +1968,19 @@ class PlainExecutor:
             if result.returncode == 0 else
             "Setup, import, and collection failures cannot prove the reviewed behavior. Use APIs available on both revisions."
         )
+        if result.returncode == 0 and task.review_recovery and task.review_recovery.test_only:
+            try:
+                from .review_mock_replay import passing_callback_hint
+
+                if hint := passing_callback_hint(
+                    self, task, archive, budget, pytest, patch, new_tests,
+                    green_output, result.stdout.decode("utf-8", "replace"),
+                ):
+                    detail += "\n" + hint
+            except Cancelled:
+                raise
+            except Exception:
+                logging.getLogger(__name__).debug("Optional regression callback comparison was unavailable")
         return CheckEvidence(command, 1, "A named assertion must fail on the ancestor. " + detail)
 
     def _verify(self, task, archive, budget, patch, refinement=None, *, actor=None):
@@ -2053,6 +2068,7 @@ class PlainExecutor:
             selections.append(new_python_tests)
         green_report = b""
         green_sources = ()
+        green_output = ""
         if (new_tests or selections) and trusted_passed:
             with self.verification_runner.workspace(
                 archive, budget.remaining, budget.cancelled
@@ -2100,10 +2116,11 @@ class PlainExecutor:
                                 )
                             elif regression_green:
                                 green_report = result.stdout
+                                green_output = check.output
                     checks.append(check)
         if task.regression_base and not any(check.returncode for check in checks):
             regression = self._verify_test_regression(
-                task, budget, patch, new_python_tests, green_report, green_sources
+                task, archive, budget, patch, new_python_tests, green_report, green_sources, green_output
             )
             checks.append(regression)
             if regression.returncode:
