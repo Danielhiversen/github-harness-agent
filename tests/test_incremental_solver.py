@@ -580,12 +580,11 @@ def test_ruff_goal_keeps_search_replace_after_malformed_proposals(
         runner, gateway, Limits(model_requests=3, concurrent_probes=1)
     )
     budget = _Budget(executor.limits, lambda: False, task)
-    monkeypatch.setattr(
-        "github_harness_agent.review_solver.evidence",
-        lambda *args, pytest_runs=None: {
-            (1, "check 2 (exit 1)"): f"{SOURCE}:1:1: I001 Imports unsorted"
-        },
-    )
+    def verify(*args, visible_operator_cases, pytest_runs=None):
+        assert visible_operator_cases == {task.pull_checks[0][-1]: {"test_first", "test_second"}}
+        return {(1, "check 2 (exit 1)"): f"{SOURCE}:1:1: I001 Imports unsorted"}
+
+    monkeypatch.setattr("github_harness_agent.review_solver.evidence", verify)
 
     with pytest.raises(AttemptRejected):
         solve(executor, task, archive, budget, "fixture-version")
@@ -630,8 +629,9 @@ def test_solver_rotates_exact_models_until_verified_progress(solver_case, monkey
 
     def verify(
         executor, task, archive, budget, patch, commands, *,
-        pytest_runs=None, static_runs=None, private_proposal=False,
+        visible_operator_cases, pytest_runs=None, static_runs=None, private_proposal=False,
     ):
+        assert visible_operator_cases == {task.pull_checks[0][-1]: {"test_first", "test_second"}}
         assert not private_proposal
         if b"+    return 1\n" in patch:
             return lint
@@ -672,10 +672,11 @@ def test_solver_reenables_sole_model_once_when_rotation_exhausts(solver_case, mo
         checks=(("ruff", "check", "."),),
         excluded_models=(tuple(OLLAMA.split("/", 1)),),
     )
-    monkeypatch.setattr(
-        "github_harness_agent.review_solver.evidence",
-        lambda *args, pytest_runs=None: {(1, "check 2 (exit 1)"): "Imports unsorted"},
-    )
+    def verify(*args, visible_operator_cases, pytest_runs=None):
+        assert visible_operator_cases == {task.pull_checks[0][-1]: {"test_first", "test_second"}}
+        return {(1, "check 2 (exit 1)"): "Imports unsorted"}
+
+    monkeypatch.setattr("github_harness_agent.review_solver.evidence", verify)
     attempts = []
     gateway = _proposal_router((OLLAMA, OPENROUTER), iter(["malformed"] * 7), attempts)
     executor = PlainExecutor(runner, gateway, Limits(model_requests=7, concurrent_probes=1))
