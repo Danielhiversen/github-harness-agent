@@ -1285,7 +1285,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
         body = "        offset = (\n            0\n" + parts + header + "            + 0\n        )\n        return self.read() - 2 + offset\n"
         production = production.replace("        return self.read() - 2\n", body)
         caller_rows = len(body.splitlines())
-    elif fragment_case in {"literal", "literal-wide", "choices", "mixed-fences"}:
+    elif fragment_case in {"literal", "literal-wide", "choices", "mixed-fences", "history"}:
         header = "        if False:\n"
         tentative_header = "        choose = True\n        enabled = choose\n        if enabled:\n"
         wide_body = "".join(f"            context_{i} = {i}\n" for i in range(32))
@@ -1377,7 +1377,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 reply.content = "+ (0 if legacy else 4)"
                 private_models.append((reply.route, reply.configured_model))
                 return reply
-            if fragment_case in {"literal", "literal-wide", "choices", "mixed-fences"} and "replacement lines for the exact tentative hunk" in prompt:
+            if fragment_case in {"literal", "literal-wide", "choices", "mixed-fences", "history"} and "replacement lines for the exact tentative hunk" in prompt:
                 if dynamic_facts:
                     assert "target-observed=-3 expected=1" in prompt
                     assert "control-observed=1 expected=-3" in prompt
@@ -1387,11 +1387,19 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 assert "legacy=False" in prompt and "test_keep_helper" in prompt and "test_first" in prompt
                 assert "context_31" not in prompt and "def unrelated" not in prompt
                 reply = super().complete(**{**kwargs, "max_output_tokens": 3072})
-                if fragment_case in {"choices", "mixed-fences"}:
+                if fragment_case in {"choices", "mixed-fences", "history"}:
                     reply.route, reply.configured_model = f"private{len(private_models)}", f"editor{len(private_models)}"
                     if private_models:
                         assert tuple(private_models) == kwargs["exclude"] and "JSON array" in prompt
+                        assert "Checked literal-hunk replacements" in prompt
+                        assert "if bool(legacy):" in prompt
+                        assert "Original target failed; previously passing control failed." in prompt
+                        if dynamic_facts:
+                            assert "target-observed=-3 expected=1" in prompt.split("Checked literal-hunk replacements")[1]
+                            assert "control-observed=1 expected=-3" in prompt.split("Checked literal-hunk replacements")[1]
                         reply.content = json.dumps(["if False:", "if not legacy:"])
+                        if fragment_case == "history":
+                            reply.content = json.dumps(["if False:", "if True:"])
                         if fragment_case == "mixed-fences":
                             reply.content = "Option 1:\n```python\nif invalid syntax(:\n```\nOption 2:\n```python\nif not legacy:\n```"
                     else:
@@ -1418,6 +1426,22 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 reply.content = "return self.read() + (-2 if legacy else 2)" if fragment_case == "success" else "def foreign(): pass"
                 if fragment_case == "malformed" and len(private_models) == 2:
                     reply.content = "Here is the corrected fragment:\n```python\nreturn self.read() + (-2 if legacy else 2)\n```"
+                return reply
+            if fragment_case == "history" and "Private regression repair. The numbered tentative method" in prompt:
+                history = prompt.split("Checked literal-hunk replacements (quoted data):\n")[1]
+                history = history.split("\nTentative method (quoted):")[0].split("\nEdit only ")[0]
+                assert 'if bool(legacy):"\nOriginal target failed; previously passing control failed.' in history
+                assert 'if False:"\nOriginal target failed; previously passing control passed.' in history
+                assert 'if True:"\nOriginal target passed; previously passing control failed.' in history
+                assert "context_31" not in history
+                reply = super().complete(**{**kwargs, "role": "coding", "max_output_tokens": 3072})
+                if kwargs["role"] == "planning":
+                    reply.role = "planning"
+                    reply.content = json.dumps({"strategy": strategy})
+                    return reply
+                reply.route, reply.configured_model = "private-final", "editor-final"
+                private_models.append((reply.route, reply.configured_model))
+                reply.content = edit(SOURCE, tentative_header, "        if not legacy:\n")
                 return reply
             if private_case and "Private regression repair. The numbered tentative method" in prompt:
                 assert "test_first" in prompt and "test_keep_helper" in prompt
@@ -1568,7 +1592,7 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                             if failover.endswith("-multistage"):
                                 assert "Checkpoint assertion at line 4: assert first() == 1" in prompt
                                 assert "Pinned ancestor assertion at line 3: assert second() == 2" in prompt
-                    if fragment_case in {"literal", "literal-wide", "choices", "mixed-fences", "blank"}:
+                    if fragment_case in {"literal", "literal-wide", "choices", "mixed-fences", "blank", "history"}:
                         reply.content = edit(SOURCE, header, tentative_header)
                     elif semantic:
                         if len(line_attempts) == 1:
@@ -1640,6 +1664,9 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
             if private_case:
                 gateway = Gateway("anchor", early_case, "caller", "invalid", "undo", "repaired")
                 requests = 8 if private_plan else 7
+                if fragment_case == "history":
+                    requests = 9
+                    gateway = Gateway("anchor", early_case, "caller", "discarded", "options", "strategy", "final", TEST)
                 if private_plan == "success":
                     gateway = Gateway("anchor", early_case, "caller", "invalid", "undo", "strategy", "repaired")
     elif failover == "raw-restored":
@@ -1683,8 +1710,9 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 assert any("mode=literal-hunk reason=single-literal-hunk hunks=1 changed_old=1 changed_new=3" in rec.getMessage()
                            for rec in caplog.records)
                 return
-            if fragment_case in {"literal", "literal-wide", "choices", "mixed-fences"}:
-                assert len(private_models) == (2 if fragment_case in {"choices", "mixed-fences"} else 1) and b"+        if not legacy:" in result.patch
+            if fragment_case in {"literal", "literal-wide", "choices", "mixed-fences", "history"}:
+                private_count = 3 if fragment_case == "history" else 2 if fragment_case in {"choices", "mixed-fences"} else 1
+                assert len(private_models) == private_count and b"+        if not legacy:" in result.patch
                 assert b"choose = True" not in result.patch
                 assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
                 assert any("mode=literal-hunk reason=single-literal-hunk hunks=1 changed_old=1 changed_new=3" in rec.getMessage()
@@ -6271,11 +6299,18 @@ def test_visible_control_and_hidden_target_report_dynamic_facts_to_each_fragment
                               fragment_case="choices", dynamic_facts=True)
     assert "target_fact_bytes=" in caplog.text and "control_fact_bytes=" in caplog.text
     assert "target-observed=" not in caplog.text and "control-observed=" not in caplog.text
+    assert "if bool(legacy):" not in caplog.text
 
 
 def test_private_fragment_choices_verify_independent_options(solver_case, caplog):
     _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-private", caplog, fragment_case="choices")
     assert "Verified another independent private fragment option; remaining checks=0" in caplog.text
+
+
+def test_private_literal_history_keeps_each_verified_option(solver_case, caplog):
+    _exercise_numbered_review(solver_case, "checkpoint-caller-after-testfirst-private", caplog, fragment_case="history")
+    assert "if bool(legacy):" not in caplog.text
+    assert "if False:" not in caplog.text and "if True:" not in caplog.text
 
 
 @pytest.mark.parametrize("response", [

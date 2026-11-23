@@ -2371,6 +2371,7 @@ class _RegressionRepair:
     retry_fragment_format: bool = False
     retries: int = 0
     retry_note: str = ""
+    literal_observations: tuple[str, ...] = ()
     retry_named: bool = False
     retry_target: tuple[int, str] | None = None
     stalled_edits: int = 0
@@ -2511,6 +2512,19 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="",
                   len(snapshot.lines), len(baseline_observed.encode()), len(observed.encode()))
 
     choices = choice_limit if repair.retry_fragment_choices and choice_limit >= 2 else 0
+
+    def with_observations(prompt, limit, ending=""):
+        for count in range(len(repair.literal_observations), 0, -1):
+            history = "\n\nChecked literal-hunk replacements (quoted data):\n" + "\n".join(
+                repair.literal_observations[-count:]
+            )
+            if fits(prompt + history + "\n" + ending, limit):
+                return prompt + history + "\n" + ending
+        return prompt + ending
+
+    def fits(prompt, limit):
+        return wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": prompt}]) <= limit
+
     if (not repair.retries or choices or repair.retry_fragment_format) and fragment:
         first, last = fragment.first, fragment.last
         visible_first = max(snapshot.first_body_line, first - 5)
@@ -2546,12 +2560,13 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="",
                 expanded = prompt + extra
                 if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": expanded}]) <= 6200:
                     prompt = expanded
-        if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": prompt}]) <= 6200:
+        if fits(prompt, 6200):
             log_selection("literal-hunk" if fragment.literal else "fragment", selection.reason)
             if choices:
                 _LOG.info("Requesting up to %d independent private fragment options", choices)
             return _LineRetry(None, snapshot, allowed_rows=frozenset(range(first, last + 1)),
-                              prompt=prompt, checkout=repair.sources, statement_fragment=fragment, fragment_choices=choices)
+                              prompt=with_observations(prompt, 6200), checkout=repair.sources,
+                              statement_fragment=fragment, fragment_choices=choices)
     reason = "retry-full-method" if repair.retries else "fragment-prompt-limit" if fragment else selection.reason
     delta = "\n".join(difflib.unified_diff(
         accepted.lines, snapshot.lines, fromfile="accepted method", tofile="tentative method", n=1, lineterm="",
@@ -2560,10 +2575,14 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="",
     for allowance in (1800, 900, 400, 0):
         evidence = "\nVerified change that fixed the target and broke the control (quoted diff):\n" + excerpt(delta, allowance) + "\n" if allowance else ""
         prompt = context + evidence + numbered
-        if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": prompt}]) <= RETRY_MESSAGE_BYTES:
+        if fits(prompt, RETRY_MESSAGE_BYTES):
             log_selection("full-method", reason)
-            return _LineRetry(None, snapshot, allowed_rows=allowed, prompt=prompt, checkout=repair.sources,
-                              checkpoint_method_edit=True, raw_context=(context + evidence if repair.retries and repair.retries > repair.stalled_edits else ""))
+            return _LineRetry(None, snapshot, allowed_rows=allowed,
+                              prompt=with_observations(context + evidence, RETRY_MESSAGE_BYTES, numbered),
+                              checkout=repair.sources,
+                              checkpoint_method_edit=True,
+                              raw_context=(with_observations(context + evidence, RETRY_MESSAGE_BYTES)
+                                           if repair.retries and repair.retries > repair.stalled_edits else ""))
     log_selection("unavailable", "full-method-prompt-limit")
     return None
 
@@ -2584,6 +2603,22 @@ def _private_case_outcome(goal, after, runs, commands):
                 and PurePosixPath(selected[0].partition("::")[0]).name == PurePosixPath(node.partition("::")[0]).name):
             return "passed"
     return "unconfirmed"
+
+
+def _literal_observation(retry, candidate, origin, target, after, runs, commands):
+    snapshot = retry.snapshot
+    fragment = retry.statement_fragment
+    revised = prepare_line_range_edit(candidate, snapshot.symbol)
+    unchanged_suffix = len(snapshot.lines) - fragment.last
+    replacement = revised.lines[fragment.first - 1:len(revised.lines) - unchanged_suffix]
+    detail = ["Replacement: " + json.dumps(excerpt("\n".join(replacement), 300))]
+    outcomes = [_private_case_outcome(goal, after, runs, commands) for goal in (origin, target)]
+    detail.append(f"Original target {outcomes[0]}; previously passing control {outcomes[1]}.")
+    for label, goal in (("Target", origin), ("Control", target)):
+        diagnostic = after.get(goal, "").partition("\nObserved pytest failure: ")[2]
+        if diagnostic:
+            detail.append(f"{label} observed failure: " + json.dumps(excerpt(diagnostic, 175)))
+    return "\n".join(detail)
 
 
 def _retry_private_method(repair, target, editor, note, *, checked=False, fragment_format=False):
@@ -6332,6 +6367,15 @@ def solve(executor, task, archive, budget, version):
                             if repair is not None and repair.dependency_seed else {}
                         ),
                     )
+                literal_observations = []
+                literal_retry = (
+                    repair is not None and repair.private_symbol and scoped_line
+                    and line_retry.statement_fragment and line_retry.statement_fragment.literal
+                )
+                if literal_retry and after:
+                    literal_observations.append(_literal_observation(
+                        line_retry, candidate, repair.origin, target, after, after_runs, commands,
+                    ))
                 for alternative in alternative_candidates:
                     if (not after or submitted >= max_proposals - 1 or budget.remaining() < 30
                             or budget.commands_remaining() < 2 * len(commands) + 4):
@@ -6344,6 +6388,10 @@ def solve(executor, task, archive, budget, version):
                     after_runs, static_runs = {}, {}
                     after = review_evidence(executor, task, archive, budget, proposed, commands,
                                             pytest_runs=after_runs, static_runs=static_runs)
+                    if literal_retry and after:
+                        literal_observations.append(_literal_observation(
+                            line_retry, candidate, repair.origin, target, after, after_runs, commands,
+                        ))
                     _LOG.info("Verified another independent private fragment option; remaining checks=%d", len(after))
             except _PrivateCheckOutputExceeded as error:
                 budget.remaining()
@@ -6813,9 +6861,13 @@ def solve(executor, task, archive, budget, version):
                         reason += " Observed pytest failure: " + excerpt(observed, 300)
                     regression_repair = _retry_private_method(repair, target, editor, reason, checked=True)
                     if regression_repair:
-                        regression_repair = replace(regression_repair, retry_fragment_choices=bool(
-                            line_retry and line_retry.statement_fragment and not line_retry.fragment_choices
-                        ))
+                        regression_repair = replace(
+                            regression_repair,
+                            retry_fragment_choices=bool(
+                                line_retry and line_retry.statement_fragment and not line_retry.fragment_choices
+                            ),
+                            literal_observations=(*repair.literal_observations, *literal_observations)[-4:],
+                        )
                         continue
                 if not improved or introduced or pending_static:
                     if improved and (repair.stock_origin or repair.attempts == 0):
@@ -6828,6 +6880,7 @@ def solve(executor, task, archive, budget, version):
                             attempts=repair.attempts + 1,
                             retries=0,
                             retry_note="",
+                            literal_observations=(),
                             retry_named=False,
                             excluded_models=(),
                             retry_target=None,
