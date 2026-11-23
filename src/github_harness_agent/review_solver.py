@@ -32,6 +32,7 @@ from .checkpoint import (
     DraftCheckpoint,
     GeneratedTestSeed,
     PrivateRecovery,
+    RedWitness,
     SolverRecovery,
 )
 from .executor import (
@@ -2806,10 +2807,20 @@ def solve(executor, task, archive, budget, version):
     retained_recovery = task.solver_recovery
     alternate = None
     test_seed = None
+    durable_witness = None
+    def witness_identity():
+        return hashlib.sha256(json.dumps((
+            retained_identity, task.regression_base, new_path, review.feedback,
+        )).encode()).hexdigest()
+
     restored_raw_targets = set()
     restored_raw_patch = patch
     if retained_recovery and retained_recovery.identity == retained_identity:
         alternate = retained_recovery.alternate
+        saved_witness = retained_recovery.red_witness
+        if (current is resumed_operator_checkout and saved_witness is not None
+                and saved_witness.identity == witness_identity()):
+            durable_witness = saved_witness
         if task.require_new_tests and not failures and not current[new_path]:
             test_seed = retained_recovery.test_seed
         goals = {goal: (bad, stalled) for goal, bad, stalled in retained_recovery.goals}
@@ -2833,8 +2844,8 @@ def solve(executor, task, archive, budget, version):
         ]
         goals.sort(key=lambda goal: (-max(goal[1:]), goal[0]))
         state = (
-            SolverRecovery(retained_identity, tuple(goals[:RECOVERY_GOAL_LIMIT]), alternate, test_seed)
-            if goals or alternate is not None or test_seed is not None
+            SolverRecovery(retained_identity, tuple(goals[:RECOVERY_GOAL_LIMIT]), alternate, test_seed, durable_witness)
+            if goals or alternate is not None or test_seed is not None or durable_witness is not None
             else None
         )
         if state != retained_recovery:
@@ -3464,13 +3475,15 @@ def solve(executor, task, archive, budget, version):
         return None, None
 
     def save_verified_progress(checkpoint_patch, note, editor):
-        nonlocal retained_failures, retained_identity
+        nonlocal retained_failures, retained_identity, durable_witness
         budget.remaining()
         malformed.clear()
         native_ready.clear()
         no_progress.clear()
         retained_failures = failures
         retained_identity = _recovery_digest(task, fixtures, checkpoint_patch)
+        if durable_witness and durable_witness.identity != witness_identity():
+            durable_witness = None
         retain_recovery()
         task.save_checkpoint(
             DraftCheckpoint(
@@ -4279,6 +4292,11 @@ def solve(executor, task, archive, budget, version):
         if not source or not _one_test_draft(source):
             _LOG.info("Test-first authoring rejected test module format")
             return None
+        return prove_red_regression(source)
+
+    def prove_red_regression(source):
+        if _complete_test_module(source, new_path, min(8192, executor.limits.patch_bytes)) != source or not _one_test_draft(source):
+            return None
         proof = _GuardBudget(budget, wall_seconds=45)
 
         def exact_bytes(workspace, _tree):
@@ -4502,6 +4520,22 @@ def solve(executor, task, archive, budget, version):
         native_ready.discard(target)
         no_progress.pop(target, None)
 
+    if (durable_witness and focused_generated and executor.verification_runner is not executor.runner
+            and getattr(executor.verification_runner, "network", "none") == "none"
+            and budget.commands_remaining() >= len(commands) * 2 + 12 and budget.remaining() >= 75):
+        try:
+            test_first_witness = prove_red_regression(durable_witness.source)
+        except Cancelled:
+            raise
+        except (ExecutionError, OSError, ValueError):
+            budget.remaining()
+        if test_first_witness:
+            test_first_attempted = True
+            _LOG.info("Reverified saved regression assertion failures on both revisions")
+        else:
+            durable_witness = None
+            retain_recovery(durable=True)
+
     pool = ThreadPoolExecutor(max_workers=executor.limits.concurrent_probes)
     try:
         while True:
@@ -4614,6 +4648,8 @@ def solve(executor, task, archive, budget, version):
                     ):
                         break
                 if test_first_witness:
+                    durable_witness = RedWitness(witness_identity(), test_first_witness[0])
+                    retain_recovery(durable=True)
                     _LOG.info("Retained an authored regression with verified assertion failures on both revisions")
             if (
                 len(operator) == 1

@@ -134,11 +134,33 @@ class GeneratedTestSeed:
 
 
 @dataclass(frozen=True)
+class RedWitness:
+    """Test bytes bound to the pinned comparison and its intermediate checkpoint."""
+
+    identity: str
+    source: str
+
+    def to_data(self):
+        return {"identity": self.identity, "source": self.source}
+
+    @classmethod
+    def from_data(cls, data):
+        if not isinstance(data, dict):
+            raise ValueError("Invalid red witness")
+        identity, source = data.get("identity"), data.get("source")
+        if (not isinstance(identity, str) or not re.fullmatch(r"[a-f0-9]{64}", identity)
+                or not isinstance(source, str) or not 0 < len(source) <= 8192 or len(source.encode()) > 8192):
+            raise ValueError("Invalid red witness")
+        return cls(identity, source)
+
+
+@dataclass(frozen=True)
 class SolverRecovery:
     identity: str
     goals: tuple[tuple[str, int, int], ...]
     alternate: PrivateRecovery | None = None
     test_seed: GeneratedTestSeed | None = None
+    red_witness: RedWitness | None = None
 
     def to_data(self):
         data = {"identity": self.identity, "goals": [list(goal) for goal in self.goals]}
@@ -146,6 +168,8 @@ class SolverRecovery:
             data["alternate"] = self.alternate.to_data()
         if self.test_seed is not None:
             data["test_seed"] = self.test_seed.to_data()
+        if self.red_witness is not None:
+            data["red_witness"] = self.red_witness.to_data()
         return data
 
     @classmethod
@@ -161,12 +185,16 @@ class SolverRecovery:
             test_seed = GeneratedTestSeed.from_data(value.get("test_seed"))
         except ValueError:
             test_seed = None
+        try:
+            red_witness = RedWitness.from_data(value.get("red_witness"))
+        except (ValueError, UnicodeError):
+            red_witness = None
         if (
             not isinstance(identity, str)
             or not re.fullmatch(r"[a-f0-9]{64}", identity)
             or not isinstance(goals, list)
             or len(goals) > RECOVERY_GOAL_LIMIT
-            or not (goals or alternate is not None or test_seed is not None)
+            or not (goals or alternate is not None or test_seed is not None or red_witness is not None)
         ):
             raise ValueError("Invalid solver recovery state")
         records = {}
@@ -191,6 +219,7 @@ class SolverRecovery:
             tuple((key, *counts) for key, counts in records.items()),
             alternate,
             test_seed,
+            red_witness,
         )
 
 

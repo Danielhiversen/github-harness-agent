@@ -1177,6 +1177,10 @@ def test_checked_caller_feedback_is_local_bounded_and_stops_duplicate_attempts(c
 
 @pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long", "checkpoint-caller", "checkpoint-caller-block", "checkpoint-caller-after-format", "checkpoint-caller-after-rejection", "checkpoint-caller-after-exhaustion", "checkpoint-caller-after-wider", "checkpoint-caller-after-semantic", "checkpoint-caller-after-implicit", "checkpoint-caller-after-method", "checkpoint-caller-after-testfirst", "checkpoint-caller-after-testfirst-green", "checkpoint-caller-after-testfirst-oldgreen", "checkpoint-caller-after-testfirst-setup", "checkpoint-caller-after-testfirst-alternate", "checkpoint-caller-after-testfirst-multistage", "checkpoint-caller-after-testfirst-timeout", "checkpoint-caller-after-testfirst-unavailable", "checkpoint-caller-after-testfirst-private"))
 def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, failover, caplog):
+    _exercise_numbered_review(solver_case, failover, caplog)
+
+
+def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve):
     task, _, runner, checkpoints = solver_case
     raw_mode = failover in {"raw", "raw-restored"}
     long_checkpoint = failover.startswith("checkpoint-")
@@ -1482,7 +1486,7 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
     )
     budget = _Budget(executor.limits, lambda: False, task)
     with caplog.at_level("INFO", logger="github_harness_agent.review_solver"):
-        result = solve(executor, task, archive, budget, "fixture")
+        result = run_solver(executor, task, archive, budget, "fixture")
 
     if long_checkpoint:
         offered, *remaining_offers = [record.getMessage() for record in caplog.records if record.msg.startswith("Requesting checkpoint method edit")]
@@ -5894,3 +5898,71 @@ def test_resumed_repeated_stock_uses_only_typed_scoped_coding(solver_case, monke
     assert b"tests/test_existing.py" not in result.patch
     assert NEW_TEST.encode() in result.patch
     assert all(check.returncode == 0 for check in result.checks)
+
+
+@pytest.mark.parametrize("restart", ("exact", "changed_review", "changed_checkpoint", "no_longer_red"))
+def test_red_witness_is_replayed_in_fresh_solver(solver_case, caplog, restart):
+    from github_harness_agent.controller import restore_solver_recovery
+    from github_harness_agent.worker import Cancelled
+
+    original_solve = solve
+
+    def solve_and_restart(executor, task, archive, budget, version):
+        records = []
+
+        def save(state, durable):
+            if durable and state and state.red_witness:
+                records.append(json.loads(json.dumps(state.to_data())))
+
+        result = original_solve(executor, replace(task, save_solver_recovery=save), archive, budget, version)
+        record = records[0]
+        assert "assert first() == 1" in record["red_witness"]["source"]
+        witness = record["red_witness"]
+        if restart == "no_longer_red":
+            witness["source"] = witness["source"].replace("first() == 1", "isinstance(first(), int)")
+        envelope = {"scope": "review", "head": "head", "parent": "main", "solver_recovery": record}
+        for binding in (("other", "head", "main"), ("review", "other", "main"), ("review", "head", "other")):
+            assert restore_solver_recovery(envelope, *binding) is None
+        restored = restore_solver_recovery(envelope, "review", "head", "main")
+        resumed = replace(task, solver_recovery=restored)
+        if restart == "changed_review":
+            reviewed = resumed.review_recovery
+            resumed = replace(resumed, review_recovery=replace(
+                reviewed, feedback=tuple((path, row, body + " New requirement.") for path, row, body in reviewed.feedback)
+            ))
+
+        if restart == "changed_checkpoint":
+            key, draft = next(iter(resumed.checkpoints.items()))
+            altered = draft.patch.replace(b"+    return 2\n", b"+    return 2  # later checkpoint\n")
+            assert altered != draft.patch
+            resumed = replace(resumed, checkpoints={key: replace(draft, patch=altered)})
+
+        class RestartGateway(FreeGateway):
+            def complete(self, **kwargs):
+                prompt = kwargs["messages"][-1]["content"]
+                visible_witness = "independently authored repository test" in prompt
+                assert visible_witness == (restart == "exact")
+                if not visible_witness:
+                    raise Cancelled("Stop after checking stale witness admission")
+                assert "Pinned ancestor assertion" in prompt and "Checkpoint assertion" in prompt
+                reply = super().complete(**{**kwargs, "max_output_tokens": 3072})
+                reply.content = json.dumps({"symbol": "Reader.dispatch", "edits": [{
+                    "start": 2, "end": 2, "lines": ["        return self.read() + 2"],
+                }]})
+                return reply
+
+        gateway = RestartGateway("scoped production edit")
+        fresh = PlainExecutor(executor.runner, gateway, executor.limits, verification_runner=executor.verification_runner)
+        with caplog.at_level("ERROR", logger="github_harness_agent.review_solver"):
+            if restart == "exact":
+                verified = original_solve(fresh, resumed, archive, _Budget(fresh.limits, lambda: False, resumed), version)
+                assert verified.patch == result.patch and len(gateway.prompts) == 1
+                assert any(c.command[0] == "verify-regression" and not c.returncode for c in verified.checks)
+            else:
+                with pytest.raises(Cancelled):
+                    original_solve(fresh, resumed, archive, _Budget(fresh.limits, lambda: False, resumed), version)
+        return result
+
+    _exercise_numbered_review(
+        solver_case, "checkpoint-caller-after-testfirst", caplog, run_solver=solve_and_restart,
+    )

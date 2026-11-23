@@ -226,7 +226,7 @@ def restore_solver_recovery(envelope, scope, head, parent):
 
 def _retired_draft_envelope(envelope):
     recovery = envelope.get("solver_recovery")
-    private = {"alternate", "test_seed"}
+    private = {"alternate", "test_seed", "red_witness"}
     if not isinstance(recovery, dict) or private.isdisjoint(recovery):
         return envelope
     retired = dict(envelope)
