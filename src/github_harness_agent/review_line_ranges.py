@@ -525,25 +525,76 @@ def isolate_statement_fragment(accepted, tentative):
     return select_statement_fragment(accepted, tentative).fragment
 
 
-def preceding_local_names(snapshot, first):
-    """Offer recent local bindings from the same method, excluding nested scopes."""
+_NESTED_SCOPES = (
+    *_FUNCTIONS, ast.ClassDef, ast.Lambda, ast.ListComp, ast.SetComp,
+    ast.DictComp, ast.GeneratorExp,
+)
+
+
+def _method_nodes(snapshot):
     try:
         method = ast.parse(textwrap.dedent("\n".join(snapshot.lines))).body[0]
     except (SyntaxError, ValueError, RecursionError, IndexError):
-        return ()
-    found = {}
-    pending = list(method.body)
+        return
+    if not isinstance(method, _FUNCTIONS):
+        return
+    pending = list(reversed(method.body))
     while pending:
         node = pending.pop()
-        if getattr(node, "lineno", 0) >= first or isinstance(node, (
-            ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda, ast.ListComp,
-            ast.SetComp, ast.DictComp, ast.GeneratorExp,
-        )):
+        if isinstance(node, _NESTED_SCOPES):
             continue
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+        yield node
+        pending.extend(reversed(list(ast.iter_child_nodes(node))))
+
+
+def preceding_local_names(snapshot, first):
+    """Offer recent local bindings from the same method, excluding nested scopes."""
+    found = {}
+    for node in _method_nodes(snapshot):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.lineno < first:
             found[node.id] = max(found.get(node.id, 0), node.lineno)
-        pending.extend(ast.iter_child_nodes(node))
     return tuple(sorted(found, key=lambda name: (-found[name], name))[:16])
+
+
+def literal_reference_rows(snapshot, accepted, fragment, *, visible_first, visible_last):
+    """Find bounded read-only binding and reference rows for names in a hunk."""
+    names = [node for node in _method_nodes(snapshot) if isinstance(node, ast.Name)]
+    referenced = {node.id for node in names if fragment.first <= node.lineno <= fragment.last}
+    # A literal hunk is the single changed span, so its start is the same on both sides.
+    accepted_end = fragment.first + len(fragment.accepted)
+    referenced.update(
+        node.id for node in _method_nodes(accepted)
+        if isinstance(node, ast.Name) and fragment.first <= node.lineno < accepted_end
+    )
+    if not referenced:
+        return ()
+
+    bindings = {}
+    preceding = {}
+    following = {}
+    for node in names:
+        row = node.lineno
+        if node.id not in referenced or len(snapshot.lines[row - 1].encode()) > 160:
+            continue
+        if row < visible_first:
+            sites = bindings if isinstance(node.ctx, ast.Store) else preceding
+            sites[node.id] = max(sites.get(node.id, row), row)
+        elif row > visible_last:
+            following[node.id] = min(following.get(node.id, row), row)
+
+    selected = []
+    groups = (
+        sorted(set(bindings.values()), reverse=True),
+        sorted(set(following.values())),
+        sorted(set(preceding.values()), reverse=True),
+    )
+    for i in range(3):
+        for rows in groups:
+            if i < len(rows):
+                row = rows[i]
+                if row not in selected:
+                    selected.append(row)
+    return tuple(f"{row} | {snapshot.lines[row - 1]}" for row in sorted(selected[:6]))
 
 
 def _literal_exterior(lines, first, last):

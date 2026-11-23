@@ -100,6 +100,7 @@ from .review_line_ranges import (
     StatementFragment,
     select_statement_fragment,
     preceding_local_names,
+    literal_reference_rows,
     apply_statement_fragment,
     full_method_native_tool,
     apply_line_range_edit,
@@ -2512,7 +2513,8 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="",
     choices = choice_limit if repair.retry_fragment_choices and choice_limit >= 2 else 0
     if (not repair.retries or choices or repair.retry_fragment_format) and fragment:
         first, last = fragment.first, fragment.last
-        local = "\n".join(snapshot.lines[max(snapshot.first_body_line - 1, first - 6):first - 1])
+        visible_first = max(snapshot.first_body_line, first - 5)
+        local = "\n".join(snapshot.lines[visible_first - 1:first - 1])
         following = "\n".join(snapshot.lines[last:last + 4])
         prompt = (
             context
@@ -2535,6 +2537,15 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="",
                 'strings. Each is an independent solution against exactly the same tentative fragment. '
                 'Alternatively put each replacement in a separate labeled Python fence, with no file paths.'
             )
+        if fragment.literal:
+            rows = literal_reference_rows(
+                snapshot, accepted, fragment, visible_first=visible_first, visible_last=last + 4,
+            )
+            if rows:
+                extra = "\nOther references in this method (read-only):\n" + "\n".join(rows)
+                expanded = prompt + extra
+                if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": expanded}]) <= 6200:
+                    prompt = expanded
         if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": prompt}]) <= 6200:
             log_selection("literal-hunk" if fragment.literal else "fragment", selection.reason)
             if choices:

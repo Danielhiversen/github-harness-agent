@@ -7,6 +7,8 @@ from github_harness_agent.review_line_ranges import (
     apply_offered_line_reply,
     apply_native_line_range_edit,
     line_range_prompt,
+    literal_reference_rows,
+    StatementFragment,
     select_line_snapshot,
     full_method_native_tool,
     selectable_line_tool,
@@ -625,3 +627,34 @@ def test_literal_window_counts_changes_and_caps_comment_and_blank_allowance():
     data = ['text = """', '# string content', '# string content', '# string content', '"""', *setup, "if all(criteria):"]
     with pytest.raises(ValueError, match="changed-row limit"):
         apply_statement_fragment("\n".join(data), {PATH: current}, snapshot, fragment)
+
+
+def test_literal_reference_rows_show_remote_bindings_and_uses_in_same_method():
+    source = """def collect(values):
+    pending = []
+    note = "pending appears in a string"
+    before(pending)
+    def nested():
+        pending = [42]
+    for value in values:
+        pending.append(value)
+        untouched(value)
+    checkpoint()
+    checkpoint()
+    checkpoint()
+    checkpoint()
+    drain(pending)
+    return note
+"""
+    snapshot = prepare_line_range_edit({PATH: source}, (PATH, "collect"))
+    accepted_source = source.replace("pending.append(value)", "pending.append(note)")
+    accepted = prepare_line_range_edit({PATH: accepted_source}, snapshot.symbol)
+    fragment = StatementFragment(8, 8, (accepted.lines[7],), literal=True)
+
+    assert literal_reference_rows(snapshot, accepted, fragment, visible_first=5, visible_last=12) == (
+        "2 |     pending = []",
+        '3 |     note = "pending appears in a string"',
+        "4 |     before(pending)",
+        "14 |     drain(pending)",
+        "15 |     return note",
+    )
