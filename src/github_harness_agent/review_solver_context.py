@@ -598,6 +598,78 @@ def _reviewed_modules(sources):
     return modules
 
 
+def production_protocol_example(preview, sources, query, *, max_bytes=1150):
+    """Quote a dependency call and nearby handling from a helper's production entry point."""
+    try:
+        setup = ast.parse(preview).body
+    except (SyntaxError, ValueError, RecursionError):
+        return ""
+    bindings = {}
+    for node in setup:
+        if isinstance(node, ast.ImportFrom) and not node.level:
+            bindings.update({a.asname or a.name: f"{node.module}.{a.name}" for a in node.names})
+        elif isinstance(node, ast.Import):
+            bindings.update({a.asname or a.name: a.name for a in node.names})
+    used = set()
+    for helper in setup:
+        if not isinstance(helper, _FUNCTION) or helper.name.startswith("test_"):
+            continue
+        local = set(_fixture_arguments(helper)) | set(_rebound_names(helper))
+        for call in ast.walk(helper):
+            if isinstance(call, ast.Call) and (name := _dotted_name(call.func)):
+                for alias, target in bindings.items():
+                    if alias.split(".")[0] not in local and (name == alias or name.startswith(alias + ".")):
+                        used.add(target + name[len(alias):])
+
+    if not used:
+        return ""
+    best = ""
+    best_rank = None
+    for path, source in sources.items():
+        file = PurePosixPath(path)
+        if (file.suffix != ".py" or "tests" in file.parts or "test" in file.parts or file.name == "conftest.py"
+                or file.name.startswith("test_") or file.name.endswith("_test.py")):
+            continue
+        module = _python_module(path)
+        if not any(name.startswith(module + ".") for name in used):
+            continue
+        try:
+            declarations = ast.parse(source).body
+        except (SyntaxError, ValueError, RecursionError):
+            continue
+        lines = source.splitlines()
+        for entry in declarations:
+            if not isinstance(entry, (*_FUNCTION, ast.ClassDef)) or module + "." + entry.name not in used:
+                continue
+            methods = entry.body if isinstance(entry, ast.ClassDef) else [entry]
+            for method in methods:
+                if not isinstance(method, _FUNCTION):
+                    continue
+                parameters = _fixture_arguments(method) - {"self", "cls"}
+                for call in ast.walk(method):
+                    if not isinstance(call, ast.Call) or not (name := _dotted_name(call.func)):
+                        continue
+                    parts = name.split(".")
+                    if not (parts[0] in parameters or parts[0] == "self" and len(parts) >= 3):
+                        continue
+                    # Stay inside the implementing method and keep its original
+                    # indentation, call arguments and consuming expressions visible.
+                    end = min(call.end_lineno + 8, method.end_lineno)
+                    if end - call.lineno > 18:
+                        continue
+                    scope = f"{entry.name}.{method.name}" if entry is not method else entry.name
+                    snippet = f"{path}:{call.lineno} ({scope})\n" + "\n".join(
+                        lines[call.lineno - 1:end]
+                    )
+                    if len(snippet.encode()) > max_bytes:
+                        continue
+                    tokens = set(re.findall(r"[a-z]{3,}", snippet.casefold()))
+                    rank = (len(query & tokens), len(parts), -call.lineno)
+                    if best_rank is None or rank > best_rank:
+                        best_rank, best = rank, snippet
+    return best
+
+
 def operator_api_contract(fixtures, sources, *, max_bytes=700):
     """Read public method shapes and dictionary keys without copying test code."""
     modules = _reviewed_modules(sources)
