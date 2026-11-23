@@ -1,8 +1,10 @@
 import pytest
 
 from github_harness_agent.review_solver import (
+    _PytestRun,
     _apply_test_reply,
     _complete_test_module,
+    _focused_test_body_assertion,
     _lost_passing_test,
     _parse_complete_pytest,
     apply_blocks,
@@ -10,6 +12,24 @@ from github_harness_agent.review_solver import (
 
 PATH = "tests/test_review_regressions.py"
 MODULE = "from math import sqrt\n\ndef test_positive():\n    assert sqrt(4) == 2\n"
+
+
+@pytest.mark.parametrize(
+    "source, detail, reached",
+    (
+        (MODULE, f"{PATH}:4: AssertionError\nE   assert 2.0 == 3", True),
+        (MODULE, f"{PATH}:4: AssertionError\nE   AssertionError: assert 2.0 == 3", True),
+        (MODULE, f"{PATH}:4: AssertionError\nE   AssertionError: helper raised", False),
+        (MODULE, "src/helper.py:4: AssertionError\nE   assert 2.0 == 3", False),
+        (MODULE.replace("assert sqrt(4) == 2", "raise AssertionError()"),
+         f"{PATH}:4: AssertionError\nE   assert 2.0 == 3", False),
+    ),
+)
+def test_focused_assertion_requires_rewritten_failure_at_a_named_test_assert(source, detail, reached):
+    node = f"{PATH}::test_positive"
+    named = frozenset({node})
+    run = _PytestRun(0, named, 0, named)
+    assert _focused_test_body_assertion(PATH, source, run, {(0, node): detail}) is reached
 
 
 def test_visually_blank_search_can_create_only_the_designated_absent_file():

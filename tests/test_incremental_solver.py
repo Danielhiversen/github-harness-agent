@@ -3239,7 +3239,10 @@ def test_solver_restores_independently_verified_test_seed(solver_case, scenario)
 
 
 @pytest.mark.parametrize(
-    "scenario", ("success", "baseline_failure", "no_collection", "ordinary", "protected_anchor", "ancestor")
+    "scenario", (
+        "success", "baseline_failure", "no_collection", "ordinary", "protected_anchor",
+        "ancestor", "assertion-retention",
+    )
 )
 def test_single_test_only_review_adds_an_independent_module(solver_case, monkeypatch, scenario):
     task, _, runner, checkpoints = solver_case
@@ -3259,7 +3262,7 @@ def test_single_test_only_review_adds_an_independent_module(solver_case, monkeyp
             "",
         ),
     )
-    if scenario in {"ordinary", "protected_anchor", "ancestor"}:
+    if scenario in {"ordinary", "protected_anchor", "ancestor", "assertion-retention"}:
         task = replace(task, pull_checks=())
     archive = BytesIO()
     fixed = BASE_SOURCE.replace("return -1", "return 1").replace("return -2", "return 2")
@@ -3276,7 +3279,7 @@ def test_single_test_only_review_adds_an_independent_module(solver_case, monkeyp
             entry = tarfile.TarInfo(path)
             entry.size = len(content)
             snapshot.addfile(entry, BytesIO(content))
-    if scenario == "ancestor":
+    if scenario in {"ancestor", "assertion-retention"}:
         ancestor = BytesIO()
         with tarfile.open(fileobj=ancestor, mode="w") as snapshot:
             data = BASE_SOURCE.encode()
@@ -3284,9 +3287,15 @@ def test_single_test_only_review_adds_an_independent_module(solver_case, monkeyp
             entry.size = len(data)
             snapshot.addfile(entry, BytesIO(data))
         task = replace(task, regression_base="2" * 40, regression_archive=ancestor.getvalue())
-        green = "from fixture_calc import first\n\ndef test_results():\n    assert isinstance(first(), int)\n"
-        loses_collection = green.replace("import first", "import unavailable")
-        proposals = (green, loses_collection, edit(next_path, green, TEST))
+        if scenario == "assertion-retention":
+            assertion = TEST.replace("(1, 2)", "(0, 0)")
+            runtime = assertion.replace("test_results", "test_renamed").replace("first()", "missing()")
+            better = assertion.replace("(0, 0)", "(1, 0)")
+            proposals = (assertion, runtime, better, edit(next_path, better, TEST))
+        else:
+            green = "from fixture_calc import first\n\ndef test_results():\n    assert isinstance(first(), int)\n"
+            loses_collection = green.replace("import first", "import unavailable")
+            proposals = (green, loses_collection, edit(next_path, green, TEST))
     elif scenario == "no_collection":
         proposals = ("__test__ = False\n" + TEST,)
     else:
@@ -3294,6 +3303,17 @@ def test_single_test_only_review_adds_an_independent_module(solver_case, monkeyp
     gateway = FreeGateway(*proposals)
     executor = PlainExecutor(runner, gateway, Limits(model_requests=len(proposals)))
     budget = _Budget(executor.limits, lambda: False, task)
+    if scenario == "assertion-retention":
+        result = solve(executor, task, archive.getvalue(), budget, "fixture")
+        _, _, after_runtime, after_better = gateway.prompts
+        assert f"Unpublished test file {next_path} to revise:\n{assertion}" in after_runtime
+        assert f"Selected failing case: {next_path}::test_results" in after_runtime
+        assert "AssertionError" in after_runtime and "NameError" in after_runtime
+        assert runtime not in after_runtime
+        assert f"Unpublished test file {next_path} to revise:\n{better}" in after_better
+        assert any(check.command[0] == "verify-regression" and not check.returncode for check in result.checks)
+        assert not checkpoints
+        return
     if scenario == "ancestor":
         result = solve(executor, task, archive.getvalue(), budget, "fixture")
         initial, retry, after_collection = gateway.prompts

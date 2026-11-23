@@ -101,6 +101,7 @@ from .review_planner import (
 from .review_recovery import operator_acceptance_context
 from .review_solver_context import (
     _pytest_fixtures,
+    _rewritten_assertion,
     extended_pytest_context,
     focused_check_excerpt,
     focused_source_excerpt,
@@ -829,6 +830,7 @@ class _PytestRun:
     failed: frozenset[str]
     deselected: int
     named_cases: frozenset[str] | None = None
+    assertion_reached: bool = False
 
 
 def _complete_pytest_run(outcome):
@@ -903,6 +905,41 @@ def _focused_generated_run(checks, command):
         if observed == command:
             return _parse_complete_pytest(check.returncode, check.output)
     return None
+
+
+def _focused_test_body_assertion(path, source, run, failures):
+    if not run or not run.failed or run.passed or run.deselected or run.named_cases != run.failed:
+        return False
+    try:
+        definitions = dict(_symbols(ast.parse(source, filename=path).body))
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+    for (_, node), detail in failures.items():
+        relative = node.removeprefix("/work/").removeprefix("./")
+        if node not in run.failed or not relative.startswith(path + "::"):
+            continue
+        name = relative.removeprefix(path + "::").split("[", 1)[0].replace("::", ".")
+        function = definitions.get(name)
+        line = stock_assertion_failure_line(node, detail)
+        rewritten = _rewritten_assertion(detail) or re.search(
+            r"(?m)^E[ \t]+AssertionError:[ \t]+assert[ \t]+\S", detail
+        )
+        if (
+            line and rewritten
+            and isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any(isinstance(item, ast.Assert) and item.lineno == line for item in ast.walk(function))
+        ):
+            return True
+    return False
+
+
+def _focused_output_reports_pass(output, path):
+    sections = _PYTEST_SECTION.split(re.sub(r"\x1b\[[0-9;]*m", "", output))
+    progress = sections[2] if sections[1:2] == ["test session starts"] else sections[0]
+    return any(
+        node.removeprefix("/work/").removeprefix("./").startswith(path + "::")
+        for node in _NAMED_PYTEST_PASS.findall(progress)
+    )
 
 
 def _failed_test_line_snapshot(path, draft, diagnostic, run):
@@ -4649,6 +4686,10 @@ def solve(executor, task, archive, budget, version):
                         check_results=fast_checks,
                     )
                     fast_run = after_runs["focused"] = fast_runs.get(0)
+                    if pinned_ancestor and _focused_test_body_assertion(
+                        new_path, candidate[new_path], fast_run, after
+                    ):
+                        after_runs["focused"] = replace(fast_run, assertion_reached=True)
                     if fast_run and fast_run.named_cases is not None:
                         _LOG.info(
                             "Focused generated pytest cases: %d passed, %d failed",
@@ -4788,6 +4829,19 @@ def solve(executor, task, archive, budget, version):
                 )
                 previous_run = test_case_runs.get("focused")
                 candidate_run = next_case_runs.get("focused")
+                if (
+                    pinned_ancestor and allow_test_module and test_checkout_snapshot is current
+                    and previous_run and previous_run.assertion_reached and focused_rejection is not None
+                    and not (candidate_run and (candidate_run.passed or candidate_run.assertion_reached))
+                    and not _focused_output_reports_pass(fast_checks[0].output, new_path)
+                ):
+                    notes[target] = (
+                        "The last edit regressed before reaching a test-body assertion. "
+                        "Revise the retained draft using its verified assertion failure.\n"
+                        + excerpt(next_diagnostic, 550)
+                    )
+                    _LOG.info("Retained the unpublished pytest draft that reached a test-body assertion")
+                    continue
                 if (
                     test_ancestor_feedback and previous_run and previous_run.named_cases
                     and not previous_run.failed and focused_rejection is not None
