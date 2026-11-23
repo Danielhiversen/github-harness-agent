@@ -3454,8 +3454,10 @@ def test_solver_retries_failed_pytest_case_with_scoped_numbered_edit(solver_case
     assert any(NEW_TEST in check.command for check in result.checks)
 
 
-@pytest.mark.parametrize("inline_setup", (False, True))
-def test_repeated_test_format_failures_route_raw_function_to_an_alternate(solver_case, inline_setup):
+@pytest.mark.parametrize("scenario", ("short", "inline_setup", "multiple"))
+def test_repeated_test_format_failures_route_raw_function_to_an_alternate(solver_case, scenario):
+    inline_setup = scenario == "inline_setup"
+    multiple = scenario == "multiple"
     task, archive, runner, _ = solver_case
     fixed = BASE_SOURCE.replace("return -1", "return 1").replace("return -2", "return 2")
     checkpoint = DraftCheckpoint(
@@ -3470,7 +3472,12 @@ def test_repeated_test_format_failures_route_raw_function_to_an_alternate(solver
         records = "".join(f"        {step}: {repr('fixture value ' * 8)},\n" for step in range(40))
         setup = "    fake_provider_records = {\n" + records + "    }\n    assert 39 in fake_provider_records\n"
     failed = TEST.replace("    assert", setup + "    assert", 1).replace("(1, 2)", "(0, 0)") + keep
+    other_fix = ()
+    if multiple:
+        failed += "\n\ndef test_other():\n    assert first() == 0\n\n\ndef test_also_keep():\n    assert first() == 1\n"
+        other_fix = (f"REPLACE {NEW_TEST}::test_other\ndef test_other():\n    assert first() == 1",)
     raw_routes = []
+    raw_prompts = []
 
     class Gateway(FreeGateway):
         def complete(self, **kwargs):
@@ -3479,6 +3486,7 @@ def test_repeated_test_format_failures_route_raw_function_to_an_alternate(solver
             reply = super().complete(**kwargs)
             if self.prompts[-1].endswith("Return only the complete Python function for this failed test."):
                 raw_routes.append(kwargs.get("exclude", ()))
+                raw_prompts.append(self.prompts[-1])
                 reply.route, reply.configured_model = f"raw-{len(raw_routes)}", f"raw/{len(raw_routes)}"
             elif len(self.prompts) == 4:
                 reply.route, reply.configured_model = "broad-text", "broad/text"
@@ -3488,20 +3496,27 @@ def test_repeated_test_format_failures_route_raw_function_to_an_alternate(solver
     gateway = Gateway(
         failed, "invalid SEARCH", "invalid numbered edit", "invalid fallback",
         "def test_keep():\n    assert first() == 1", "```python\n" + fixed_test + "\n```",
+        *other_fix,
     )
     independent = runner.path / "raw-test-verifier"
     independent.mkdir()
     executor = PlainExecutor(
-        runner, gateway, Limits(model_requests=7, concurrent_probes=1),
+        runner, gateway, Limits(model_requests=7 + int(multiple), concurrent_probes=1),
         verification_runner=FixtureRunner(independent),
     )
     result = solve(executor, task, archive, _Budget(executor.limits, lambda: False, task), "fixture")
 
     assert len(raw_routes) == 2 and ("raw-1", "raw/1") in raw_routes[1]
-    for prompt in gateway.prompts[-2:]:
+    for prompt in raw_prompts:
         assert prompt.startswith(f"Selected failing case: {NEW_TEST}::test_results\n")
         assert "def test_keep():" not in prompt
         assert setup in prompt
+    if multiple:
+        assert f"Other failing cases or checks: {NEW_TEST}::test_other" in raw_prompts[0]
+        assert "def test_other():" not in raw_prompts[0]
+        assert f"Selected failing case: {NEW_TEST}::test_other" in gateway.prompts[-1]
+        assert b"def test_also_keep():\n+    assert first() == 1" in result.patch
+        assert b"def test_other():\n+    assert first() == 1" in result.patch
     if inline_setup:
         assert len(fixed_test.encode()) > 4096
         assert not any(prompt.endswith(LINE_RANGE_ENDING) for prompt in gateway.prompts)

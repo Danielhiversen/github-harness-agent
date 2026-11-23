@@ -481,6 +481,8 @@ def test_oversized_temporary_file_fixture_keeps_shape_in_numbered_retry(with_fac
 
 
 def test_raw_pytest_snapshot_keeps_long_case_bound_to_current_draft():
+    from dataclasses import replace
+
     from github_harness_agent import review_solver
 
     path = "tests/test_draft.py"
@@ -489,7 +491,7 @@ def test_raw_pytest_snapshot_keeps_long_case_bound_to_current_draft():
     short = "def test_result():\n    assert False"
     helper = "\n\ndef test_keep():\n    assert True\n"
     long = short.replace("    assert", "    # " + "fixture data " * 390 + "\n    assert")
-    run = review_solver._PytestRun(0, frozenset({selected}), 1, frozenset({selected, sibling}))
+    run = review_solver._PytestRun(1, frozenset({selected}), 0, frozenset({selected, sibling}))
     select = review_solver._failed_test_line_snapshot
 
     assert select(path, long + helper, note, run) is None
@@ -500,10 +502,20 @@ def test_raw_pytest_snapshot_keeps_long_case_bound_to_current_draft():
     assert select(path, long + helper.replace("True", "False"), note, run, raw=True).digest != snapshot.digest
     too_many_rows = short.replace("    assert", "    # fixture step\n" * 89 + "    assert")
     too_many_bytes = short.replace("    assert", "    # " + "x" * 6144 + "\n    assert")
-    multiple = review_solver._PytestRun(0, frozenset({selected, sibling}), 0, frozenset({selected, sibling}))
     assert select(path, too_many_rows + helper, note, run, raw=True) is None
     assert select(path, too_many_bytes + helper, note, run, raw=True) is None
-    assert select(path, long + helper, note, multiple, raw=True) is None
+    other_failed = f"{path}::test_other"
+    multiple = review_solver._PytestRun(1, frozenset({selected, other_failed}), 0, frozenset({selected, sibling, other_failed}))
+    multiple_draft = long + helper + "\ndef test_other():\n    assert False\n"
+    assert select(path, multiple_draft, note, multiple, raw=True).symbol == (path, "test_result")
+    no_trace = f"Selected failing case: {selected}\nFAILED {selected} - AssertionError"
+    assert select(path, multiple_draft, no_trace, multiple, raw=True) is None
+    assert select(path, multiple_draft, note.replace(selected, sibling), multiple, raw=True) is None
+    assert select(path, multiple_draft, note, replace(multiple, named_cases=None), raw=True) is None
+    assert select(path, multiple_draft, note, replace(multiple, deselected=1), raw=True) is None
+    parameter, other_parameter = f"{selected}[one]", f"{selected}[two]"
+    parameter_run = review_solver._PytestRun(1, frozenset({parameter}), 0, frozenset({parameter, other_parameter}))
+    assert select(path, long, note.replace(selected, parameter), parameter_run, raw=True) is None
 
 
 def test_prior_generated_fixture_context_quotes_only_complete_predecessor_setup():

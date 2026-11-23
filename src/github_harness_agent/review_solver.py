@@ -960,8 +960,6 @@ def _failed_test_line_snapshot(path, draft, diagnostic, run, *, raw=False):
     heading, _, detail = diagnostic.partition("\n")
     if not heading.startswith("Selected failing case: ") or not run or run.named_cases is None:
         return None
-    if raw and len(run.failed) != 1:
-        return None
     selected = heading.removeprefix("Selected failing case: ")
     if selected not in run.failed or not selected.startswith(path + "::"):
         return None
@@ -970,7 +968,13 @@ def _failed_test_line_snapshot(path, draft, diagnostic, run, *, raw=False):
         for row in detail.splitlines()
     ):
         return None
-    qualified = selected.removeprefix(path + "::").split("[", 1)[0].replace("::", ".")
+    function_node = selected.partition("[")[0]
+    if raw and (
+        run.deselected or selected not in run.named_cases
+        or any(node != selected and node.partition("[")[0] == function_node for node in run.named_cases)
+    ):
+        return None
+    qualified = function_node.removeprefix(path + "::").replace("::", ".")
     snapshot = prepare_line_range_edit({path: draft}, (path, qualified))
     max_rows, max_bytes = (90, 6 * 1024) if raw else (26, 2400)
     if (
@@ -5243,6 +5247,15 @@ def solve(executor, task, archive, budget, version):
                 )
                 previous_run = test_case_runs.get("focused")
                 candidate_run = next_case_runs.get("focused")
+                if (
+                    test_raw_retry is not None and previous_run and previous_run.passed
+                    and (not candidate_run or candidate_run.named_cases is None or candidate_run.deselected)
+                ):
+                    notes[target] = (
+                        "The scoped edit could not verify the already-passing cases. The previous draft was retained.\n"
+                        + excerpt(next_diagnostic, 550)
+                    )
+                    continue
                 if prior_test_fallback is not None and snapshot is current:
                     if candidate_run and candidate_run.passed and not lost_test:
                         prior_test_fallback = None
