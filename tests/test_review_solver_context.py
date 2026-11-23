@@ -744,6 +744,27 @@ def test_prior_seed_can_reference_pinned_fixtures_without_quoting_restricted_set
         assert seed is None
 
 
+def test_operator_module_alternate_checks_imports_scenarios_and_lexical_dependencies():
+    import ast
+
+    fixtures = {"operator/test_hidden.py": "def test_private():\n    assert first() == 99\n"}
+    plan = review_solver_context.OperatorTestAssembly(tuple(ast.parse(
+        "from probe import first, second\ndef call(fn): return fn()"
+    ).body), {}, frozenset({"probe", "json"}), "")
+    source = "from probe import first\ndef test_observe():\n    assert call(first) == 1\n"
+    accepted = plan.assemble_module(source, fixtures=fixtures, max_bytes=2000)
+    assert "from probe import first" in accepted and "def call(fn):" in accepted and "second" not in accepted
+    standalone = "def test_independent():\n    from probe import first\n    assert first() == 1\n"
+    assert "from probe import first" in plan.assemble_module(standalone, fixtures=fixtures, max_bytes=2000)
+    for rejected in (
+        standalone.replace("== 1", "== 99"), standalone.replace("from probe", "from subprocess"),
+        source.replace("call(first)", "unknown(first)"), "go()\n" + source,
+        "from json import loads\ndef test_constant():\n    assert loads('1') == 1\n",
+    ):
+        with pytest.raises(ValueError):
+            plan.assemble_module(rejected, fixtures=fixtures, max_bytes=2000)
+
+
 def test_operator_assembly_selects_lexical_setup_dependencies_and_rejects_unsafe_responses():
     archive = BytesIO()
     with tarfile.open(fileobj=archive, mode="w"):

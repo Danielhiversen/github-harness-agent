@@ -116,6 +116,7 @@ from .review_planner import (
 from .review_recovery import operator_acceptance_context
 from .review_solver_context import (
     OperatorTestAssembly,
+    TestAssemblyRejection,
     _pytest_fixtures,
     _rewritten_assertion,
     extended_pytest_context,
@@ -4462,7 +4463,14 @@ def solve(executor, task, archive, budget, version):
             try:
                 source = assembly.assemble(result.content, max_bytes=max_bytes)
             except ValueError:
-                source = None
+                module = _complete_test_module(result.content, new_path, max_bytes)
+                try:
+                    source = assembly.assemble_module(module, fixtures=fixtures, max_bytes=max_bytes)
+                except TestAssemblyRejection as error:
+                    _LOG.info("Test-first function alternate classification: %s", error)
+                    source = None
+                except (ValueError, SyntaxError, RecursionError):
+                    source = None
         else:
             source = _complete_test_module(result.content, new_path, max_bytes)
         if not source or not _one_test_draft(source):

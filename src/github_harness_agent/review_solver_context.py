@@ -1139,7 +1139,7 @@ def _prior_setup_import(node, modules):
 
 
 def _prior_setup_source(
-    items, fixtures, modules, *, sample=None, reference_helpers=False, fixture_placeholders=False,
+    items, fixtures, modules, *, sample=None, reference_helpers=False, fixture_placeholders=False, sample_imports=False,
 ):
     available = _PRIOR_SETUP_FIXTURES | {name for name, fixture in fixtures.items() if fixture in items}
     fixture_nodes = set(fixtures.values())
@@ -1159,7 +1159,7 @@ def _prior_setup_source(
             and not (_words(node.arg.replace("_", " ")) & (_PRIOR_SENSITIVE - {"token"}))
         } if borrowed else set()
         for node in ast.walk(item):
-            if borrowed and isinstance(node, _IMPORT) and _prior_setup_import(node, modules):
+            if (borrowed or (sample_imports and item is sample)) and isinstance(node, _IMPORT) and _prior_setup_import(node, modules):
                 continue
             spelling = (
                 getattr(node, "id", "") or getattr(node, "attr", "")
@@ -1285,12 +1285,69 @@ def _prior_reference_header(body, fixture_nodes, modules):
     return True
 
 
+class TestAssemblyRejection(ValueError):
+    """Content-free classification for a rejected test author response."""
+
+
 @dataclass(frozen=True)
 class OperatorTestAssembly:
     declarations: tuple
     fixtures: dict
     modules: frozenset
     preview: str
+
+    def assemble_module(self, module, *, fixtures, max_bytes):
+        """Accept a single authored test with explicit approved imports and inert setup."""
+        if not module or len(module.encode()) > max_bytes:
+            raise TestAssemblyRejection("invalid module")
+        body = ast.parse(module).body
+        tests = [node for node in body if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")]
+        if len(tests) != 1 or not any(isinstance(node, ast.Assert) for node in ast.walk(tests[0])):
+            raise TestAssemblyRejection("missing unique assertion test")
+        test, = tests
+        if not _prior_reference_header(body, set(), self.modules):
+            raise TestAssemblyRejection("unsupported import or extra declaration")
+        # Compare only inside this worker. No operator statements enter the model context.
+        def checks(function):
+            return tuple(ast.dump(row) for row in function.body if not isinstance(row, (*_IMPORT, ast.Expr)))
+
+        scenario = checks(test)
+        for value in fixtures.values():
+            try:
+                if any(checks(node) == scenario for node in ast.walk(ast.parse(value))
+                       if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")):
+                    raise TestAssemblyRejection("duplicate operator test")
+            except (SyntaxError, RecursionError):
+                continue
+        declarations, known = [], set()
+        for node in (*self.declarations, *body):
+            if node is test:
+                continue
+            parts = [node]
+            if isinstance(node, _IMPORT):
+                parts = [ast.copy_location(
+                    ast.Import(names=[alias]) if isinstance(node, ast.Import)
+                    else ast.ImportFrom(module=node.module, names=[alias], level=node.level), node,
+                ) for alias in node.names]
+            for part in parts:
+                key = ast.dump(part)
+                if key not in known:
+                    known.add(key)
+                    declarations.append(part)
+        setup = _local_fixture_setup(test, self.fixtures)
+        items = _complete_pytest_nodes(declarations, test, setup, references=_lexical_references) if setup is not None else ()
+        if not items:
+            raise TestAssemblyRejection("ambiguous or missing setup")
+        # Imports and helpers originate in different modules and have independent line numbers.
+        items = sorted(items, key=lambda node: (node is test, not isinstance(node, _IMPORT)))
+        source = _prior_setup_source(items, self.fixtures, self.modules, sample=test, fixture_placeholders=True,
+                                     sample_imports=True)
+        if not source or len(source.encode()) >= max_bytes:
+            raise TestAssemblyRejection("unbound name or unsupported setup")
+        if not any(isinstance(node, _IMPORT) and not _prior_setup_import(node, _PRIOR_SETUP_IMPORTS)
+                   for item in items for node in ast.walk(item)):
+            raise TestAssemblyRejection("missing production import")
+        return source + "\n"
 
     def assemble(self, response, *, max_bytes):
         if not isinstance(response, str) or not 0 < len(response.encode()) <= 6000:

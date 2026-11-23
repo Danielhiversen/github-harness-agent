@@ -1377,6 +1377,8 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                     reply.route, reply.configured_model = "free-third", "model-third"
                 early_routes.append((reply.route, reply.configured_model))
                 reply.content = "def test_dispatch_observable():\n    assert observe(first) == 1\n"
+                if not failover.endswith("-runtime-function"):
+                    reply.content = "```python\nfrom fixture_calc import first\n" + reply.content + "```"
                 if failover.endswith("-runtime-function") and len(early_routes) == 2:
                     reply.content = reply.content.replace("observe(first)", "observe(first, mistake=True)")
                 return reply
