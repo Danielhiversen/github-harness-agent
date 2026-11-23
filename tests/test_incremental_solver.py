@@ -754,7 +754,8 @@ def test_single_pinned_production_review_fixes_all_checks_before_authoring_regre
     assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
 
 
-def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case):
+@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress"))
+def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, failover):
     task, _, runner, _ = solver_case
     operator = Path(task.pull_checks[0][-1])
     with operator.open("a") as stream:
@@ -796,6 +797,8 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case):
         regression_archive=archive, regression_edit_path=SOURCE,
     )
 
+    line_attempts = []
+
     class Gateway(FreeGateway):
         def complete(self, **kwargs):
             if kwargs.get("max_output_tokens") != 2048:
@@ -805,23 +808,37 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case):
             digest = re.search(r'"snapshot":"([0-9a-f]{64})"', prompt)[1]
             target = re.search(r"(?m)^(\d+) \| ( +)return -1$", prompt)
             row = int(target[1])
-            reply.content = json.dumps({
-                "snapshot": digest,
-                "edits": [{"start": row, "end": row, "lines": [target[2] + "return 1"]}],
-            })
+            first_route = not line_attempts
+            reply.route = "numbered-free-a" if first_route else "numbered-free-b"
+            reply.configured_model = "small-code-model" if first_route else "alternate-code-model"
+            line_attempts.append((digest, kwargs.get("exclude", ()), kwargs.get("after_provider")))
+            if first_route and failover == "malformed":
+                reply.content = '{"unexpected":"format","edits":[]}'
+            else:
+                value = -3 if first_route and failover == "no_progress" else 1
+                reply.content = json.dumps({
+                    "snapshot": digest,
+                    "edits": [{"start": row, "end": row, "lines": [target[2] + f"return {value}"]}],
+                })
             return reply
 
     malformed = edit(SOURCE, "    missing_anchor()\n", "    return 1\n")
-    gateway = Gateway(malformed, malformed, "Numbered response expected.", TEST)
+    numbered_replies = 1 if failover == "none" else 2
+    gateway = Gateway(malformed, malformed, *(["Numbered response expected."] * numbered_replies), TEST)
     independent = runner.path / "mixed-numbered-verifier"
     independent.mkdir()
     executor = PlainExecutor(
-        runner, gateway, Limits(model_requests=4, concurrent_probes=1),
+        runner, gateway, Limits(model_requests=3 + numbered_replies, concurrent_probes=1),
         verification_runner=FixtureRunner(independent),
     )
     result = solve(executor, task, archive, _Budget(executor.limits, lambda: False, task), "fixture")
 
     numbered = gateway.prompts[2]
+    assert len(line_attempts) == numbered_replies
+    if failover != "none":
+        assert line_attempts[0][0] == line_attempts[1][0]
+        assert line_attempts[1][1] == (("numbered-free-a", "small-code-model"),)
+        assert line_attempts[1][2] == "numbered-free-a"
     assert "Correct the dispatch result" in numbered and "assert -1 == 1" in numbered
     assert f"{SOURCE}::Reader.read" in numbered and "def local_result():" in numbered
     assert "def unrelated" not in numbered and "withheld-operator-source" not in numbered

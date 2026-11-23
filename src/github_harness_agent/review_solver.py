@@ -1815,6 +1815,8 @@ class _LineRetry:
     snapshot: LineRangeSnapshot
     allowed_rows: frozenset[int] | None = None
     prompt: str = ""
+    checkout: dict[str, str] | None = None
+    excluded_models: tuple[tuple[str, str], ...] = ()
 
 
 def _review_anchored_line_retry(review, sources, path, node, diagnostic):
@@ -1848,7 +1850,7 @@ def _review_anchored_line_retry(review, sources, path, node, diagnostic):
     def bounded_retry(snapshot, visible, allowed):
         prompt = heading + line_range_prompt(snapshot, visible_rows=visible) + LINE_RANGE_ENDING
         if wire_size([{"role": "user", "content": prompt}]) <= 7500:
-            return _LineRetry(None, snapshot, allowed, prompt)
+            return _LineRetry(None, snapshot, allowed, prompt, checkout=sources)
         return None
 
     if len(snapshot.lines) <= 90:
@@ -3508,6 +3510,21 @@ def solve(executor, task, archive, budget, version):
     iteration_attempted = set()
     anchored_line_attempted = set()
 
+    def retry_numbered_route(target, line_retry, editor):
+        if (
+            line_retry is None
+            or line_retry.checkout is not current
+            or target not in failures
+            or len(line_retry.excluded_models) >= 3
+            or not editor.configured_model
+        ):
+            return
+        model = editor.route, editor.configured_model
+        if model not in line_retry.excluded_models:
+            line_retries[target] = replace(
+                line_retry, excluded_models=(*line_retry.excluded_models, model),
+            )
+
     def queue_review_anchored_retry(target):
         number, node = target
         run = pytest_runs.get(number)
@@ -4156,6 +4173,11 @@ def solve(executor, task, archive, budget, version):
                         if target not in line_retries:
                             queue_review_anchored_retry(target)
                     line_retry = line_retries.pop(target, None)
+                    if (
+                        line_retry is not None and line_retry.checkout is not None
+                        and (line_retry.checkout is not current or repair is not None)
+                    ):
+                        line_retry = None
                     scoped_line = (
                         line_retry is not None and line_retry.allowed_rows is not None
                     )
@@ -4519,6 +4541,8 @@ def solve(executor, task, archive, budget, version):
                                 model for model, count in counts.items()
                                 if count >= _MODEL_FAILURE_THRESHOLD
                             )
+                    if line_retry is not None and line_retry.excluded_models:
+                        exclude = tuple(dict.fromkeys((*exclude, *line_retry.excluded_models)))
                     route = (
                         line_routes.get(target)
                         if line_retry and not scoped_line else last_routes.get(target)
@@ -4851,6 +4875,7 @@ def solve(executor, task, archive, budget, version):
                 if line_followup is not None and snapshot is current:
                     line_retries[target] = line_followup
                 notes[target] = str(error)[:400]
+                retry_numbered_route(target, line_retry, editor)
                 if repair is not None and repair.stock_origin:
                     regression_repair = _retry_stock_repair(
                         repair,
@@ -5310,6 +5335,8 @@ def solve(executor, task, archive, budget, version):
                 or not (progressed or partial or prefix_progress)
             ):
                 count_model_failure(rotation_key, snapshot, editor)
+                if after.keys() == failures.keys():
+                    retry_numbered_route(target, line_retry, editor)
                 if fresh_stock:
                     interactive_misses[target] += 1
                 if snapshot is current and (
