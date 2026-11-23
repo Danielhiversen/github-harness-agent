@@ -2480,7 +2480,9 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="",
             + "Method signature:\n" + "\n".join(snapshot.lines[:snapshot.first_body_line - 1])
             + ("\nNames assigned earlier in this method: " + excerpt(", ".join(preceding_local_names(snapshot, first)), 250) if fragment.literal else "")
             + "\nPreceding context:\n" + excerpt(local, 700)
-            + "\nAccepted fragment:\n" + ("\n".join(fragment.accepted) or "(empty)")
+            + "\nAccepted fragment:\n" + ("\n".join(fragment.accepted) if any(row.strip() for row in fragment.accepted) else "(blank; no executable statement)")
+            + ("\nTo restore those exact blank rows, return RESTORE_ACCEPTED_BLANK. Both cases will still be checked."
+               if fragment.literal and not any(row.strip() for row in fragment.accepted) else "")
             + "\nTentative fragment to replace:\n" + "\n".join(snapshot.lines[first - 1:last])
             + "\nFollowing context:\n" + excerpt(following, 450)
         )

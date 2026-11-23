@@ -516,3 +516,40 @@ def test_literal_hunk_preserves_external_syntax_and_rejects_new_execution_scope(
             apply_statement_fragment(wrong, {PATH: tentative}, new, span)
     with pytest.raises(ValueError, match="snapshot"):
         apply_statement_fragment("if not legacy:", {PATH: accepted}, new, span)
+
+
+
+def test_literal_blank_edges_retain_indentation_and_restore_only_verified_blank_rows():
+    from github_harness_agent.review_line_ranges import apply_statement_fragment, select_statement_fragment
+
+    prefix = "class Reader:\n    def score(self, legacy):\n        result = (\n            0\n"
+    prefix += "".join(f"            + 0  # prefix {i}\n" for i in range(27))
+    suffix = "            + 0  # unchanged suffix\n        )\n        return result\n\n    def guard(self): return 9\n"
+    blank = " " * 12 + "\n"
+    added = "\n            + (4\n               )\n"
+    original, tentative = prefix + blank + suffix, prefix + added + suffix
+    def snapshot(source):
+        return prepare_line_range_edit({PATH: source}, (PATH, "Reader.score"))
+    old, new = snapshot(original), snapshot(tentative)
+    choice = select_statement_fragment(old, new)
+    assert (choice.reason, choice.old_rows, choice.new_rows) == ("single-literal-hunk", 1, 3)
+    fragment = choice.fragment
+    assert fragment.accepted == (blank[:-1],)
+    assert apply_statement_fragment("RESTORE_ACCEPTED_BLANK", {PATH: tentative}, new, fragment) == {PATH: original}
+    replacement = "+ (0 if legacy else 4)"
+    fixed = apply_statement_fragment(replacement, {PATH: tentative}, new, fragment)
+    assert fixed == {PATH: prefix + "            " + replacement + "\n" + suffix}
+    for source, expected in ((original, (0, 0)), (tentative, (4, 4)), (fixed[PATH], (4, 0))):
+        namespace = {}
+        exec(source, namespace)
+        reader = namespace["Reader"]()
+        assert (reader.score(False), reader.score(True)) == expected
+        assert reader.guard() == 9
+    reverse = select_statement_fragment(new, old).fragment
+    assert reverse.literal
+    assert apply_statement_fragment(replacement, {PATH: original}, old, reverse) == fixed
+    with pytest.raises(ValueError):
+        apply_statement_fragment("RESTORE_ACCEPTED_BLANK", {PATH: original}, old, reverse)
+    for broken in ('"""', ")", "def escaped(): pass", ""):
+        with pytest.raises(ValueError):
+            apply_statement_fragment(broken, {PATH: tentative}, new, fragment)

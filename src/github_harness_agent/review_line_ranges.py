@@ -505,7 +505,7 @@ def select_statement_fragment(accepted, tentative):
             if old_mask is not None and old_mask == _masked_suite(new_tree, c, d):
                 return FragmentSelection("common-suite", *stats, StatementFragment(c + 1, d, accepted.lines[a:b]))
     if (len(changes) == 1 and 1 <= old_end - old_first <= 6 and 1 <= new_end - new_first <= 6
-            and tentative.lines[new_first].strip() and accepted.lines[old_first].strip()):
+            and any(line.strip() for line in (*accepted.lines[old_first:old_end], *tentative.lines[new_first:new_end]))):
         return FragmentSelection("single-literal-hunk", *stats, StatementFragment(
             new_first + 1, new_end, accepted.lines[old_first:old_end], literal=True,
         ))
@@ -565,18 +565,29 @@ def _literal_exterior(lines, first, last):
     return exterior, crossing
 
 
-def _apply_literal_hunk(rows, sources, snapshot, fragment):
+def _apply_literal_hunk(rows, sources, snapshot, fragment, *, restore_blank=False):
     first, last = fragment.first, fragment.last
     if not (snapshot.first_body_line <= first <= last <= len(snapshot.lines)
             and max(last-first+1, len(fragment.accepted)) <= 6 and len(rows) <= 12):
         raise ValueError("Literal hunk exceeds its body window")
-    indent = re.match(r"[ \t]*", snapshot.lines[first-1])[0]
-    inserted = [indent + row if row else row for row in rows]
+    if restore_blank:
+        if any(line.strip() for line in fragment.accepted):
+            raise ValueError("Only an accepted blank fragment can be restored")
+        inserted = list(fragment.accepted)
+    else:
+        # A blank boundary has no Python indentation. Use the first substantive
+        # tentative line, or the accepted binding at the same verified location
+        # when the tentative rows are all blank.
+        anchor = next((line for line in (*snapshot.lines[first-1:last], *fragment.accepted) if line.strip()), None)
+        if anchor is None:
+            raise ValueError("Literal hunk lacks an indentation anchor")
+        indent = re.match(r"[ \t]*", anchor)[0]
+        inserted = [indent + row if row else row for row in rows]
     edit = {"start": first, "end": last, "lines": inserted}
     revised = apply_line_range_edit(json.dumps({"snapshot": snapshot.digest, "edits": [edit]}),
                                     sources, snapshot, allowed_rows=frozenset(range(first, last+1)))
     updated = prepare_line_range_edit(revised, snapshot.symbol)
-    after = first + len(rows) - 1
+    after = first + len(inserted) - 1
     if (updated is None or updated.lines[:first-1] != snapshot.lines[:first-1]
             or updated.lines[after:] != snapshot.lines[last:]):
         raise ValueError("Literal hunk changed its source boundaries")
@@ -594,6 +605,8 @@ def apply_statement_fragment(reply, sources, snapshot, fragment):
     """Splice one standalone statement suite and verify surrounding AST equivalence."""
     if not isinstance(reply, str) or len(reply.encode()) > 4096:
         raise ValueError("Expected a bounded Python statement fragment")
+    if fragment.literal and reply.strip() == "RESTORE_ACCEPTED_BLANK":
+        return _apply_literal_hunk([], sources, snapshot, fragment, restore_blank=True)
     text = reply.strip("\n")
     if fence := re.fullmatch(r"```(?:python|py)?[ \t]*\n(.*?)\n```", text, re.S):
         text = fence[1]
