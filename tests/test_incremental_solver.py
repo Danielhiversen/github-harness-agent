@@ -1232,12 +1232,15 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
     strategy = "Keep legacy reads on the old path and apply the correction to ordinary reads."
     early_routes = []
     retain_early = failover.endswith(("-testfirst", "-alternate", "-multistage", "-timeout", "-private", "-strengthen", "-function", "-skipformats"))
+    prospective = failover.endswith("-checkpoint-green")
     if failover.endswith("-multistage"):
         early_case = early_case.replace("import first", "import first, second").replace(
             "    assert first()", "    assert second() == 2\n    assert first()"
         )
     elif failover.endswith("-oldgreen"):
         early_case = early_case.replace("first", "second").replace("== 1", "== -2")
+    elif prospective:
+        early_case = early_case.replace("first", "second").replace("== 1", "== 2")
     elif failover.endswith("-setup"):
         early_case = early_case.replace("assert first() == 1", "raise AssertionError('setup failure')")
     elif failover.endswith("-green"):
@@ -1699,6 +1702,9 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
             assert len(early_routes) == (3 if failover.endswith(("-strengthen", "-runtime-function", "-skipformats")) else 1 if failover.endswith(("-testfirst", "-multistage", "-unavailable", "-private")) else 2)
             assert any(prompt.startswith("Test-first regression") for prompt in gateway.prompts)
             assert (b"test_dispatch_observable" in result.patch) == retain_early
+            if prospective:
+                assert "passed on the partial checkpoint and failed by assertion" in gateway.prompts[-1]
+                assert "assert second() == 2" in gateway.prompts[-1]
         first_request = gateway.prompts[0]
         assert len(line_attempts) == 1 + repeats and not native_attempts and not raw_attempts
         assert len(re.findall(r"(?m)^\d+ \|", first_request)) > 110
@@ -6132,7 +6138,7 @@ def test_resumed_repeated_stock_uses_only_typed_scoped_coding(solver_case, monke
     assert all(check.returncode == 0 for check in result.checks)
 
 
-@pytest.mark.parametrize("restart", ("exact", "changed_review", "changed_checkpoint", "no_longer_red"))
+@pytest.mark.parametrize("restart", ("exact", "changed_review", "changed_checkpoint", "no_longer_red", "checkpoint_green"))
 def test_red_witness_is_replayed_in_fresh_solver(solver_case, caplog, restart):
     from github_harness_agent.controller import restore_solver_recovery
     from github_harness_agent.worker import Cancelled
@@ -6148,7 +6154,8 @@ def test_red_witness_is_replayed_in_fresh_solver(solver_case, caplog, restart):
 
         result = original_solve(executor, replace(task, save_solver_recovery=save), archive, budget, version)
         record = records[0]
-        assert "assert first() == 1" in record["red_witness"]["source"]
+        assertion = "assert second() == 2" if restart == "checkpoint_green" else "assert first() == 1"
+        assert assertion in record["red_witness"]["source"]
         witness = record["red_witness"]
         if restart == "no_longer_red":
             witness["source"] = witness["source"].replace("first() == 1", "isinstance(first(), int)")
@@ -6172,23 +6179,30 @@ def test_red_witness_is_replayed_in_fresh_solver(solver_case, caplog, restart):
         class RestartGateway(FreeGateway):
             def complete(self, **kwargs):
                 prompt = kwargs["messages"][-1]["content"]
+                if restart == "checkpoint_green" and self.prompts:
+                    assert "passed on the partial checkpoint and failed by assertion" in prompt
+                    assert "assert second() == 2" in prompt
+                    return super().complete(**kwargs)
                 visible_witness = "independently authored repository test" in prompt
                 assert visible_witness == (restart == "exact")
-                if not visible_witness:
+                if not visible_witness and restart != "checkpoint_green":
                     raise Cancelled("Stop after checking stale witness admission")
-                assert "Pinned ancestor assertion" in prompt and "Checkpoint assertion" in prompt
+                if visible_witness:
+                    assert "Pinned ancestor assertion" in prompt and "Checkpoint assertion" in prompt
+                else:
+                    assert "assert second() == 2" not in prompt
                 reply = super().complete(**{**kwargs, "max_output_tokens": 3072})
                 reply.content = json.dumps({"symbol": "Reader.dispatch", "edits": [{
                     "start": 2, "end": 2, "lines": ["        return self.read() + 2"],
                 }]})
                 return reply
 
-        gateway = RestartGateway("scoped production edit")
+        gateway = RestartGateway("scoped production edit", *([TEST] if restart == "checkpoint_green" else []))
         fresh = PlainExecutor(executor.runner, gateway, executor.limits, verification_runner=executor.verification_runner)
         with caplog.at_level("ERROR", logger="github_harness_agent.review_solver"):
-            if restart == "exact":
+            if restart in {"exact", "checkpoint_green"}:
                 verified = original_solve(fresh, resumed, archive, _Budget(fresh.limits, lambda: False, resumed), version)
-                assert verified.patch == result.patch and len(gateway.prompts) == 1
+                assert verified.patch == result.patch and len(gateway.prompts) == (2 if restart == "checkpoint_green" else 1)
                 assert any(c.command[0] == "verify-regression" and not c.returncode for c in verified.checks)
             else:
                 with pytest.raises(Cancelled):
@@ -6196,7 +6210,8 @@ def test_red_witness_is_replayed_in_fresh_solver(solver_case, caplog, restart):
         return result
 
     _exercise_numbered_review(
-        solver_case, "checkpoint-caller-after-testfirst", caplog, run_solver=solve_and_restart,
+        solver_case, "checkpoint-caller-after-testfirst" + ("-checkpoint-green" if restart == "checkpoint_green" else ""),
+        caplog, run_solver=solve_and_restart,
     )
 
 

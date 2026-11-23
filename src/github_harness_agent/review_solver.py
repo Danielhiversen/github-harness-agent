@@ -4745,7 +4745,7 @@ def solve(executor, task, archive, budget, version):
         witness = prove_red_regression(source, outcomes=outcomes, runtime=runtime if assembly else None)
         if assembly and runtime:
             test_first_runtime = (result.content, runtime[0] + "\nCorrect the setup or API usage and retain the requested behavioral assertions.")
-        if not witness and len(outcomes) == 2 and any(item.endswith(" passed") for item in outcomes):
+        if (not witness or not witness[1]) and len(outcomes) == 2 and any(item.endswith(" passed") for item in outcomes):
             runnable_drafts[source] = tuple(outcomes)
         return witness
 
@@ -4760,6 +4760,7 @@ def solve(executor, task, archive, budget, version):
                 raise ValueError("Staged regression differs from authored bytes")
 
         assertions = []
+        checkpoint_pass = None
         for stage, revision, changes in (
             ("checkpoint", archive, patch_for(original, {**current, new_path: source})),
             ("pinned ancestor", task.regression_archive, patch_for({new_path: ""}, {new_path: source})),
@@ -4771,9 +4772,14 @@ def solve(executor, task, archive, budget, version):
             if not run or len(run.failed) != 1:
                 outcome = "green" if run and run.passed == 1 and not failed and not run.deselected else "incomplete or setup error"
                 _LOG.info("Test-first %s verification: %s", stage, outcome)
-                if outcome == "green" and outcomes is not None:
-                    outcomes.append(stage + " passed")
-                    continue
+                if outcome == "green":
+                    if outcomes is not None:
+                        outcomes.append(stage + " passed")
+                    if stage == "checkpoint" and run.named_cases and len(run.named_cases) == 1:
+                        checkpoint_pass = next(iter(run.named_cases))
+                        continue
+                    if outcomes is not None:
+                        continue
                 return None
             observed = next(_focused_test_assertions(new_path, source, run, failed), None)
             if observed is None:
@@ -4786,6 +4792,9 @@ def solve(executor, task, archive, budget, version):
             assertions.append(observed)
             if outcomes is not None:
                 outcomes.append(f"{stage} failed by assertion at line {observed[1]}")
+        if len(assertions) == 1 and assertions[0][0] == checkpoint_pass:
+            # The checkpoint already satisfies this test. Keep it for final regression verification.
+            return source, ""
         if len(assertions) != 2 or assertions[0][0] != assertions[1][0]:
             _LOG.info("Test-first verification rejected mismatched collected cases")
             return None
@@ -4994,7 +5003,8 @@ def solve(executor, task, archive, budget, version):
             budget.remaining()
         if test_first_witness:
             test_first_attempted = True
-            _LOG.info("Reverified saved regression assertion failures on both revisions")
+            _LOG.info("Reverified saved regression %s", "assertion failures on both revisions" if test_first_witness[1]
+                      else "candidate against checkpoint and pinned ancestor")
         else:
             durable_witness = None
             retain_recovery(durable=True)
@@ -5008,16 +5018,25 @@ def solve(executor, task, archive, budget, version):
                 new_path, current[new_path].encode()
             )
             if test_first_witness and not failures and needs_tests and not pending:
-                retained, _ = test_first_witness
+                retained, behavior_hint = test_first_witness
                 test_first_witness = None
-                combined = patch_for(original, {**current, new_path: retained})
-                if len(combined) <= executor.limits.patch_bytes:
-                    try:
-                        return _finish_review(executor, task, archive, budget, combined, actor, version)
-                    except AttemptRejected as error:
-                        if not isinstance(error.__cause__, _VerificationRejected):
-                            raise
-                        _LOG.info("Test-first candidate failed final verification; resuming standard test authoring")
+                if behavior_hint:
+                    combined = patch_for(original, {**current, new_path: retained})
+                    if len(combined) <= executor.limits.patch_bytes:
+                        try:
+                            return _finish_review(executor, task, archive, budget, combined, actor, version)
+                        except AttemptRejected as error:
+                            if not isinstance(error.__cause__, _VerificationRejected):
+                                raise
+                            _LOG.info("Test-first candidate failed final verification; resuming standard test authoring")
+                elif not test_draft:
+                    test_draft = retained
+                    test_checkout_snapshot = current
+                    test_diagnostic = (
+                        "This earlier draft passed on the partial checkpoint and failed by assertion on the pinned ancestor. "
+                        "Strengthen it to expose the reviewed behavior still missing at the partial checkpoint. "
+                        "The revised test must fail by assertion there and pass on the repaired checkout."
+                    )
             ready = not failures and not needs_tests and bool(patch)
             if ready and not pending:
                 return _finish_review(
@@ -5094,7 +5113,15 @@ def solve(executor, task, archive, budget, version):
                     submitted += 1
                     launch_budget -= 1
                     try:
-                        test_first_witness = author_red_regression(routes, after_provider, runnable_drafts)
+                        authored = author_red_regression(routes, after_provider, runnable_drafts)
+                        if authored and (test_first_witness is None or authored[1]):
+                            test_first_witness = authored
+                            durable_witness = RedWitness(witness_identity(), authored[0])
+                            retain_recovery(durable=True)
+                            if authored[1]:
+                                _LOG.info("Retained an authored regression with verified assertion failures on both revisions")
+                            else:
+                                _LOG.info("Retained a test draft for strengthening after checkpoint-green and ancestor-red verification")
                         after_provider = routes[-1][0] if routes else None
                     except Cancelled:
                         raise
@@ -5116,15 +5143,11 @@ def solve(executor, task, archive, budget, version):
                     if test_first_format_misses > previous_misses and skipped_formats < 2:
                         skipped_formats += 1
                     if (
-                        test_first_witness or not after_provider or launch_budget < 3
+                        (test_first_witness and test_first_witness[1]) or not after_provider or launch_budget < 3
                         or budget.model_requests_remaining() < 3 or budget.remaining() < 75
                         or budget.commands_remaining() < len(commands) * 2 + 12
                     ):
                         break
-                if test_first_witness:
-                    durable_witness = RedWitness(witness_identity(), test_first_witness[0])
-                    retain_recovery(durable=True)
-                    _LOG.info("Retained an authored regression with verified assertion failures on both revisions")
             if (
                 len(operator) == 1
                 and not other_checks
@@ -5974,7 +5997,8 @@ def solve(executor, task, archive, budget, version):
                             {"role": "system", "content": _LINE_RANGE_SYSTEM},
                             {"role": "user", "content": line_retry.prompt},
                         ]
-                    if test_first_witness and (target in operator or repair is not None and target in repair.introduced):
+                    if (test_first_witness and test_first_witness[1]
+                            and (target in operator or repair is not None and target in repair.introduced)):
                         hint = test_first_witness[1] + "\n"
                         augmented = [*messages[:-1], {**messages[-1], "content": hint + messages[-1]["content"]}]
                         if wire_size(augmented) <= RETRY_MESSAGE_BYTES:
