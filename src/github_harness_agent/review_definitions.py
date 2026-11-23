@@ -170,23 +170,34 @@ def reviewed_nested_helper(source, anchor):
     return name, textwrap.dedent(body), tuple(calls)
 
 
-def apply_scoped_raw_definition(response, sources, symbol):
-    """Bind plain Python only to a previously selected, existing nested function."""
+def apply_scoped_raw_definition(response, sources, symbol, *, require_nested=True):
+    """Bind plain Python only to a previously selected, existing function."""
     path, name = symbol
-    if not isinstance(response, str) or len(response.encode()) > 4096 or path not in sources:
+    max_reply = (4 if require_nested else 8) * 1024
+    if not isinstance(response, str) or len(response.encode()) > max_reply or path not in sources:
         raise ValueError("Expected one complete Python helper within the edit limit")
     body = _unfence(response.replace("\r\n", "\n"))
     nodes = _parse(body, path).body
     scopes = _qualified_scope(_definition_index(_parse(sources[path], path)), name)
     if (
-        not scopes or not any(isinstance(owner, _FUNCTION) for owner in scopes[:-1])
+        not scopes or (require_nested and not any(isinstance(owner, _FUNCTION) for owner in scopes[:-1]))
         or len(nodes) != 1 or not isinstance(nodes[0], _FUNCTION)
         or _definition_start(nodes[0]) != 1 or nodes[0].end_lineno != len(body.splitlines())
     ):
-        raise ValueError("Expected only the selected complete nested Python function")
-    return apply_definitions(
+        raise ValueError("Expected only the selected complete Python function")
+    if not require_nested and (
+        not isinstance(scopes[-1], _FUNCTION) or _nested_signature(scopes[-1]) != _nested_signature(nodes[0])
+    ):
+        raise ValueError("The selected pytest function must retain its signature and decorators")
+    result = apply_definitions(
         f"REPLACE {path}::{name}\n{body}", sources, only=symbol, single_function=True,
     )
+    if not require_nested:
+        try:
+            compile(result[path], path, "exec", dont_inherit=True)
+        except (SyntaxError, ValueError, RecursionError):
+            raise ValueError("The revised pytest module must be valid Python") from None
+    return result
 
 
 def _imports(nodes):

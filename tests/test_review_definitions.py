@@ -196,6 +196,28 @@ def test_omitted_annotations_splice_body_under_exact_multiline_declaration():
             apply_definitions(reply.replace(signature, changed), {"module.py": source})
 
 
+@pytest.mark.parametrize("invalid", (
+    "def test_keep():\n    assert True",
+    "def test_failed(other):\n    assert other",
+    "@pytest.mark.skip\ndef test_failed(self):\n    assert True",
+    "import pytest\ndef test_failed(self):\n    assert True",
+    "def test_failed(self):\n    assert True\n# extra",
+))
+def test_raw_collected_test_repair_rejects_siblings_or_contract_change(invalid):
+    from github_harness_agent.review_definitions import apply_scoped_raw_definition
+
+    source = (
+        "class TestCases:\n"
+        "    def test_failed(self):\n        assert False\n\n"
+        "    def test_keep(self):\n        assert True\n"
+    )
+    sources = {"tests/test_draft.py": source}
+    symbol = ("tests/test_draft.py", "TestCases.test_failed")
+    with pytest.raises(ValueError):
+        apply_scoped_raw_definition(invalid, sources, symbol, require_nested=False)
+    assert sources[symbol[0]] == source
+
+
 def test_omitted_annotations_preserve_inline_declaration_and_replace_suite():
     source = "def outer():\n    def inner(value: str): return value\n    return inner('input')\n"
     reply = "REPLACE module.py::outer.inner\ndef inner(value):\n    upper = value.upper()\n    return upper"

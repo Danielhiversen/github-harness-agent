@@ -36,6 +36,7 @@ from github_harness_agent.review_assertions import (
 from github_harness_agent.review_recovery import ReviewRecovery, plan_recovery
 from github_harness_agent.task_context import compact_focused_review, wire_size
 from github_harness_agent.review_solver import (
+    LINE_RANGE_ENDING,
     _GUIDANCE,
     _generic_verifier_failure,
     _rejected_attempt,
@@ -3432,6 +3433,63 @@ def test_solver_retries_failed_pytest_case_with_scoped_numbered_edit(solver_case
     assert len(gateway.prompts) == (3 if numbered_reply == "valid" else 4)
     assert b"assert (first(), second()) == (1, 2)" in result.patch
     assert b"def test_keep():\n+    assert second() == 2" in result.patch
+    assert all(check.returncode == 0 for check in result.checks)
+    assert any(NEW_TEST in check.command for check in result.checks)
+
+
+@pytest.mark.parametrize("inline_setup", (False, True))
+def test_repeated_test_format_failures_route_raw_function_to_an_alternate(solver_case, inline_setup):
+    task, archive, runner, _ = solver_case
+    fixed = BASE_SOURCE.replace("return -1", "return 1").replace("return -2", "return 2")
+    checkpoint = DraftCheckpoint(
+        "harness2/base", task.base_sha,
+        patch_for({SOURCE: BASE_SOURCE}, {SOURCE: fixed}),
+        guidance=_GUIDANCE, last_editor=("fixture", "fixture/coder"),
+    )
+    task = replace(task, checkpoints={checkpoint.key: checkpoint})
+    keep = "\n\ndef test_keep():\n    assert second() == 2\n"
+    setup = ""
+    if inline_setup:
+        records = "".join(f"        {step}: {repr('fixture value ' * 8)},\n" for step in range(40))
+        setup = "    fake_provider_records = {\n" + records + "    }\n    assert 39 in fake_provider_records\n"
+    failed = TEST.replace("    assert", setup + "    assert", 1).replace("(1, 2)", "(0, 0)") + keep
+    raw_routes = []
+
+    class Gateway(FreeGateway):
+        def complete(self, **kwargs):
+            if kwargs["tools"]:
+                raise ProviderExhausted(None, {"fixture": "no structured route"})
+            reply = super().complete(**kwargs)
+            if self.prompts[-1].endswith("Return only the complete Python function for this failed test."):
+                raw_routes.append(kwargs.get("exclude", ()))
+                reply.route, reply.configured_model = f"raw-{len(raw_routes)}", f"raw/{len(raw_routes)}"
+            elif len(self.prompts) == 4:
+                reply.route, reply.configured_model = "broad-text", "broad/text"
+            return reply
+
+    fixed_test = "def test_results():\n" + setup + "    assert (first(), second()) == (1, 2)"
+    gateway = Gateway(
+        failed, "invalid SEARCH", "invalid numbered edit", "invalid fallback",
+        "def test_keep():\n    assert first() == 1", "```python\n" + fixed_test + "\n```",
+    )
+    independent = runner.path / "raw-test-verifier"
+    independent.mkdir()
+    executor = PlainExecutor(
+        runner, gateway, Limits(model_requests=7, concurrent_probes=1),
+        verification_runner=FixtureRunner(independent),
+    )
+    result = solve(executor, task, archive, _Budget(executor.limits, lambda: False, task), "fixture")
+
+    assert len(raw_routes) == 2 and ("raw-1", "raw/1") in raw_routes[1]
+    for prompt in gateway.prompts[-2:]:
+        assert prompt.startswith(f"Selected failing case: {NEW_TEST}::test_results\n")
+        assert "def test_keep():" not in prompt
+        assert setup in prompt
+    if inline_setup:
+        assert len(fixed_test.encode()) > 4096
+        assert not any(prompt.endswith(LINE_RANGE_ENDING) for prompt in gateway.prompts)
+    assert b"def test_keep():\n+    assert second() == 2" in result.patch
+    assert fixed_test.splitlines()[-1].encode() in result.patch
     assert all(check.returncode == 0 for check in result.checks)
     assert any(NEW_TEST in check.command for check in result.checks)
 

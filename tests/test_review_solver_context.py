@@ -480,6 +480,32 @@ def test_oversized_temporary_file_fixture_keeps_shape_in_numbered_retry(with_fac
     assert prompt.endswith(review_solver.LINE_RANGE_ENDING)
 
 
+def test_raw_pytest_snapshot_keeps_long_case_bound_to_current_draft():
+    from github_harness_agent import review_solver
+
+    path = "tests/test_draft.py"
+    selected, sibling = (f"{path}::{name}" for name in ("test_result", "test_keep"))
+    note = f"Selected failing case: {selected}\nE   AssertionError: result differed"
+    short = "def test_result():\n    assert False"
+    helper = "\n\ndef test_keep():\n    assert True\n"
+    long = short.replace("    assert", "    # " + "fixture data " * 390 + "\n    assert")
+    run = review_solver._PytestRun(0, frozenset({selected}), 1, frozenset({selected, sibling}))
+    select = review_solver._failed_test_line_snapshot
+
+    assert select(path, long + helper, note, run) is None
+    snapshot = select(path, long + helper, note, run, raw=True)
+    assert snapshot.lines == tuple(long.splitlines())
+    assert snapshot.symbol == (path, "test_result")
+    assert select(path, long + helper, note, run, raw=True).digest == snapshot.digest
+    assert select(path, long + helper.replace("True", "False"), note, run, raw=True).digest != snapshot.digest
+    too_many_rows = short.replace("    assert", "    # fixture step\n" * 89 + "    assert")
+    too_many_bytes = short.replace("    assert", "    # " + "x" * 6144 + "\n    assert")
+    multiple = review_solver._PytestRun(0, frozenset({selected, sibling}), 0, frozenset({selected, sibling}))
+    assert select(path, too_many_rows + helper, note, run, raw=True) is None
+    assert select(path, too_many_bytes + helper, note, run, raw=True) is None
+    assert select(path, long + helper, note, multiple, raw=True) is None
+
+
 def test_prior_generated_fixture_context_quotes_only_complete_predecessor_setup():
     prior_path = "tests/test_review_regressions_2.py"
     new_path = "tests/test_review_regressions_3.py"

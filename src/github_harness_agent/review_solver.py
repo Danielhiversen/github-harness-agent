@@ -955,10 +955,12 @@ def _focused_output_reports_pass(output, path):
     )
 
 
-def _failed_test_line_snapshot(path, draft, diagnostic, run):
+def _failed_test_line_snapshot(path, draft, diagnostic, run, *, raw=False):
     """Bind the selected failure to a named case from the complete focused run."""
     heading, _, detail = diagnostic.partition("\n")
     if not heading.startswith("Selected failing case: ") or not run or run.named_cases is None:
+        return None
+    if raw and len(run.failed) != 1:
         return None
     selected = heading.removeprefix("Selected failing case: ")
     if selected not in run.failed or not selected.startswith(path + "::"):
@@ -970,15 +972,16 @@ def _failed_test_line_snapshot(path, draft, diagnostic, run):
         return None
     qualified = selected.removeprefix(path + "::").split("[", 1)[0].replace("::", ".")
     snapshot = prepare_line_range_edit({path: draft}, (path, qualified))
+    max_rows, max_bytes = (90, 6 * 1024) if raw else (26, 2400)
     if (
-        snapshot is not None and len(snapshot.lines) <= 26
-        and sum(len(row.encode()) + 1 for row in snapshot.lines) <= 2400
+        snapshot is not None and len(snapshot.lines) <= max_rows
+        and sum(len(row.encode()) + 1 for row in snapshot.lines) <= max_bytes
     ):
         return snapshot
     return None
 
 
-def _test_line_messages(snapshot, note, current, *, repository_usage=""):
+def _test_line_messages(snapshot, note, current, *, repository_usage="", raw=False):
     path, _ = snapshot.symbol
     production = {name: code for name, code in current.items() if name != path}
     failure_source = test_failure_focus(production, note)
@@ -986,18 +989,35 @@ def _test_line_messages(snapshot, note, current, *, repository_usage=""):
     failure_source = (
         TEST_VERIFICATION_SOURCE + excerpt(failure_source, 750) + "\n" if failure_source else ""
     )
+    if raw:
+        system = (
+            _SYSTEM_PREFIX
+            + "Return only one complete Python test function with its current name, signature, and decorators.\n"
+            + _SYSTEM_SUFFIX
+        )
+        editor = (
+            f"Current failed function {path}::{snapshot.symbol[1]} (quoted source):\n"
+            + "\n".join(snapshot.lines)
+            + "\nReturn only the complete Python function for this failed test."
+        )
+    else:
+        system = _LINE_RANGE_SYSTEM
+        editor = line_range_prompt(snapshot) + LINE_RANGE_ENDING
     return [
-        {"role": "system", "content": _LINE_RANGE_SYSTEM},
+        {"role": "system", "content": system},
         {
             "role": "user",
             "content": (
                 excerpt(note, 1300) + "\n"
                 "Repair the failing test setup or call and keep the tested behavior and assertions. "
-                "Use the sample JSON structure with your actual replacement lines.\n"
+                + (
+                    "Use one Python function, optionally in one fence.\n" if raw else
+                    "Use the sample JSON structure with your actual replacement lines.\n"
+                )
                 + (bindings + "\n" if bindings else "")
                 + failure_source
                 + (REPOSITORY_PYTEST_USAGE + excerpt(repository_usage, 820) + "\n" if repository_usage else "")
-                + line_range_prompt(snapshot) + LINE_RANGE_ENDING
+                + editor
             ),
         },
     ]
@@ -1850,6 +1870,13 @@ class _LineRetry:
     native_prompt: str = ""
     native_ready: bool = False
     native_attempted: bool = False
+
+
+@dataclass(frozen=True)
+class _RawTestRetry:
+    snapshot: LineRangeSnapshot
+    revision: tuple[bytes, bytes]
+    excluded_models: tuple[tuple[str, str], ...]
 
 
 def _review_anchored_line_retry(review, sources, path, node, diagnostic):
@@ -3751,6 +3778,7 @@ def solve(executor, task, archive, budget, version):
     test_model_failures = Counter()
     test_tool_attempts = set()
     test_line_attempts = set()
+    test_raw_attempts = {}
     repository_example = None
     ancestor_delta = ""
     repository_checkout = None
@@ -4374,6 +4402,7 @@ def solve(executor, task, archive, budget, version):
                     allow_test_module = False
                     native_test = False
                     test_line_snapshot = None
+                    test_raw_retry = None
                     if target == _TEST_GOAL:
                         if test_checkout_snapshot is not current:
                             test_checkout_snapshot = current
@@ -4437,6 +4466,16 @@ def solve(executor, task, archive, budget, version):
                             # Each stored digest pair costs a reserved proposal.
                             test_tool_attempts.add(revision)
                             _LOG.info("Trying structured pytest module reply after repeated format errors")
+                        elif (
+                            allow_test_module and test_format_failures > RECOVERY_MODE_THRESHOLD
+                            and (prior := test_raw_attempts.get(revision, ())) is not None
+                            and len(prior) < 2
+                            and (raw := _failed_test_line_snapshot(
+                                new_path, test_draft, test_diagnostic, test_case_runs.get("focused"), raw=True,
+                            ))
+                        ):
+                            test_raw_attempts[revision] = None
+                            test_raw_retry = _RawTestRetry(raw, revision, prior)
                         elif (
                             allow_test_module and test_format_failures and revision not in test_line_attempts
                         ):
@@ -4677,7 +4716,11 @@ def solve(executor, task, archive, budget, version):
                             else ""
                         ),
                     )
-                    if test_line_snapshot is not None:
+                    if test_raw_retry is not None:
+                        messages = _test_line_messages(
+                            test_raw_retry.snapshot, note, source, repository_usage=repository_usage, raw=True,
+                        )
+                    elif test_line_snapshot is not None:
                         messages = _test_line_messages(
                             test_line_snapshot, note, source, repository_usage=repository_usage,
                         )
@@ -4719,6 +4762,8 @@ def solve(executor, task, archive, budget, version):
                             pair for (pair, _), count in test_model_failures.items()
                             if count >= _MODEL_FAILURE_THRESHOLD
                         ))
+                    if test_raw_retry is not None:
+                        exclude = tuple(dict.fromkeys((*exclude, *test_raw_retry.excluded_models)))
                     if line_retry is not None and line_retry.excluded_models:
                         exclude = tuple(dict.fromkeys((*exclude, *line_retry.excluded_models)))
                     route = (
@@ -4753,7 +4798,7 @@ def solve(executor, task, archive, budget, version):
                         line_retry,
                         line_followup,
                         allow_test_module,
-                        test_line_snapshot,
+                        test_raw_retry or test_line_snapshot,
                         None,
                         repair,
                     )
@@ -4804,14 +4849,16 @@ def solve(executor, task, archive, budget, version):
                 line_retry,
                 line_followup,
                 allow_test_module,
-                test_line_snapshot,
+                test_retry,
                 raw_nested,
                 repair,
             ) = pending.pop(future)
+            test_raw_retry = test_retry if isinstance(test_retry, _RawTestRetry) else None
+            test_line_snapshot = test_retry if isinstance(test_retry, LineRangeSnapshot) else None
             scoped_line = line_retry is not None and line_retry.allowed_rows is not None
             if (
                 paired or continuation is not None or advised
-                or repair is not None or scoped_line or test_line_snapshot is not None
+                or repair is not None or scoped_line or test_retry is not None
                 or raw_nested is not None
             ) and snapshot is not current:
                 continue
@@ -4837,6 +4884,8 @@ def solve(executor, task, archive, budget, version):
                     _LOG.info("Numbered review edit format had no available coding route")
                 elif test_line_snapshot is not None:
                     _LOG.info("Numbered pytest edit format had no available coding route")
+                elif test_raw_retry is not None:
+                    _LOG.info("Raw pytest function edit had no available coding route")
                 elif raw_nested is not None:
                     _LOG.info("Raw nested Python edit had no available coding route")
                 elif rotated:
@@ -4886,6 +4935,11 @@ def solve(executor, task, archive, budget, version):
             )
             routes[target] = completion.route
             editor = RouteEvidence.from_completion(completion)
+            if (
+                test_raw_retry is not None
+                and test_raw_retry.revision[1] != hashlib.sha256(test_draft.encode()).digest()
+            ):
+                continue
             if raw_nested is not None:
                 raw_symbol, raw_revision, prior_raw = raw_nested
                 raw_model = editor.route, editor.configured_model
@@ -4902,7 +4956,14 @@ def solve(executor, task, archive, budget, version):
                     if raw_nested is not None:
                         candidate = apply_scoped_raw_definition(completion.content, source, raw_symbol)
                     if target == _TEST_GOAL:
-                        if test_line_snapshot is not None:
+                        if test_raw_retry is not None:
+                            pair = editor.route, editor.configured_model
+                            if pair in test_raw_retry.excluded_models:
+                                raise ValueError("Raw pytest edit requires a distinct coding route and model")
+                            candidate = apply_scoped_raw_definition(
+                                completion.content, source, test_raw_retry.snapshot.symbol, require_nested=False,
+                            )
+                        elif test_line_snapshot is not None:
                             candidate = apply_line_range_edit(
                                 completion.content, source, test_line_snapshot,
                             )
@@ -4941,6 +5002,11 @@ def solve(executor, task, archive, budget, version):
                         if snapshot is current:
                             test_format_failures += 1
                             count_test_model_failure(snapshot, editor, ("edit format",))
+                            if test_raw_retry is not None and editor.configured_model:
+                                pair = editor.route, editor.configured_model
+                                prior = test_raw_retry.excluded_models
+                                if pair not in prior:
+                                    test_raw_attempts[test_raw_retry.revision] = (*prior, pair)
                         raw = completion.content or ""
                         _LOG.info(
                             "New pytest module reply via %s did not parse "
