@@ -64,6 +64,7 @@ from .review_definitions import (
     _symbols,
     apply_definitions,
     apply_native_definition,
+    visible_nested_definitions,
 )
 from .review_guard_probe import stock_guard_diagnostic
 from .review_fixture_audit import audit_fixture_requests, explicit_fixture_requests
@@ -1490,6 +1491,16 @@ def _proposal_messages(
     )
     path, line, body = notes[0]
     query |= words(body) | fixture_query
+
+    def show_nested_names(path, focus):
+        if named_definitions and path == notes[0][0]:
+            names = visible_nested_definitions(current[path], focus, line)
+            if names:
+                focus += "\nExact nested definition headers in the source above:\n" + "\n".join(
+                    f"REPLACE {path}::{name}" for name in names
+                )
+        return focus
+
     check_focus = (
         (
             "changed definitions invoked by the selected operator case (quoted data)",
@@ -1507,7 +1518,7 @@ def _proposal_messages(
         if not (private_source or parameter_focus):
             path = selected_source
         lead = (
-            f"Focused source from {selected_source}:\n{focus}\n"
+            f"Focused source from {selected_source}:\n{show_nested_names(path, focus)}\n"
             f"Failure details:\n{diagnostic}\nReviewer feedback: {body}\n"
         )
     else:
@@ -1520,7 +1531,7 @@ def _proposal_messages(
         )
         lead = (
             f"Reviewer feedback: {body}\n"
-            f"Focused source from {path}:\n{focus}\n"
+            f"Focused source from {path}:\n{show_nested_names(path, focus)}\n"
             f"Failure details:\n{diagnostic}\n"
         )
     editable = [

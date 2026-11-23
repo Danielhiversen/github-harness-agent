@@ -69,6 +69,68 @@ def test_bare_fenced_definition_is_bound_to_one_existing_owner():
         apply_definitions(response, {**code, "other.py": code["first.py"]})
 
 
+@pytest.mark.parametrize("native", (False, True))
+def test_replaces_nested_function_by_exact_lexical_owner(native):
+    original = (
+        "class Reader:\n"
+        "    def decode(self, raw):\n"
+        "        value = raw\n"
+        "        if raw:\n"
+        "            @decorate\n"
+        "            def normalize(item: str = '') -> str:\n"
+        "                nonlocal value\n"
+        "                return value + item\n"
+        "            return normalize()\n"
+        "        return raw\n\n"
+        "    def render(self, raw):\n"
+        "        def normalize(item):\n"
+        "            return item\n"
+        "        return normalize(raw)\n"
+    )
+    body = (
+        "@decorate\ndef normalize(item: str = '') -> str:\n"
+        "    nonlocal value\n    return value.strip() + item"
+    )
+    sources = {"module.py": original}
+
+    def replace(symbol, definition):
+        if not native:
+            return apply_definitions(f"REPLACE module.py::{symbol}\n{definition}", sources)
+        call = {
+            "type": "function",
+            "function": {
+                "name": "replace_python_definition",
+                "arguments": json.dumps({
+                    "path": "module.py", "symbol": symbol, "definition": definition,
+                }),
+            },
+        }
+        return apply_native_definition((call,), sources)
+
+    result = replace("Reader.decode.normalize", body)
+    assert result["module.py"] == original.replace("return value + item", "return value.strip() + item")
+    for symbol in ("normalize", "decode.normalize", "Reader.normalize"):
+        with pytest.raises(ValueError):
+            replace(symbol, body)
+    with pytest.raises(ValueError, match="signature and decorators"):
+        replace("Reader.decode.normalize", body.replace("item: str = ''", "item"))
+    with pytest.raises(ValueError, match="signature and decorators"):
+        replace("Reader.decode.normalize", body.removeprefix("@decorate\n"))
+    with pytest.raises(ValueError, match="syntax|valid"):
+        replace("Reader.decode.normalize", body.replace("nonlocal value", "nonlocal missing"))
+
+
+def test_nested_function_rejects_duplicate_owners_and_overlapping_edits():
+    before = "def outer():\n    def inner():\n        return 1\n    return inner()\n"
+    inner = "REPLACE module.py::outer.inner\ndef inner():\n    return 2\n"
+    with pytest.raises(ValueError, match="ambiguous"):
+        apply_definitions(inner, {"module.py": before + "\ndef outer():\n    return 0\n"})
+    with pytest.raises(ValueError, match="overlap"):
+        apply_definitions(inner + "REPLACE module.py::outer\n" + before, {"module.py": before})
+    result = apply_definitions(inner, {"module.py": before})
+    assert result["module.py"] == before.replace("return 1", "return 2")
+
+
 def test_class_and_nested_method_replacements_cannot_overlap():
     code = {"module.py": "class Reader:\n    def read(self):\n        return 1\n"}
     response = (

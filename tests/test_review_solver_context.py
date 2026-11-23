@@ -710,6 +710,30 @@ def test_pinned_context_prefers_real_caller_of_reviewed_private_helper(as_method
         assert "def fixture_formatter():\n    return Service()" in context
 
 
+def test_named_prompt_advertises_only_visible_nested_definitions_in_reviewed_method():
+    path = "src/example.py"
+    source = (
+        "class Reader:\n"
+        "    def decode(self, raw):\n"
+        "        def normalize(value):\n"
+        "            return value.strip()\n"
+        "        return normalize(raw)\n\n"
+        "    def unrelated(self, raw):\n"
+        "        def normalize(value):\n"
+        "            return value\n"
+        "        return normalize(raw)\n"
+    )
+    review = ReviewRecovery(feedback=((path, 5, "Correct decode behavior"),), previous_failure="")
+    target = (0, "tests/test_example.py::test_decode")
+    args = (target, {path: source}, {target: "AssertionError"}, False, "", review, {}, [], "")
+    named = _proposal_messages(*args, named_definitions=True)[-1]["content"]
+    search = _proposal_messages(*args, named_definitions=False)[-1]["content"]
+
+    assert f"{path}::Reader.decode.normalize" in named
+    assert f"{path}::Reader.unrelated.normalize" not in named
+    assert f"{path}::Reader.decode.normalize" not in search
+
+
 def test_test_only_requirements_survive_compaction_without_operator_inventory():
     path = "src/example/formatting.py"
     new_path = "tests/test_review_regressions.py"

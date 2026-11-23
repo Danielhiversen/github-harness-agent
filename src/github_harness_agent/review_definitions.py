@@ -13,7 +13,7 @@ LOCALIZED_METHOD_HEADING = "Exact current method localized by the offline replay
 DEFINITION_FORMAT = """Use only definition edit blocks. Begin each with an exact header:
 REPLACE relative/path.py::Class.method
 Then include the complete replacement definition, optionally in a Python code fence.
-For a module-level symbol, use relative/path.py::function. Keep the same name and kind.
+Use the exact dotted lexical name for a nested symbol. Keep the same name and kind.
 Optionally add imports separately with IMPORTS relative/path.py and raw import statements.
 Both methods and functions may be unindented. Keep unrelated code and preserve behavior."""
 
@@ -31,7 +31,7 @@ NATIVE_DEFINITION_TOOL = {
                 },
                 "symbol": {
                     "type": "string",
-                    "description": "Existing function name or Class.method.",
+                    "description": "Exact dotted lexical name, such as function, Class.method, or Class.method.inner.",
                 },
                 "definition": {
                     "type": "string",
@@ -44,7 +44,8 @@ NATIVE_DEFINITION_TOOL = {
     },
 }
 
-_DEF = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+_FUNCTION = (ast.FunctionDef, ast.AsyncFunctionDef)
+_DEF = (*_FUNCTION, ast.ClassDef)
 _IMPORT = (ast.Import, ast.ImportFrom)
 _LIMIT = 256 * 1024
 _IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
@@ -68,13 +69,67 @@ def _parse(text, label):
         raise ValueError(f"{label}: complete valid Python is required") from None
 
 
-def _symbols(body, prefix=""):
+def _symbols(body, prefix="", *, nested=False, _local=False):
     for node in body:
         if isinstance(node, _DEF):
             qualified = prefix + node.name
             yield qualified, node
-            if isinstance(node, ast.ClassDef):
-                yield from _symbols(node.body, qualified + ".")
+            if nested or isinstance(node, ast.ClassDef):
+                yield from _symbols(
+                    node.body, qualified + ".", nested=nested,
+                    _local=_local or isinstance(node, _FUNCTION),
+                )
+        elif _local and isinstance(node, (ast.stmt, ast.ExceptHandler, ast.match_case)):
+            yield from _symbols(ast.iter_child_nodes(node), prefix, nested=nested, _local=True)
+
+
+def _definition_index(module):
+    index = defaultdict(list)
+    for name, node in _symbols(module.body, nested=True):
+        index[name].append(node)
+    return index
+
+
+def _qualified_scope(index, name):
+    parts = name.split(".")
+    scopes = []
+    for level in range(1, len(parts) + 1):
+        matches = index.get(".".join(parts[:level]), ())
+        if len(matches) != 1:
+            return ()
+        scopes.append(matches[0])
+    return scopes
+
+
+def _definition_start(node):
+    return min([node.lineno, *(entry.lineno for entry in node.decorator_list)])
+
+
+def visible_nested_definitions(source, shown, anchor):
+    """Find exact nested functions already shown inside the reviewed function."""
+    try:
+        index = _definition_index(_parse(source, "Reviewed source"))
+    except ValueError:
+        return ()
+    lines = source.splitlines()
+    visible = "\n" + shown.replace("\r\n", "\n") + "\n"
+    names = []
+    for name in index:
+        scopes = _qualified_scope(index, name)
+        if not scopes or not isinstance(scopes[-1], _FUNCTION):
+            continue
+        if not any(
+            isinstance(owner, _FUNCTION) and _definition_start(owner) <= anchor <= owner.end_lineno
+            for owner in scopes[:-1]
+        ):
+            continue
+        node = scopes[-1]
+        snippet = "\n".join(lines[_definition_start(node) - 1:node.end_lineno])
+        if f"\n{snippet}\n" in visible and len(name.encode()) <= 120:
+            names.append(name)
+        if len(names) == 3:
+            break
+    return tuple(names)
 
 
 def _imports(nodes):
@@ -226,10 +281,8 @@ def apply_native_definition(calls, sources):
     body = _unfence(body.replace("\r\n", "\n"))
     documents = _documents(sources)
     current = documents.get(path)
-    if current is None or not any(
-        name == symbol and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        for name, node in _symbols(current.body)
-    ):
+    scopes = _qualified_scope(_definition_index(current), symbol) if current else ()
+    if not scopes or not isinstance(scopes[-1], _FUNCTION):
         raise ValueError(
             "Native edit must name an existing function in the editable source list"
         )
@@ -239,6 +292,8 @@ def apply_native_definition(calls, sources):
 def _apply_definition_edits(sources, documents, replacements, *, functions_only=False):
     edits = defaultdict(list)
     added_imports = defaultdict(dict)
+    indexes = {}
+    nested_paths = set()
     for path, name, body in replacements:
         if path not in documents:
             raise ValueError("File is outside the editable Python source list")
@@ -256,12 +311,15 @@ def _apply_definition_edits(sources, documents, replacements, *, functions_only=
                     )
             continue
 
-        matches = [node for symbol, node in _symbols(module.body) if symbol == name]
-        if len(matches) != 1:
+        if path not in indexes:
+            indexes[path] = _definition_index(module)
+        scopes = _qualified_scope(indexes[path], name)
+        if not scopes:
             raise ValueError(
                 "Qualified definition is missing or ambiguous in the named file"
             )
-        old = matches[0]
+        old = scopes[-1]
+        is_nested = any(isinstance(owner, _FUNCTION) for owner in scopes[:-1])
         if functions_only and len(nodes) > 1:
             # Some providers repeat imports before a single requested test.
             # Treat only imports already present in the module as context.
@@ -280,10 +338,17 @@ def _apply_definition_edits(sources, documents, replacements, *, functions_only=
             raise ValueError(
                 "Replacement must be one complete definition with the same name and kind"
             )
-        if functions_only and not isinstance(old, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if (functions_only or is_nested) and not isinstance(old, _FUNCTION):
             raise ValueError("Expected a function or method, including for class-based pytest tests")
+        if is_nested:
+            signature = ("args", "returns", "decorator_list", "type_params")
+            if any(_definition_field(old, field) != _definition_field(nodes[0], field) for field in signature):
+                raise ValueError("Nested replacement must preserve its signature and decorators")
+            if "\f" in body or "\r" in body:
+                raise ValueError("Nested replacement requires valid indentation")
+            nested_paths.add(path)
         lines = sources[path].splitlines(keepends=True)
-        start = min([old.lineno, *(item.lineno for item in old.decorator_list)]) - 1
+        start = _definition_start(old) - 1
         margin = lines[start][: len(lines[start]) - len(lines[start].lstrip())]
         edits[path].append(
             (start, old.end_lineno, textwrap.indent(body + "\n", margin))
@@ -307,7 +372,19 @@ def _apply_definition_edits(sources, documents, replacements, *, functions_only=
         if len(revised.encode()) > _LIMIT:
             raise ValueError("Edited file exceeds the source limit")
         _parse(revised, path)
+        if path in nested_paths:
+            try:
+                compile(revised, path, "exec", dont_inherit=True)
+            except (SyntaxError, ValueError, RecursionError):
+                raise ValueError("Nested replacement must produce valid Python in its enclosing scope") from None
         result[path] = revised
     if result == sources:
         raise ValueError("No definition replacements changed the checkout")
     return result
+
+
+def _definition_field(node, field):
+    value = getattr(node, field, None)
+    if isinstance(value, list):
+        return tuple(ast.dump(item) for item in value)
+    return ast.dump(value) if value is not None else None
