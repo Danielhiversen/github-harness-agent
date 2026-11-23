@@ -454,3 +454,43 @@ def test_complete_method_accepts_seven_small_disjoint_edits_with_original_limits
     oversized = [line + " + 1" if "item_" in line and "=" in line else line for line in lines]
     with pytest.raises(ValueError, match="changed-row limit"):
         apply("\n".join(oversized))
+
+
+@pytest.mark.parametrize("gap", ("        # explain input\n\n        # explain output\n\n", "        tick()\n" * 4))
+def test_tiny_hunks_bridge_only_bounded_context(gap):
+    from github_harness_agent.review_line_ranges import select_statement_fragment, apply_statement_fragment
+
+    padding = "".join(f"        a_{i} = {i}\n" for i in range(25))
+    before = "class Reader:\n    def collect(self):\n" + padding + "        x = 0\n" + gap + "        y = 0\n        return x + y\n"
+    after = before.replace("x = 0", "x = 1").replace("y = 0", "y = 1")
+    old, new = [prepare_line_range_edit({PATH: source}, (PATH, "Reader.collect")) for source in (before, after)]
+    decision = select_statement_fragment(old, new)
+    assert decision.reason == "common-suite" and (decision.hunks, decision.old_rows, decision.new_rows) == (2, 2, 2)
+    assert decision.fragment.accepted == tuple(("        x = 0\n"+gap+"        y = 0").splitlines())
+    actual = apply_statement_fragment("x = 3\ny = 4", {PATH: after}, new, decision.fragment)
+    assert actual[PATH] == before.replace("        x = 0\n"+gap+"        y = 0", "        x = 3\n        y = 4")
+
+
+@pytest.mark.parametrize("mutation", ("insert", "delete"))
+def test_pure_edits_offer_a_surviving_statement_on_both_checkouts(mutation):
+    from github_harness_agent.review_line_ranges import select_statement_fragment, apply_statement_fragment
+
+    sources, old, _ = _long_body()
+    original = sources[PATH]
+    line = "        item_3 = 3\n"
+    with_step = original.replace(line, line+"        item_3 += 1\n")
+    before, after = (original, with_step) if mutation == "insert" else (with_step, original)
+    old, new = [prepare_line_range_edit({PATH: source}, old.symbol) for source in (before, after)]
+    decision = select_statement_fragment(old, new)
+    assert decision.reason == "common-suite" and decision.hunks == 1
+    offered = new.lines[decision.fragment.first-1:decision.fragment.last]
+    stable = set(offered) & set(decision.fragment.accepted)
+    assert len(stable) == 1
+    replacement = list(offered)
+    changed = "        item_3 += 1"
+    if changed in replacement:
+        replacement[replacement.index(changed)] = "        item_3 += 2"
+    else:
+        replacement.insert(0 if offered[0] != line.rstrip() else 1, "        item_3 += 2")
+    result = apply_statement_fragment("\n".join(replacement), {PATH: after}, new, decision.fragment)
+    assert result[PATH] == original.replace(line, line+"        item_3 += 2\n")

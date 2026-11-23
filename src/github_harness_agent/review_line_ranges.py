@@ -439,34 +439,73 @@ def _covering_statements(tree, first, last):
     return min(options, key=lambda item: item[0]) if options else None
 
 
-def isolate_statement_fragment(accepted, tentative):
-    """Map one small contiguous change to complete statements in the tentative body."""
-    if accepted.symbol != tentative.symbol or len(tentative.lines) < 24:
+@dataclass(frozen=True)
+class FragmentSelection:
+    reason: str
+    hunks: int
+    old_rows: int
+    new_rows: int
+    fragment: StatementFragment | None = None
+
+
+def _masked_suite(tree, start, end):
+    if start >= end:
         return None
+    covering = _covering_statements(tree, start + 1, end)
+    if not covering or covering[1:3] != (start + 1, end):
+        return None
+    _, _, _, suite, low, high = covering
+    original = suite[low:high + 1]
+    suite[low:high + 1] = [ast.Pass()]
+    try:
+        return ast.dump(tree)
+    finally:
+        suite[low:low + 1] = original
+
+
+def select_statement_fragment(accepted, tentative):
+    """Find the smallest bounded pair of complete suites with identical surrounding AST."""
     changes = [op for op in difflib.SequenceMatcher(None, accepted.lines, tentative.lines, autojunk=False).get_opcodes()
                if op[0] != "equal"]
-    if not changes or any(nxt[3] - prev[4] > 2 for prev, nxt in zip(changes, changes[1:])):
-        return None
+    stats = len(changes), sum(j-i for _, i, j, _, _ in changes), sum(n-k for _, _, _, k, n in changes)
+    if accepted.symbol != tentative.symbol:
+        return FragmentSelection("different-symbol", *stats)
+    if len(tentative.lines) < 24 or not changes:
+        return FragmentSelection("short-method" if changes else "unchanged", *stats)
+    for previous, following in zip(changes, changes[1:]):
+        gap = tentative.lines[previous[4]:following[3]]
+        significant = [line for line in gap if line.strip() and not line.lstrip().startswith("#")]
+        if len(significant) > 2 and len(set(significant)) > 1:
+            return FragmentSelection("scattered-hunks", *stats)
     _, old_first, _, new_first, _ = changes[0]
     _, _, old_end, _, new_end = changes[-1]
-    if min(old_first + 1, new_first + 1) < max(accepted.first_body_line, tentative.first_body_line):
-        return None
-    first, last = new_first + 1, new_end
-    if first > last:  # A deletion needs a surviving statement at its boundary.
-        first = last = min(first, len(tentative.lines))
+    if old_first + 1 < accepted.first_body_line or new_first + 1 < tentative.first_body_line:
+        return FragmentSelection("header-change", *stats)
+    width = max(old_end - old_first, new_end - new_first)
+    if width > 12:
+        return FragmentSelection("span-too-wide", *stats)
     try:
-        tree = ast.parse(textwrap.dedent("\n".join(tentative.lines)))
+        old_tree, new_tree = (ast.parse(textwrap.dedent("\n".join(s.lines))) for s in (accepted, tentative))
     except (SyntaxError, ValueError, RecursionError):
-        return None
-    covering = _covering_statements(tree, first, last)
-    if not covering:
-        return None
-    _, a, b, _, _, _ = covering
-    start, end = old_first - (new_first - a + 1), old_end + (b - new_end)
-    if (a < tentative.first_body_line or start < accepted.first_body_line - 1
-            or max(b - a + 1, end - start) > 12 or end > len(accepted.lines)):
-        return None
-    return StatementFragment(a, b, accepted.lines[start:end])
+        return FragmentSelection("unparseable-method", *stats)
+    # Identical context may be included on either side. In particular pure
+    # inserts/deletes must anchor to an actual surviving statement on both sides.
+    for extra in range(13 - width):
+        for left in range(extra + 1):
+            right = extra - left
+            a, b = old_first - left, old_end + right
+            c, d = new_first - left, new_end + right
+            if (a < accepted.first_body_line - 1 or c < tentative.first_body_line - 1
+                    or b > len(accepted.lines) or d > len(tentative.lines)):
+                continue
+            old_mask = _masked_suite(old_tree, a, b)
+            if old_mask is not None and old_mask == _masked_suite(new_tree, c, d):
+                return FragmentSelection("common-suite", *stats, StatementFragment(c + 1, d, accepted.lines[a:b]))
+    return FragmentSelection("no-common-suite-within-12-rows", *stats)
+
+
+def isolate_statement_fragment(accepted, tentative):
+    return select_statement_fragment(accepted, tentative).fragment
 
 
 def apply_statement_fragment(reply, sources, snapshot, fragment):

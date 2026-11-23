@@ -1617,6 +1617,13 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
             assert bool(planning_calls) == bool(private_plan)
             assert len(private_models) == (1 if fragment_case == "success" else 3)
             assert b"(-2 if legacy else 2)" in result.patch
+            if fragment_case:
+                telemetry = [rec.getMessage() for rec in caplog.records if rec.msg.startswith("Private statement selection:")]
+                assert "mode=fragment reason=common-suite hunks=1 changed_old=1 changed_new=1" in telemetry[0]
+                assert "fragment_old_rows=1 fragment_new_rows=1" in telemetry[0]
+                assert all("self.read" not in line and "test_keep_helper" not in line for line in telemetry)
+                if fragment_case == "malformed":
+                    assert any("mode=full-method reason=retry-full-method" in line for line in telemetry)
             if fragment_case == "success":
                 assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
                 return

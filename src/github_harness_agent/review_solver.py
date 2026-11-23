@@ -97,7 +97,7 @@ from .review_line_ranges import (
     LineRangeSnapshot,
     ScopedRangeRejection,
     StatementFragment,
-    isolate_statement_fragment,
+    select_statement_fragment,
     apply_statement_fragment,
     full_method_native_tool,
     apply_line_range_edit,
@@ -2412,9 +2412,11 @@ def _private_changed_method(current, tentative):
 def _private_method_retry(current, repair, target, review, origin_diagnostic=""):
     snapshot = prepare_line_range_edit(repair.sources, repair.private_symbol)
     if snapshot is None:
+        _LOG.info("Private statement selection: mode=unavailable reason=tentative-snapshot-unavailable")
         return None
     accepted = prepare_line_range_edit(current, repair.private_symbol)
     if accepted is None:
+        _LOG.info("Private statement selection: mode=unavailable reason=accepted-snapshot-unavailable")
         return None
     visible = frozenset(range(1, len(snapshot.lines) + 1))
     allowed = frozenset(range(snapshot.first_body_line, len(snapshot.lines) + 1))
@@ -2427,7 +2429,17 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="")
         + ("Observed pytest failure: " + excerpt(observed, 450) + "\n" if observed else "")
         + (excerpt(repair.retry_note, 450) + "\n" if repair.retry_note else "")
     )
-    if not repair.retries and (fragment := isolate_statement_fragment(accepted, snapshot)):
+    selection = select_statement_fragment(accepted, snapshot)
+    fragment = selection.fragment
+
+    def log_selection(mode, reason):
+        _LOG.info("Private statement selection: mode=%s reason=%s hunks=%d changed_old=%d changed_new=%d "
+                  "fragment_old_rows=%d fragment_new_rows=%d method_rows=%d limit=12",
+                  mode, reason, selection.hunks, selection.old_rows, selection.new_rows,
+                  len(fragment.accepted) if fragment else 0, fragment.last - fragment.first + 1 if fragment else 0,
+                  len(snapshot.lines))
+
+    if not repair.retries and fragment:
         first, last = fragment.first, fragment.last
         local = "\n".join(snapshot.lines[max(snapshot.first_body_line - 1, first - 6):first - 1])
         following = "\n".join(snapshot.lines[last:last + 4])
@@ -2444,8 +2456,10 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="")
             + "\nFollowing context:\n" + excerpt(following, 450)
         )
         if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": prompt}]) <= 6200:
+            log_selection("fragment", selection.reason)
             return _LineRetry(None, snapshot, allowed_rows=frozenset(range(first, last + 1)),
                               prompt=prompt, checkout=repair.sources, statement_fragment=fragment)
+    reason = "retry-full-method" if repair.retries else "fragment-prompt-limit" if fragment else selection.reason
     delta = "\n".join(difflib.unified_diff(
         accepted.lines, snapshot.lines, fromfile="accepted method", tofile="tentative method", n=1, lineterm="",
     ))
@@ -2454,8 +2468,10 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="")
         evidence = "\nVerified change that fixed the target and broke the control (quoted diff):\n" + excerpt(delta, allowance) + "\n" if allowance else ""
         prompt = context + evidence + numbered
         if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": prompt}]) <= RETRY_MESSAGE_BYTES:
+            log_selection("full-method", reason)
             return _LineRetry(None, snapshot, allowed_rows=allowed, prompt=prompt, checkout=repair.sources,
                               checkpoint_method_edit=True, raw_context=(context + evidence if repair.retries and repair.retries > repair.stalled_edits else ""))
+    log_selection("unavailable", "full-method-prompt-limit")
     return None
 
 
