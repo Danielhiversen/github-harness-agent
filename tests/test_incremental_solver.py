@@ -707,12 +707,17 @@ TEST = (
 
 
 @pytest.mark.parametrize(
-    ("oversized", "committed_setup"),
-    ((False, False), (True, False), (False, True), (False, "retry"), (False, "fallback")),
-    ids=("quoted", "oversized", "committed-setup", "prior-green-seed", "prior-seed-fallback"),
+    ("oversized", "committed_setup", "assertion_delta"),
+    (
+        (False, False, ""), (True, False, ""), (False, True, ""),
+        (False, "retry", ""), (False, "fallback", ""),
+        (False, False, "different"), (False, False, "ancestor-pass"),
+    ),
+    ids=("quoted", "oversized", "committed-setup", "prior-green-seed", "prior-seed-fallback",
+         "different-operand", "ancestor-pass"),
 )
 def test_single_pinned_production_review_fixes_all_checks_before_authoring_regression(
-    solver_case, oversized, committed_setup,
+    solver_case, oversized, committed_setup, assertion_delta,
 ):
     task, archive, runner, _ = solver_case
     if oversized:
@@ -754,6 +759,10 @@ def test_single_pinned_production_review_fixes_all_checks_before_authoring_regre
         regression_base=task.base_sha, regression_archive=archive, regression_edit_path=SOURCE,
     )
     proposals = (TEST,)
+    if assertion_delta:
+        expected = -1 if assertion_delta == "ancestor-pass" else 314159
+        failing = f"from fixture_calc import first\n\ndef test_result():\n    assert first() == {expected}\n"
+        proposals = (failing, TEST)
     if committed_setup in {"retry", "fallback"}:
         missing = "def test_missing(missing_setup):\n    assert missing_setup\n"
         still_missing = missing.replace("missing_setup", "other_setup")
@@ -814,6 +823,14 @@ def test_single_pinned_production_review_fixes_all_checks_before_authoring_regre
         assert "Restored the previous unpublished draft" in retries[2]
         assert "def test_missing(other_setup):" in retries[2]
         assert b"+def make_config(tmp_path):" not in result.patch
+    if assertion_delta:
+        [retry] = retries
+        hint = next(line for line in retry.splitlines() if line.startswith("Pinned comparison for"))
+        assert "314159" not in hint and "assert 1" not in hint and "assert -1" not in hint
+        if assertion_delta == "different":
+            assert "same assertion line 4" in hint and "left scalar operand differed" in hint
+        else:
+            assert "passed on the pinned ancestor" in hint
     assert b"+    return 1\n" in result.patch and b"+    return 2\n" in result.patch
     assert f"+++ b/{test_path}".encode() in result.patch
     assert any(check.command == task.pull_checks[0] and check.returncode == 0 for check in result.checks)

@@ -10,6 +10,7 @@ import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
+from math import isfinite
 from textwrap import dedent
 
 from . import review_recovery
@@ -920,13 +921,13 @@ def _focused_generated_run(checks, command):
     return None
 
 
-def _focused_test_body_assertion(path, source, run, failures):
+def _focused_test_assertions(path, source, run, failures):
     if not run or not run.failed or run.passed or run.deselected or run.named_cases != run.failed:
-        return False
+        return
     try:
         definitions = dict(_symbols(ast.parse(source, filename=path).body))
     except (SyntaxError, ValueError, RecursionError):
-        return False
+        return
     for (_, node), detail in failures.items():
         relative = node.removeprefix("/work/").removeprefix("./")
         if node not in run.failed or not relative.startswith(path + "::"):
@@ -934,16 +935,71 @@ def _focused_test_body_assertion(path, source, run, failures):
         name = relative.removeprefix(path + "::").split("[", 1)[0].replace("::", ".")
         function = definitions.get(name)
         line = stock_assertion_failure_line(node, detail)
-        rewritten = _rewritten_assertion(detail) or re.search(
-            r"(?m)^E[ \t]+AssertionError:[ \t]+assert[ \t]+\S", detail
-        )
+        rewritten = _rewritten_assertion(detail)
+        if not rewritten and (match := re.search(
+            r"(?m)^E[ \t]+AssertionError:[ \t]+assert[ \t]+(\S[^\n]*)", detail
+        )):
+            rewritten = match[1]
         if (
             line and rewritten
             and isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
             and any(isinstance(item, ast.Assert) and item.lineno == line for item in ast.walk(function))
         ):
-            return True
-    return False
+            yield node, line, rewritten
+
+
+def _focused_test_body_assertion(path, source, run, failures):
+    return next(_focused_test_assertions(path, source, run, failures), None) is not None
+
+
+def _scalar_assertion(expression):
+    """Read a simple rewritten comparison without evaluating executable code."""
+    if len(expression) > 160:
+        return None
+    try:
+        comparison = ast.parse(expression, mode="eval").body
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    if not isinstance(comparison, ast.Compare) or len(comparison.ops) != 1:
+        return None
+    operands = []
+    for node in (comparison.left, comparison.comparators[0]):
+        sign = 1
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            sign = -1 if isinstance(node.op, ast.USub) else 1
+            node = node.operand
+            if not isinstance(node, ast.Constant) or type(node.value) not in (int, float):
+                return None
+        if not isinstance(node, ast.Constant) or type(node.value) not in (bool, int, float, type(None)):
+            return None
+        value = node.value
+        if type(value) is float and not isfinite(value):
+            return None
+        operands.append((type(value), sign * value if type(value) in (int, float) else value))
+    return type(comparison.ops[0]), tuple(operands)
+
+
+def _assertion_comparison_hint(name, fixed, older):
+    _, line, expression = fixed
+    _, old_line, old_expression = older
+    lead = f"Pinned comparison for {name} found failures on both revisions"
+    if line != old_line:
+        return f"{lead} at fixed test line {line} and ancestor test line {old_line}."
+    text = f"{lead} at the same assertion line {line}."
+    new, old = _scalar_assertion(expression), _scalar_assertion(old_expression)
+    if new and old and new[0] is old[0]:
+        differing = [
+            side for side, left, right in zip(("left", "right"), new[1], old[1], strict=True)
+            if left != right
+        ]
+        if differing:
+            subject = (
+                "The left and right scalar operands" if len(differing) == 2
+                else f"The {differing[0]} scalar operand"
+            )
+            return f"{text} {subject} differed."
+        return f"{text} The scalar operands matched."
+    return text
 
 
 def _focused_output_reports_pass(output, path):
@@ -3791,6 +3847,65 @@ def solve(executor, task, archive, budget, version):
     repository_usage = ""
     repository_models = ""
     attempted_seed_cases = set()
+    ancestor_assertion_hints = {}
+
+    def failed_assertion_hint(source, run, fixed_failures):
+        if (
+            not run or not run.assertion_reached or len(run.failed) != 1
+            or not focused_generated
+        ):
+            return ""
+        fixed = next(_focused_test_assertions(new_path, source, run, fixed_failures), None)
+        if fixed is None:
+            return ""
+        node = fixed[0]
+        name = node.split("[", 1)[0].rsplit("::", 1)[-1]
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", name):
+            return ""
+        projected = patch_for({new_path: ""}, {new_path: source})
+        revision = hashlib.sha256(patch + b"\x00" + projected).digest()
+        if revision in ancestor_assertion_hints:
+            return ancestor_assertion_hints[revision]
+        if (
+            len(ancestor_assertion_hints) >= 2 or not budget.model_requests_remaining()
+            or budget.commands_remaining() < len(commands) + 4 or budget.remaining() < 45
+            or getattr(executor.verification_runner, "network", "none") != "none"
+        ):
+            return ""
+        ancestor_assertion_hints[revision] = ""
+        probe = _GuardBudget(budget, wall_seconds=20)
+
+        def check_test_bytes(workspace, _tree):
+            result = executor._command(
+                workspace, probe, ("cat", "--", new_path), cap=executor.limits.patch_bytes,
+            )
+            if result.stdout != source.encode():
+                raise ValueError("Historical replay did not stage the original test bytes")
+
+        old_runs = {}
+        try:
+            old_failures = evidence(
+                executor, task, task.regression_archive, probe, projected,
+                (focused_generated,), pytest_runs=old_runs, on_staged=check_test_bytes,
+            )
+        except Cancelled:
+            raise
+        except (ExecutionError, OSError, ValueError):
+            return ""
+        older = old_runs.get(0)
+        if older is None or older.deselected or older.named_cases != run.named_cases:
+            return ""
+        if not old_failures and older.passed == 1:
+            hint = (
+                f"Pinned comparison for {name} failed on the fixed revision and passed on the pinned ancestor. "
+                "Recheck the assertion against the reviewed behavior."
+            )
+        elif old := next(_focused_test_assertions(new_path, source, older, old_failures), None):
+            hint = _assertion_comparison_hint(name, fixed, old)
+        else:
+            return ""
+        ancestor_assertion_hints[revision] = hint
+        return hint
 
     def verified_prior_seed():
         if budget.commands_remaining() < len(commands) + 6 or budget.remaining() < 35:
@@ -5376,6 +5491,8 @@ def solve(executor, task, archive, budget, version):
                     _LOG.info("Retained passing pytest draft with %d missing fixture requests", len(missing))
                 if allow_test_module and snapshot is current:
                     retain_test_seed(candidate, next_case_runs)
+                    if production_regression and len(review.feedback) == 1 and focused_rejection is not None:
+                        next_ancestor_feedback = failed_assertion_hint(next_draft, candidate_run, after)
                 test_draft = next_draft
                 test_rejection = next_rejection
                 test_diagnostic = next_diagnostic
