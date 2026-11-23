@@ -5760,6 +5760,7 @@ def solve(executor, task, archive, budget, version):
                         line_retry = None
                     if (
                         line_retry is None and repair is None and failures.keys() == {target}
+                        and target[0] >= len(task.pull_checks)
                         and check_label(commands[target[0]], ()) == "mypy"
                         and target[1] == f"check {target[0] + 1} (exit 1)"
                     ):
@@ -7335,6 +7336,7 @@ def solve(executor, task, archive, budget, version):
             if (
                 not progressed and repair is None and scoped_line and snapshot is current
                 and failures.keys() == after.keys() == {target}
+                and target[0] >= len(task.pull_checks)
                 and check_label(commands[target[0]], ()) == "mypy"
             ):
                 before_errors = Counter(
