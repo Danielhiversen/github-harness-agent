@@ -1623,6 +1623,9 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 else:
                     assert "Work only on the direct caller" in prompt
                     assert "Edit only fixture_calc.py::Reader.dispatch" in prompt
+                    assert "may omit snapshot" in prompt
+                    assert "exact SEARCH/REPLACE" in prompt
+                    assert "complete Python definition with its exact header" in prompt
                     assert "def local_result" not in prompt and line_attempts[0][0] not in prompt
                     previous_model = ("numbered-free-a", "small-code-model")
                     if failover.endswith("exhaustion") and len(line_attempts) == 1:
@@ -1662,10 +1665,8 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                             reply.route, reply.configured_model = "numbered-free-c", "third-code-model"
                             reply.content = edit(SOURCE, "        return self.read() - 2\n", "        return self.read() + 2\n")
                     elif failover.endswith("implicit"):
-                        assert "may omit snapshot" in prompt
                         reply.content = json.dumps({"edits": [{"start": 2, "end": 2, "lines": ["        return self.read() + 2"]}]})
                     elif failover.endswith("method"):
-                        assert "complete Python method" in prompt and "exact SEARCH/REPLACE" in prompt
                         reply.content = "def dispatch(self):\n    return self.read() + 2"
                     elif wider:
                         assert "to 48 in total" in prompt
