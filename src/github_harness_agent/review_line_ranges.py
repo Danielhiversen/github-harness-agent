@@ -1,6 +1,7 @@
 """Apply bounded line-range edits to one existing Python definition."""
 
 import ast
+import difflib
 import hashlib
 import json
 import re
@@ -218,7 +219,7 @@ def prepare_loop_line_range_edit(sources, symbol, body_line, variable, caller_li
     return snapshot, visible, allowed
 
 
-def line_range_prompt(snapshot, *, visible_rows=None, native=False):
+def line_range_prompt(snapshot, *, visible_rows=None, native=False, full_method=False):
     """Render the editor contract and exact line numbering for this snapshot."""
     path, qualified = snapshot.symbol
     first = snapshot.first_body_line
@@ -228,10 +229,12 @@ def line_range_prompt(snapshot, *, visible_rows=None, native=False):
         f"{row} | {line}" for row, line in enumerate(snapshot.lines, 1)
         if visible_rows is None or row in visible_rows
     )
+    max_ranges = _MAX_EDITS if full_method or (visible_rows is None and not native) else 3
+    limit = 48 if full_method else 24
     sparse = (
-        "Use only rows shown below in the definition body, with at most three edit ranges. "
-        "Do not span gaps between shown rows. Limit old and replacement lines to 24 in total.\n"
-        if visible_rows is not None else ""
+        f"Use only the displayed body rows. Do not span gaps between shown rows. "
+        f"Limit changed old and new lines to {limit} in total across at most {max_ranges} ranges; "
+        "matching context lines do not count.\n" if visible_rows is not None else ""
     )
     instruction = (
         "Supply only the edits field in the tool arguments, with exact indentation.\n"
@@ -243,7 +246,7 @@ def line_range_prompt(snapshot, *, visible_rows=None, native=False):
         + instruction + example
         + f'{{"start":{first},"end":{first},"lines":[{example_line}]}}'
         + "]}\n"
-        + f"Use one to {3 if native else _MAX_EDITS} non-overlapping, inclusive ranges within lines "
+        + f"Use one to {max_ranges} non-overlapping, inclusive ranges within lines "
         f"{snapshot.first_body_line} through {len(snapshot.lines)}. Numbers refer to the unedited definition. "
         "Preserve exact indentation. Use an empty lines array to delete a range. To insert, "
         "replace an anchor line with itself and the inserted lines in their desired order.\n"
@@ -261,7 +264,22 @@ def selectable_line_tool(snapshots):
     }}
 
 
-def apply_native_line_range_edit(calls, sources, snapshot, *, allowed_rows, alternatives=()):
+def full_method_native_tool(snapshot):
+    function = NATIVE_LINE_RANGE_TOOL["function"]
+    schema = function["parameters"]
+    edits = schema["properties"]["edits"]
+    item = edits["items"]
+    fields = item["properties"]
+    lines = {**fields["lines"], "maxItems": len(snapshot.lines) + 48}
+    record = {**item, "properties": {**fields, "lines": lines}}
+    return {"type": "function", "function": {
+        **function, "parameters": {
+            **schema, "properties": {"edits": {**edits, "maxItems": _MAX_EDITS, "items": record}},
+        },
+    }}
+
+
+def apply_native_line_range_edit(calls, sources, snapshot, *, allowed_rows, alternatives=(), full_method=False):
     """Bind a single edits-only tool response to trusted numbered source."""
     try:
         if not isinstance(snapshot, LineRangeSnapshot) or not allowed_rows or len(calls) != 1:
@@ -285,7 +303,7 @@ def apply_native_line_range_edit(calls, sources, snapshot, *, allowed_rows, alte
     except (IndexError, KeyError, TypeError, ValueError, RecursionError):
         raise ValueError("Expected one numbered editing tool call with edits only") from None
     response = json.dumps({"snapshot": snapshot.digest, "edits": payload["edits"]}, ensure_ascii=False)
-    return apply_line_range_edit(response, sources, snapshot, allowed_rows=allowed_rows)
+    return apply_line_range_edit(response, sources, snapshot, allowed_rows=allowed_rows, full_method=full_method and not alternatives)
 
 
 def _line_payload(response):
@@ -327,7 +345,7 @@ def _single_hunk(response, path, original):
     return start - 1, old, new
 
 
-def apply_offered_line_reply(response, sources, snapshots, *, block_pattern):
+def apply_offered_line_reply(response, sources, snapshots, *, block_pattern, full_method=False):
     """Bind a textual free-model edit to one of the actually offered full definitions."""
     if not isinstance(response, str) or not 0 < len(response.encode()) <= _MAX_REPLY:
         raise ValueError("Expected a bounded scoped edit")
@@ -407,7 +425,7 @@ def apply_offered_line_reply(response, sources, snapshots, *, block_pattern):
         selected, edits = matches[0]
     normalized = json.dumps({"snapshot": selected.digest, "edits": edits})
     allowed = frozenset(range(selected.first_body_line, len(selected.lines) + 1))
-    return apply_line_range_edit(normalized, sources, selected, allowed_rows=allowed)
+    return apply_line_range_edit(normalized, sources, selected, allowed_rows=allowed, full_method=full_method and len(snapshots) == 1)
 
 
 def select_line_snapshot(response, snapshots):
@@ -418,26 +436,44 @@ def select_line_snapshot(response, snapshots):
     raise ValueError("The reply must identify exactly one offered line-range snapshot")
 
 
-def _edits(response, snapshot, indent):
+class ScopedRangeRejection(ValueError):
+    """A content-free rejection suitable for retry feedback and telemetry."""
+
+
+def _edits(response, snapshot, indent, *, absolute_offset=None):
     payload = _line_payload(response)
     if payload["snapshot"] != snapshot.digest:
         raise ValueError("Line-range response does not identify this snapshot")
     records = payload["edits"]
-    if type(records) is not list or not 1 <= len(records) <= _MAX_EDITS:
-        raise ValueError("Expected one to six line-range edits")
+    if type(records) is not list:
+        raise ValueError("Expected a list of line-range edits")
+    if not 1 <= len(records) <= _MAX_EDITS:
+        raise ScopedRangeRejection(f"Line range count outside parser limit (submitted={len(records)}, allowed=1-{_MAX_EDITS})")
+    # Translate only when *every* requested body range lies beyond the entire
+    # relative numbering and all endpoints identify rows of this single method.
+    use_absolute = absolute_offset is not None and all(
+        isinstance(r, dict) and type(r.get("start")) is int and type(r.get("end")) is int
+        and len(snapshot.lines) < r["start"] <= r["end"]
+        and absolute_offset + snapshot.first_body_line <= r["start"] <= r["end"] <= absolute_offset + len(snapshot.lines)
+        for r in records
+    )
     edits = []
     for record in records:
         if type(record) is not dict or record.keys() != {"start", "end", "lines"}:
             raise ValueError("Each range requires start, end, and lines")
         start, end, lines = record["start"], record["end"], record["lines"]
+        if use_absolute:
+            start -= absolute_offset
+            end -= absolute_offset
         if (
             type(start) is not int
             or type(end) is not int
             or not snapshot.first_body_line <= start <= end <= len(snapshot.lines)
         ):
-            raise ValueError(
+            requested = f"{start}-{end}" if all(type(n) is int and n.bit_length() <= 32 for n in (start, end)) else "invalid"
+            raise ScopedRangeRejection(
                 f"Use numbered definition rows {snapshot.first_body_line} through "
-                f"{len(snapshot.lines)} for start and end. The numbers are relative to this definition."
+                f"{len(snapshot.lines)} (requested={requested}, ranges={len(records)})."
             )
         if type(lines) is not list or any(
             type(line) is not str or _INVALID_LINE.search(line) for line in lines
@@ -452,7 +488,7 @@ def _edits(response, snapshot, indent):
     return edits
 
 
-def apply_line_range_edit(response, sources, snapshot, *, allowed_rows=None):
+def apply_line_range_edit(response, sources, snapshot, *, allowed_rows=None, full_method=False):
     """Validate a proposal and return an independent source mapping."""
     if not isinstance(snapshot, LineRangeSnapshot) or not _valid_symbol(
         snapshot.symbol
@@ -466,13 +502,36 @@ def apply_line_range_edit(response, sources, snapshot, *, allowed_rows=None):
         fresh = None
     if fresh != snapshot:
         raise ValueError("Current checkout does not match the line-range snapshot")
-    edits = _edits(response, snapshot, scope.indent)
-    if allowed_rows is not None and (
-        len(edits) > 3
-        or sum(end - start + 1 + len(lines) for start, end, lines in edits) > 24
-        or any(not allowed_rows.issuperset(range(start, end + 1)) for start, end, _ in edits)
-    ):
-        raise ValueError("Line ranges exceeded the shown scoped edit windows")
+    complete = full_method and allowed_rows == frozenset(range(snapshot.first_body_line, len(snapshot.lines) + 1))
+    edits = _edits(response, snapshot, scope.indent, absolute_offset=scope.start if complete else None)
+    if allowed_rows is not None:
+        outside = sum(
+            row not in allowed_rows for start, end, _ in edits for row in range(start, end + 1)
+        )
+        if outside:
+            raise ScopedRangeRejection(f"Edit crosses shown scoped edit windows (outside rows={outside}, ranges={len(edits)})")
+        changed_old = changed_new = changed_ranges = 0
+        for start, end, lines in edits:
+            old = snapshot.lines[start - 1:end]
+            if tuple(lines) == old:
+                continue
+            changed_ranges += 1
+            # Strip matching ends first so repeated context is never mistaken for
+            # changed lines by the sequence matcher's popular-line heuristic.
+            common = min(len(old), len(lines))
+            prefix = next((i for i in range(common) if old[i] != lines[i]), common)
+            suffix = next((i for i in range(common - prefix) if old[-1 - i] != lines[-1 - i]), common - prefix)
+            before = old[prefix:len(old) - suffix]
+            after = lines[prefix:len(lines) - suffix]
+            for operation, i, j, k, n in difflib.SequenceMatcher(None, before, after).get_opcodes():
+                if operation != "equal":
+                    changed_old += j - i
+                    changed_new += n - k
+        max_ranges, max_changed = (_MAX_EDITS, 48) if complete else (3, 24)
+        if changed_ranges > max_ranges:
+            raise ScopedRangeRejection(f"Scoped edit range limit exceeded (changed ranges={changed_ranges}, max={max_ranges})")
+        if changed_old + changed_new > max_changed:
+            raise ScopedRangeRejection(f"Scoped edit changed-row limit exceeded (old={changed_old}, new={changed_new}, max={max_changed})")
     rows = scope.rows.copy()
     for start, end, replacement in reversed(edits):
         first, last = scope.start + start - 1, scope.start + end

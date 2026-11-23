@@ -1141,13 +1141,14 @@ def test_pinned_setup_failures_recover_using_an_authored_function_and_only_neede
     assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
 
 
-@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long", "checkpoint-caller", "checkpoint-caller-block", "checkpoint-caller-after-format", "checkpoint-caller-after-rejection", "checkpoint-caller-after-exhaustion"))
+@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long", "checkpoint-caller", "checkpoint-caller-block", "checkpoint-caller-after-format", "checkpoint-caller-after-rejection", "checkpoint-caller-after-exhaustion", "checkpoint-caller-after-wider"))
 def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, failover, caplog):
     task, _, runner, checkpoints = solver_case
     raw_mode = failover in {"raw", "raw-restored"}
     long_checkpoint = failover.startswith("checkpoint-")
     caller_edit = failover.startswith("checkpoint-caller")
     caller_retry = failover.startswith("checkpoint-caller-after-")
+    wider = failover == "checkpoint-caller-after-wider"
     operator = Path(task.pull_checks[0][-1])
     with operator.open("a") as stream:
         stream.write("# withheld-operator-source " + "x" * review_recovery.MAX_OPERATOR_SOURCE + "\n")
@@ -1173,6 +1174,13 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         ).replace("return Reader().read()", "return Reader().dispatch()")
         with operator.open("a") as stream:
             stream.write("def test_keep_helper():\n    from fixture_calc import Reader\n    assert Reader().read() == -1\n")
+    caller_rows = 1
+    if wider:
+        before_body = ["        deltas = (", *(["            0,"] * 16), "        )", "        return self.read() - 2 + sum(deltas)"]
+        after_body = ["        deltas = (", *(["            1,", "            -1,"] * 8), "        )", "        return self.read() + 2 + sum(deltas)"]
+        production = production.replace("        return self.read() - 2\n", "\n".join(before_body) + "\n")
+        absolute_first = production.splitlines().index(before_body[0]) + 1
+        caller_rows = len(before_body)
     if long_checkpoint:
         production = production.replace("    return 2\n", "    return -2\n")
     archive = BytesIO()
@@ -1294,7 +1302,13 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
                         assert "could not be applied" in prompt
                     else:
                         assert "did not improve verification" in prompt and "additional failing check" in prompt
-                    reply.content = edit(SOURCE, "        return self.read() - 2\n", "        return self.read() + 2\n")
+                    if wider:
+                        assert "to 48 in total" in prompt
+                        reply.content = json.dumps({"symbol": "Reader.dispatch", "edits": [{
+                            "start": absolute_first, "end": absolute_first + caller_rows - 1, "lines": after_body,
+                        }]})
+                    else:
+                        reply.content = edit(SOURCE, "        return self.read() - 2\n", "        return self.read() + 2\n")
                 line_attempts.append((digest, kwargs.get("exclude", ()), kwargs.get("after_provider")))
                 return reply
             if caller_edit:
@@ -1351,10 +1365,10 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
     if long_checkpoint:
         offered, *remaining_offers = [record.getMessage() for record in caplog.records if record.msg.startswith("Requesting checkpoint method edit")]
         assert "anchor Reader.read (" in offered
-        assert ("direct callers offered (1): Reader.dispatch (body rows=1)" if caller_edit else "direct callers offered (0): none") in offered
+        assert (f"direct callers offered (1): Reader.dispatch (body rows={caller_rows})" if caller_edit else "direct callers offered (0): none") in offered
         assert "self.read()" not in offered and "return" not in offered
         repeats = 2 if failover.endswith("exhaustion") else int(caller_retry)
-        assert remaining_offers == ["Requesting checkpoint method edit: direct caller only Reader.dispatch (body rows=1)"] * repeats
+        assert remaining_offers == [f"Requesting checkpoint method edit: direct caller only Reader.dispatch (body rows={caller_rows})"] * repeats
         first_request = gateway.prompts[0]
         assert len(line_attempts) == 1 + repeats and not native_attempts and not raw_attempts
         assert len(re.findall(r"(?m)^\d+ \|", first_request)) > 110

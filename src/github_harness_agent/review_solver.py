@@ -91,6 +91,8 @@ from .review_line_ranges import (
     LINE_RANGE_ENDING,
     NATIVE_LINE_RANGE_TOOL,
     LineRangeSnapshot,
+    ScopedRangeRejection,
+    full_method_native_tool,
     apply_line_range_edit,
     apply_native_line_range_edit,
     line_range_prompt,
@@ -1907,7 +1909,8 @@ def _coding_completion(
             request = native_line_retry.native_prompt
             tool = (
                 selectable_line_tool((native_line_retry.snapshot, *native_line_retry.alternatives))
-                if native_line_retry.alternatives else NATIVE_LINE_RANGE_TOOL
+                if native_line_retry.alternatives else full_method_native_tool(native_line_retry.snapshot)
+                if native_line_retry.complete_single_method else NATIVE_LINE_RANGE_TOOL
             )
             instruction = "Call replace_python_line_ranges exactly once with the numbered edits."
         elif native_test_path is not None:
@@ -1962,6 +1965,7 @@ def _coding_completion(
                 candidate = apply_native_line_range_edit(
                     completion.tool_calls, native_line_retry.checkout, native_line_retry.snapshot,
                     allowed_rows=native_line_retry.allowed_rows, alternatives=native_line_retry.alternatives,
+                    full_method=native_line_retry.complete_single_method,
                 )
             elif native_test_path is None:
                 candidate = apply_native_definition(completion.tool_calls, native_source)
@@ -2066,6 +2070,13 @@ class _LineRetry:
     direct_caller_only: bool = False
     caller_routes_reopened: bool = False
 
+    @property
+    def complete_single_method(self):
+        return (
+            self.checkpoint_method_edit and not self.alternatives
+            and self.allowed_rows == frozenset(range(self.snapshot.first_body_line, len(self.snapshot.lines) + 1))
+        )
+
 
 @dataclass(frozen=True)
 class _RawTestRetry:
@@ -2144,7 +2155,12 @@ def _review_anchored_line_retry(review, sources, path, node, diagnostic, *, whol
                         text += option
                     if len(choices) == 2:
                         break
-                if choices:
+                if not choices:
+                    prompt = heading + line_range_prompt(snapshot, visible_rows=visible, full_method=True) + LINE_RANGE_ENDING
+                    native = heading + line_range_prompt(snapshot, visible_rows=visible, native=True, full_method=True)
+                    if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": prompt}]) <= RETRY_MESSAGE_BYTES:
+                        retry = replace(retry, prompt=prompt, native_prompt=native)
+                else:
                     retry = replace(
                         retry, prompt=choice_instruction + text + LINE_RANGE_ENDING,
                         native_prompt=choice_instruction + text, alternatives=tuple(choices), checkpoint_context=heading,
@@ -3848,7 +3864,7 @@ def solve(executor, task, archive, budget, version):
     anchored_line_attempted = set()
     raw_nested_attempts = {}
 
-    def retry_numbered_route(target, line_retry, editor, *, malformed=False, after=None):
+    def retry_numbered_route(target, line_retry, editor, *, malformed=False, after=None, range_error=None):
         if (
             line_retry is None
             or line_retry.checkout is not current
@@ -3867,6 +3883,8 @@ def solve(executor, task, archive, budget, version):
             allowed = frozenset(range(caller.first_body_line, len(caller.lines) + 1))
             if malformed:
                 result = "The previous proposal could not be applied to the selected definition."
+                if isinstance(range_error, ScopedRangeRejection):
+                    result += " " + str(range_error)
             else:
                 result = "The previous proposal did not improve verification."
                 if after is not None:
@@ -3877,8 +3895,8 @@ def solve(executor, task, archive, budget, version):
                     if observed:
                         result += "\nObserved pytest failure on the previous proposal: " + excerpt(observed, 350)
             context = line_retry.checkpoint_context + result + "\nWork only on the direct caller shown below.\n"
-            text = context + line_range_prompt(caller, visible_rows=visible) + LINE_RANGE_ENDING
-            native = context + line_range_prompt(caller, visible_rows=visible, native=True)
+            text = context + line_range_prompt(caller, visible_rows=visible, full_method=True) + LINE_RANGE_ENDING
+            native = context + line_range_prompt(caller, visible_rows=visible, native=True, full_method=True)
             if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": text}]) <= RETRY_MESSAGE_BYTES:
                 line_retries[target] = replace(
                     line_retry, snapshot=caller, allowed_rows=allowed, prompt=text, native_prompt=native,
@@ -3886,6 +3904,12 @@ def solve(executor, task, archive, budget, version):
                     native_ready=False, native_attempted=False,
                 )
                 return
+        if line_retry.checkpoint_method_edit and isinstance(range_error, ScopedRangeRejection):
+            note = f"Previous edit rejected: {range_error}\n"
+            if note not in line_retry.prompt:
+                prompt = line_retry.prompt.removesuffix(LINE_RANGE_ENDING) + note + LINE_RANGE_ENDING
+                if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": prompt}]) <= RETRY_MESSAGE_BYTES:
+                    line_retry = replace(line_retry, prompt=prompt, native_prompt=line_retry.native_prompt + note)
         line_retries[target] = replace(
             line_retry, excluded_models=excluded, native_ready=line_retry.native_ready or malformed,
         )
@@ -5442,11 +5466,13 @@ def solve(executor, task, archive, budget, version):
                         if scoped_line and (line_retry.alternatives or line_retry.direct_caller_only):
                             candidate = apply_offered_line_reply(
                                 completion.content, source, (line_retry.snapshot, *line_retry.alternatives), block_pattern=_BLOCK,
+                                full_method=line_retry.complete_single_method,
                             )
                         else:
                             candidate = apply_line_range_edit(
                                 completion.content, source, active_line_snapshot,
                                 allowed_rows=line_retry.allowed_rows if scoped_line else None,
+                                full_method=scoped_line and line_retry.complete_single_method,
                             )
                     if candidate is None:
                         candidate = (
@@ -5603,7 +5629,7 @@ def solve(executor, task, archive, budget, version):
                 if line_followup is not None and snapshot is current:
                     line_retries[target] = line_followup
                 notes[target] = str(error)[:400]
-                retry_numbered_route(target, line_retry, editor, malformed=True)
+                retry_numbered_route(target, line_retry, editor, malformed=True, range_error=error)
                 if repair is not None and repair.stock_origin:
                     regression_repair = _retry_stock_repair(
                         repair,

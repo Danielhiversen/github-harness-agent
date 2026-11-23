@@ -8,6 +8,7 @@ from github_harness_agent.review_line_ranges import (
     apply_native_line_range_edit,
     line_range_prompt,
     select_line_snapshot,
+    full_method_native_tool,
     selectable_line_tool,
     prepare_line_range_edit,
 )
@@ -266,3 +267,79 @@ def test_free_text_edit_preserves_existing_scope_and_change_limits(form):
         reply = reply.replace(PATH, "other.py")
     with pytest.raises(ValueError):
         apply_offered_line_reply(reply, sources, (anchor, caller), block_pattern=_BLOCK)
+
+def _long_body(prefix=90):
+    source = (
+        "# file prefix\n" * prefix + "class Processor:\n    def process(self):\n"
+        + "".join(f"        item_{i} = {i}\n" for i in range(32))
+        + "        return item_0\n\n    def stable(self):\n        return 88\n"
+    )
+    sources = {PATH: source}
+    snapshot = prepare_line_range_edit(sources, (PATH, "Processor.process"))
+    return sources, snapshot, frozenset(range(snapshot.first_body_line, len(snapshot.lines) + 1))
+
+
+def test_echoed_context_and_full_single_method_rewrite_use_actual_changed_rows():
+    from github_harness_agent.review_solver import _BLOCK
+
+    sources, snapshot, allowed = _long_body()
+    echoed = list(snapshot.lines[1:])
+    echoed[0] = "        item_0 = 100"
+    echoed[-2] = "        item_31 = 131"
+    reply = _reply(snapshot, _edit(2, len(snapshot.lines), *echoed))
+    partial = apply_line_range_edit(reply, sources, snapshot, allowed_rows=allowed)
+    assert partial[PATH] == sources[PATH].replace("item_0 = 0", "item_0 = 100").replace("item_31 = 31", "item_31 = 131")
+    widened = [f"        item_{i} = {100+i}" for i in range(20)] + list(snapshot.lines[21:])
+    reply = _reply(snapshot, _edit(2, len(snapshot.lines), *widened))
+    with pytest.raises(ValueError, match=r"old=20, new=20, max=24"):
+        apply_line_range_edit(reply, sources, snapshot, allowed_rows=allowed)
+    expected = sources[PATH]
+    for i in range(20):
+        expected = expected.replace(f"item_{i} = {i}\n", f"item_{i} = {100+i}\n")
+    result = apply_offered_line_reply(reply, sources, (snapshot,), block_pattern=_BLOCK, full_method=True)
+    assert result[PATH] == expected and "def stable(self):\n        return 88" in result[PATH]
+    params = full_method_native_tool(snapshot)["function"]["parameters"]["properties"]["edits"]
+    assert params["maxItems"] == 6 and params["items"]["properties"]["lines"]["maxItems"] >= len(snapshot.lines)
+    calls = ({"type":"function","function":{"name":"replace_python_line_ranges","arguments":json.dumps({"edits": json.loads(reply)["edits"]})}},)
+    assert apply_native_line_range_edit(calls, sources, snapshot, allowed_rows=allowed, full_method=True) == result
+
+
+def test_full_method_absolute_rows_must_be_unambiguous_and_contained():
+    sources, snapshot, allowed = _long_body()
+    absolute_start = sources[PATH].splitlines().index(snapshot.lines[1]) + 1
+    absolute = _reply(snapshot, _edit(absolute_start, absolute_start, "        item_0 = 100"))
+    expected = sources[PATH].replace("item_0 = 0", "item_0 = 100")
+    assert apply_line_range_edit(absolute, sources, snapshot, allowed_rows=allowed, full_method=True)[PATH] == expected
+    for rows in (allowed, allowed - {3}):
+        with pytest.raises(ValueError, match="numbered definition rows"):
+            apply_line_range_edit(absolute, sources, snapshot, allowed_rows=rows, full_method=rows != allowed)
+    for reply in (
+        _reply(snapshot, _edit(2, 2, "        pass"), _edit(absolute_start, absolute_start, "        pass")),
+        _reply(snapshot, _edit(absolute_start + len(snapshot.lines) + 1, absolute_start + len(snapshot.lines) + 1, "        pass")),
+        _reply(snapshot, _edit(1, 1, "    def different(self):")),
+    ):
+        with pytest.raises(ValueError, match="numbered definition rows"):
+            apply_line_range_edit(reply, sources, snapshot, allowed_rows=allowed, full_method=True)
+    # Absolute row 6 also names an offered relative row; keep the documented relative interpretation.
+    nearby, near, rows = _long_body(prefix=2)
+    actual = apply_line_range_edit(_reply(near, _edit(6, 6, "        pass")), nearby, near, allowed_rows=rows, full_method=True)
+    assert actual[PATH] == nearby[PATH].replace(near.lines[5], "        pass")
+
+
+def test_full_and_partial_method_limits_report_counts_without_content():
+    sources, snapshot, allowed = _long_body()
+    records = tuple(_edit(2+i, 2+i, f"        confidential_{i} = 0") for i in range(4))
+    with pytest.raises(ValueError, match=r"changed ranges=4, max=3") as err:
+        apply_line_range_edit(_reply(snapshot, *records), sources, snapshot, allowed_rows=allowed)
+    assert "confidential" not in str(err.value)
+    assert apply_line_range_edit(_reply(snapshot, *records), sources, snapshot, allowed_rows=allowed, full_method=True)
+    outside = _reply(snapshot, _edit(2, 4, *snapshot.lines[1:4]))
+    with pytest.raises(ValueError, match=r"outside rows=1, ranges=1"):
+        apply_line_range_edit(outside, sources, snapshot, allowed_rows=allowed-{3}, full_method=True)
+    huge = _reply(snapshot, _edit(2, 26, *["        pass"] * 25))
+    with pytest.raises(ValueError, match=r"old=25, new=25, max=48"):
+        apply_line_range_edit(huge, sources, snapshot, allowed_rows=allowed, full_method=True)
+    invalid = _reply(snapshot, _edit(2, 2, "        if"))
+    with pytest.raises(ValueError, match="valid Python"):
+        apply_line_range_edit(invalid, sources, snapshot, allowed_rows=allowed, full_method=True)
+    assert "confidential" not in sources[PATH]
