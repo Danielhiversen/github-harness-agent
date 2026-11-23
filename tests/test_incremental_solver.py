@@ -898,7 +898,7 @@ def test_helper_authoring_prioritizes_reviewed_api_and_fits_prior_case(bulky):
     assert wire_size(messages) <= 12 * 1024
 
 
-@pytest.mark.parametrize("scenario", ("rename", "helper", "helper_repair", "helper_same_route", "helper_exhausted", "passing_siblings", "ancestor_error"))
+@pytest.mark.parametrize("scenario", ("rename", "helper", "helper_repair", "helper_progress", "helper_repeat", "helper_same_route", "helper_exhausted", "passing_siblings", "ancestor_error"))
 def test_only_verified_discriminating_replacement_may_retire_an_unpublished_smoke(solver_case, scenario):
     task, archive, runner, _ = solver_case
     acceptance = Path(task.pull_checks[0][-1])
@@ -928,7 +928,16 @@ def test_only_verified_discriminating_replacement_may_retire_an_unpublished_smok
         invalid = authored.replace("== 'offline'", "== 'incorrect'")
         prefix = (invalid,) if scenario == "helper_repair" else ()
         middle = ("unavailable",) if scenario == "helper_exhausted" else ()
-        proposals = (*prefix, authored, *middle, authored + "    assert (first(), second()) == (1, 2)\n")
+        fixed = authored + "    assert (first(), second()) == (1, 2)\n"
+        if scenario in {"helper_progress", "helper_repeat"}:
+            expectations = (9, 10, 11) if scenario == "helper_progress" else (9, 9, 9)
+            rejected = tuple(
+                authored.replace("test_offline", f"test_case_{index}") + f"    assert first() == {expected}\n"
+                for index, expected in enumerate(expectations)
+            )
+            proposals = (*rejected, fixed if scenario == "helper_progress" else edit(NEW_TEST, smoke, TEST))
+        else:
+            proposals = (*prefix, authored, *middle, fixed)
     else:
         proposals = (edit(NEW_TEST, smoke, other_smoke), edit(NEW_TEST, smoke, TEST))
     helper_requests = []
@@ -938,6 +947,13 @@ def test_only_verified_discriminating_replacement_may_retire_an_unpublished_smok
             result = super().complete(**kwargs)
             if "Return exactly one new Python test function" in self.prompts[-1]:
                 helper_requests.append(self.prompts[-1])
+                if scenario in {"helper_progress", "helper_repeat"}:
+                    result.route = "route-" + str(len(helper_requests) % 2)
+                    result.configured_model = "model-" + str(len(helper_requests) % 2)
+                    if len(helper_requests) == 4:
+                        assert scenario == "helper_progress"
+                        assert "assert first() == 11" in helper_requests[-1]
+                    return result
                 if len(helper_requests) == 3:
                     if scenario == "helper_exhausted":
                         assert ("stand-in-free", "stand-in/free") not in kwargs.get("exclude", ())
@@ -972,7 +988,7 @@ def test_only_verified_discriminating_replacement_may_retire_an_unpublished_smok
     assert (b"def test_sibling():" in result.patch) == (scenario == "passing_siblings")
     assert b"def test_other_smoke():" not in result.patch
     if scenario.startswith("helper"):
-        assert len(helper_requests) == len(proposals)
+        assert len(helper_requests) == (3 if scenario == "helper_repeat" else len(proposals))
         assert all("passed on both revisions" in prompt for prompt in helper_requests)
     else:
         assert "def test_smoke():" in gateway.prompts[-1]

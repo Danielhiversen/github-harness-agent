@@ -3909,6 +3909,8 @@ def solve(executor, task, archive, budget, version):
     prior_test_fallback = None
     helper_setup = None
     helper_attempts = 0
+    helper_outcomes = Counter()
+    helper_setup_misses = 0
     helper_feedback = ""
     helper_function = ""
     helper_bad_model = ()
@@ -4625,6 +4627,8 @@ def solve(executor, task, archive, budget, version):
                             prior_test_fallback = None
                             helper_setup = None
                             helper_attempts = 0
+                            helper_outcomes = Counter()
+                            helper_setup_misses = 0
                             helper_feedback = ""
                             helper_function = ""
                             helper_bad_model = ()
@@ -4697,7 +4701,9 @@ def solve(executor, task, archive, budget, version):
                         smoke = lone_both_pass_case()
                         if (
                             production_regression and allow_test_module and fixtures and test_seed is None
-                            and (helper_attempts == 0 or helper_attempts < 3 and (helper_feedback or helper_bad_model))
+                            and helper_attempts < 8 and helper_setup_misses < 2
+                            and max(helper_outcomes.values(), default=0) < 3
+                            and (not helper_attempts or helper_feedback or helper_bad_model)
                             and (
                                 smoke or helper_feedback
                                 or current is resumed_verified_checkout and not test_draft and not test_case_runs
@@ -5283,8 +5289,10 @@ def solve(executor, task, archive, budget, version):
                         if snapshot is current:
                             test_format_failures += 1
                             count_test_model_failure(snapshot, editor, ("edit format",))
-                            if helper_authoring is not None and editor.configured_model:
-                                helper_bad_model = editor.route, editor.configured_model
+                            if helper_authoring is not None:
+                                helper_setup_misses += 1
+                                if editor.configured_model:
+                                    helper_bad_model = editor.route, editor.configured_model
                             if test_raw_retry is not None and editor.configured_model:
                                 pair = editor.route, editor.configured_model
                                 prior = test_raw_retry.excluded_models
@@ -5520,6 +5528,16 @@ def solve(executor, task, archive, budget, version):
                         for line in detail.splitlines()
                         if re.match(r"^E\s+(?:assert\b|[\w.]*(?:Error|Exception):)", line)
                     ]
+                    if next_passed_ancestor or (candidate_run and candidate_run.assertion_reached):
+                        # Count verifier observations, independent of test names and
+                        # proposal formatting. Repeated both-green tests are one outcome.
+                        signature = ("both passed",) if next_passed_ancestor else tuple(
+                            re.sub(r"0x[0-9a-fA-F]{6,}", "<address>", item) for item in reasons[:2]
+                        ) or ("assertion reached",)
+                        helper_outcomes[signature] += 1
+                        helper_setup_misses = 0
+                    else:
+                        helper_setup_misses += 1
                     detail = next_ancestor_feedback or next_diagnostic
                     helper_feedback = outcome + "\n" + excerpt("\n".join((*reasons[:2], detail)), 750)
                     helper_function = completion.content or ""
