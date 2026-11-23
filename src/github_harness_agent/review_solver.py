@@ -2,6 +2,7 @@
 
 import ast
 import difflib
+from pathlib import PurePosixPath
 import hashlib
 import json
 import logging
@@ -2345,9 +2346,12 @@ def _private_changed_method(current, tentative):
     return None
 
 
-def _private_method_retry(repair, target, review):
+def _private_method_retry(current, repair, target, review):
     snapshot = prepare_line_range_edit(repair.sources, repair.private_symbol)
     if snapshot is None:
+        return None
+    accepted = prepare_line_range_edit(current, repair.private_symbol)
+    if accepted is None:
         return None
     visible = frozenset(range(1, len(snapshot.lines) + 1))
     allowed = frozenset(range(snapshot.first_body_line, len(snapshot.lines) + 1))
@@ -2360,11 +2364,35 @@ def _private_method_retry(repair, target, review):
         + ("Observed pytest failure: " + excerpt(observed, 450) + "\n" if observed else "")
         + (excerpt(repair.retry_note, 450) + "\n" if repair.retry_note else "")
     )
-    prompt = context + line_range_prompt(snapshot, visible_rows=visible, full_method=True) + _SINGLE_METHOD_ENDING
-    if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": prompt}]) > RETRY_MESSAGE_BYTES:
-        return None
-    return _LineRetry(None, snapshot, allowed_rows=allowed, prompt=prompt, checkout=repair.sources,
-                      checkpoint_method_edit=True)
+    delta = "\n".join(difflib.unified_diff(
+        accepted.lines, snapshot.lines, fromfile="accepted method", tofile="tentative method", n=1, lineterm="",
+    ))
+    numbered = line_range_prompt(snapshot, visible_rows=visible, full_method=True) + _SINGLE_METHOD_ENDING
+    for allowance in (1800, 900, 400, 0):
+        evidence = "\nVerified change that fixed the target and broke the control (quoted diff):\n" + excerpt(delta, allowance) + "\n" if allowance else ""
+        prompt = context + evidence + numbered
+        if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": prompt}]) <= RETRY_MESSAGE_BYTES:
+            return _LineRetry(None, snapshot, allowed_rows=allowed, prompt=prompt, checkout=repair.sources,
+                              checkpoint_method_edit=True)
+    return None
+
+
+def _private_case_outcome(goal, after, runs, commands):
+    number, node = goal
+    if goal in after:
+        return "failed"
+    run = runs.get(number)
+    if run and not run.deselected and run.passed:
+        if run.named_cases is not None and node in run.named_cases - run.failed:
+            return "passed"
+        # Quiet pytest may suppress individual passing IDs. A single explicit
+        # selector and one passing case still identify the original test.
+        selected = [arg for arg in commands[number] if "::" in arg]
+        if (run.passed == 1 and not run.failed and len(selected) == 1
+                and selected[0].partition("::")[2] == node.partition("::")[2]
+                and PurePosixPath(selected[0].partition("::")[0]).name == PurePosixPath(node.partition("::")[0]).name):
+            return "passed"
+    return "unconfirmed"
 
 
 def _retry_private_method(repair, target, editor, note):
@@ -5042,7 +5070,7 @@ def solve(executor, task, archive, budget, version):
                     ):
                         line_retry = None
                     if repair is not None and repair.private_symbol and target in repair.introduced:
-                        line_retry = _private_method_retry(repair, target, review)
+                        line_retry = _private_method_retry(current, repair, target, review)
                     if (
                         production_regression and repair is None and target in operator
                         and not (current is resumed_operator_checkout and line_retry is not None)
@@ -5985,6 +6013,7 @@ def solve(executor, task, archive, budget, version):
                         not named_definitions,
                     )
                 elif repair is not None and repair.private_symbol:
+                    _LOG.info("Private method repair outcome: malformed, attempt=%d", repair.retries + 1)
                     regression_repair = _retry_private_method(
                         repair, target, editor, "Previous proposal could not be applied. Use this tentative checkout.",
                     )
@@ -6396,9 +6425,14 @@ def solve(executor, task, archive, budget, version):
                         )
                 else:
                     pending_static = {}
+                if repair.private_symbol:
+                    gained_status = _private_case_outcome(repair.origin, after, after_runs, commands)
+                    control_status = _private_case_outcome(target, after, after_runs, commands)
+                    _LOG.info("Private method repair outcome: executable, attempt=%d, target=%s, control=%s, failing_checks=%d",
+                              repair.retries + 1, gained_status, control_status, len(after))
                 if not improved and repair.private_symbol:
                     observed = after.get(target, "").partition("\nObserved pytest failure: ")[2]
-                    reason = "The proposal lost the original gain." if repair.gained & new_operator else "Coverage did not improve."
+                    reason = f"Last discarded edit: original target {gained_status}; previously passing control {control_status}."
                     if observed:
                         reason += " Observed pytest failure: " + excerpt(observed, 300)
                     regression_repair = _retry_private_method(repair, target, editor, reason)

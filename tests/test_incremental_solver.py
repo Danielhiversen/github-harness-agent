@@ -1299,6 +1299,9 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
                 assert "test_first" in prompt and "test_keep_helper" in prompt
                 assert "test_dispatch_observable" in prompt and "return self.read() + 2" in prompt
                 assert "Observed pytest failure:" in prompt and "Correct the dispatch result" in prompt
+                assert "-        return self.read() - 2" in prompt and "+        return self.read() + 2" in prompt
+                if len(private_models) == 2:
+                    assert "original target failed; previously passing control passed" in prompt
                 assert "withheld-operator-source" not in prompt
                 assert tuple(private_models) == kwargs.get("exclude", ())
                 reply = super().complete(**{**kwargs, "max_output_tokens": 3072})
@@ -1520,6 +1523,11 @@ def _exercise_numbered_review(solver_case, failover, caplog, *, run_solver=solve
         assert "Observed pytest failure:" in first_request
         if private_case:
             assert len(private_models) == 3 and b"(-2 if legacy else 2)" in result.patch
+            outcomes = [r.getMessage() for r in caplog.records if r.msg.startswith("Private method repair outcome")]
+            assert len(outcomes) == 3 and "malformed, attempt=1" in outcomes[0]
+            assert "target=failed, control=passed" in outcomes[1]
+            assert "target=passed, control=passed" in outcomes[2]
+            assert all("self.read" not in item and "test_keep_helper" not in item for item in outcomes)
         elif caller_edit:
             assert b"+        return self.read() + 2" in result.patch and b"-            return -1" not in result.patch
         else:
