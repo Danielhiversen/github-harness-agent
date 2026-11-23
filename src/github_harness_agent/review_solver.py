@@ -133,6 +133,7 @@ from .review_stock_collection import stock_collection
 from .task_context import (
     EXTENDED_TEST_CONTEXT,
     MESSAGE_BYTES,
+    RETRY_MESSAGE_BYTES,
     OPERATOR_API_CONTRACT,
     REPOSITORY_PYTEST_EXAMPLE,
     REPOSITORY_PYTEST_USAGE,
@@ -2062,7 +2063,7 @@ class _RawTestRetry:
     excluded_models: tuple[tuple[str, str], ...]
 
 
-def _review_anchored_line_retry(review, sources, path, node, diagnostic):
+def _review_anchored_line_retry(review, sources, path, node, diagnostic, *, whole_method=False):
     """Number the current reviewed function without requiring operator test source."""
     if len(review.feedback) != 1 or review.feedback[0][0] != path:
         return None
@@ -2090,19 +2091,22 @@ def _review_anchored_line_retry(review, sources, path, node, diagnostic):
         "Edit only the shown body rows of the reviewed function. Preserve passing behavior.\n"
     )
 
-    def bounded_retry(snapshot, visible, allowed):
+    def bounded_retry(snapshot, visible, allowed, *, limit=7500):
         prompt = heading + line_range_prompt(snapshot, visible_rows=visible) + LINE_RANGE_ENDING
-        if wire_size([{"role": "user", "content": prompt}]) <= 7500:
+        messages = [{"role": "user", "content": prompt}]
+        if whole_method:
+            messages.insert(0, {"role": "system", "content": _LINE_RANGE_SYSTEM})
+        if wire_size(messages) <= limit:
             native_prompt = heading + line_range_prompt(snapshot, visible_rows=visible, native=True)
             return _LineRetry(
                 None, snapshot, allowed, prompt, checkout=sources, native_prompt=native_prompt,
             )
         return None
 
-    if len(snapshot.lines) <= 90:
+    if whole_method or len(snapshot.lines) <= 90:
         visible = frozenset(range(1, len(snapshot.lines) + 1))
         allowed = frozenset(range(snapshot.first_body_line, len(snapshot.lines) + 1))
-        if retry := bounded_retry(snapshot, visible, allowed):
+        if retry := bounded_retry(snapshot, visible, allowed, limit=RETRY_MESSAGE_BYTES if whole_method else 7500):
             return retry
     window = prepare_window_line_range_edit(sources, symbol, ((max(1, anchor - 5), anchor + 9),))
     return bounded_retry(*window) if window else None
@@ -2593,6 +2597,11 @@ def solve(executor, task, archive, budget, version):
             production_regression and restored_checkpoint and draft.key == _CHECKPOINT
             and patch and patch == draft.patch and not failures and not current[new_path]
         ) else None
+    )
+    resumed_operator_checkout = (
+        current if production_regression and restored_checkpoint and draft.key == _CHECKPOINT
+        and patch and patch == draft.patch and len(failures) == 1 and not current[new_path]
+        else None
     )
     if review.test_only and failures:
         raise ExecutionError("Required checks failed on the unchanged baseline for the test-only review")
@@ -3816,9 +3825,16 @@ def solve(executor, task, archive, budget, version):
     def queue_review_anchored_retry(target):
         number, node = target
         run = pytest_runs.get(number)
+        whole_method = (
+            current is resumed_operator_checkout and failures.keys() == {target}
+            and run is not None and run.failed == {node} and not run.deselected
+            and any(control and control.passed and not control.deselected for control in pytest_runs.values())
+            and 0 <= number < len(task.pull_checks)
+            and not _trusted_operator_node(node, commands[number], operator_cases)
+        )
         if (
             not production_regression
-            or malformed.get(target, 0) < RECOVERY_MODE_THRESHOLD
+            or (not whole_method and malformed.get(target, 0) < RECOVERY_MODE_THRESHOLD)
             or not 0 <= number < len(task.pull_checks)
             or target not in failures
             or executor.verification_runner is executor.runner
@@ -3834,7 +3850,7 @@ def solve(executor, task, archive, budget, version):
         anchored_line_attempted.add(revision)
         retry = _review_anchored_line_retry(
             _draft_review(review, original, current), current, task.regression_edit_path,
-            node, failures[target],
+            node, failures[target], whole_method=whole_method,
         )
         if retry is not None:
             continuations.pop(target, None)
@@ -4586,8 +4602,11 @@ def solve(executor, task, archive, budget, version):
                         break
                     attempts[target] = attempts.get(target, 0) + 1
                     repair = regression_repair if target == repair_target else None
-                    if repair is None and target in operator and malformed.get(target):
-                        queue_iteration_retry(target, current)
+                    if repair is None and target in operator and (
+                        malformed.get(target) or current is resumed_operator_checkout
+                    ):
+                        if malformed.get(target):
+                            queue_iteration_retry(target, current)
                         if target not in line_retries:
                             queue_review_anchored_retry(target)
                     line_retry = line_retries.pop(target, None)
@@ -4598,6 +4617,7 @@ def solve(executor, task, archive, budget, version):
                         line_retry = None
                     if (
                         production_regression and repair is None and target in operator
+                        and not (current is resumed_operator_checkout and line_retry is not None)
                         and launch_budget >= 2
                         and (
                             attempts[target] >= 5

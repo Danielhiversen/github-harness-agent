@@ -1141,10 +1141,11 @@ def test_pinned_setup_failures_recover_using_an_authored_function_and_only_neede
     assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
 
 
-@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored"))
+@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long"))
 def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, failover):
     task, _, runner, checkpoints = solver_case
     raw_mode = failover in {"raw", "raw-restored"}
+    long_checkpoint = failover == "checkpoint-long"
     operator = Path(task.pull_checks[0][-1])
     with operator.open("a") as stream:
         stream.write("# withheld-operator-source " + "x" * review_recovery.MAX_OPERATOR_SOURCE + "\n")
@@ -1152,7 +1153,7 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         "class Reader:\n"
         "    def read(self):\n"
         "        # Reviewed dispatch stays in this method.\n"
-        + "        # Keep surrounding setup.\n" * (47 if raw_mode else 12)
+        + "        # Keep surrounding setup.\n" * (112 if long_checkpoint else 47 if raw_mode else 12)
         + "        def local_result():\n"
         "            return -1\n"
         "        return local_result()\n\n"
@@ -1163,6 +1164,8 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         "def second():\n"
         "    return 2\n"
     )
+    if long_checkpoint:
+        production = production.replace("    return 2\n", "    return -2\n")
     archive = BytesIO()
     with tarfile.open(fileobj=archive, mode="w") as tar:
         for path, body in ((SOURCE, production), ("tests/test_existing.py", "def test_existing(): pass\n")):
@@ -1186,6 +1189,17 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
     )
     independent = runner.path / "mixed-numbered-verifier"
     independent.mkdir()
+    if long_checkpoint:
+        partial = production.replace("    return -2\n", "    return 2\n")
+        draft = DraftCheckpoint(
+            "harness2/base", task.base_sha, patch_for({SOURCE: production}, {SOURCE: partial}),
+            guidance=_GUIDANCE, last_editor=("previous-free", "previous/free"),
+        )
+        # The only failing operator case has no passing sibling in its
+        # invocation. The verified control runs under a separate command.
+        check = task.pull_checks[0]
+        checks = tuple((*check[:-1], check[-1] + "::" + case) for case in ("test_first", "test_second"))
+        task = replace(task, checkpoints={draft.key: draft}, pull_checks=checks)
     if failover == "raw-restored":
         from github_harness_agent import review_solver
 
@@ -1263,7 +1277,10 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         "def local_result():\n    return -4\n",
         "```python\ndef local_result():\n    return 1\n```",
     ) if failover == "raw" else ()
-    if failover == "raw-restored":
+    if long_checkpoint:
+        gateway = Gateway("Numbered response expected.", TEST)
+        requests = 2
+    elif failover == "raw-restored":
         gateway = Gateway("def local_result():\n    return 1\n", TEST)
         requests = 2
     else:
@@ -1279,6 +1296,16 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
     budget = _Budget(executor.limits, lambda: False, task)
     result = solve(executor, task, archive, budget, "fixture")
 
+    if long_checkpoint:
+        [first_request, _] = gateway.prompts
+        assert len(line_attempts) == 1 and not native_attempts and not raw_attempts
+        assert len(re.findall(r"(?m)^\d+ \|", first_request)) > 110
+        assert "Reviewed dispatch" in first_request and "return local_result()" in first_request
+        assert "def unrelated" not in first_request and "withheld-operator-source" not in first_request
+        assert "Observed pytest failure:" in first_request
+        assert b"+            return 1" in result.patch and b"+    return 2" in result.patch
+        assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
+        return
     if failover == "raw-restored":
         assert len(gateway.prompts) == 2 and raw_attempts == [()]
         assert "Reader.read.local_result" in gateway.prompts[0]
