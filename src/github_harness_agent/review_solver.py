@@ -100,6 +100,7 @@ from .review_planner import (
 )
 from .review_recovery import operator_acceptance_context
 from .review_solver_context import (
+    extended_pytest_context,
     focused_check_excerpt,
     focused_source_excerpt,
     imported_model_declarations,
@@ -115,6 +116,7 @@ from .review_solver_context import (
 )
 from .review_stock_collection import stock_collection
 from .task_context import (
+    EXTENDED_TEST_CONTEXT,
     MESSAGE_BYTES,
     OPERATOR_API_CONTRACT,
     REPOSITORY_PYTEST_EXAMPLE,
@@ -1171,7 +1173,7 @@ def _regression_api(path, content, query, limit, *, anchors=()):
 def _test_authoring_messages(
     current, review, fixtures, interfaces, new_path, note, *,
     allow_test_module=False, repository_example="", repository_usage="",
-    repair_failed_tests=False, ancestor_evidence="",
+    repair_failed_tests=False, ancestor_evidence="", extended_context="",
 ):
     behaviors = list(
         dict.fromkeys(" ".join(body.split()) for _, _, body in review.feedback)
@@ -1225,6 +1227,12 @@ def _test_authoring_messages(
         "Use self-contained setup in the failing case or a fixture available in this module's scope.\n"
         if repair_failed_tests and setup_kind == "fixture not found" else ""
     )
+    scenarios = (
+        "Keep the observations of one reviewer-described scenario together in one test execution. "
+        "Use separate cases for distinct requested scenarios. "
+        if review.test_only and ancestor_evidence else
+        "Use two or three focused cases when enough, and cover every distinct requested fixture. "
+    )
     request = (
         "Selected failure: new regression tests\n"
         + (TEST_ONLY_REQUIREMENTS + requirements + "\n" if review.test_only else "")
@@ -1237,8 +1245,8 @@ def _test_authoring_messages(
             + " Start with the selected failing case if listed. Keep existing fixtures and coverage where they already work. "
             if repair_failed_tests else
             "Write fresh offline pytest tests for the repository regressions explicitly requested in the review. "
-            "Use two or three focused cases when enough, and cover every distinct requested fixture. "
-            "Keep the module concise. Combine overlapping examples with shared setup or parameters. "
+            + scenarios
+            + "Keep the module concise. Combine overlapping examples with shared setup or parameters. "
         )
         + "Use independent fixtures. "
         + ("Prefer public APIs. " if reviewed_helpers else "Use public APIs. ")
@@ -1271,6 +1279,12 @@ def _test_authoring_messages(
         + excerpt("\n".join(interfaces), 1300)
         + f"\nNew test file: {new_path}\n"
         + "\nCurrent checkout:\n"
+        + (
+            EXTENDED_TEST_CONTEXT
+            + "Use these examples to understand API calls and setup. Write fresh tests for the review.\n"
+            + extended_context + "\n"
+            if extended_context else ""
+        )
         + f"Edit the test file at the exact path {new_path}.\n"
         + definition_guidance
         + (
@@ -1331,6 +1345,7 @@ def _proposal_messages(
     repository_usage="",
     repair_failed_tests=False,
     ancestor_evidence="",
+    extended_context="",
 ):
     if target == _TEST_GOAL:
         return _test_authoring_messages(
@@ -1345,6 +1360,7 @@ def _proposal_messages(
             repository_usage=repository_usage,
             repair_failed_tests=repair_failed_tests,
             ancestor_evidence=ancestor_evidence,
+            extended_context=extended_context,
         )
     diagnostic = failures.get(
         target,
@@ -3453,6 +3469,7 @@ def solve(executor, task, archive, budget, version):
     test_tool_attempts = set()
     test_line_attempts = set()
     repository_example = None
+    extended_context = ""
     repository_usage = ""
     repository_models = ""
     attempted_seed_cases = set()
@@ -3994,6 +4011,13 @@ def solve(executor, task, archive, budget, version):
                                 reviewed_sources, " ".join(body for _, _, body in review.feedback),
                             )
                             repository_models = imported_model_declarations(archive, reviewed_sources)
+                            if pinned_ancestor:
+                                extended_context = extended_pytest_context(
+                                    task.regression_archive,
+                                    {path: text for path, text in reviewed_sources.items()
+                                     if not _protected(path, task, new_test=False)},
+                                    review.feedback,
+                                )
                         allow_test_module = bool(
                             original[new_path] == current[new_path] == ""
                             and not _protected(new_path, task, new_test=True)
@@ -4235,6 +4259,7 @@ def solve(executor, task, archive, budget, version):
                             + ("\n" + ancestor_delta if ancestor_delta else "")
                             if target == _TEST_GOAL and pinned_ancestor else ""
                         ),
+                        extended_context=extended_context,
                         rejection=(
                             _private_repair_context(current, repair)
                             if repair is not None

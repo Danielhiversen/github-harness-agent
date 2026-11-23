@@ -509,6 +509,134 @@ def test_test_repair_prioritizes_the_missing_fixture_and_setup_frame():
     assert "a fixture available in this module's scope" in lead
 
 
+def test_pinned_extended_context_uses_a_ranked_complete_tracked_example_and_reviewed_body():
+    path = "src/example/formatting.py"
+    new_path = "tests/test_review_regressions.py"
+    source = (
+        "def format_item(item):\n    return item.kind.upper()\n\n"
+        "def format_count(amount):\n    return str(amount)\n"
+    )
+    preferred = (
+        "import pytest\nfrom example.formatting import format_item\n\n"
+        "DEFAULT_KIND = 'complete fixture'\n"
+        "def make_row(kind):\n    return type('Row', (), {'kind': kind})()\n"
+        "@pytest.fixture\n"
+        "def original_kind():\n"
+        + "    # representative tracked setup\n" * 40
+        + "    return make_row(DEFAULT_KIND)\n"
+        "@pytest.fixture\n"
+        "def fixture_item(original_kind):\n    return original_kind\n"
+        "@pytest.fixture(autouse=True)\n"
+        "def enable_offline(monkeypatch):\n    monkeypatch.setenv('OFFLINE', '1')\n"
+        "def test_preserves_kind(fixture_item):\n"
+        "    assert format_item(fixture_item) == 'COMPLETE FIXTURE'\n"
+    )
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as tar:
+        files = {
+            "tests/test_a_count.py": (
+                "from example.formatting import format_count\n"
+                "def test_count():\n    assert format_count(10) == '10'\n"
+            ),
+            "tests/test_z_kind.py": preferred,
+            "tests/test_review_regressions_2.py": preferred + "# generated module\n",
+            "tests/operator/test_kind.py": preferred + "# operator-only module\n",
+            "tests/secrets/test_kind.py": preferred + "# secret-only module\n",
+        }
+        for name, body in files.items():
+            contents = body.encode()
+            member = tarfile.TarInfo(name)
+            member.size = len(contents)
+            tar.addfile(member, BytesIO(contents))
+    feedback = ((path, 2, "Use format_item to prove that the original kind is preserved."),)
+    review = ReviewRecovery(feedback=feedback, previous_failure="", test_only=True)
+    extended = review_solver_context.extended_pytest_context(archive.getvalue(), {path: source}, feedback)
+    assert "tests/test_z_kind.py" in extended
+    assert extended.count("# representative tracked setup") == 40
+    assert "def make_row(kind):" in extended
+    assert "DEFAULT_KIND = 'complete fixture'" in extended
+    assert "def fixture_item(original_kind):" in extended
+    assert "def enable_offline(monkeypatch):" in extended
+    assert "assert format_item(fixture_item)" in extended
+    assert "return item.kind.upper()" in extended and "return str(amount)" not in extended
+    assert not any(hint in extended for hint in ("test_a_count", "test_review_regressions", "operator/", "secrets/"))
+
+    proposal = (-1, "new regression tests"), {path: source, new_path: ""}, {}, True, ""
+    messages = _proposal_messages(
+        *proposal, review, {}, [], new_path, allow_test_module=True,
+        ancestor_evidence="The new tests also pass on the ancestor.",
+        extended_context=extended,
+    )
+    ordinary = _proposal_messages(
+        *proposal, review, {}, [], new_path, allow_test_module=True,
+        ancestor_evidence="The new tests also pass on the ancestor.",
+    )
+    assert extended in messages[-1]["content"]
+    assert "together in one test execution" in messages[-1]["content"]
+    assert "Use two or three" not in messages[-1]["content"]
+    assert messages[-1]["content"].endswith(TEST_MODULE_REPLY_ENDING)
+    assert compact_focused_review(messages, max_bytes=wire_size(ordinary)) == ordinary
+
+
+@pytest.mark.parametrize("as_method", (False, True))
+def test_pinned_context_prefers_real_caller_of_reviewed_private_helper(as_method):
+    path = "src/example/formatting.py"
+    if as_method:
+        source = (
+            "class Formatter:\n"
+            "    def _apply_primary_rule(self, row):\n"
+            "        return row.kind.upper()\n\n"
+            "    def process(self, row):\n"
+            "        return self._apply_primary_rule(row)\n\n"
+            "def summarize_kind(row):\n    return row.kind\n"
+        )
+        genuine = (
+            "import pytest\nfrom example.formatting import Formatter as Service\n\n"
+            "@pytest.fixture\n"
+            "def fixture_formatter():\n    return Service()\n\n"
+            "def test_process(fixture_formatter):\n"
+            "    assert fixture_formatter.process(build_row()) == 'EXAMPLE'\n"
+        )
+        wanted_call = "fixture_formatter.process(build_row())"
+        caller_body = "return self._apply_primary_rule(row)"
+    else:
+        source = (
+            "def _apply_primary_rule(row):\n    return row.kind.upper()\n\n"
+            "def process(row):\n    return _apply_primary_rule(row)\n\n"
+            "def summarize_kind(row):\n    return row.kind\n"
+        )
+        genuine = (
+            "from example.formatting import process as execute\n\n"
+            "def test_process():\n"
+            "    assert execute(build_row()) == 'EXAMPLE'\n"
+        )
+        wanted_call = "execute(build_row())"
+        caller_body = "return _apply_primary_rule(row)"
+    genuine += "\n\ndef build_row():\n    return type('Row', (), {'kind': 'example'})()\n"
+    misleading = (
+        "from example.formatting import summarize_kind\n"
+        "def test_original_kind_is_preserved_in_summary():\n"
+        "    assert summarize_kind(row) == 'unchanged'\n"
+    )
+    archive = BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as tar:
+        for name, body in (("tests/test_a_summary.py", misleading), ("tests/test_z_process.py", genuine)):
+            member = tarfile.TarInfo(name)
+            contents = body.encode()
+            member.size = len(contents)
+            tar.addfile(member, BytesIO(contents))
+
+    context = review_solver_context.extended_pytest_context(
+        archive.getvalue(), {path: source},
+        ((path, 3 if as_method else 2, "Verify that the original kind is preserved in the summary."),),
+    )
+    assert "tests/test_z_process.py" in context and "tests/test_a_summary.py" not in context
+    assert wanted_call in context and "def build_row():" in context
+    assert "return row.kind.upper()" in context and caller_body in context
+    if as_method:
+        assert "def fixture_formatter():\n    return Service()" in context
+
+
 def test_test_only_requirements_survive_compaction_without_operator_inventory():
     path = "src/example/formatting.py"
     new_path = "tests/test_review_regressions.py"

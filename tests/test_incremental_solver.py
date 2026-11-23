@@ -3298,6 +3298,9 @@ def test_single_test_only_review_adds_an_independent_module(solver_case, monkeyp
         for prompt in (initial, retry, after_collection):
             assert "-    return -1" in prompt and "+    return 1" in prompt
             assert "return -2" not in prompt
+            optional = prompt.partition("Optional tracked pytest and production context")[2]
+            assert "def first():\n    return 1" in optional
+        assert "together in one test execution" in initial
         for prompt in (retry, after_collection):
             lead = prompt.partition("Edit only")[0]
             assert "The new tests also pass on the ancestor." in lead

@@ -10,6 +10,7 @@ from pathlib import PurePosixPath
 
 from .check_diagnostics import check_locations
 from .review_assertions import _STRAIGHT_LINE
+from .review_definitions import _symbols
 
 _FUNCTION = (ast.FunctionDef, ast.AsyncFunctionDef)
 _IMPORT = (ast.Import, ast.ImportFrom)
@@ -264,14 +265,17 @@ def _module_pytest_fixtures(body, imports):
                 symbols.add(local)
     fixtures = {}
     nodes = set()
-    for name, item, _ in _pytest_fixtures(body, symbols=symbols):
+    autouse = set()
+    for name, item, automatic in _pytest_fixtures(body, symbols=symbols):
         nodes.add(item)
+        if automatic:
+            autouse.add(name)
         fixtures[name] = item if name not in fixtures and bindings[item.name] == 1 else None
-    return fixtures, nodes
+    return fixtures, nodes, autouse
 
 
-def _local_fixture_setup(node, fixtures):
-    wanted = _fixture_arguments(node) & fixtures.keys()
+def _local_fixture_setup(node, fixtures, *, autouse=()):
+    wanted = (_fixture_arguments(node) | set(autouse)) & fixtures.keys()
     selected = set()
     for _ in range(4):
         if not wanted:
@@ -505,20 +509,24 @@ def _usage_block(statements, reviewed_calls, local_names, origins, bound, contra
                 )
 
 
+def _python_module(path):
+    source_path = PurePosixPath(path)
+    parts = source_path.relative_to(_source_root(source_path)).with_suffix("").parts
+    if parts[-1:] == ("__init__",):
+        parts = parts[:-1]
+    return ".".join(parts) if parts and all(part.isidentifier() for part in parts) else ""
+
+
 def _reviewed_modules(sources):
     modules = {}
     for path, source in sources.items():
-        source_path = PurePosixPath(path)
-        parts = source_path.relative_to(_source_root(source_path)).with_suffix("").parts
-        if parts[-1:] == ("__init__",):
-            parts = parts[:-1]
-        if not parts or not all(part.isidentifier() for part in parts):
+        if not (name := _python_module(path)):
             continue
         try:
             declarations = ast.parse(source).body
         except (SyntaxError, ValueError, RecursionError):
             continue
-        modules[".".join(parts)] = _reviewed_calls(declarations)
+        modules[name] = _reviewed_calls(declarations)
     return modules
 
 
@@ -814,7 +822,106 @@ def _temporary_file_shapes(setup, module_bindings, imports, fixture_names):
                 )
 
 
-def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usage_bytes=820):
+def _extended_context_path(path):
+    if path.is_absolute() or any(part.startswith(".") for part in path.parts):
+        return False
+    if re.fullmatch(r"test_review_regressions(?:_\d+)?", path.stem):
+        return False
+    return not _words(str(path)).intersection({
+        "operator", "secret", "secrets", "credential", "credentials",
+        "settings", "config", "configuration", "script", "scripts",
+    })
+
+
+def _complete_pytest_nodes(body, node, setup):
+    bindings = {}
+    for item in body:
+        if isinstance(item, (*_IMPORT, *_ASSIGNMENT, *_FUNCTION)) and (
+            not isinstance(item, _FUNCTION) or not item.name.startswith("test_")
+        ):
+            for name in _bindings(item):
+                bindings.setdefault(name, []).append(item)
+    selected = {node, *setup}
+    for _ in range(8):
+        needed = _references(selected, include_attributes=False) & bindings.keys()
+        if any(len(bindings[name]) != 1 for name in needed):
+            return ()
+        extra = {bindings[name][0] for name in needed} - selected
+        if not extra:
+            return sorted(selected, key=lambda item: item.lineno)
+        selected.update(extra)
+    return ()
+
+
+def _invoked_anchored_apis(node, setup, imports, fixtures, preferred_apis):
+    """Resolve exact imported calls and receivers built by the example's local fixtures."""
+    if not preferred_apis:
+        return set()
+    owners = {name.rpartition(".")[0] for name in preferred_apis}
+    aliases = {}
+    for name, item in imports.items():
+        for alias in item.names:
+            if isinstance(item, ast.Import) and name == (alias.asname or alias.name.split(".")[0]):
+                aliases[name] = alias.name if alias.asname else name
+            elif isinstance(item, ast.ImportFrom) and name == (alias.asname or alias.name):
+                aliases[name] = f"{item.module}.{alias.name}"
+    hits = set()
+
+    def walk(function, known_fixtures):
+        values = {name: known_fixtures[name] for name in _fixture_arguments(function) & known_fixtures.keys()}
+        shadowed = set(_rebound_names(function)) | _fixture_arguments(function)
+
+        def qualify(expression):
+            root, dot, tail = _dotted_name(expression).partition(".")
+            return aliases.get(root, "") + dot + tail if root not in shadowed and root in aliases else ""
+
+        def origin(expression):
+            if isinstance(expression, ast.Name):
+                return values.get(expression.id, "")
+            if isinstance(expression, ast.Call):
+                name = qualify(expression.func)
+                return name if name in owners else ""
+            return ""
+
+        returns = []
+        for statement in function.body:
+            for child in ast.walk(statement):
+                if isinstance(child, ast.Call):
+                    name = qualify(child.func)
+                    if isinstance(child.func, ast.Attribute) and (receiver := origin(child.func.value)):
+                        name = f"{receiver}.{child.func.attr}"
+                    if name in preferred_apis:
+                        hits.add(name)
+            if isinstance(statement, ast.Return):
+                returns.append(origin(statement.value))
+            else:
+                targets = tuple(_rebound_names(statement))
+                expression = getattr(statement, "value", None)
+                assigned = (
+                    origin(expression)
+                    if len(targets) == 1 and isinstance(statement, _ASSIGNMENT) else ""
+                )
+                for target in targets:
+                    values.pop(target, None)
+                    if assigned:
+                        values[target] = assigned
+        return returns[0] if len(returns) == 1 else ""
+
+    origins = {}
+    relevant = {name: fixture for name, fixture in fixtures.items() if fixture in setup}
+    for _ in range(min(4, len(relevant))):
+        proved = {name: kind for name, fixture in relevant.items() if (kind := walk(fixture, origins))}
+        if proved == origins:
+            break
+        origins = proved
+    walk(node, origins)
+    return hits
+
+
+def repository_pytest_context(
+    archive, sources, query="", *, max_bytes=850, usage_bytes=820, ranked=False,
+    preferred_apis=(),
+):
     """Return a small example plus bounded tracked API and fixture setup shapes."""
     modules = _reviewed_modules(sources)
     if not any(modules.values()):
@@ -822,6 +929,7 @@ def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usag
     module_stems = {module.rsplit(".", 1)[-1] for module in modules}
     query_words = _words(query.replace("_", " "))
     example = ""
+    example_rank = (-1, -1, -1)
     shapes = []
     setup_usage = ()
     setup_rank = (-1, False)
@@ -835,6 +943,7 @@ def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usag
                     member.type in (tarfile.REGTYPE, tarfile.AREGTYPE)
                     and member.size <= 128 * 1024
                     and _STOCK_NODE.fullmatch(member.name + "::test_example")
+                    and (not ranked or _extended_context_path(path))
                     and (
                         path.name == "conftest.py"
                         or path.name.startswith("test_")
@@ -852,7 +961,7 @@ def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usag
                 imports, reviewed_calls = _reviewed_imports(body, modules)
                 if not reviewed_calls:
                     continue
-                fixtures, fixture_nodes = _module_pytest_fixtures(body, imports)
+                fixtures, fixture_nodes, autouse = _module_pytest_fixtures(body, imports)
                 unambiguous_fixtures = set(fixtures.values()) - {None}
                 if usage_bytes:
                     module_bindings = _mock_bindings(body)
@@ -898,34 +1007,51 @@ def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usag
                                     ):
                                         setup_rank = rank
                                         setup_usage = context
-                    if example or node in members:
+                    if (example and not ranked) or node in members:
                         continue
-                    if not any(
-                        _dotted_name(call.func) in reviewed_calls
-                        for call in ast.walk(node) if isinstance(call, ast.Call)
-                    ):
+                    if ranked and not node.name.startswith("test_"):
+                        continue
+                    setup = _local_fixture_setup(node, fixtures, autouse=autouse if ranked else ())
+                    if setup is None:
+                        continue
+                    called = {
+                        name for item in ({node, *setup} if ranked else {node})
+                        for call in ast.walk(item) if isinstance(call, ast.Call)
+                        if (name := _dotted_name(call.func)) in reviewed_calls
+                    }
+                    anchored_calls = _invoked_anchored_apis(node, setup, imports, fixtures, preferred_apis)
+                    if not (called or anchored_calls):
                         continue
                     if node in fixture_nodes and node not in unambiguous_fixtures:
                         continue
-                    setup = _local_fixture_setup(node, fixtures)
-                    if setup is None:
-                        continue
                     references = _references([node, *setup], include_attributes=False)
                     selected = {imports[name] for name in references & imports.keys()}
+                    items = (
+                        *sorted(selected, key=lambda item: item.lineno),
+                        *sorted(setup - {node}, key=lambda item: item.lineno),
+                        node,
+                    )
+                    if ranked:
+                        grounded = [symbol for symbol, _ in _usage_shapes(node, reviewed_calls)]
+                        rank = (
+                            len(anchored_calls),
+                            _usage_relevance(" ".join((*sorted(called), *grounded, node.name)), query_words),
+                            len(setup),
+                        )
+                        if rank <= example_rank or not (items := _complete_pytest_nodes(body, node, setup)):
+                            continue
                     excerpt = f"# {path}\n"
                     if PurePosixPath(path).name != "conftest.py" and (setup or node in fixture_nodes):
                         excerpt += "# Module-local pytest fixture setup. Define it explicitly if reusing it.\n"
                     excerpt += "".join(
                         "".join(lines[_start(item) - 1 : item.end_lineno])
-                        for item in (
-                            *sorted(selected, key=lambda item: item.lineno),
-                            *sorted(setup - {node}, key=lambda item: item.lineno),
-                            node,
-                        )
+                        for item in items
                     )
                     if len(excerpt.encode()) <= max_bytes:
                         example = excerpt.rstrip()
-                        if not usage_bytes:
+                        if ranked:
+                            example_rank = rank
+                        elif not usage_bytes:
                             return example, ""
     except (tarfile.TarError, OSError, EOFError):
         pass
@@ -950,6 +1076,70 @@ def repository_pytest_context(archive, sources, query="", *, max_bytes=850, usag
 def repository_pytest_example(archive, sources, *, max_bytes=850):
     example, _ = repository_pytest_context(archive, sources, max_bytes=max_bytes, usage_bytes=0)
     return example
+
+
+def _direct_review_caller(name, node, anchored):
+    owner, _, _ = name.rpartition(".")
+    receivers = node.args.posonlyargs + node.args.args
+    receiver = receivers[0].arg if receivers and receivers[0].arg in {"self", "cls"} else ""
+    targets = {
+        (f"{receiver}.{leaf}" if owner else leaf)
+        for symbol in anchored
+        for enclosing, _, leaf in [symbol.rpartition(".")]
+        if enclosing == owner and (not owner or receiver)
+    }
+    return any(
+        _dotted_name(call.func) in targets
+        for statement in node.body for call in ast.walk(statement)
+        if isinstance(call, ast.Call)
+    )
+
+
+def extended_pytest_context(archive, sources, feedback, *, max_bytes=16 * 1024):
+    """Quote a tracked example and exact reviewed functions as optional context."""
+    sources = {
+        path: source for path, source in sources.items()
+        if _extended_context_path(PurePosixPath(path))
+    }
+    query = " ".join(body for _, _, body in feedback)
+    query_words = _words(query)
+    definitions = []
+    preferred_apis = set()
+    for path, source in sources.items():
+        try:
+            module = ast.parse(source)
+        except (SyntaxError, ValueError, RecursionError):
+            continue
+        lines = source.splitlines(keepends=True)
+        anchors = {row for reviewed_path, row, _ in feedback if reviewed_path == path}
+        functions = [(name, node) for name, node in _symbols(module.body) if isinstance(node, _FUNCTION)]
+        anchored = {
+            name for name, node in functions if any(_start(node) <= row <= node.end_lineno for row in anchors)
+        }
+        for name, node in functions:
+            start = _start(node)
+            public = not any(part.startswith("_") for part in name.split("."))
+            caller = public and _direct_review_caller(name, node, anchored)
+            if public and (name in anchored or caller) and (namespace := _python_module(path)):
+                preferred_apis.add(f"{namespace}.{name}")
+            relevance = _usage_relevance(name, query_words)
+            if name in anchored or caller or relevance:
+                code = f"# {path}::{name}\n" + "".join(lines[start - 1 : node.end_lineno])
+                definitions.append((name in anchored, caller, relevance, code.rstrip()))
+    example, _ = repository_pytest_context(
+        archive, sources, query, max_bytes=2 * max_bytes // 3, usage_bytes=0,
+        ranked=True, preferred_apis=preferred_apis,
+    )
+    sections = [example] if example else []
+    remaining = max_bytes - len(example.encode())
+    ranked = sorted(definitions, reverse=True)
+    selected = [item for item in ranked if item[0] or item[1]] or ranked[:1]
+    for _, _, _, code in selected[:3]:
+        size = len(code.encode()) + 2
+        if size <= remaining:
+            sections.append(code)
+            remaining -= size
+    return "\n\n".join(sections)
 
 
 def imported_model_declarations(archive, sources, *, max_bytes=850):

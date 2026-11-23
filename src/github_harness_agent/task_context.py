@@ -32,6 +32,7 @@ TEST_VERIFICATION_SOURCE = "\nVerified failure source (quoted data):\n"
 TEST_ANCESTOR_EVIDENCE = "\nPinned regression ancestor (quoted verification and source):\n"
 TEST_ONLY_REQUIREMENTS = "\nTest-only requirements (quoted review):\n"
 TEST_ONLY_CONTEXT = "\nTest authoring context:\n"
+EXTENDED_TEST_CONTEXT = "Optional tracked pytest and production context (quoted source):\n"
 PAGE_CHARS = 1800
 HISTORY_PAGES = 12
 HISTORY_ROWS = 4
@@ -616,7 +617,16 @@ def compact_focused_review(messages, *, max_bytes):
     text = request.get("content")
     if not isinstance(text, str) or not text.startswith("Selected failure: "):
         return None
-    context, checkout_marker, _ = text.partition("\nCurrent checkout:\n")
+    checkout = "\nCurrent checkout:\n"
+    prefix, extended, appendix = text.partition(checkout + EXTENDED_TEST_CONTEXT)
+    if extended:
+        _, edit_marker, instruction = appendix.rpartition("\nEdit the test file at the exact path ")
+        if edit_marker:
+            text = prefix + checkout + edit_marker.lstrip("\n") + instruction
+            request = {**request, "content": text}
+            if wire_size([system, request]) <= max_bytes:
+                return [system, request]
+    context, checkout_marker, _ = text.partition(checkout)
     goal, _, _ = context.partition("\nOther reviewer feedback:\n")
     endings = (
         "Respond with exact SEARCH/REPLACE blocks only.",
