@@ -2414,26 +2414,59 @@ def _private_changed_method(current, tentative):
     return None
 
 
-def _private_fragment_choices(response, source, snapshot, retry):
+def _fragment_option_texts(response, limit):
     if not isinstance(response, str) or len(response.encode()) > 12 * 1024:
-        raise ValueError("Expected a bounded array of private fragment options")
+        raise ValueError("Expected a bounded private fragment response")
+    text = response.strip().replace("\r\n", "\n")
+    if text.startswith("["):
+        json_text = text
+    else:
+        blocks = list(re.finditer(r"(?ms)^```(json|python|py)[ \t]*\n(.*?)^```[ \t]*(?=\n|$)", text, re.I))
+        if not 1 <= len(blocks) <= limit or text.count("```") != 2 * len(blocks):
+            raise ValueError("Expected a JSON array or separate labeled Python fences")
+        ends = [0, *(block.end() for block in blocks)]
+        starts = [*(block.start() for block in blocks), len(text)]
+        prose = "\n".join(text[a:b].strip() for a, b in zip(ends, starts)).strip()
+        if (len(prose) > 240 or len(prose.splitlines()) > 8 or ".py" in prose.casefold()
+                or any(line and not re.fullmatch(r"(?:[A-Za-z]|[1-3][.)] )[A-Za-z0-9 ,.'’!?:-]*", line)
+                       for line in prose.splitlines())
+                or re.search(r"(?im)^(?:return|def|import|from|assert|raise|pass|class|if|while|for|else|diff|replace|file)\b", prose)):
+            raise ValueError("Unexpected text outside private fragment options")
+        if all(block[1].lower() in {"python", "py"} for block in blocks):
+            return [block[2] for block in blocks]
+        if len(blocks) != 1 or blocks[0][1].lower() != "json":
+            raise ValueError("Mixed private fragment option formats")
+        json_text = blocks[0][2]
     try:
-        options = json.loads(response)
+        options = json.loads(json_text)
     except (ValueError, RecursionError):
         raise ValueError("Expected a JSON array of private fragment options") from None
-    if not isinstance(options, list) or not 2 <= len(options) <= retry.fragment_choices:
+    if not isinstance(options, list) or not 1 <= len(options) <= limit:
         raise ValueError("Unexpected number of private fragment options")
+    return options
+
+
+def _private_fragment_choices(response, source, snapshot, retry):
+    options = _fragment_option_texts(response, retry.fragment_choices)
     candidates = []
     signatures = set()
     for option in options:
         if not isinstance(option, str):
-            raise ValueError("Each private fragment option must be source text")
-        candidate = apply_statement_fragment(option, source, snapshot, retry.statement_fragment)
+            continue
+        if re.search(r"(?im)^\s*(?:(?:file|path):\s*\S|(?:[-+]{3} |diff --git |@@ |<<<<<<< SEARCH)|(?:[\w.-]+/)*[\w.-]+\.py:?[ \t]*$)", option):
+            raise ValueError("Private fragment options may not name files or contain patches")
+        try:
+            candidate = apply_statement_fragment(option, source, snapshot, retry.statement_fragment)
+        except ValueError:
+            continue
         signature = ast.dump(ast.parse(candidate[snapshot.symbol[0]]))
         if signature in signatures:
-            raise ValueError("Private fragment options must contain distinct changes")
+            continue
         signatures.add(signature)
         candidates.append(candidate)
+    _LOG.info("Private fragment options: submitted=%d distinct_valid=%d", len(options), len(candidates))
+    if not candidates:
+        raise ValueError("No valid in-scope private fragment options")
     return candidates
 
 
@@ -2490,9 +2523,9 @@ def _private_method_retry(current, repair, target, review, origin_diagnostic="",
         )
         if choices:
             prompt += (
-                f'\nInstead of a single fragment, return a JSON array of 2 to {choices} distinct replacement '
+                f'\nReturn up to {choices} distinct replacements as a JSON array of source '
                 'strings. Each is an independent solution against exactly the same tentative fragment. '
-                'Use this array as the entire reply.'
+                'Alternatively put each replacement in a separate labeled Python fence, with no file paths.'
             )
         if wire_size([{"role": "system", "content": _LINE_RANGE_SYSTEM}, {"role": "user", "content": prompt}]) <= 6200:
             log_selection("literal-hunk" if fragment.literal else "fragment", selection.reason)
