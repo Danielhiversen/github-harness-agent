@@ -4,6 +4,7 @@ import pytest
 
 from github_harness_agent.review_line_ranges import (
     apply_line_range_edit,
+    apply_offered_line_reply,
     apply_native_line_range_edit,
     line_range_prompt,
     select_line_snapshot,
@@ -208,3 +209,60 @@ def test_native_selection_binds_alternate_body_to_offered_hash():
     calls = ({"type": "function", "function": {"name": "replace_python_line_ranges", "arguments": arguments}},)
     revised = apply_native_line_range_edit(calls, sources, initial, allowed_rows=frozenset({6}), alternatives=(alternate,))
     assert revised[PATH] == SOURCE.replace("return 9", "return 10")
+
+@pytest.mark.parametrize("form", ("fence", "symbol", "prefix", "qualified", "symbol_as_id", "block", "implicit_block", "unified"))
+def test_free_text_edit_binds_only_the_selected_current_caller(form):
+    import difflib
+    from github_harness_agent.review_solver import _BLOCK
+
+    sources = {PATH: SOURCE}
+    anchor = _prepare(sources)
+    caller = prepare_line_range_edit(sources, (PATH, "Queue.unrelated"))
+    expected = SOURCE.replace("return 9", "return 10")
+    edit = _edit(2, 2, "        return 10")
+    if form == "fence":
+        reply = "```json\n" + _reply(caller, edit) + "\n```"
+    elif form in {"block", "implicit_block"}:
+        reply = f"{PATH}\n<<<<<<< SEARCH\n        return 9\n=======\n        return 10\n>>>>>>> REPLACE"
+        if form == "implicit_block":
+            reply = reply.partition("\n")[2]
+    elif form == "symbol_as_id":
+        reply = json.dumps({"path": PATH, "snapshot": "Queue.unrelated", "edits": [edit]})
+    elif form == "unified":
+        reply = "".join(difflib.unified_diff(SOURCE.splitlines(True), expected.splitlines(True), f"a/{PATH}", f"b/{PATH}"))
+    elif form == "symbol":
+        reply = json.dumps({"symbol": "Queue.unrelated", "edits": [edit]})
+    elif form == "qualified":
+        reply = json.dumps({"symbol": PATH + "::Queue.unrelated", "snapshot": caller.digest[:12], "edits": [edit]})
+    else:
+        reply = json.dumps({"snapshot": caller.digest[:12], "edits": [edit]})
+    assert apply_offered_line_reply(reply, sources, (anchor, caller), block_pattern=_BLOCK) == {PATH: expected}
+    stale = {PATH: "# changed before reply\n" + SOURCE}
+    with pytest.raises(ValueError):
+        apply_offered_line_reply(reply, stale, (anchor, caller), block_pattern=_BLOCK)
+
+
+@pytest.mark.parametrize("form", ("ambiguous", "outside", "signature", "mixed", "no_symbol", "wrong_hash", "too_big", "wrong_file"))
+def test_free_text_edit_preserves_existing_scope_and_change_limits(form):
+    from github_harness_agent.review_solver import _BLOCK
+
+    text = SOURCE + "\ndef another():\n        return 9\n" if form == "ambiguous" else SOURCE
+    sources = {PATH: text}
+    anchor = _prepare(sources)
+    caller = prepare_line_range_edit(sources, (PATH, "Queue.unrelated"))
+    old, new = {
+        "ambiguous": ("        return 9", "        return 10"),
+        "outside": ("after = 2", "after = 3"),
+        "signature": ("    def unrelated(self):", "    def unrelated(self, x):"),
+        "mixed": ("        return 9\n\nafter = 2", "        return 10\n\nafter = 3"),
+        "too_big": ("        return 9", "        pass\n" * 24 + "        return 10"),
+    }.get(form, ("        return 9", "        return 10"))
+    reply = f"{PATH}\n<<<<<<< SEARCH\n{old}\n=======\n{new}\n>>>>>>> REPLACE"
+    if form == "no_symbol":
+        reply = json.dumps({"edits": [_edit(2, 2, new)]})
+    elif form == "wrong_hash":
+        reply = json.dumps({"snapshot": anchor.digest, "symbol": "Queue.unrelated", "edits": [_edit(2, 2, new)]})
+    elif form == "wrong_file":
+        reply = reply.replace(PATH, "other.py")
+    with pytest.raises(ValueError):
+        apply_offered_line_reply(reply, sources, (anchor, caller), block_pattern=_BLOCK)

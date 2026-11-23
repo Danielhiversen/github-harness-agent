@@ -95,7 +95,7 @@ from .review_line_ranges import (
     apply_native_line_range_edit,
     line_range_prompt,
     prepare_line_range_edit,
-    select_line_snapshot,
+    apply_offered_line_reply,
     selectable_line_tool,
     prepare_loop_line_range_edit,
     prepare_window_line_range_edit,
@@ -2061,6 +2061,7 @@ class _LineRetry:
     native_ready: bool = False
     native_attempted: bool = False
     alternatives: tuple[LineRangeSnapshot, ...] = ()
+    checkpoint_method_edit: bool = False
 
 
 @dataclass(frozen=True)
@@ -2107,6 +2108,7 @@ def _review_anchored_line_retry(review, sources, path, node, diagnostic, *, whol
             native_prompt = heading + line_range_prompt(snapshot, visible_rows=visible, native=True)
             return _LineRetry(
                 None, snapshot, allowed, prompt, checkout=sources, native_prompt=native_prompt,
+                checkpoint_method_edit=whole_method,
             )
         return None
 
@@ -5165,6 +5167,16 @@ def solve(executor, task, archive, budget, version):
                         if line_retry and not scoped_line else last_routes.get(target)
                     )
                     advice_source = "planning" if planner_input is not None else "guided" if advice is not None else None
+                    if line_retry is not None and line_retry.checkpoint_method_edit:
+                        caller_rows = ", ".join(
+                            f"{candidate.symbol[1]} (body rows={len(candidate.lines) - candidate.first_body_line + 1})"
+                            for candidate in line_retry.alternatives
+                        )
+                        _LOG.info(
+                            "Requesting checkpoint method edit: anchor %s (body rows=%d), direct callers offered (%d): %s",
+                            line_retry.snapshot.symbol[1], len(line_retry.allowed_rows),
+                            len(line_retry.alternatives), caller_rows or "none",
+                        )
                     launched_at = time.monotonic()
                     future = pool.submit(
                         _coding_completion,
@@ -5388,16 +5400,15 @@ def solve(executor, task, archive, budget, version):
                         if candidate == source:
                             raise ValueError("The pytest edit did not change the draft.")
                     if candidate is None and active_line_snapshot is not None:
-                        allowed = line_retry.allowed_rows if scoped_line else None
                         if scoped_line and line_retry.alternatives:
-                            active_line_snapshot = select_line_snapshot(
-                                completion.content, (line_retry.snapshot, *line_retry.alternatives),
+                            candidate = apply_offered_line_reply(
+                                completion.content, source, (line_retry.snapshot, *line_retry.alternatives), block_pattern=_BLOCK,
                             )
-                            if active_line_snapshot is not line_retry.snapshot:
-                                allowed = frozenset(range(active_line_snapshot.first_body_line, len(active_line_snapshot.lines) + 1))
-                        candidate = apply_line_range_edit(
-                            completion.content, source, active_line_snapshot, allowed_rows=allowed,
-                        )
+                        else:
+                            candidate = apply_line_range_edit(
+                                completion.content, source, active_line_snapshot,
+                                allowed_rows=line_retry.allowed_rows if scoped_line else None,
+                            )
                     if candidate is None:
                         candidate = (
                             apply_definitions(

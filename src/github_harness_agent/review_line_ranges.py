@@ -307,6 +307,109 @@ def _line_payload(response):
     return payload
 
 
+def _single_hunk(response, path, original):
+    rows = response.splitlines()
+    if rows[:1] == [f"diff --git a/{path} b/{path}"]:
+        rows = rows[1:]
+        if rows and re.fullmatch(r"index [0-9a-f]+\.\.[0-9a-f]+(?: 100644)?", rows[0]):
+            rows = rows[1:]
+    if len(rows) < 4 or rows[:2] not in ([f"--- a/{path}", f"+++ b/{path}"], [f"--- {path}", f"+++ {path}"]):
+        raise ValueError("Expected a single unified hunk for the offered file")
+    header = re.fullmatch(r"@@ -([0-9]+)(?:,([0-9]+))? \+([0-9]+)(?:,([0-9]+))? @@(?: .*)?", rows[2])
+    if not header or any(not row or row[0] not in " +-" for row in rows[3:]):
+        raise ValueError("Expected an exact unified hunk with old and new line counts")
+    start, old_count, new_start, new_count = (int(value or 1) for value in header.groups())
+    old = [row[1:] for row in rows[3:] if row[0] in " -"]
+    new = [row[1:] for row in rows[3:] if row[0] in " +"]
+    if (not old or start < 1 or new_start != (start if new else start - 1)
+            or (len(old), len(new)) != (old_count, new_count) or original[start - 1:start - 1 + len(old)] != old):
+        raise ValueError("Unified hunk does not match the exact current file lines")
+    return start - 1, old, new
+
+
+def apply_offered_line_reply(response, sources, snapshots, *, block_pattern):
+    """Bind a textual free-model edit to one of the actually offered full definitions."""
+    if not isinstance(response, str) or not 0 < len(response.encode()) <= _MAX_REPLY:
+        raise ValueError("Expected a bounded scoped edit")
+    text = response.replace("\r\n", "\n").strip("\n")
+    fenced = re.fullmatch(r"```(?:json|diff|patch|text)?[ \t]*\n(.*)\n```", text, re.S | re.I)
+    if fenced:
+        text = fenced[1]
+    path = snapshots[0].symbol[0]
+    original = sources[path].splitlines()
+    if text.lstrip().startswith("{"):
+        try:
+            payload = json.loads(text, object_pairs_hook=_unique_object)
+        except (ValueError, RecursionError):
+            raise ValueError("Expected one exact JSON line-range edit object") from None
+        if type(payload) is not dict or "edits" not in payload or payload.keys() - {"snapshot", "symbol", "path", "edits"}:
+            raise ValueError("Expected edits and an offered snapshot or symbol")
+        matches = list(snapshots)
+        if "path" in payload and payload["path"] != path:
+            raise ValueError("The supplied path must match the offered file")
+        if "symbol" in payload:
+            matches = [s for s in matches if payload["symbol"] in (s.symbol[1], "::".join(s.symbol))]
+        if "snapshot" in payload:
+            prefix = payload["snapshot"]
+            if isinstance(prefix, str) and re.fullmatch("[0-9a-f]{12,64}", prefix):
+                matches = [s for s in matches if s.digest.startswith(prefix)]
+            else:
+                matches = [s for s in matches if prefix in (s.symbol[1], "::".join(s.symbol))]
+        if len(matches) != 1 or not ({"symbol", "snapshot"} & payload.keys()):
+            raise ValueError("The reply must identify exactly one offered definition")
+        selected = matches[0]
+        edits = payload["edits"]
+    else:
+        if text.startswith(("diff --git ", "--- ")):
+            start, old, new = _single_hunk(text, path, original)
+        else:
+            if text.startswith("<<<<<<< SEARCH\n"):
+                text = path + "\n" + text
+            block = block_pattern.fullmatch(text + "\n")
+            if not block or block[1] != path or any(
+                row.startswith(("<<<<<<<", "=======", ">>>>>>>")) for row in (block[2] + block[3]).splitlines()
+            ):
+                raise ValueError("Expected one exact SEARCH/REPLACE block for the offered file")
+            old, new = block[2].splitlines(), block[3].splitlines()
+            if not old:
+                raise ValueError("The SEARCH must contain an exact old source line")
+            haystack = "\n" + "\n".join(original) + "\n"
+            needle = "\n" + "\n".join(old) + "\n"
+            match = haystack.find(needle)
+            if match < 0 or haystack.find(needle, match + 1) >= 0:
+                raise ValueError("The SEARCH must match exactly one location in the current file")
+            start = haystack.count("\n", 0, match)
+        common = min(len(old), len(new))
+        prefix = next((i for i in range(common) if old[i] != new[i]), common)
+        suffix = next((i for i in range(common - prefix) if old[-1 - i] != new[-1 - i]), common - prefix)
+        start += prefix
+        old, new = old[prefix:len(old) - suffix], new[prefix:len(new) - suffix]
+        if not old and not new:
+            raise ValueError("The alternate format did not change the checkout")
+        # Bind insertions to a real on-snapshot preceding row, just like the native format.
+        if not old:
+            if start < 1:
+                raise ValueError("Insertions need an existing body row as their anchor")
+            start -= 1
+            old = [original[start]]
+            new = old + new
+        matches = []
+        for snapshot in snapshots:
+            scope = _scope(sources[path], snapshot.symbol[1])
+            if scope is None:
+                continue
+            first = start + 1 - scope.start
+            last = first + len(old) - 1
+            if snapshot.first_body_line <= first <= last <= len(snapshot.lines):
+                matches.append((snapshot, [{"start": first, "end": last, "lines": new}]))
+        if len(matches) != 1:
+            raise ValueError("The change must lie in the body of exactly one offered definition")
+        selected, edits = matches[0]
+    normalized = json.dumps({"snapshot": selected.digest, "edits": edits})
+    allowed = frozenset(range(selected.first_body_line, len(selected.lines) + 1))
+    return apply_line_range_edit(normalized, sources, selected, allowed_rows=allowed)
+
+
 def select_line_snapshot(response, snapshots):
     digest = _line_payload(response)["snapshot"]
     for snapshot in snapshots:

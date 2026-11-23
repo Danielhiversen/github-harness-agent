@@ -1141,12 +1141,12 @@ def test_pinned_setup_failures_recover_using_an_authored_function_and_only_neede
     assert any(check.command[0] == "verify-regression" and check.returncode == 0 for check in result.checks)
 
 
-@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long", "checkpoint-caller"))
-def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, failover):
+@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long", "checkpoint-caller", "checkpoint-caller-block"))
+def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, failover, caplog):
     task, _, runner, checkpoints = solver_case
     raw_mode = failover in {"raw", "raw-restored"}
-    long_checkpoint = failover in {"checkpoint-long", "checkpoint-caller"}
-    caller_edit = failover == "checkpoint-caller"
+    long_checkpoint = failover.startswith("checkpoint-")
+    caller_edit = failover.startswith("checkpoint-caller")
     operator = Path(task.pull_checks[0][-1])
     with operator.open("a") as stream:
         stream.write("# withheld-operator-source " + "x" * review_recovery.MAX_OPERATOR_SOURCE + "\n")
@@ -1283,6 +1283,8 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
                     "snapshot": digest,
                     "edits": [{"start": row, "end": row, "lines": [target[2] + ("return self.read() + 2" if caller_edit else f"return {value}")]}],
                 })
+            if failover == "checkpoint-caller-block":
+                reply.content = edit(SOURCE, "        return self.read() - 2\n", "        return self.read() + 2\n")
             return reply
 
     malformed = edit(SOURCE, "    missing_anchor()\n", "    return 1\n")
@@ -1309,9 +1311,14 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         verification_runner=FixtureRunner(independent),
     )
     budget = _Budget(executor.limits, lambda: False, task)
-    result = solve(executor, task, archive, budget, "fixture")
+    with caplog.at_level("INFO", logger="github_harness_agent.review_solver"):
+        result = solve(executor, task, archive, budget, "fixture")
 
     if long_checkpoint:
+        [offered] = [record.getMessage() for record in caplog.records if record.msg.startswith("Requesting checkpoint method edit")]
+        assert "anchor Reader.read (" in offered
+        assert ("direct callers offered (1): Reader.dispatch (body rows=1)" if caller_edit else "direct callers offered (0): none") in offered
+        assert "self.read()" not in offered and "return" not in offered
         [first_request, _] = gateway.prompts
         assert len(line_attempts) == 1 and not native_attempts and not raw_attempts
         assert len(re.findall(r"(?m)^\d+ \|", first_request)) > 110
