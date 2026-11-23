@@ -911,6 +911,11 @@ def test_helper_prompt_quotes_only_reviewed_production_protocol():
     assert "if len(records) >= 8:" in section and "result['next']" in section
     assert "secret" not in section and "unrelated" not in section
     # A helper argument shadowing an import cannot identify the production class.
+    from github_harness_agent.review_solver_context import production_protocol_example
+    inferred = production_protocol_example("def mask(): return True", sources, {"records"},
+                                          review_anchors=(("ingest.py", 6), ("tests/storage.py", 6)))
+    assert "self.client.page" in inferred and "result['records']" in inferred
+    assert "tests/storage" not in inferred
     helper.preview = "from ingest import Reader\ndef make(Reader):\n    return Reader()"
     prompt = _operator_function_messages(helper, review, sources, NEW_TEST, "")[-1]["content"]
     assert "Production call and response handling" not in prompt
@@ -1170,7 +1175,7 @@ def test_checked_caller_feedback_is_local_bounded_and_stops_duplicate_attempts(c
     assert "return 2" not in caplog.text and "candidate observation" not in caplog.text
 
 
-@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long", "checkpoint-caller", "checkpoint-caller-block", "checkpoint-caller-after-format", "checkpoint-caller-after-rejection", "checkpoint-caller-after-exhaustion", "checkpoint-caller-after-wider", "checkpoint-caller-after-semantic", "checkpoint-caller-after-implicit", "checkpoint-caller-after-method", "checkpoint-caller-after-testfirst", "checkpoint-caller-after-testfirst-green", "checkpoint-caller-after-testfirst-oldgreen", "checkpoint-caller-after-testfirst-setup", "checkpoint-caller-after-testfirst-alternate", "checkpoint-caller-after-testfirst-multistage"))
+@pytest.mark.parametrize("failover", ("none", "malformed", "no_progress", "native", "raw", "raw-restored", "checkpoint-long", "checkpoint-caller", "checkpoint-caller-block", "checkpoint-caller-after-format", "checkpoint-caller-after-rejection", "checkpoint-caller-after-exhaustion", "checkpoint-caller-after-wider", "checkpoint-caller-after-semantic", "checkpoint-caller-after-implicit", "checkpoint-caller-after-method", "checkpoint-caller-after-testfirst", "checkpoint-caller-after-testfirst-green", "checkpoint-caller-after-testfirst-oldgreen", "checkpoint-caller-after-testfirst-setup", "checkpoint-caller-after-testfirst-alternate", "checkpoint-caller-after-testfirst-multistage", "checkpoint-caller-after-testfirst-timeout", "checkpoint-caller-after-testfirst-unavailable"))
 def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, failover, caplog):
     task, _, runner, checkpoints = solver_case
     raw_mode = failover in {"raw", "raw-restored"}
@@ -1182,7 +1187,7 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
     testfirst = "testfirst" in failover
     early_case = "def test_dispatch_observable():\n    from fixture_calc import first\n    assert first() == 1\n"
     early_routes = []
-    retain_early = failover.endswith(("-testfirst", "-alternate", "-multistage"))
+    retain_early = failover.endswith(("-testfirst", "-alternate", "-multistage", "-timeout"))
     if failover.endswith("-multistage"):
         early_case = early_case.replace("import first", "import first, second").replace(
             "    assert first()", "    assert second() == 2\n    assert first()"
@@ -1283,9 +1288,15 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
                 assert testfirst and len(line_attempts) == 1
                 assert "withheld-operator-source" not in prompt and "def test_keep_helper" not in prompt
                 reply = super().complete(**{**kwargs, "max_output_tokens": 3072})
+                assert 110 < kwargs["timeout"] < 840
+                if not early_routes and failover.endswith(("-timeout", "-unavailable")):
+                    early_routes.append(("free-first", "model-first"))
+                    failures = {"gateway": "deadline exceeded", "free-first": "upstream timeout"} if failover.endswith("-timeout") else {"free-first": "rate limited"}
+                    raise ProviderExhausted(None, failures)
                 if early_routes:
                     assert early_routes == [("free-first", "model-first")]
-                    assert tuple(early_routes) == kwargs["exclude"] and kwargs["after_provider"] == "free-first"
+                    assert kwargs.get("exclude", ()) == (() if failover.endswith("-timeout") else tuple(early_routes))
+                    assert kwargs["after_provider"] == "free-first"
                     reply.route, reply.configured_model = "free-second", "model-second"
                 else:
                     reply.route, reply.configured_model = "free-first", "model-first"
@@ -1429,7 +1440,7 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         gateway = Gateway(*replies)
         requests = len(replies)
         if testfirst:
-            gateway = Gateway("numbered", early_case, *(("second author",) if not failover.endswith(("-testfirst", "-multistage")) else ()), "numbered", TEST)
+            gateway = Gateway("numbered", early_case, *(("second author",) if not failover.endswith(("-testfirst", "-multistage", "-unavailable")) else ()), "numbered", TEST)
             requests = 5
     elif failover == "raw-restored":
         gateway = Gateway("def local_result():\n    return 1\n", TEST)
@@ -1456,7 +1467,7 @@ def test_mixed_review_uses_numbered_retry_without_operator_source(solver_case, f
         repeats = 2 if semantic or failover.endswith("exhaustion") else int(caller_retry)
         assert remaining_offers == [f"Requesting checkpoint method edit: direct caller only Reader.dispatch (body rows={caller_rows})"] * repeats
         if testfirst:
-            assert len(early_routes) == (1 if failover.endswith(("-testfirst", "-multistage")) else 2)
+            assert len(early_routes) == (1 if failover.endswith(("-testfirst", "-multistage", "-unavailable")) else 2)
             assert any(prompt.startswith("Test-first regression") for prompt in gateway.prompts)
             assert (b"test_dispatch_observable" in result.patch) == retain_early
         first_request = gateway.prompts[0]

@@ -691,12 +691,14 @@ def direct_caller_names(module, qualified):
     return tuple(callers)
 
 
-def production_protocol_example(preview, sources, query, *, max_bytes=1150):
+def production_protocol_example(preview, sources, query, *, max_bytes=1150, review_anchors=()):
     """Quote a dependency call and nearby handling from a helper's production entry point."""
     try:
         setup = ast.parse(preview).body
     except (SyntaxError, ValueError, RecursionError):
-        return ""
+        if not review_anchors:
+            return ""
+        setup = []
     bindings = {}
     for node in setup:
         if isinstance(node, ast.ImportFrom) and not node.level:
@@ -714,7 +716,7 @@ def production_protocol_example(preview, sources, query, *, max_bytes=1150):
                     if alias.split(".")[0] not in local and (name == alias or name.startswith(alias + ".")):
                         used.add(target + name[len(alias):])
 
-    if not used:
+    if not used and not review_anchors:
         return ""
     best = ""
     best_rank = None
@@ -724,7 +726,8 @@ def production_protocol_example(preview, sources, query, *, max_bytes=1150):
                 or file.name.startswith("test_") or file.name.endswith("_test.py")):
             continue
         module = _python_module(path)
-        if not any(name.startswith(module + ".") for name in used):
+        anchors = [line for location, line in review_anchors if location == path and type(line) is int]
+        if not anchors and not any(name.startswith(module + ".") for name in used):
             continue
         try:
             declarations = ast.parse(source).body
@@ -732,7 +735,10 @@ def production_protocol_example(preview, sources, query, *, max_bytes=1150):
             continue
         lines = source.splitlines()
         for entry in declarations:
-            if not isinstance(entry, (*_FUNCTION, ast.ClassDef)) or module + "." + entry.name not in used:
+            if not isinstance(entry, (*_FUNCTION, ast.ClassDef)):
+                continue
+            anchored = any(entry.lineno <= line <= entry.end_lineno for line in anchors)
+            if not anchored and module + "." + entry.name not in used:
                 continue
             methods = entry.body if isinstance(entry, ast.ClassDef) else [entry]
             for method in methods:
@@ -772,7 +778,7 @@ def production_protocol_example(preview, sources, query, *, max_bytes=1150):
                     if len(snippet.encode()) > max_bytes:
                         continue
                     tokens = set(re.findall(r"[a-z]{3,}", snippet.casefold()))
-                    rank = (bool(traced), parts[0] == "self" and len(parts) >= 3, len(query & tokens), traced, -call.lineno)
+                    rank = (bool(traced), anchored, parts[0] == "self" and len(parts) >= 3, len(query & tokens), traced, -call.lineno)
                     if best_rank is None or rank > best_rank:
                         best_rank, best = rank, snippet
     return best

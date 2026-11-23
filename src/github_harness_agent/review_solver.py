@@ -4179,7 +4179,7 @@ def solve(executor, task, archive, budget, version):
     test_first_attempted = False
     test_first_witness = None
 
-    def author_red_regression(routes):
+    def author_red_regression(routes, after_provider):
         # Only public repository context is provided. The independent operator
         # check and its diagnostic play no part in composing this test.
         public = {path: current[path] for path in paths}
@@ -4197,7 +4197,10 @@ def solve(executor, task, archive, budget, version):
             archive, task.regression_archive, new_path, public, require_identical=True,
         )
         examples = "\n".join(filter(None, (setup, example, usage)))
-        protocol = production_protocol_example(setup.partition("\n")[2], public, query) if setup else ""
+        protocol = production_protocol_example(
+            setup.partition("\n")[2], public, query,
+            review_anchors=tuple((path, line) for path, line, _ in review.feedback),
+        )
 
         prompt = (
             f"Test-first regression for {new_path}. Write exactly one original offline pytest test "
@@ -4209,15 +4212,18 @@ def solve(executor, task, archive, budget, version):
         )
         messages = [{"role": "system", "content": _SYSTEM_PREFIX + _SYSTEM_SUFFIX},
                     {"role": "user", "content": prompt}]
+        remaining = budget.remaining()
         result = budget.complete(executor.gateway, "coding", messages, max_output_tokens=2048, retry_oversize=False,
-                                 exclude=tuple(routes), after_provider=routes[-1][0] if routes else None,
-                                 timeout_cap=min(75, budget.remaining() - 45))
+                                 exclude=tuple(routes), after_provider=after_provider,
+                                 timeout_cap=remaining - max(60, remaining / 3))
         model = result.route, result.configured_model
         if model in routes or not result.configured_model:
+            _LOG.info("Test-first authoring rejected duplicate or unidentified route")
             return None
         routes.append(model)
         source = _complete_test_module(result.content, new_path, min(8192, executor.limits.patch_bytes))
         if not source or not _one_test_draft(source):
+            _LOG.info("Test-first authoring rejected test module format")
             return None
         proof = _GuardBudget(budget, wall_seconds=45)
 
@@ -4227,21 +4233,26 @@ def solve(executor, task, archive, budget, version):
                 raise ValueError("Staged regression differs from authored bytes")
 
         assertions = []
-        for revision, changes in (
-            (archive, patch_for(original, {**current, new_path: source})),
-            (task.regression_archive, patch_for({new_path: ""}, {new_path: source})),
+        for stage, revision, changes in (
+            ("checkpoint", archive, patch_for(original, {**current, new_path: source})),
+            ("pinned ancestor", task.regression_archive, patch_for({new_path: ""}, {new_path: source})),
         ):
             runs = {}
             failed = review_evidence(executor, task, revision, proof, changes, (focused_generated,),
                                      pytest_runs=runs, on_staged=exact_bytes)
             run = runs.get(0)
             if not run or len(run.failed) != 1:
+                outcome = "green" if run and run.passed == 1 and not failed and not run.deselected else "incomplete or setup error"
+                _LOG.info("Test-first %s verification: %s", stage, outcome)
                 return None
             observed = next(_focused_test_assertions(new_path, source, run, failed), None)
             if observed is None:
+                _LOG.info("Test-first %s verification: failure outside test assertion", stage)
                 return None
+            _LOG.info("Test-first %s verification: red at a verified test assertion", stage)
             assertions.append(observed)
         if assertions[0][0] != assertions[1][0]:
+            _LOG.info("Test-first verification rejected mismatched collected cases")
             return None
         rows = source.splitlines()
         diagnostics = [
@@ -4520,17 +4531,30 @@ def solve(executor, task, archive, budget, version):
             ):
                 test_first_attempted = True
                 routes = []
-                for _ in range(2):
+                after_provider = None
+                for attempt in (1, 2):
+                    _LOG.info("Requesting test-first regression authoring, attempt %d of 2", attempt)
                     submitted += 1
                     launch_budget -= 1
                     try:
-                        test_first_witness = author_red_regression(routes)
+                        test_first_witness = author_red_regression(routes, after_provider)
+                        after_provider = routes[-1][0] if routes else None
                     except Cancelled:
                         raise
-                    except (ExecutionError, ProviderExhausted, OSError, ValueError):
+                    except ProviderExhausted as error:
+                        # A new account is useful after a deadline interrupted gateway
+                        # rotation. A completed exhaustion already visited eligible routes.
+                        after_provider = None
+                        if error.failures.get("gateway") == "deadline exceeded":
+                            after_provider = next((alias for alias, reason in reversed(error.failures.items())
+                                if alias != "gateway" and reason in {"upstream timeout", "upstream connection failed"}), None)
+                        _LOG.info("Test-first provider request exhausted; alternate available=%s", bool(after_provider))
+                    except (ExecutionError, OSError, ValueError):
+                        _LOG.info("Test-first attempt ended without a verified regression")
                         budget.remaining()
+                        after_provider = routes[-1][0] if routes else None
                     if (
-                        test_first_witness or not routes or launch_budget < 3
+                        test_first_witness or not after_provider or launch_budget < 3
                         or budget.model_requests_remaining() < 3 or budget.remaining() < 75
                         or budget.commands_remaining() < len(commands) * 2 + 12
                     ):
