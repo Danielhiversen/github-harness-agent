@@ -2746,6 +2746,26 @@ def _named_operator_cases(keys, commands):
     )
 
 
+def _is_partial_operator_counterexample(failures, runs, commands, operator_checks):
+    """Require a complete named assertion failure and independently passing review coverage."""
+    if len(failures) != 1:
+        return False
+    goal, = failures
+    number, node = goal
+    checked = runs.get(number)
+    observed = failures[goal].partition("\nObserved pytest failure: ")[2]
+    return bool(
+        number < operator_checks
+        and _named_operator_cases((goal,), commands)
+        and _operator_diagnostic_replay(commands[number], node)
+        and checked and checked.failed == {node} and not checked.deselected
+        and (observed.startswith(("assert ", "AssertionError: "))
+             or _named_test_diagnostic_kind(failures[goal]) == "AssertionError")
+        and any(run and run.passed and not run.deselected for index, run in runs.items()
+                if index < operator_checks)
+    )
+
+
 def _operator_case_names(fixtures):
     names = {}
     for path, source in fixtures.items():
@@ -3109,6 +3129,13 @@ def solve(executor, task, archive, budget, version):
         and patch and patch == draft.patch and len(failures) == 1 and not current[new_path]
         else None
     )
+    if (
+        resumed_operator_checkout is not None
+        and executor.verification_runner is not executor.runner
+        and _is_partial_operator_counterexample(failures, pytest_runs, commands, len(task.pull_checks))
+    ):
+        budget.regression_counterexample = patch
+        _LOG.info("Retained a verified partial checkpoint for regression coverage")
     if review.test_only and failures:
         raise ExecutionError("Required checks failed on the unchanged baseline for the test-only review")
     notes = {}
@@ -6565,6 +6592,10 @@ def solve(executor, task, archive, budget, version):
                         failures_by_check = {}
                         for index, check in enumerate(rejection.checks):
                             if not check.returncode:
+                                continue
+                            if check.command == ("verify-regression-counterexample",):
+                                failures_by_check[index, "Partial checkpoint coverage"] = excerpt(check.output, 420)
+                                test_check_labels.add("partial checkpoint/no verified assertion failure")
                                 continue
                             if pinned_ancestor and check.command == ("verify-regression", task.regression_base):
                                 next_ancestor_feedback = excerpt(check.output, 420)

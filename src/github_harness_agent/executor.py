@@ -322,6 +322,7 @@ class _Budget:
         self.deadline = time.monotonic() + limits.wall_time
         self.routes: list[RouteEvidence] = []
         self.task = task
+        self.regression_counterexample: bytes | None = None
         self._calls = Counter()
         self._lock = Lock()
         self._message_limit = MESSAGE_BYTES
@@ -1958,9 +1959,13 @@ class PlainExecutor:
         )
 
     def _verify_test_regression(
-        self, task, archive, budget, patch, new_tests, green_report, green_sources, green_output
+        self, task, archive, budget, patch, new_tests, green_report, green_sources, green_output,
+        *, counterexample=None,
     ):
-        command = ("verify-regression", task.regression_base)
+        command = (
+            ("verify-regression", task.regression_base)
+            if counterexample is None else ("verify-regression-counterexample",)
+        )
         report = f".git/gha-regression-{uuid4().hex}.xml"
         selectors = tuple(path for path in new_tests if path.endswith(".py"))
         pytest = focused_pytest(task.checks, selectors, report, verbose=True)
@@ -1968,21 +1973,42 @@ class PlainExecutor:
             return CheckEvidence(command, 1, "Run the new tests with the configured pytest launcher before checking the ancestor.")
         budget.claim("command", budget.limits.commands)
         with self.verification_runner.workspace(
-            task.regression_archive, budget.remaining, budget.cancelled,
+            task.regression_archive if counterexample is None else archive,
+            budget.remaining, budget.cancelled,
         ) as workspace:
-            self._stage_baseline(workspace, budget)
+            tree = self._stage_baseline(workspace, budget)
+            if counterexample is not None:
+                self._git(workspace, budget, "apply", "--index", "--binary", data=counterexample)
+                partial_tests, amended_test = self._check_patch_paths(workspace, task, budget, tree)
+                if partial_tests or amended_test:
+                    raise ExecutionError("The verified partial checkpoint must contain production changes only.")
             applied = self._git(
                 workspace, budget, "apply", "--index", "--binary", data=patch, checked=False,
             )
             if applied.returncode:
-                return CheckEvidence(command, 1, "Use new test paths that can be added unchanged to the verified ancestor.")
+                return CheckEvidence(
+                    command, 1, "Use new test paths that can be added unchanged to "
+                    + ("the verified ancestor." if counterexample is None else "the verified partial checkpoint."),
+                )
             if self._regression_sources(workspace, budget, new_tests) != green_sources:
                 return CheckEvidence(command, 1, "The generated test sources must be byte-identical on both revisions.")
             result = self._command(workspace, budget, pytest, checked=False)
             if result.returncode == 1:
                 red_report = self._command(workspace, budget, ("cat", report), checked=False)
                 if red_report.returncode == 0 and regression_assertion_report(green_report, red_report.stdout):
-                    return CheckEvidence(command, 0, "A named test passed on the candidate and failed by assertion on the verified ancestor.")
+                    return CheckEvidence(
+                        command, 0, "A named test passed on the candidate and failed by assertion on "
+                        + ("the verified ancestor." if counterexample is None else "the verified partial checkpoint."),
+                    )
+        if counterexample is not None:
+            detail = (
+                "The new tests also pass on the verified partial checkpoint. "
+                "Assert the requested behavior that remained missing on that revision."
+                if result.returncode == 0 else
+                "The verified partial checkpoint did not produce a matched test assertion failure. "
+                "Use the same scenario and available public APIs on both revisions."
+            )
+            return CheckEvidence(command, 1, detail)
         detail = (
             "The new tests also pass on the ancestor. Assert the reviewed behavior that differs on the pinned revision."
             if result.returncode == 0 else
@@ -2152,6 +2178,12 @@ class PlainExecutor:
                 task, archive, budget, historical_patch, historical_tests, green_report, green_sources, green_output
             )
             checks.append(regression)
+            if not regression.returncode and budget.regression_counterexample is not None:
+                regression = self._verify_test_regression(
+                    task, archive, budget, historical_patch, historical_tests, green_report, green_sources, green_output,
+                    counterexample=budget.regression_counterexample,
+                )
+                checks.append(regression)
             if regression.returncode:
                 rejection = _VerificationRejected(regression.output)
                 rejection.checks = tuple(checks)

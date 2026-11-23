@@ -1741,3 +1741,53 @@ def test_review_protected_test_rejection_retries_from_last_safe_draft(fixture):
     assert b"test_number.py" not in result.patch
     assert b"test_regression.py" in result.patch
     assert b"test_number.py" not in saved["harness2/base"].patch
+
+
+@pytest.mark.parametrize("assert_order", [False, True])
+def test_regression_coverage_distinguishes_verified_partial_checkpoint(tmp_path, assert_order):
+    from github_harness_agent.executor import _Budget, _VerificationRejected
+    from github_harness_agent.review_solver import patch_for
+
+    def as_archive(files):
+        output = BytesIO()
+        with tarfile.open(fileobj=output, mode="w") as archive:
+            for path, content in files.items():
+                raw = content.encode()
+                info = tarfile.TarInfo(path)
+                info.size = len(raw)
+                archive.addfile(info, BytesIO(raw))
+        return output.getvalue()
+
+    path, new_test = "scheduler.py", "test_regression.py"
+    old = "def schedule():\n    return ['left']\n"
+    partial = "def schedule():\n    return ['left', 'right', 'child']\n"
+    fixed = "def schedule():\n    return ['left', 'child', 'right']\n"
+    source = (
+        "from scheduler import schedule\n\n"
+        "def test_schedule():\n"
+        "    issued = schedule()\n"
+        "    assert set(issued) == {'left', 'right', 'child'}\n"
+    )
+    if assert_order:
+        source += "    assert issued.index('child') < issued.index('right')\n"
+    archive = as_archive({path: old, "test_stock.py": "def test_stock(): pass\n"})
+    task = TaskSnapshot(
+        "org/fixture", "1" * 40, "Cover breadth and child priority.",
+        ((sys.executable, "-m", "pytest", "test_stock.py"),),
+        require_new_tests=True, regression_base="2" * 40, regression_archive=archive,
+        regression_edit_path=path,
+    )
+    executor = PlainExecutor(FixtureRunner(tmp_path), ScriptedGateway(None))
+    budget = _Budget(executor.limits, lambda: False, task)
+    patch = patch_for({path: old, new_test: ""}, {path: fixed, new_test: source})
+    budget.regression_counterexample = patch_for({path: old}, {path: partial})
+    if assert_order:
+        result = executor._verify(task, archive, budget, patch)
+        checks = {check.command[0]: check.returncode for check in result.checks}
+        assert checks["verify-regression"] == checks["verify-regression-counterexample"] == 0
+    else:
+        with pytest.raises(_VerificationRejected, match="also pass on the verified partial checkpoint") as rejected:
+            executor._verify(task, archive, budget, patch)
+        checks = rejected.value.checks
+        assert checks[-2].command[0] == "verify-regression" and checks[-2].returncode == 0
+        assert checks[-1].command == ("verify-regression-counterexample",) and checks[-1].returncode == 1

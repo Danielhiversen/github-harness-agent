@@ -38,6 +38,8 @@ from github_harness_agent.task_context import compact_focused_review, wire_size
 from github_harness_agent.review_solver import (
     LINE_RANGE_ENDING,
     _GUIDANCE,
+    _PytestRun,
+    _is_partial_operator_counterexample,
     _RegressionRepair,
     _private_method_retry,
     _generic_verifier_failure,
@@ -6478,3 +6480,27 @@ def test_repeated_checked_literal_replacements_open_the_method_with_direct_call_
     assert "collected = collect(mode == 'full')" in broader.prompt
     assert "return min(collected, 50)" in broader.prompt
     assert "unrelated" not in broader.prompt
+
+
+def test_only_an_assertion_with_another_operator_case_passing_certifies_partial_checkpoint():
+    path = f"{review_recovery.OPERATOR_CHECK_ROOT}/test_scheduler.py"
+    scenario = path + "::test_child_first"
+    control = path + "::test_visit_both"
+    commands = (
+        (sys.executable, "-m", "pytest", scenario),
+        (sys.executable, "-m", "pytest", control),
+    )
+    failed = frozenset({scenario})
+    checked = {
+        0: _PytestRun(0, failed, 0, failed),
+        1: _PytestRun(1, frozenset(), 0, frozenset({control})),
+    }
+    failures = {(0, scenario): scenario + "\nObserved pytest failure: assert 2 < 1"}
+    assert _is_partial_operator_counterexample(failures, checked, commands, 2)
+    assert not _is_partial_operator_counterexample(failures, checked, commands, 1)
+    assert not _is_partial_operator_counterexample(
+        {(0, scenario): "E   TimeoutError: fixture did not finish"}, checked, commands, 2,
+    )
+    assert not _is_partial_operator_counterexample(
+        failures, {**checked, 0: replace(checked[0], deselected=1)}, commands, 2,
+    )
