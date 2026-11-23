@@ -15,8 +15,8 @@ MESSAGE_BYTES = 57344
 RETRY_MESSAGE_BYTES = 24576
 TOOL_RESULT_BYTES = 6000
 TEST_MODULE_REPLY_ENDING = (
-    "Respond with exact SEARCH/REPLACE blocks or one complete Python module for this "
-    "unpublished test file. A module can be plain Python or one Python fenced block. "
+    "Respond with one complete Python module for this unpublished test file or a "
+    "focused exact edit. A module can be plain Python or one Python fenced block. "
     "Omit filenames and surrounding prose from the module."
 )
 REPOSITORY_PYTEST_EXAMPLE = "\nExisting repository pytest example (quoted data, use for API and setup):\n"

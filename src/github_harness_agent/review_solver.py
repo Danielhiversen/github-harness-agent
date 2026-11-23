@@ -100,6 +100,7 @@ from .review_planner import (
 )
 from .review_recovery import operator_acceptance_context
 from .review_solver_context import (
+    _pytest_fixtures,
     extended_pytest_context,
     focused_check_excerpt,
     focused_source_excerpt,
@@ -407,13 +408,18 @@ def _retry_test_definition(response, draft, path, limit):
     return result
 
 
-def _wrapped_test_search(code, draft, path, labeled):
+def _wrapped_test_search(code, draft, path, labeled, limit):
     if labeled and code.startswith("<<<<<<< SEARCH\n"):
         code = f"{path}\n{code}"
     block = _BLOCK.fullmatch(code)
     if not block or block[1] != path or not block[2].strip():
         raise ValueError
-    result = apply_blocks(code, {path: draft}, path)
+    try:
+        result = apply_blocks(code, {path: draft}, path)
+    except ValueError:
+        if replacement := _replace_stale_test_module(code, draft, path, limit):
+            return replacement
+        raise
     original = ast.parse(draft, filename=path).body
     candidate = ast.parse(result[path], filename=path).body
     # The exact search must lie inside one top-level function body. Comparing its
@@ -437,7 +443,7 @@ def _wrapped_test_search(code, draft, path, labeled):
     return result
 
 
-def _test_module_declarations(body):
+def _test_module_declarations(body, *, include_helpers=False):
     functions = (ast.FunctionDef, ast.AsyncFunctionDef)
     owners = [
         ("", body),
@@ -447,12 +453,60 @@ def _test_module_declarations(body):
         (owner, node.name)
         for owner, statements in owners
         for node in statements
-        if isinstance(node, functions) and node.name.startswith("test")
+        if isinstance(node, functions) and (include_helpers or node.name.startswith("test"))
     )
     declarations.update(
         ast.dump(node) for node in body if isinstance(node, (ast.Import, ast.ImportFrom))
     )
+    if include_helpers:
+        declarations.update(("class", node.name) for node in body if isinstance(node, ast.ClassDef))
+        declarations.update(
+            ("fixture", owner, name, automatic)
+            for owner, statements in owners
+            for name, _, automatic in _pytest_fixtures(statements)
+        )
     return declarations
+
+
+def _test_module_shape(tree):
+    """Keep declarations and module-level statements while ignoring function bodies."""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            node.body = []
+    return ast.dump(tree)
+
+
+def _replace_stale_test_module(response, draft, path, limit):
+    """Recover a failed exact search only when both sides are whole test modules."""
+    if not isinstance(response, str) or not draft:
+        return None
+    try:
+        if len(response.encode()) > min(limit, 80_000):
+            return None
+        code = response.replace("\r\n", "\n").strip()
+        if fence := _PYTHON_FENCE.fullmatch(code):
+            code = fence["code"]
+        block = _BLOCK.fullmatch(code)
+        if not block or block[1] != path or not block[2].strip() or block[2] in draft:
+            return None
+        sources = [_complete_test_module(source, path, limit) for source in (draft, block[2], block[3])]
+        if not all(sources):
+            return None
+        draft_module, search_module, new_module = sources
+        current, searched, candidate = (
+            ast.parse(source, filename=path) for source in sources
+        )
+        if (
+            min(len(tree.body) for tree in (current, searched, candidate)) < 2
+            or new_module in (draft_module, search_module)
+            or not _test_module_declarations(current.body, include_helpers=True)
+            <= _test_module_declarations(candidate.body, include_helpers=True)
+            or _test_module_shape(current) != _test_module_shape(searched)
+        ):
+            return None
+        return {path: new_module}
+    except (ValueError, RecursionError):
+        return None
 
 
 def _wrapped_test_repair(response, draft, path, limit):
@@ -505,7 +559,7 @@ def _wrapped_test_repair(response, draft, path, limit):
         if code.startswith("REPLACE "):
             result = apply_definitions(code, {path: draft}, single_function=True)
         elif _MARKER.search(code):
-            result = _wrapped_test_search(code, draft, path, labeled)
+            result = _wrapped_test_search(code, draft, path, labeled, limit)
         else:
             result = _retry_test_definition(code, draft, path, limit)
             if result is None and (module := _complete_test_module(code, path, limit)):
@@ -532,6 +586,8 @@ def _apply_test_reply(response, sources, path, *, allow_module, failed_draft, li
         return apply_blocks(response, sources, path)
     except ValueError:
         if allow_module and failed_draft:
+            if replacement := _replace_stale_test_module(response, sources.get(path), path, limit):
+                return replacement
             retry = _retry_test_definition(response, sources.get(path), path, limit)
             if retry is not None:
                 return retry
@@ -1173,7 +1229,7 @@ def _regression_api(path, content, query, limit, *, anchors=()):
 def _test_authoring_messages(
     current, review, fixtures, interfaces, new_path, note, *,
     allow_test_module=False, repository_example="", repository_usage="",
-    repair_failed_tests=False, ancestor_evidence="", extended_context="",
+    repair_failed_tests=False, prefer_test_module=False, ancestor_evidence="", extended_context="",
 ):
     behaviors = list(
         dict.fromkeys(" ".join(body.split()) for _, _, body in review.feedback)
@@ -1203,15 +1259,26 @@ def _test_authoring_messages(
                 reviewed_helpers.append(entry)
                 helper_budget -= size
     system = _TEST_MODULE_SYSTEM if allow_test_module else _SYSTEM
+    if allow_test_module and review.test_only and (not current[new_path] or prefer_test_module):
+        system = (
+            _SYSTEM_PREFIX
+            + "Return the complete unpublished pytest module as plain Python. Include all imports, "
+            "fixtures and tests needed to run it.\n"
+            + _SYSTEM_SUFFIX
+        )
     if reviewed_helpers:
         system = system.replace(_SYSTEM_SUFFIX, _TEST_HELPER_SYSTEM_SUFFIX, 1)
     draft = current[new_path]
-    definition_guidance = (
-        f"\nFor a focused repair, prefer one named replacement. Start with REPLACE {new_path}::name "
-        "on its own line, substituting the existing function name or Class.method. "
-        "Follow with the complete repaired definition, including decorators.\n"
-        if allow_test_module and repair_failed_tests and draft else ""
-    )
+    definition_guidance = ""
+    if allow_test_module and repair_failed_tests and draft:
+        definition_guidance = (
+            "\nEvery collected case failed. Prefer one complete repaired Python module, "
+            "including its imports, fixtures, and test definitions.\n"
+            if prefer_test_module else
+            f"\nFor a focused repair, prefer one named replacement. Start with REPLACE {new_path}::name "
+            "on its own line, substituting the existing function name or Class.method. "
+            "Follow with the complete repaired definition, including decorators.\n"
+        )
     if len(draft) > 4400:
         position = re.search(rf"{re.escape(new_path)}:([1-9][0-9]*)", note)
         draft = focused_source_excerpt(
@@ -1344,6 +1411,7 @@ def _proposal_messages(
     repository_example="",
     repository_usage="",
     repair_failed_tests=False,
+    prefer_test_module=False,
     ancestor_evidence="",
     extended_context="",
 ):
@@ -1359,6 +1427,7 @@ def _proposal_messages(
             repository_example=repository_example,
             repository_usage=repository_usage,
             repair_failed_tests=repair_failed_tests,
+            prefer_test_module=prefer_test_module,
             ancestor_evidence=ancestor_evidence,
             extended_context=extended_context,
         )
@@ -4253,6 +4322,11 @@ def solve(executor, task, archive, budget, version):
                         repository_example=repository_example or "",
                         repository_usage=repository_usage,
                         repair_failed_tests=target == _TEST_GOAL and bool(test_draft and test_diagnostic),
+                        prefer_test_module=bool(
+                            target == _TEST_GOAL and review.test_only
+                            and (test_run := test_case_runs.get("focused"))
+                            and test_run.named_cases and not test_run.passed and not test_run.deselected
+                        ),
                         ancestor_evidence=(
                             (test_ancestor_feedback or
                              "Write an assertion that passes here and fails on the pinned ancestor.")

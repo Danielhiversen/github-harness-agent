@@ -2847,12 +2847,12 @@ def test_solver_verifies_another_goal_while_a_provider_is_still_working(
     assert budget.model_requests_remaining() == 0
 
 
-@pytest.mark.parametrize("late_failure", ("stock", "focused", "setup-only"))
+@pytest.mark.parametrize("late_failure", ("stock", "focused", "setup-only", "stale-module"))
 def test_solver_repairs_an_unpublished_regression_test_in_place(
     solver_case, late_failure
 ):
     task, archive, runner, checkpoints = solver_case
-    bad_return = "(0, 0)" if late_failure == "focused" else "(1, 2)  # rejected-style"
+    bad_return = "(0, 0)" if late_failure in {"focused", "stale-module"} else "(1, 2)  # rejected-style"
     if late_failure == "stock":
         lint = (
             "from pathlib import Path\n"
@@ -2872,6 +2872,8 @@ def test_solver_repairs_an_unpublished_regression_test_in_place(
             f"    assert (first(), second()) == {bad_return}\n",
             "    assert (first(), second()) == (1, 2)\n",
         )
+        if late_failure == "stale-module":
+            repair = edit(NEW_TEST, bad_test.replace("(0, 0)", "(3, 4)"), TEST)
         expected_diagnostic = (
             "invalid style" if late_failure == "stock" else "test_results"
         )

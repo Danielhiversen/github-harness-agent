@@ -140,6 +140,50 @@ def test_wrapped_search_repair_uses_the_exact_labeled_target():
     ) == {PATH: MODULE.replace("sqrt(4) == 2", "sqrt(9) == 3")}
 
 
+@pytest.mark.parametrize("envelope", ("plain", "fenced", "labeled"))
+def test_stale_full_module_search_can_replace_only_the_unpublished_module(envelope):
+    old = MODULE.replace("sqrt(4) == 2", "sqrt(16) == 4")
+    new = MODULE.replace("sqrt(4) == 2", "sqrt(9) == 3")
+    block = f"<<<<<<< SEARCH\n{old}=======\n{new}>>>>>>> REPLACE"
+    reply = {
+        "plain": f"{PATH}\n{block}\n",
+        "fenced": f"```\n{PATH}\n{block}\n```",
+        "labeled": f"File: `{PATH}`\n```\n{block}\n```",
+    }[envelope]
+    options = dict(allow_module=True, failed_draft=True, limit=4096)
+    assert _apply_test_reply(reply, {PATH: MODULE}, PATH, **options) == {PATH: new}
+    for flag in ("allow_module", "failed_draft"):
+        with pytest.raises(ValueError):
+            _apply_test_reply(reply, {PATH: MODULE}, PATH, **{**options, flag: False})
+
+
+def test_stale_full_module_search_requires_unambiguous_old_and_new_modules():
+    fixture = '@pytest.fixture(name="coverage_value")\n'
+    draft = "import pytest\n" + MODULE + "\n" + fixture + "def pytest_helper():\n    return 7\n"
+    old = draft.replace("sqrt(4) == 2", "sqrt(16) == 4")
+    new = draft.replace("sqrt(4) == 2", "sqrt(9) == 3")
+
+    def block(path, before, after):
+        return f"{path}\n<<<<<<< SEARCH\n{before}=======\n{after}>>>>>>> REPLACE\n"
+
+    options = dict(allow_module=True, failed_draft=True, limit=4096)
+    assert _apply_test_reply(block(PATH, old, new), {PATH: draft}, PATH, **options) == {PATH: new}
+    for reply in (
+        block(PATH, old.split("\n\n")[1] + "\n", new),
+        block(PATH, old.split(fixture)[0], new),
+        block(PATH, old, MODULE),
+        block(PATH, old, new.replace("from math import sqrt", "import math")),
+        block(PATH, old, new.replace(fixture, "")),
+        block(PATH, old, new + "return 5\n"),
+        block(PATH, old, new) + block(PATH, old, new),
+        block("tests/test_other.py", old, new),
+    ):
+        with pytest.raises(ValueError):
+            _apply_test_reply(reply, {PATH: draft}, PATH, **options)
+    with pytest.raises(ValueError):
+        _apply_test_reply(block(PATH, old, new), {PATH: draft}, PATH, **{**options, "limit": 24})
+
+
 def test_wrapped_complete_module_preserves_existing_tests_and_imports():
     draft = MODULE + "\nclass TestValues:\n    def test_sibling(self):\n        assert sqrt(16) == 4\n"
     repaired = draft.replace("sqrt(4) == 2", "sqrt(9) == 3")
