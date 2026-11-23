@@ -5,8 +5,50 @@ import pytest
 from github_harness_agent.review_definitions import (
     apply_definitions,
     apply_native_definition,
+    apply_scoped_raw_definition,
+    reviewed_nested_helper,
 )
 from github_harness_agent.task_context import compact_focused_review
+
+
+def test_raw_reply_binds_only_to_one_reviewed_nested_helper():
+    path = "module.py"
+    source = (
+        "def run(value):\n"
+        "    base = 2\n"
+        "    unrelated = 5\n"
+        "    def helper(number: int) -> int:\n"
+        "        return base + number\n"
+        "    return helper(value)\n"
+    )
+    assert reviewed_nested_helper(source, 2) == (
+        "run.helper", "def helper(number: int) -> int:\n    return base + number", ("helper(value)",),
+    )
+    assert reviewed_nested_helper(source + "\n", 20) is None
+    assert reviewed_nested_helper(
+        source.replace("    return helper(value)", "    def other():\n        pass\n    return helper(value)"), 2
+    ) is None
+    symbol = (path, "run.helper")
+    replacement = "def helper(number):\n    return base * number"
+    assert apply_scoped_raw_definition(replacement, {path: source}, symbol) == {
+        path: source.replace("base + number", "base * number"),
+    }
+    assert apply_scoped_raw_definition(f"```python\n{replacement}\n```", {path: source}, symbol) == {
+        path: source.replace("base + number", "base * number"),
+    }
+    for answer in (
+        replacement.replace("def helper", "def other"),
+        replacement + "\nvalue = 4",
+        "REPLACE module.py::run.helper\n" + replacement,
+        f"Here is the helper.\n```python\n{replacement}\n```",
+        f"```diff\n{replacement}\n```",
+        replacement.replace("def helper(number)", "def helper(number, extra)"),
+        "def helper(number):\n    nonlocal undefined_outer_name\n    return base * number",
+    ):
+        with pytest.raises(ValueError):
+            apply_scoped_raw_definition(answer, {path: source}, symbol)
+    with pytest.raises(ValueError):
+        apply_scoped_raw_definition(replacement, {path: source.replace("def helper", "def extra")}, symbol)
 
 
 def test_qualified_replace_updates_one_method_and_adds_only_imports():

@@ -133,6 +133,62 @@ def visible_nested_definitions(source, shown, anchor):
     return tuple(names)
 
 
+def reviewed_nested_helper(source, anchor):
+    """Return one uniquely shown nested helper and calls in its short reviewed owner."""
+    try:
+        module = _parse(source, "Reviewed source")
+    except ValueError:
+        return None
+    owners = [
+        (name, node) for name, node in _symbols(module.body)
+        if isinstance(node, _FUNCTION) and _definition_start(node) <= anchor <= node.end_lineno
+    ]
+    if len(owners) != 1:
+        return None
+    owner_name, owner = owners[0]
+    lines = source.splitlines()
+    shown = "\n".join(lines[_definition_start(owner) - 1:owner.end_lineno])
+    if owner.end_lineno - _definition_start(owner) >= 90 or len(shown.encode()) > 3600:
+        return None
+    nested = [node for node in ast.walk(owner) if node is not owner and isinstance(node, _FUNCTION)]
+    if len(nested) != 1:
+        return None
+    helper = nested[0]
+    name = f"{owner_name}.{helper.name}"
+    if visible_nested_definitions(source, shown, anchor) != (name,):
+        return None
+    calls = [
+        ast.get_source_segment(source, call)
+        for call in ast.walk(owner)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == helper.name
+        and owner.body[0].lineno <= call.lineno
+        and not _definition_start(helper) <= call.lineno <= helper.end_lineno
+    ]
+    if not calls or len(calls) > 3 or not all(calls) or sum(len(call.encode()) for call in calls) > 900:
+        return None
+    body = "\n".join(lines[_definition_start(helper) - 1:helper.end_lineno])
+    return name, textwrap.dedent(body), tuple(calls)
+
+
+def apply_scoped_raw_definition(response, sources, symbol):
+    """Bind plain Python only to a previously selected, existing nested function."""
+    path, name = symbol
+    if not isinstance(response, str) or len(response.encode()) > 4096 or path not in sources:
+        raise ValueError("Expected one complete Python helper within the edit limit")
+    body = _unfence(response.replace("\r\n", "\n"))
+    nodes = _parse(body, path).body
+    scopes = _qualified_scope(_definition_index(_parse(sources[path], path)), name)
+    if (
+        not scopes or not any(isinstance(owner, _FUNCTION) for owner in scopes[:-1])
+        or len(nodes) != 1 or not isinstance(nodes[0], _FUNCTION)
+        or _definition_start(nodes[0]) != 1 or nodes[0].end_lineno != len(body.splitlines())
+    ):
+        raise ValueError("Expected only the selected complete nested Python function")
+    return apply_definitions(
+        f"REPLACE {path}::{name}\n{body}", sources, only=symbol, single_function=True,
+    )
+
+
 def _imports(nodes):
     if not nodes or any(
         not isinstance(node, _IMPORT)

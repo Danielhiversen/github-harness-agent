@@ -64,6 +64,8 @@ from .review_definitions import (
     _symbols,
     apply_definitions,
     apply_native_definition,
+    apply_scoped_raw_definition,
+    reviewed_nested_helper,
     visible_nested_definitions,
 )
 from .review_guard_probe import stock_guard_diagnostic
@@ -1644,6 +1646,7 @@ def _coding_completion(
     scoped_line=False,
     native_test_path=None,
     native_line_retry=None,
+    raw_python=False,
 ):
     fresh_advice = None
     if planner_input is not None:
@@ -1764,7 +1767,7 @@ def _coding_completion(
                 2048 if scoped_line
                 else 3072 if fresh_line_snapshot is not None else max_tokens
             ),
-            retry_oversize=not scoped_line,
+            retry_oversize=not (scoped_line or raw_python),
         )
     except ProviderExhausted:
         if fresh_line_snapshot is None:
@@ -1879,6 +1882,34 @@ def _review_anchored_line_retry(review, sources, path, node, diagnostic):
             return retry
     window = prepare_window_line_range_edit(sources, symbol, ((max(1, anchor - 5), anchor + 9),))
     return bounded_retry(*window) if window else None
+
+
+def _raw_nested_messages(review, source, path, node, diagnostic):
+    if len(review.feedback) != 1 or review.feedback[0][0] != path:
+        return None
+    _, anchor, request = review.feedback[0]
+    if not (scope := reviewed_nested_helper(source[path], anchor)):
+        return None
+    name, helper, calls = scope
+    return (path, name), [
+        {
+            "role": "system",
+            "content": _SYSTEM_PREFIX
+            + "Return only one complete Python function with the same name and signature.\n"
+            + _SYSTEM_SUFFIX,
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Selected failure: {node}\n"
+                f"Reviewed request (quoted):\n{excerpt(request, 900)}\n"
+                f"Verified pytest failure (quoted):\n{excerpt(diagnostic, 700)}\n"
+                f"Current helper {path}::{name} (quoted):\n{helper}\n"
+                f"Calls from its parent (quoted):\n" + "\n".join(calls)
+                + "\nReturn only the complete Python function for this helper."
+            ),
+        },
+    ]
 
 
 @dataclass(frozen=True)
@@ -2348,6 +2379,8 @@ def solve(executor, task, archive, budget, version):
     retained_recovery = task.solver_recovery
     alternate = None
     test_seed = None
+    restored_raw_targets = set()
+    restored_raw_patch = patch
     if retained_recovery and retained_recovery.identity == retained_identity:
         alternate = retained_recovery.alternate
         if task.require_new_tests and not failures and not current[new_path]:
@@ -2355,6 +2388,8 @@ def solve(executor, task, archive, budget, version):
         goals = {goal: (bad, stalled) for goal, bad, stalled in retained_recovery.goals}
         for target in failures:
             bad, stalled = goals.get(_goal_digest(target), (0, 0))
+            if production_regression and min(bad, stalled) >= RECOVERY_MODE_THRESHOLD:
+                restored_raw_targets.add(target)
             if bad:
                 malformed[target] = bad
             if stalled:
@@ -3528,6 +3563,7 @@ def solve(executor, task, archive, budget, version):
     line_routes = {}
     iteration_attempted = set()
     anchored_line_attempted = set()
+    raw_nested_attempts = {}
 
     def retry_numbered_route(target, line_retry, editor, *, malformed=False):
         if (
@@ -4198,6 +4234,42 @@ def solve(executor, task, archive, budget, version):
                         and (line_retry.checkout is not current or repair is not None)
                     ):
                         line_retry = None
+                    if (
+                        production_regression and repair is None and target in operator
+                        and launch_budget >= 2
+                        and (
+                            attempts[target] >= 5
+                            or (target in restored_raw_targets and patch == restored_raw_patch)
+                        )
+                        and malformed.get(target, 0) >= RECOVERY_MODE_THRESHOLD
+                        and (observed := pytest_runs.get(target[0])) is not None
+                        and target[1] in observed.failed
+                        and (prior_raw := raw_nested_attempts.get(hashlib.sha256(patch).digest(), ())) is not None
+                        and len(prior_raw) < 3
+                    ):
+                        revision = hashlib.sha256(patch).digest()
+                        # Close this slot while the request runs. Failed formats or
+                        # unchanged checks can reopen it for a different coding model.
+                        raw_nested_attempts[revision] = None
+                        raw_retry = _raw_nested_messages(
+                            _draft_review(review, original, current), current,
+                            task.regression_edit_path, target[1], failures[target],
+                        )
+                        if raw_retry is not None:
+                            if line_retry is not None:
+                                line_retries[target] = line_retry
+                            symbol, messages = raw_retry
+                            future = pool.submit(
+                                _coding_completion, executor, budget, messages,
+                                last_routes.get(target), None, exclude=prior_raw, raw_python=True,
+                            )
+                            pending[future] = (
+                                target, current, None, False, None, (None, False),
+                                None, None, None, False, None, (symbol, revision, prior_raw), None,
+                            )
+                            submitted += 1
+                            launch_budget -= 1
+                            continue
                     scoped_line = (
                         line_retry is not None and line_retry.allowed_rows is not None
                     )
@@ -4602,6 +4674,7 @@ def solve(executor, task, archive, budget, version):
                         line_followup,
                         allow_test_module,
                         test_line_snapshot,
+                        None,
                         repair,
                     )
                     if (
@@ -4652,12 +4725,14 @@ def solve(executor, task, archive, budget, version):
                 line_followup,
                 allow_test_module,
                 test_line_snapshot,
+                raw_nested,
                 repair,
             ) = pending.pop(future)
             scoped_line = line_retry is not None and line_retry.allowed_rows is not None
             if (
                 paired or continuation is not None or advised
                 or repair is not None or scoped_line or test_line_snapshot is not None
+                or raw_nested is not None
             ) and snapshot is not current:
                 continue
             if (
@@ -4679,6 +4754,8 @@ def solve(executor, task, archive, budget, version):
                     _LOG.info("Numbered review edit format had no available coding route")
                 elif test_line_snapshot is not None:
                     _LOG.info("Numbered pytest edit format had no available coding route")
+                elif raw_nested is not None:
+                    _LOG.info("Raw nested Python edit had no available coding route")
                 elif rotated:
                     if snapshot is current:
                         # Reopen this goal's model choices for the rest of this draft.
@@ -4726,6 +4803,11 @@ def solve(executor, task, archive, budget, version):
             )
             routes[target] = completion.route
             editor = RouteEvidence.from_completion(completion)
+            if raw_nested is not None:
+                raw_symbol, raw_revision, prior_raw = raw_nested
+                raw_model = editor.route, editor.configured_model
+                if not editor.configured_model or raw_model in prior_raw:
+                    continue
             try:
                 source = current if continuation is None else continuation[0]
                 if repair is not None:
@@ -4734,6 +4816,8 @@ def solve(executor, task, archive, budget, version):
                     source = {new_path: test_draft}
                 try:
                     candidate = native_candidate
+                    if raw_nested is not None:
+                        candidate = apply_scoped_raw_definition(completion.content, source, raw_symbol)
                     if target == _TEST_GOAL:
                         if test_line_snapshot is not None:
                             candidate = apply_line_range_edit(
@@ -4895,6 +4979,8 @@ def solve(executor, task, archive, budget, version):
                 _LOG.info("Rejected private review proposal: %s", error)
                 continue
             except ValueError as error:
+                if raw_nested is not None:
+                    raw_nested_attempts[raw_revision] = (*prior_raw, raw_model)
                 if fresh_stock:
                     interactive_misses[target] += 1
                 if fresh_line_snapshot is not None and snapshot is current:
@@ -5361,6 +5447,11 @@ def solve(executor, task, archive, budget, version):
                 or stale_regression
                 or not (progressed or partial or prefix_progress)
             ):
+                if raw_nested is not None:
+                    if after.keys() == failures.keys():
+                        raw_nested_attempts[raw_revision] = (*prior_raw, raw_model)
+                    notes[target] = "The scoped helper replacement did not improve the verified checks."
+                    continue
                 count_model_failure(rotation_key, snapshot, editor)
                 if after.keys() == failures.keys():
                     retry_numbered_route(target, line_retry, editor)
