@@ -402,9 +402,9 @@ def test_exhaustion_identifies_all_excluded_only_if_their_routes_were_eligible()
 
 
 @pytest.mark.parametrize(
-    ("timeout", "expected"), [(None, [40, 20]), (120, [40, 40, 40])]
+    ("timeout", "expected"), [(None, [20, 20, 20]), (120, [40, 40, 40])]
 )
-def test_explicit_long_deadline_can_reach_fallback_past_sixty_seconds(
+def test_default_and_explicit_deadlines_give_each_provider_a_turn(
     monkeypatch, timeout, expected
 ):
     clock = [0.0]
@@ -425,15 +425,53 @@ def test_explicit_long_deadline_can_reach_fallback_past_sixty_seconds(
         raise httpx.ReadTimeout("fixture")
 
     router = routed(config, handle)
-    if timeout is None:
-        with pytest.raises(ProviderExhausted):
-            router.complete(role="plain", messages=[])
-    else:
-        assert (
-            router.complete(role="plain", messages=[], timeout=timeout).route
-            == "ollama-local"
-        )
+    assert (
+        router.complete(role="plain", messages=[], timeout=timeout).route
+        == "ollama-local"
+    )
     assert attempts == expected
+
+
+def test_timeout_reserve_counts_accounts_instead_of_sibling_models(monkeypatch):
+    monkeypatch.setattr(
+        providers, "time", SimpleNamespace(monotonic=lambda: 0.0, time=time.time)
+    )
+    config = deployment(KILO, "kilo-free/reflection/beam-free", OPENROUTER)
+    config[0].update(quality_priority=10, attempt_timeout=60)
+
+    def handle(request):
+        assert request.extensions["timeout"]["read"] == 40
+        return httpx.Response(200, json=openai_response())
+
+    assert routed(config, handle).complete(role="plain", messages=[]).route == "kilo-free"
+
+
+@pytest.mark.parametrize("status", [404, 410])
+def test_unavailable_model_cools_down_without_blocking_siblings(monkeypatch, status):
+    clock = [1000.0]
+    monkeypatch.setattr(
+        providers, "time", SimpleNamespace(monotonic=time.monotonic, time=lambda: clock[0])
+    )
+    sibling = "reflection/beam-free"
+    unavailable = KILO.split("/", 1)[1]
+    config = deployment(KILO, f"kilo-free/{sibling}")
+    config[0]["quality_priority"] = 10
+    calls = []
+
+    def handle(request):
+        model = json.loads(request.content)["model"]
+        calls.append(model)
+        if model == unavailable:
+            return httpx.Response(status)
+        return httpx.Response(200, json=openai_response())
+
+    router = routed(config, handle)
+    for _ in range(2):
+        router.complete(role="plain", messages=[])
+    assert calls == [unavailable, sibling, sibling]
+    clock[0] += 901
+    router.complete(role="plain", messages=[])
+    assert calls[-2:] == [unavailable, sibling]
 
 
 def test_import_preserves_exact_parity_without_copying_deployment_values():

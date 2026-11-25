@@ -161,11 +161,10 @@ def requests_regression_production(body: str) -> bool:
 
 def authorized_regression_request(feedback: Iterable[Mapping]) -> tuple[str | None, str | None]:
     """Return the pinned revision and the explicitly authorized production path, if any."""
-    items = tuple(feedback)
-    revisions = set()
+    revision = None
     edit_path = None
     directive = "Verify regression against:"
-    for item in items:
+    for item in feedback:
         if not (
             item.get("key", "").startswith("comment:")
             and item.get("author") and item.get("path") and item.get("thread") and item.get("reply_to")
@@ -181,6 +180,8 @@ def authorized_regression_request(feedback: Iterable[Mapping]) -> tuple[str | No
                 sha = line.strip().removeprefix(directive).strip().lower()
                 if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
                     raise ValueError("Verify regression against requires a full commit SHA")
+                if revision is not None:
+                    raise ValueError("Use one regression verification directive per review batch")
                 if mixed:
                     path = item["path"]
                     parts = PurePosixPath(path).parts
@@ -192,10 +193,8 @@ def authorized_regression_request(feedback: Iterable[Mapping]) -> tuple[str | No
                     ):
                         raise ValueError("A mixed regression review must authorize one reviewed Python production file")
                     edit_path = path
-                revisions.add(sha)
-    if revisions and (len(items) != 1 or len(revisions) != 1):
-        raise ValueError("Use one regression verification SHA in a standalone inline review")
-    return next(iter(revisions), None), edit_path
+                revision = sha
+    return revision, edit_path
 
 
 def authorized_regression_base(feedback: Iterable[Mapping]) -> str | None:

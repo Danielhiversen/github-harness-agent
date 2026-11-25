@@ -42,6 +42,7 @@ from .task_context import (
 
 logger = logging.getLogger(__name__)
 DEFAULT_REQUEST_TIMEOUT = 60
+FALLBACK_RESERVE_SECONDS = 20
 MAX_REQUEST_TIMEOUT = 900
 _FOCUSED_RETRY_INPUT_BYTES = 12 * 1024
 _FOCUSED_RETRY_OUTPUT_TOKENS = 1536
@@ -53,6 +54,7 @@ _LOCAL_MODEL_NAME = re.compile(
 )
 _LOCAL_ATTEMPT_MAX = 480
 _MODEL_BACKOFF_SECONDS = 15
+_UNAVAILABLE_MODEL_BACKOFF_SECONDS = 15 * 60
 _INFERENCE_BACKOFF_MAX_SECONDS = 900
 
 PUBLIC_ALIASES = frozenset(
@@ -915,6 +917,12 @@ class ProviderRouter:
                 if blocked is None:
                     deferred.pop(key, None)
                     self._in_flight.add(route.quota_key)
+                    fallback_accounts = {
+                        candidate.quota_key
+                        for candidate in pending.values()
+                        if candidate.quota_key != route.quota_key
+                        and self._quota_block(candidate, wall_time) is None
+                    }
                 else:
                     deferred[key] = route
             if blocked is not None:
@@ -940,7 +948,12 @@ class ProviderRouter:
                 )
                 if route.model == _NEMOTRON and not extended:
                     attempt_limit = min(60, attempt_limit)
-                attempt_deadline = min(deadline, now + attempt_limit)
+                # Reserve time for each other available account's first turn.
+                # Fast failures return their unused time to the next attempt.
+                remaining = deadline - now
+                other_accounts = len(fallback_accounts)
+                reserve = min(FALLBACK_RESERVE_SECONDS, remaining / (1 + other_accounts))
+                attempt_deadline = now + min(attempt_limit, remaining - reserve * other_accounts)
                 max_tokens = min(
                     route.max_tokens, max_output_tokens or route.max_tokens
                 )
@@ -1126,7 +1139,11 @@ class ProviderRouter:
                     403: "account or model ineligible",
                     404: "model unavailable",
                 }.get(status, f"upstream HTTP {status}")
-                if status is not None and status >= 500:
+                if status in {404, 410}:
+                    retry_times[key] = self._defer_model(
+                        key, _UNAVAILABLE_MODEL_BACKOFF_SECONDS
+                    )
+                elif status is not None and status >= 500:
                     retry_times[key] = self._defer_model(key)
             except (httpx.TimeoutException, TimeoutError) as exc:
                 logger.info(

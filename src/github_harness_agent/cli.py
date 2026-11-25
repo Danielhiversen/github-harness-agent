@@ -55,12 +55,35 @@ def _provider_failure_map(failures, aliases):
     return safe
 
 
+def _archive_candidate_failures(data):
+    failures = data.pop("model_attempt_failures", [])
+    if not failures:
+        return
+    from .executor import is_review_round_record
+
+    recent = [*data.get("prior_model_attempt_failures", ()), *failures][-16:]
+    data["prior_model_attempt_failures"] = [
+        attempt
+        if is_review_round_record(attempt)
+        else {
+            "candidate": {
+                field: value[:160]
+                for field, value in attempt.get("candidate", {}).items()
+                if field in {"role", "route", "model", "configured_model"}
+                and isinstance(value, str)
+            },
+            "reason": str(attempt.get("reason", "")).split(":", 1)[0][:160],
+        }
+        for attempt in recent
+    ]
+
+
 def _defer_provider(store, job, error, aliases):
     data = job["data"]
     previous = data.get("provider_retry_count", 0)
     count = 1 + previous if type(previous) is int and previous > 0 else 1
     now = store.clock()
-    delay = min(3600, 30 * 2 ** min(count - 1, 7))
+    delay = 3 * 60 * 60
     try:
         cooldown = float(error.retry_at) if type(error.retry_at) in {int, float} else 0
     except OverflowError:
@@ -73,30 +96,7 @@ def _defer_provider(store, job, error, aliases):
         provider_failures=_provider_failure_map(error.failures, aliases),
         retry_at=now + delay,
     )
-    if error.failures == {"gateway": _EXCLUDED_MODELS}:
-        from .executor import is_review_round_record
-
-        failures = data.pop("model_attempt_failures", [])
-        if failures:
-            previous_rounds = [
-                item
-                for item in data.get("prior_model_attempt_failures", ())
-                if is_review_round_record(item)
-            ]
-            data["prior_model_attempt_failures"] = [
-                attempt
-                if is_review_round_record(attempt)
-                else {
-                    "candidate": {
-                        field: value[:160]
-                        for field, value in attempt.get("candidate", {}).items()
-                        if field in {"role", "route", "model", "configured_model"}
-                        and isinstance(value, str)
-                    },
-                    "reason": str(attempt.get("reason", "")).split(":", 1)[0][:160],
-                }
-                for attempt in [*previous_rounds, *failures][-16:]
-            ]
+    _archive_candidate_failures(data)
     store.save(job, "queued", delay=delay)
 
 
@@ -244,6 +244,11 @@ def run_worker(store, config, once=False, *, pull: tuple[str, int] | None = None
         if job:
             before = (job["data"]["stage"], job["data"].get("last_commit"))
             try:
+                data = job["data"]
+                if data.get("last_error") == PROVIDER_EXHAUSTED and "retry_at" in data:
+                    # Also recover exclusions saved before exhaustion archived them.
+                    _archive_candidate_failures(data)
+                    data.pop("retry_at")
                 controllers[job["repo"]].run(job)
             except LeaseLost:
                 pass

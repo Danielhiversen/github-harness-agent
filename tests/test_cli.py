@@ -315,7 +315,7 @@ def test_provider_cooldown_and_backoff_are_durable_and_only_clear_on_progress(
     outcomes = iter(
         [
             providers.ProviderExhausted(
-                150,
+                12_000,
                 {
                     "kilo-free": "rate limited",
                     "groq-free": "secret or response text",
@@ -348,22 +348,22 @@ def test_provider_cooldown_and_backoff_are_durable_and_only_clear_on_progress(
 
     work()
     record = _stored_job(store, "pull", 20)
-    assert record["state"] == "queued" and record["due"] == 150
+    assert record["state"] == "queued" and record["due"] == 12_000
     assert record["data"]["provider_failures"] == {
         "kilo-free": "rate limited",
         "groq-free": "unclassified failure",
     }
     work()
     assert contexts == [0]
-    now[0] = 150
+    now[0] = 12_000
     work()
     record = _stored_job(store, "pull", 20)
-    assert record["state"] == "queued" and record["due"] == 210
+    assert record["state"] == "queued" and record["due"] == 22_800
     assert (
-        record["data"]["retry_at"] == 210
+        record["data"]["retry_at"] == 22_800
         and record["data"]["provider_retry_count"] == 2
     )
-    now[0] = 210
+    now[0] = 22_800
     work()
     assert _stored_job(store, "pull", 20)["data"]["provider_retry_count"] == 2
     work()
@@ -375,8 +375,12 @@ def test_provider_cooldown_and_backoff_are_durable_and_only_clear_on_progress(
     assert contexts == [0, 1, 2, 2]
 
 
-def test_all_excluded_retries_after_resetting_only_active_candidate_exclusions(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize("failure", [
+    {"gateway": "all eligible models excluded"},
+    {"kilo-free": "rate limited", "groq-free": "model unavailable"},
+])
+def test_provider_exhaustion_resets_active_candidate_exclusions(
+    monkeypatch, tmp_path, failure
 ):
     def run(store, job):
         job["data"]["provider_retry_count"] = 100
@@ -392,14 +396,14 @@ def test_all_excluded_retries_after_resetting_only_active_candidate_exclusions(
             for number in range(20)
         ]
         raise providers.ProviderExhausted(
-            101, {"gateway": "all eligible models excluded"}
+            101, failure
         )
 
     repo, now, store, config = _provider_test_worker(monkeypatch, tmp_path, run)
     _seed_retry_pull(store, repo, 20)
     cli.run_worker(store, config, once=True, pull=(repo, 20))
     record = _stored_job(store, "pull", 20)
-    assert record["state"] == "queued" and record["due"] == now[0] + 3600
+    assert record["state"] == "queued" and record["due"] == now[0] + 10_800
     assert "model_attempt_failures" not in record["data"]
     assert record["data"]["prior_model_attempt_failures"] == [
         {
@@ -408,6 +412,34 @@ def test_all_excluded_retries_after_resetting_only_active_candidate_exclusions(
         }
         for number in range(4, 20)
     ]
+
+
+def test_provider_retry_archives_legacy_exclusions_once(monkeypatch, tmp_path):
+    failure = {"candidate": {"route": "kilo-free", "configured_model": "test"}, "reason": "empty patch"}
+    draft = {"drafts": {"harness2/base": {"patch": "saved"}}}
+    seen = []
+
+    def run(store, job):
+        data = job["data"]
+        seen.append(data.get("model_attempt_failures", []))
+        assert data["prior_model_attempt_failures"] == [failure]
+        assert data["draft_checkpoints"] == draft
+        data["model_attempt_failures"] = [failure]
+        store.save(job, "queued")
+
+    repo, now, store, config = _provider_test_worker(monkeypatch, tmp_path, run)
+    _seed_retry_pull(store, repo, 20)
+    job = store.claim(pull=(repo, 20))
+    job["data"].update(
+        last_error="provider routes exhausted",
+        retry_at=now[0],
+        model_attempt_failures=[failure],
+        draft_checkpoints=draft,
+    )
+    store.save(job, "queued")
+    for _ in range(2):
+        cli.run_worker(store, config, once=True, pull=(repo, 20))
+    assert seen == [[], [failure]]
 
 
 def test_aggregate_review_exhaustion_uses_existing_retry_ceiling(monkeypatch, tmp_path):

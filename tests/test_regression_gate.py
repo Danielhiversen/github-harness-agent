@@ -43,6 +43,14 @@ def test_mixed_regression_must_explicitly_authorize_a_reviewed_production_file()
         "path": "src/value.py", "body": f"{command}\nVerify regression against: {sha}",
     }
     assert authorized_regression_request([item]) == (sha, "src/value.py")
+    batch = [
+        {"key": "review:2", "author": "maintainer", "body": "Fix the queue."},
+        {**item, "key": "comment:3", "body": "Preserve existing region counts."},
+        item,
+    ]
+    assert authorized_regression_request(batch) == (sha, "src/value.py")
+    with pytest.raises(ValueError, match="one regression verification"):
+        authorized_regression_request([*batch, {**item, "key": "comment:4", "path": "src/other.py"}])
     assert authorized_regression_request([{**item, "body": "> " + item["body"]}]) == (None, None)
     with pytest.raises(ValueError, match="production"):
         authorized_regression_request([{**item, "path": "tests/test_existing.py"}])
