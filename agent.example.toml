@@ -7,7 +7,9 @@ installation_id = 12345
 mode = "shadow"
 backend = "plain"
 base = "main"
-label = "agent:ready"
+# assignee = "assignable-account"  # Defaults to bot_login; may differ from App author.
+# Optional extra gate; assignment to the selected account is always required.
+# label = "agent:ready"
 branch_prefix = "agent/"
 worker_image = "your-tested-worker-image"
 # verification_image = "your-trusted-verification-image"

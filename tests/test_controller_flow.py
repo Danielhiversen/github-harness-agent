@@ -45,7 +45,7 @@ def test_candidate_diagnostics_log_check_categories_without_private_data(caplog)
     "scenario",
     [
         "stable", "moving", "conflict", "fallback", "aggregate", "aggregate-legacy",
-        "moving-operator-failure",
+        "moving-operator-failure", "partial-review", "edited-issue", "unassigned-issue",
     ],
 )
 def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario, caplog):
@@ -101,7 +101,8 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario, 
         return git(repo, "rev-parse", "HEAD").decode().strip()
 
     issue = dict(
-        number=3, title="change value", state="open", labels=[{"name": "agent:ready"}]
+        number=3, title="change value", state="open", labels=[{"name": "agent:ready"}],
+        assignees=[{"login": "app[bot]"}]
     )
 
     class API(FakeGitHub):
@@ -197,6 +198,14 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario, 
                 feedback = json.loads(
                     task.instructions.split("Review requests against this commit:\n")[1]
                 )
+                if (
+                    scenario == "partial-review"
+                    and feedback[0]["key"] == "second-revision"
+                ):
+                    assert len(feedback) == 1
+                    raise controller.NeedsClarification(
+                        "Which example should the second request change?"
+                    )
                 assert [item["line"] for item in feedback] == [1]
                 assert [item["key"] for item in feedback] == ["review-revision"]
                 if move_target:
@@ -214,6 +223,14 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario, 
                 )
             (path / "value").write_text("two\n" if is_review else "one\n")
             patch = git(path, "diff")
+            if scenario == "unassigned-issue":
+                issue["assignees"] = []
+            if scenario == "edited-issue":
+                if "Previous requirements" not in task.instructions:
+                    issue["body"] = "updated requirement"
+                else:
+                    assert "updated requirement" in task.instructions
+                    assert b"+one" in task.checkpoints["plain/coding"].patch
             return SimpleNamespace(
                 patch=patch,
                 checks=(CheckEvidence(("test",), 0, "ok"),),
@@ -249,10 +266,21 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario, 
     cfg = {"checks": [["test"]], "base": "main", "mode": "canary"}
     if operator_failure:
         cfg.update(checks=[list(stock_check)], pull_checks={"21": [list(operator_check)]})
-    reconcile(api, db, "a/b", cfg)
+    reconcile(api, db, "a/b", {**cfg, "bot_login": "app[bot]"})
     if move_target:
         target["main"] = commit_file(base, "main-before", "main moved before editing\n")
     run = Controller(db, api, Executor(), cfg, "app[bot]").run
+    if scenario in {"edited-issue", "unassigned-issue"}:
+        from github_harness_agent.store import LeaseLost
+        with pytest.raises(LeaseLost):
+            run(db.claim())
+        assert not api.pulls and api.branch is None
+        if scenario == "unassigned-issue":
+            assert db.claim() is None
+            return
+        run(db.claim())
+        assert len(api.pulls) == 1
+        return
     run(db.claim())
     if scenario == "fallback":
         assert not api.pulls and api.branch is None
@@ -308,10 +336,25 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario, 
         "@@ -5 +5 @@\n-before\n+after",
         "RIGHT",
     )
+    second = Feedback(
+        "second-revision",
+        "second-thread",
+        6,
+        "Change the second example",
+        "owner",
+        "value",
+        1,
+    )
     monkeypatch.setattr(
         controller,
         "collect_reviews",
-        lambda *a, **kw: ReviewBatch(first, (item,) if operator_failure else (item, ambiguous)),
+        lambda *a, **kw: ReviewBatch(
+            api.branch,
+            tuple(candidate for candidate in (
+                (item, second, ambiguous) if scenario == "partial-review" else
+                (item,) if operator_failure else (item, ambiguous)
+            ) if candidate.key not in kw.get("seen", ())),
+        ),
     )
     replies = []
     lag = True
@@ -396,6 +439,9 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario, 
     clock[0] += 16
     retry = db.claim()
     assert retry["data"]["stage"] == "reply"
+    assert retry["data"]["review_outcomes"][item.key]["status"] == "addressed"
+    assert retry["data"]["review_outcomes"][item.key]["commit"] == api.branch
+    assert not retry["data"]["review_outcomes"][item.key].get("replied")
     run(retry)
     assert git(repo, "show", api.branch + ":value") == b"two\n"
     if move_target:
@@ -421,6 +467,24 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario, 
         state["seen"] == ["ambiguous-revision", "review-revision"]
         and state["stage"] == "watch"
     )
+    if scenario == "partial-review":
+        assert state["review_outcomes"][item.key]["status"] == "addressed"
+        assert second.key not in state["seen"]
+        assert state["review_outcomes"][item.key]["changes"]
+        commit = api.branch
+        clock[0] += 46
+        run(db.claim())
+        clock[0] += 1
+        run(db.claim())
+        assert api.branch == commit
+        assert len(replies) == 3
+        assert replies[-1]["item"].key == second.key
+        assert replies[-1]["commit"] is None
+        assert "second request" in replies[-1]["question"]
+        with db.tx() as conn:
+            state = json.loads(conn.execute("SELECT data FROM tasks").fetchone()[0])
+        assert state["review_outcomes"][second.key]["status"] == "clarification"
+        assert state["review_outcomes"][item.key]["commit"] == commit
 
 
 @pytest.mark.parametrize("revoke", [False, True])
@@ -529,3 +593,37 @@ def test_adopted_job_repairs_only_the_existing_branch_without_issue_eligibility(
         assert b"Address review feedback on PR #25" in git(
             repo, "log", "-1", "past/feature"
         )
+
+
+def test_adopted_issue_pull_stops_when_originating_issue_is_unassigned(tmp_path):
+    from github_harness_agent.store import LeaseLost
+    from test_intake import PullListing
+
+    store = Store(tmp_path / "db")
+    store.enqueue(
+        "owner/repo",
+        5,
+        {
+            "stage": "watch",
+            "pull": 20,
+            "title": "issue",
+            "body": "",
+            "branch": "agent/issue-5",
+        },
+    )
+    request = pull(20, "agent/issue-5")
+
+    class API(PullListing):
+        def rest(self, method, path):
+            if path.endswith("/pulls/20"):
+                return request
+            assert path.endswith("/issues/5")
+            return {"number": 5, "state": "open", "assignees": [], "title": "issue"}
+
+    api = API([request])
+    adopt_open_pulls(api, store, "owner/repo", {}, "agent-user")
+    job = store.claim()
+    assert job["kind"] == "pull"
+    with pytest.raises(LeaseLost):
+        Controller(store, api, object(), {"checks": [["test"]]}, "agent-user").run(job)
+    assert store.claim() is None

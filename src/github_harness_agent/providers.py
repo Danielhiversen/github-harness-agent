@@ -15,7 +15,7 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from email.utils import parsedate_to_datetime
 from importlib.resources import files
 from itertools import zip_longest
@@ -182,10 +182,17 @@ class Completion:
 
 
 class ProviderExhausted(RuntimeError):
-    def __init__(self, retry_at: float | None, failures: dict[str, str] | None = None):
+    def __init__(
+        self,
+        retry_at: float | None,
+        failures: dict[str, str] | None = None,
+        *,
+        usage=None,
+    ):
         super().__init__("No eligible model is currently available")
         self.retry_at = retry_at
         self.failures = failures or {}
+        self.usage = usage
 
 
 @dataclass(frozen=True)
@@ -377,6 +384,32 @@ def _chat_payload(
     return body
 
 
+def _response_tokens(route, body):
+    if route.protocol == "gemini":
+        usage = body.get("usageMetadata") or {}
+        inputs = usage.get("promptTokenCount")
+        outputs = None
+        if "candidatesTokenCount" in usage or "thoughtsTokenCount" in usage:
+            parts = (
+                usage.get("candidatesTokenCount", 0),
+                usage.get("thoughtsTokenCount", 0),
+            )
+            if any(type(value) is not int or value < 0 for value in parts):
+                raise ValueError("Invalid token usage")
+            outputs = sum(parts)
+    else:
+        usage = body.get("usage") or {}
+        inputs, outputs = usage.get("prompt_tokens"), usage.get("completion_tokens")
+    counts = {
+        key: value
+        for key, value in (("input_tokens", inputs), ("output_tokens", outputs))
+        if value is not None
+    }
+    if any(type(value) is not int or value < 0 for value in counts.values()):
+        raise ValueError("Invalid token usage")
+    return counts
+
+
 def _decode(
     route: _Route, role: str, body: dict, tools: Sequence[Mapping]
 ) -> Completion:
@@ -396,13 +429,6 @@ def _decode(
             for index, part in enumerate(parts)
             if (fn := part.get("functionCall")) or (required_numbered_tool and "functionCall" in part)
         )
-        usage = body.get("usageMetadata") or {}
-        input_tokens = usage.get("promptTokenCount")
-        output_tokens = None
-        if "candidatesTokenCount" in usage or "thoughtsTokenCount" in usage:
-            output_tokens = usage.get("candidatesTokenCount", 0) + usage.get(
-                "thoughtsTokenCount", 0
-            )
         model = body.get("modelVersion") or route.model
         context = {"route": route.alias, "model": route.model, "parts": parts}
     else:
@@ -417,9 +443,6 @@ def _decode(
         )
         if (not calls or required_numbered_tool) and (legacy := message.get("function_call")):
             calls += (_call("legacy-function", legacy["name"], legacy["arguments"]),)
-        usage = body.get("usage") or {}
-        input_tokens = usage.get("prompt_tokens")
-        output_tokens = usage.get("completion_tokens")
         model = body.get("model") or route.model
 
     if required_numbered_tool and len(calls) != 1:
@@ -460,17 +483,8 @@ def _decode(
         raise ValueError("Invalid message content")
     if not (content and content.strip()) and not calls:
         raise ValueError("Empty completion")
-    counts = {
-        name: value
-        for name, value in {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-        }.items()
-        if value is not None
-    }
-    if not isinstance(model, str) or any(
-        type(n) is not int or n < 0 for n in counts.values()
-    ):
+    counts = _response_tokens(route, body)
+    if not isinstance(model, str):
         raise ValueError("Invalid completion metadata")
     return Completion(
         content, calls, route.alias, model, role, counts, context, route.model
@@ -849,6 +863,8 @@ class ProviderRouter:
         max_output_tokens=None,
     ):
         deadline = time.monotonic() + _completion_timeout(timeout)
+        usage = {}
+        unmetered = 0
         rank = {(route.alias, route.model): index for index, route in enumerate(routes)}
         routes, failures, deferred = self._ordered_routes(
             routes,
@@ -1030,6 +1046,7 @@ class ProviderRouter:
                     route.model,
                 )
                 yield {"provider": route.alias, "model": route.model}
+                unmetered += 1
                 failed_accounts.add(route.quota_key)
                 if route.local_model_digest is not None:
                     response = asyncio.run(
@@ -1040,6 +1057,7 @@ class ProviderRouter:
                         )
                     )
                     if response is None:
+                        unmetered -= 1
                         failures[route.alias] = "model unavailable"
                         continue
                 else:
@@ -1104,6 +1122,8 @@ class ProviderRouter:
                         route.model,
                         response.status_code,
                     )
+                    if response.status_code == 429:
+                        unmetered -= 1
                     cooldown = _retry_time(retry_after)
                     with self._lock:
                         self._quota_cooldown[route.quota_key] = cooldown
@@ -1111,7 +1131,13 @@ class ProviderRouter:
                     failures[route.alias] = "rate limited"
                     continue
                 response.raise_for_status()
-                result = _decode(route, role, response.json(), tools)
+                body = response.json()
+                counts = _response_tokens(route, body)
+                for name, value in counts.items():
+                    usage[name] = usage.get(name, 0) + value
+                if len(counts) == 2:
+                    unmetered -= 1
+                result = _decode(route, role, body, tools)
                 if (
                     needs_initial_tool
                     and not result.tool_calls
@@ -1124,10 +1150,14 @@ class ProviderRouter:
                     route.alias,
                     route.model,
                 )
-                yield result
+                if unmetered:
+                    usage["unmetered_attempts"] = unmetered
+                yield replace(result, usage=usage)
                 return
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
+                if status in {400, 401, 403, 404, 410, 413, 422}:
+                    unmetered -= 1
                 logger.info(
                     "Provider rejected provider=%s configured_model=%s status=%d",
                     route.alias,
@@ -1168,7 +1198,11 @@ class ProviderRouter:
                 with self._lock:
                     self._in_flight.remove(route.quota_key)
 
-        raise ProviderExhausted(min(retry_times.values(), default=None), failures)
+        if unmetered:
+            usage["unmetered_attempts"] = unmetered
+        elif not usage:
+            usage = {"input_tokens": 0, "output_tokens": 0}
+        raise ProviderExhausted(min(retry_times.values(), default=None), failures, usage=usage)
 
     def _defer_model(
         self, key: tuple[str, str], delay: float = _MODEL_BACKOFF_SECONDS
@@ -1206,7 +1240,7 @@ def create_model_gateway(router: ProviderRouter, token: str) -> FastAPI:
             return asdict(router.complete(**payload.model_dump()))
         except ProviderExhausted as exc:
             raise HTTPException(
-                503, {"retry_at": exc.retry_at, "failures": exc.failures}
+                503, {"retry_at": exc.retry_at, "failures": exc.failures, "usage": exc.usage}
             ) from None
 
     @app.post("/complete/observed")
@@ -1236,6 +1270,7 @@ def create_model_gateway(router: ProviderRouter, token: str) -> FastAPI:
                 yield (
                     json.dumps(
                         {
+                            "usage": error.usage,
                             "exhausted": {
                                 "retry_at": error.retry_at,
                                 "failures": error.failures,
@@ -1315,7 +1350,11 @@ class ModelGatewayClient:
                 response = self.client.post(self.url, **request)
                 if response.status_code == 503:
                     details = response.json()["detail"]
-                    raise ProviderExhausted(details["retry_at"], details["failures"])
+                    raise ProviderExhausted(
+                        details["retry_at"],
+                        details["failures"],
+                        usage=details.get("usage"),
+                    )
                 response.raise_for_status()
                 result = response.json()
             else:
@@ -1342,7 +1381,7 @@ class ModelGatewayClient:
                                 event["attempt"]["provider"], event["attempt"]["model"]
                             )
                         elif "exhausted" in event:
-                            raise ProviderExhausted(**event["exhausted"])
+                            raise ProviderExhausted(**event["exhausted"], usage=event.get("usage"))
                         else:
                             result = event["completion"]
                             break

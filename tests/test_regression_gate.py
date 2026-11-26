@@ -76,14 +76,31 @@ def commit(path, message):
     return git(path, "rev-parse", "HEAD").decode().strip()
 
 
-@pytest.mark.parametrize("case", ("current", "rebased", "tracked_test", "other_source", "test_only"))
-def test_mixed_pinned_regression_only_overlays_new_tests_on_original_production(tmp_path, case):
+@pytest.mark.parametrize(
+    "case",
+    (
+        "current",
+        "rebased",
+        "tracked_test",
+        "other_source",
+        "test_only",
+        "first_pr",
+        "first_pr_vacuous",
+        "first_pr_unittest",
+        "first_pr_rebased",
+    ),
+)
+def test_mixed_pinned_regression_only_overlays_new_tests_on_original_production(
+    tmp_path, case
+):
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     git(checkout, "init", "-q")
     path, other_path, existing = "fixture_value.py", "other.py", "tests/test_existing.py"
     before = "def answer():\n    return 1\n"
     stock = "def test_smoke():\n    assert True\n"
+    if case == "first_pr_unittest":
+        stock = "import unittest\nclass Smoke(unittest.TestCase):\n    def test_smoke(self):\n        self.assertTrue(True)\n"
     (checkout / "tests").mkdir()
     (checkout / path).write_text(before)
     (checkout / other_path).write_text("value = 1\n")
@@ -92,12 +109,16 @@ def test_mixed_pinned_regression_only_overlays_new_tests_on_original_production(
     (checkout / "origin.txt").write_text("original PR head\n")
     origin = commit(checkout, "origin")
     base = origin
-    if case == "rebased":
+    if case in {"rebased", "first_pr_rebased"}:
         git(checkout, "checkout", "--detach", parent)
         (checkout / "target.txt").write_text("synthetic rebased target\n")
         base = commit(checkout, "rebased")
     new_path = "tests/test_review_regressions.py"
     test_source = "from fixture_value import answer\n\ndef test_answer():\n    assert answer() == 2\n"
+    if case == "first_pr_vacuous":
+        test_source = test_source.replace("== 2", ">= 1")
+    if case == "first_pr_unittest":
+        test_source = "import unittest\nfrom fixture_value import answer\nclass ValueTests(unittest.TestCase):\n    def test_answer(self):\n        self.assertEqual(answer(), 2)\n"
     original = {path: before, new_path: ""}
     patched = {path: before.replace("return 1", "return 2"), new_path: test_source}
     if case == "tracked_test":
@@ -109,21 +130,51 @@ def test_mixed_pinned_regression_only_overlays_new_tests_on_original_production(
     sandbox.mkdir()
     runner = FixtureRunner(sandbox)
     task = TaskSnapshot(
-        "org/fixture", base, "Add regression coverage.",
-        ((sys.executable, "-m", "pytest", "-q", existing),),
-        require_new_tests=True, regression_base=parent if case == "test_only" else origin,
+        "org/fixture",
+        base,
+        "Add regression coverage.",
+        ((sys.executable, "-m", "unittest", "discover", "-s", "tests"),)
+        if case == "first_pr_unittest"
+        else ((sys.executable, "-m", "pytest", "-q", existing),),
+        require_new_tests=True,
+        regression_base=parent
+        if case == "test_only"
+        else base
+        if case == "first_pr_rebased"
+        else origin,
         regression_head=None if case == "test_only" else origin,
-        regression_edit_path=None if case == "test_only" else path,
+        regression_edit_path=None
+        if case
+        in {
+            "test_only",
+            "first_pr",
+            "first_pr_vacuous",
+            "first_pr_unittest",
+            "first_pr_rebased",
+        }
+        else path,
+        first_pr_regression=case.startswith("first_pr"),
     )
     executor = PlainExecutor(runner, None)
     if case in {"tracked_test", "other_source", "test_only"}:
         with pytest.raises(ExecutionError, match="out-of-scope path"):
             executor.verify_patch(task, checkout, patch)
         return
+    if case == "first_pr_vacuous":
+        with pytest.raises(ExecutionError, match="tests also pass"):
+            executor.verify_patch(task, checkout, patch)
+        return
     result = executor.verify_patch(task, checkout, patch)
     assert result.patch == patch
     assert any(check.command[0] == "verify-regression" and not check.returncode for check in result.checks)
+    if case in {"first_pr", "first_pr_unittest"}:
+        proof = next(check for check in result.checks if check.command[0] == "verify-regression")
+        assert "Observed baseline failure:" in proof.output
+        assert "test_answer (assertion failure)" in proof.output
+        assert "Passing candidate:" in proof.output
     historical = runner.workspaces[-1]
+    if case == "first_pr_rebased":
+        assert (historical / "target.txt").read_text() == "synthetic rebased target\n"
     assert (historical / path).read_text() == before
     assert (historical / existing).read_text() == stock
     assert (historical / new_path).read_text() == test_source

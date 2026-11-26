@@ -152,6 +152,12 @@ class Publisher:
                 )
             original = entry["intent"]["sha"]
             self.journal.finish(key, {"sha": original})
+            if head != original:
+                # A revised issue can reuse a branch pushed before a crash, but only
+                # when that exact commit has this job's durable push intent.
+                pushed = self.journal.get(f"push:{request.repo}:{request.branch}:{head}")
+                if pushed and pushed.get("intent", {}).get("sha") == head:
+                    return head
             return original
         if entry and entry.get("result"):
             raise StaleHead("issue branch was deleted")
@@ -296,7 +302,10 @@ class Publisher:
                 "base": request.base,
                 "draft": True,
             }
-            self.journal.begin(key, intent)
+            if entry and entry["intent"] != intent:
+                self.journal.replace_pending(key, intent)
+            else:
+                self.journal.begin(key, intent)
             self.authorize()
             if self._head(request.repo, request.branch) != request.commit:
                 raise StaleHead("branch changed before pull request creation")
@@ -313,7 +322,12 @@ class Publisher:
         number = pull["number"]
         key = f"ready:{request.repo}:{number}"
         path = f"/repos/{request.repo}/pulls/{number}"
-        self.journal.begin(key, {"node_id": pull["node_id"], "sha": request.commit})
+        intent = {"node_id": pull["node_id"], "sha": request.commit}
+        entry = self.journal.get(key)
+        if entry and "result" not in entry and entry["intent"] != intent:
+            self.journal.replace_pending(key, intent)
+        else:
+            self.journal.begin(key, intent)
         self.authorize()
         current = self.github.rest("GET", path)
         if current["state"] != "open":

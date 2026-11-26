@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 import secrets
 import statistics
 import subprocess
@@ -11,6 +12,29 @@ import time
 from pathlib import Path
 
 ARMS = ("incumbent", "plain", "harness2")
+
+
+def replay_usage(path):
+    if not path.exists():
+        return None
+    calls = {}
+    for line in path.read_bytes().splitlines():
+        try:
+            call, inputs, outputs, complete = json.loads(line)
+            if not isinstance(call, str) or type(complete) is not bool or any(
+                value is not None and (type(value) is not int or value < 0)
+                for value in (inputs, outputs)
+            ) or (complete and None in (inputs, outputs)):
+                raise ValueError("invalid counts")
+            calls[call] = (inputs, outputs, complete)
+        except (ValueError, TypeError, UnicodeError):
+            # Includes a partially written record when a wrapper is killed.
+            return None
+    return {
+        "input_tokens": sum(inputs or 0 for inputs, _, _ in calls.values()),
+        "output_tokens": sum(outputs or 0 for _, outputs, _ in calls.values()),
+        "incomplete_calls": sum(not complete for _, _, complete in calls.values()),
+    }
 
 
 def replay(spec, output):
@@ -26,10 +50,12 @@ def replay(spec, output):
             # Trusted operator wrappers receive only the frozen task input, on stdin.
             # Each wrapper provisions a disposable worker without evaluation files.
             with tempfile.TemporaryDirectory() as tmp:
+                usage_file = Path(tmp) / "usage.jsonl"
                 try:
                     result = subprocess.run(
                         spec["commands"][arm],
                         cwd=tmp,
+                        env={**os.environ, "HARNESS_REPLAY_USAGE_FILE": str(usage_file)},
                         input=json.dumps(case["input"]).encode(),
                         capture_output=True,
                         timeout=spec["timeout_seconds"],
@@ -38,6 +64,7 @@ def replay(spec, output):
                     status = "produced" if patch else "failed"
                 except subprocess.TimeoutExpired:
                     patch, status = b"", "timeout"
+                usage = replay_usage(usage_file)
             (output / "patches" / f"{code}.patch").write_bytes(patch)
             ledger.append(
                 dict(
@@ -45,6 +72,7 @@ def replay(spec, output):
                     arm=arm,
                     code=code,
                     status=status,
+                    token_usage=usage,
                     digest=hashlib.sha256(patch).hexdigest(),
                     seconds=round(time.monotonic() - start, 2),
                 )
@@ -69,7 +97,9 @@ def replay(spec, output):
     )
 
 
-def report(ledger, scores):
+def report(ledger, scores, *, max_tokens_per_fix=None):
+    if max_tokens_per_fix is not None and max_tokens_per_fix <= 0:
+        raise ValueError("Maximum tokens per accepted fix must be positive")
     keyed = {r["code"]: r for r in scores}
     if len(keyed) != len(scores) or set(keyed) != {r["code"] for r in ledger}:
         raise ValueError("Score each run exactly once")
@@ -101,6 +131,18 @@ def report(ledger, scores):
             ),
             median_seconds=statistics.median(r["seconds"] for r in runs),
         )
+        totals = summary[arm]
+        metered = [r["token_usage"] for r in runs if r.get("token_usage") is not None]
+        totals["input_tokens"] = sum(row["input_tokens"] for row in metered)
+        totals["output_tokens"] = sum(row["output_tokens"] for row in metered)
+        totals["incomplete_usage_runs"] = len(runs) - sum(
+            not row["incomplete_calls"] for row in metered
+        )
+        totals["tokens_per_accepted_fix"] = (
+            (totals["input_tokens"] + totals["output_tokens"]) / totals["accepted"]
+            if totals["accepted"] and not totals["incomplete_usage_runs"]
+            else None
+        )
     reference = summary["incumbent"]
     for arm in ARMS[1:]:
         result = summary[arm]
@@ -109,6 +151,24 @@ def report(ledger, scores):
             and result["accepted"] >= reference["accepted"]
             and result["median_minutes"] <= reference["median_minutes"]
         )
+    plain, refined = summary["plain"], summary["harness2"]
+    cost = refined["tokens_per_accepted_fix"]
+    summary["recommended_backend"] = (
+        "harness2"
+        if (
+            refined["passes_replay_gate"]
+            and refined["accepted"] >= plain["accepted"]
+            and refined["median_minutes"] <= plain["median_minutes"]
+            and (
+                refined["accepted"] > plain["accepted"]
+                or refined["median_minutes"] < plain["median_minutes"]
+            )
+            and max_tokens_per_fix is not None
+            and cost is not None
+            and cost <= max_tokens_per_fix
+        )
+        else "plain"
+    )
     return summary
 
 
@@ -117,6 +177,7 @@ def main():
     parser.add_argument("action", choices=["replay", "report"])
     parser.add_argument("directory", type=Path)
     parser.add_argument("--spec", type=Path)
+    parser.add_argument("--max-tokens-per-fix", type=int)
     args = parser.parse_args()
     if args.action == "replay":
         replay(json.loads(args.spec.read_text()), args.directory)
@@ -125,7 +186,8 @@ def main():
             return json.loads((args.directory / name).read_text())
         print(
             json.dumps(
-                report(read("private-ledger.json"), read("blind-scorecard.json")),
+                report(read("private-ledger.json"), read("blind-scorecard.json"),
+                       max_tokens_per_fix=args.max_tokens_per_fix),
                 indent=2,
             )
         )

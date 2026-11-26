@@ -4,6 +4,36 @@ from github_harness_agent.activity import control, status
 from github_harness_agent.store import LeaseLost, Store
 
 
+def test_lifetime_usage_accumulates_across_rejection_restart_adoption_and_review(tmp_path):
+    repo = "org/project"
+    store = Store(tmp_path / "jobs.db")
+    original = dict(branch="agent/issue-4", stage="implement")
+    store.enqueue(repo, 4, original)
+    first = store.claim()
+    store.observe_model(first, "late", "start", "probe", None, None)
+    store.observe_model(first, "a", "success", "coding", "route", "model",
+                        {"input_tokens": 80, "output_tokens": 20})
+    store.save(first, "queued")
+    store = Store(tmp_path / "jobs.db")
+    retry = store.claim()
+    retry["data"].update(pull=20, stage="watch")
+    store.observe_model(retry, "b", "success", "coding", "route", "model",
+                        {"input_tokens": 40, "output_tokens": 15})
+    store.save(retry, "queued")
+    store.adopt_pull(repo, 20, dict(branch=original["branch"], linked_issues=[4], author="agent",
+                                    pull=20, stage="watch"), "agent/")
+    repair = store.claim()
+    with pytest.raises(LeaseLost):
+        store.observe_model(first, "late", "success", "probe", "route", "model",
+                            {"input_tokens": 4, "output_tokens": 3})
+    for _ in range(2):
+        store.observe_model(repair, "c", "end", "coding", None, None,
+                            {"input_tokens": 30, "unmetered_attempts": 1})
+    assert next(status(store, repo, 20))["token_usage"] == {
+        "calls": 4, "input_tokens": 154, "output_tokens": 38, "incomplete_calls": 1
+    }
+
+
 def test_previous_provider_failure_only_blocks_a_waiting_retry(tmp_path):
     now = 100.0
     store = Store(tmp_path / "jobs.db", lambda: now)

@@ -83,12 +83,15 @@ def test_current_agent_ci_failure_can_update_existing_pr_once(
     class Executor:
         def execute(self, task, path, *, cancelled):
             nonlocal current_status
+            executions.append(task)
+            if "Human review" in task.instructions:
+                assert "ci/circleci" not in task.instructions
+                assert "Failed regression" not in task.instructions
+                raise NeedsClarification("Which behavior should the human request change?")
             assert (
                 "ci/circleci" in task.instructions
                 and "Failed regression" in task.instructions
             )
-            assert ("Human review" in task.instructions) == (scenario in {"mixed", "review-after-limit"})
-            executions.append(task)
             if scenario == "clarification":
                 raise NeedsClarification("What is the hidden failure?")
             (path / "value").write_text("CI fix\n")
@@ -138,7 +141,20 @@ def test_current_agent_ci_failure_can_update_existing_pr_once(
     config = {"base": "main", "checks": [["test"]], "mode": "canary"}
     run = Controller(store, API(), Executor(), config, "agent-user").run
     run(store.claim())
-    if scenario == "stale":
+    if scenario in {"mixed", "review-after-limit"}:
+        assert len(executions) == 1 and not pushes and not replies
+        run(store.claim())
+        assert len(replies) == 1 and replies[0]["commit"] is None
+        assert "human request" in replies[0]["question"]
+        now[0] += 46
+        run(store.claim())
+        assert len(replies) == 1
+        assert len(pushes) == (1 if scenario == "mixed" else 0)
+        with store.tx() as db:
+            persisted = json.loads(db.execute("SELECT data FROM tasks").fetchone()[0])
+        assert persisted["review_outcomes"][human.key]["status"] == "clarification"
+        assert "commit" not in persisted["review_outcomes"][human.key]
+    elif scenario == "stale":
         assert not reads and not executions and not pushes and not replies
     elif scenario in {"retired", "clarification"}:
         assert len(executions) == 1 and not pushes and not replies

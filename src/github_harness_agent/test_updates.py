@@ -201,6 +201,58 @@ def authorized_regression_base(feedback: Iterable[Mapping]) -> str | None:
     return authorized_regression_request(feedback)[0]
 
 
+_UNITTEST_REPORT = """import sys, unittest, xml.etree.ElementTree as ET
+from pathlib import Path
+root = ET.Element("testsuite")
+class Result(unittest.TextTestResult):
+    def record(self, test, kind=None):
+        node = ET.SubElement(root, "testcase", classname=type(test).__module__ + "." + type(test).__name__, name=str(test).split(" ")[0])
+        if kind:
+            ET.SubElement(node, kind, message="AssertionError" if kind == "failure" else kind)
+    def addSuccess(self, test):
+        super().addSuccess(test); self.record(test)
+    def addFailure(self, test, err):
+        super().addFailure(test, err)
+        trace = err[2]
+        call_phase = False
+        while trace:
+            call_phase |= trace.tb_frame.f_code.co_name == getattr(test, "_testMethodName", None)
+            trace = trace.tb_next
+        self.record(test, "failure" if call_phase and issubclass(err[0], AssertionError) else "error")
+    def addError(self, test, err):
+        super().addError(test, err); self.record(test, "error")
+    def addSkip(self, test, reason):
+        super().addSkip(test, reason); self.record(test, "skipped")
+suite = unittest.TestSuite()
+for filename in sys.argv[2:]:
+    path = Path(filename)
+    suite.addTests(unittest.TestLoader().discover(str(path.parent), pattern=path.name))
+result = unittest.TextTestRunner(resultclass=Result, verbosity=2).run(suite)
+if sys.argv[1]:
+    ET.ElementTree(root).write(sys.argv[1])
+sys.exit(0 if result.wasSuccessful() and result.testsRun else 1)
+"""
+
+
+def focused_python_tests(checks, selectors, report=None, *, verbose=False):
+    command = focused_pytest(checks, selectors, report, verbose=verbose)
+    if command:
+        return command
+    for command in checks:
+        for index in range(len(command) - 2):
+            if re.fullmatch(
+                r"python(?:[0-9.]+)?", PurePosixPath(command[index]).name
+            ) and command[index + 1 : index + 3] == ("-m", "unittest"):
+                return (
+                    *command[: index + 1],
+                    "-c",
+                    _UNITTEST_REPORT,
+                    report or "",
+                    *selectors,
+                )
+    return None
+
+
 def focused_pytest(checks, selectors, report=None, *, verbose=False):
     """Reuse the configured pytest launcher with an explicit node selection."""
     for command in checks:
@@ -245,8 +297,15 @@ def passed_pytest_report(report: bytes) -> bool:
     )
 
 
-def regression_assertion_report(green: bytes, red: bytes) -> bool:
-    """Require an identified passing case to report a call-phase assertion failure."""
+def validation_label(command):
+    """Keep the harness's reporting script out of public check descriptions."""
+    if _UNITTEST_REPORT in command:
+        return "unittest (focused regression coverage)"
+    return " ".join(command)
+
+
+def regression_proof(green: bytes, red: bytes) -> str:
+    """Describe a matching assertion failure and pass without exposing parameter values."""
 
     def cases(report):
         result = {}
@@ -261,7 +320,7 @@ def regression_assertion_report(green: bytes, red: bytes) -> bool:
         green_cases = cases(green)
         red_cases = cases(red)
     except ET.ParseError:
-        return False
+        return ""
     for name, case in red_cases.items():
         passing = green_cases.get(name)
         if passing is None or any(child.tag in {"failure", "error", "skipped"} for child in passing):
@@ -272,8 +331,13 @@ def regression_assertion_report(green: bytes, red: bytes) -> bool:
         if failure is not None and re.match(
             r"(?:AssertionError(?::|$)|assert\s)", failure.get("message", "")
         ):
-            return True
-    return False
+            method = re.sub(r"[^A-Za-z0-9_.-]", "_", name[1].split("[", 1)[0])[:160]
+            return f"Observed baseline failure: {method} (assertion failure). Passing candidate: the same test passed."
+    return ""
+
+
+def regression_assertion_report(green: bytes, red: bytes) -> bool:
+    return bool(regression_proof(green, red))
 
 
 def _definition(body, types, name):

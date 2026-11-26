@@ -101,7 +101,7 @@ def test_resumed_unprepared_repair_refreshes_feedback_and_fences_changed_draft_s
             assert not moved
             assert "Still outstanding." in task.instructions
             assert "Already resolved." not in task.instructions
-            assert ("Arrived after the previous batch." in task.instructions) == changed
+            assert "Arrived after the previous batch." not in task.instructions
             assert (task.checkpoint_scope != scope) == changed
             raise AtExecutor
 
@@ -124,7 +124,8 @@ def test_resumed_unprepared_repair_refreshes_feedback_and_fences_changed_draft_s
         assert saved["stage"] == "watch"
         assert saved["retired_draft_checkpoints"]["head"] == head
         return
-    assert [item["key"] for item in saved["feedback"]] == [item.key for item in active]
+    assert [item["key"] for item in saved["feedback"]] == [retained.key]
+    assert saved["deferred_review_keys"] == ([new.key] if changed else [])
     if changed:
         assert "draft_checkpoints" not in saved
         assert saved["retired_draft_checkpoints"]["scope"] == scope

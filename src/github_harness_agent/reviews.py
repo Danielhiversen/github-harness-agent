@@ -94,6 +94,20 @@ class ReviewBatch:
     handled: tuple[Feedback, ...] = ()
 
 
+_ACKNOWLEDGMENT = re.compile(
+    r"(?:thanks(?: a lot)?|thank you(?: very much)?|lgtm|looks good(?: to me)?|"
+    r"approved|all good|great|perfect|done|resolved|👍|🙏)[\s.!]*", re.IGNORECASE
+)
+
+
+def _review_batch(head, items, retry_at, handled=()):
+    """Ignore only whole-message acknowledgments, retaining mixed requests."""
+    actionable, ignored = [], list(handled)
+    for item in items:
+        (ignored if _ACKNOWLEDGMENT.fullmatch(item.body.strip()) else actionable).append(item)
+    return ReviewBatch(head, tuple(actionable), retry_at, tuple(ignored))
+
+
 def map_feedback(item: Feedback, source: str | None) -> Feedback | None:
     """Map an outdated anchor to a unique line in the pinned file."""
     if not item.outdated:
@@ -437,7 +451,7 @@ def collect_reviews(
             items.append(Feedback(key, thread, None, comment["body"], login, revision_at=when.timestamp()))
 
     if cutoff is None:
-        return ReviewBatch(
+        return _review_batch(
             head,
             tuple(body_items.values()) + tuple(row[0] for row in inline_items) + tuple(items),
             retry_at,
@@ -509,7 +523,36 @@ def collect_reviews(
             handled.append(item)
         else:
             items.append(item)
-    return ReviewBatch(head, tuple(items), retry_at, tuple(handled))
+    return _review_batch(head, items, retry_at, handled)
+
+
+def recover_legacy_review_reply(github, journal, *, repo, pull, item, commit, bot_login):
+    """Recover an existing reply without authorizing a new legacy success claim."""
+    repo = validate_repository(repo)
+    legacy = _digest(repo, pull, item.thread, commit)
+    claim_key = f"reply-legacy:{legacy}"
+    claim = journal.get(claim_key)
+    if claim is not None and claim["intent"]["item"] != item.key:
+        return None
+    entry = journal.get(f"reply:{legacy}")
+    result = entry.get("result") if entry is not None else None
+    if result is None:
+        marker = f"<!-- github-harness-agent:{legacy} -->"
+        kind = "issues" if item.reply_to is None else "pulls"
+        for comment in github.paginate(f"/repos/{repo}/{kind}/{pull}/comments"):
+            if (
+                (comment.get("user") or {}).get("login", "").casefold() == bot_login.casefold()
+                and comment.get("in_reply_to_id") == item.reply_to
+                and (comment.get("body") or "").rstrip().endswith(marker)
+            ):
+                result = {"id": comment["id"]}
+                if entry is not None:
+                    journal.finish(f"reply:{legacy}", result)
+                break
+    if result is not None:
+        journal.begin(claim_key, {"item": item.key})
+        journal.finish(claim_key, result)
+    return result
 
 
 def reply_to_review(
@@ -525,13 +568,14 @@ def reply_to_review(
     bot_login: str,
     question: str | None = None,
     expected_head: str | None = None,
+    changes: Iterable[str] = (),
 ) -> int | None:
     repo = validate_repository(repo)
     if bool(commit) == bool(question):
         raise ValueError(
             "a review reply requires a verified commit or a clarification question"
         )
-    attempt = _digest(repo, pull, item.thread, commit or item.key)
+    attempt = _digest(repo, pull, item.thread, item.key, commit or "clarification")
     key = f"reply:{attempt}"
     marker = f"<!-- github-harness-agent:{attempt} -->"
     if item.reply_to is None:
@@ -545,12 +589,32 @@ def reply_to_review(
         evidence = "\n".join(f"- {check}" for check in checks)
         if not evidence:
             raise ValueError("a review commit reply requires verification evidence")
-        body = f"Addressed this feedback in `{commit}`.\n\nChecks\n\n{evidence}"
+        request = (
+            " ".join(item.body.split())
+            .encode("utf-8")[:240]
+            .decode("utf-8", errors="ignore")
+        )
+        change_evidence = (
+            "\n".join(f"- {change}" for change in changes)
+            .encode("utf-8")[:4000]
+            .decode("utf-8", errors="ignore")
+        )
+        body = (
+            f"Addressed this feedback in [{commit}](https://github.com/{repo}/commit/{commit})."
+            f"\n\nRequest: {request}"
+            + (f"\n{change_evidence}" if change_evidence else "")
+            + f"\n\nChecks\n\n{evidence}"
+        )
     if item.reply_to is None:
         kind, _, number = item.thread.partition(":")
         reference = f"PR comment #{number}" if kind == "conversation" else f"review #{number}"
         body = f"Following up on {reference}.\n\n{body}"
     intent = {"path": post_path, "body": f"{body}\n\n{marker}"}
+    legacy = _digest(repo, pull, item.thread, commit or item.key)
+    legacy_marker = f"<!-- github-harness-agent:{legacy} -->"
+    claim_key = f"reply-legacy:{legacy}"
+    claim = journal.get(claim_key)
+    recover_legacy = claim is None or claim["intent"]["item"] == item.key
 
     def lookup():
         for comment in github.paginate(path):
@@ -558,8 +622,14 @@ def reply_to_review(
             if (
                 login.casefold() == bot_login.casefold()
                 and comment.get("in_reply_to_id") == item.reply_to
-                and comment["body"].rstrip().endswith(marker)
+                and (
+                    comment["body"].rstrip().endswith(marker)
+                    or (recover_legacy and comment["body"].rstrip().endswith(legacy_marker))
+                )
             ):
+                if comment["body"].rstrip().endswith(legacy_marker):
+                    journal.begin(claim_key, {"item": item.key})
+                    journal.finish(claim_key, {"id": comment["id"]})
                 return comment
         return None
 
@@ -570,6 +640,16 @@ def reply_to_review(
     head = expected_head or commit
     if head is not None and current["head"]["sha"] != head:
         raise StaleHead("pull request head changed before replying")
+    legacy_entry = journal.get(f"reply:{legacy}") if recover_legacy else None
+    if legacy_entry is not None:
+        journal.begin(claim_key, {"item": item.key})
+        if "result" in legacy_entry:
+            journal.finish(claim_key, legacy_entry["result"])
+            return legacy_entry["result"]["id"]
+        # Preserve an interrupted previous release's exact write-ahead intent.
+        key = f"reply:{legacy}"
+        marker = legacy_marker
+        intent = legacy_entry["intent"]
     journal.begin(key, intent)
     entry = journal.get(key)
     if "result" in entry:

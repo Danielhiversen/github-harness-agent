@@ -30,10 +30,10 @@ from .review_recovery import (
 )
 from .providers import ProviderExhausted
 from .test_updates import (
-    focused_pytest,
+    focused_python_tests as focused_pytest,
     has_runnable_test,
     passed_pytest_report,
-    regression_assertion_report,
+    regression_proof,
     valid_test_update,
 )
 from .task_context import (
@@ -221,6 +221,7 @@ class TaskSnapshot:
     regression_archive: bytes | None = field(default=None, repr=False, compare=False)
     regression_edit_path: str | None = None
     regression_head: str | None = None
+    first_pr_regression: bool = False
 
 
 @dataclass(frozen=True)
@@ -645,7 +646,7 @@ class PlainExecutor:
         full_sha = r"[0-9a-f]{40}|[0-9a-f]{64}"
         if (
             not re.fullmatch(full_sha, sha) or not re.fullmatch(full_sha, head)
-            or (not mixed and sha == head)
+            or (not mixed and sha == head and not task.first_pr_regression)
         ):
             raise ExecutionError("Regression verification requires a full SHA for an authorized revision or ancestor")
         for args, expected in (
@@ -2093,10 +2094,23 @@ class PlainExecutor:
             result = self._command(workspace, budget, pytest, checked=False)
             if result.returncode == 1:
                 red_report = self._command(workspace, budget, ("cat", report), checked=False)
-                if red_report.returncode == 0 and regression_assertion_report(green_report, red_report.stdout):
+                proof = (
+                    regression_proof(green_report, red_report.stdout)
+                    if red_report.returncode == 0
+                    else ""
+                )
+                if proof:
                     return CheckEvidence(
-                        command, 0, "A named test passed on the candidate and failed by assertion on "
-                        + ("the verified ancestor." if counterexample is None else "the verified partial checkpoint."),
+                        command,
+                        0,
+                        "A named test passed on the candidate and failed by assertion on "
+                        + (
+                            "the verified ancestor."
+                            if counterexample is None
+                            else "the verified partial checkpoint."
+                        )
+                        + "\n"
+                        + proof,
                     )
         if counterexample is not None:
             detail = (
@@ -2159,9 +2173,16 @@ class PlainExecutor:
                 )
                 self._git(workspace, budget, "apply", "--index", "--binary", data=patch)
                 new_tests, amended_test = self._check_patch_paths(
-                    workspace, task, budget, baseline_tree,
+                    workspace,
+                    task,
+                    budget,
+                    baseline_tree,
                     new_tests_only=bool(
-                        (task.regression_base and not task.regression_edit_path)
+                        (
+                            task.regression_base
+                            and not task.regression_edit_path
+                            and not task.first_pr_regression
+                        )
                         or (task.review_recovery and task.review_recovery.test_only)
                     ),
                 )
@@ -2215,7 +2236,11 @@ class PlainExecutor:
         green_sources = ()
         green_output = ""
         historical_patch = patch
-        historical_tests = tuple(new_tests) if task.regression_edit_path else new_python_tests
+        historical_tests = (
+            tuple(new_tests)
+            if (task.regression_edit_path or task.first_pr_regression)
+            else new_python_tests
+        )
         if (new_tests or selections) and trusted_passed:
             with self.verification_runner.workspace(
                 archive, budget.remaining, budget.cancelled
@@ -2251,7 +2276,7 @@ class PlainExecutor:
                             self._git(
                                 selected, budget, "apply", "--index", "--binary", data=patch,
                             )
-                            if task.regression_edit_path:
+                            if task.regression_edit_path or task.first_pr_regression:
                                 historical_patch = self._git(
                                     selected, budget, "--literal-pathspecs", "diff", "--cached",
                                     "--binary", "--no-ext-diff", "--full-index", tree, "--",

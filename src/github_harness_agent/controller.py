@@ -41,8 +41,21 @@ from .rebase import (
     transplant_patch,
 )
 from .review_recovery import plan_recovery
-from .reviews import ReviewItem, collect_reviews, map_feedback, reply_to_review
-from .test_updates import authorized_regression_request, authorized_test_update, requests_new_tests
+from .reviews import (
+    ReviewItem,
+    collect_reviews,
+    map_feedback,
+    recover_legacy_review_reply,
+    reply_to_review,
+)
+from .first_pr import pull_summary, reproducible_bug
+from .test_updates import (
+    authorized_regression_request,
+    authorized_test_update,
+    focused_python_tests,
+    requests_new_tests,
+    validation_label,
+)
 from .store import LeaseLost
 from .task_context import build_task_context, github_history, review_source_context
 
@@ -124,7 +137,7 @@ def verified_commit(
         "sha": sha,
         "object": base64.b64encode(git(path, "cat-file", "commit", sha)).decode(),
         "checks": [
-            " ".join(check.command) + f" (exit {check.returncode})" for check in checks
+            validation_label(check.command) + f" (exit {check.returncode})" for check in checks
         ],
         "digest": hashlib.sha256(patch).hexdigest(),
         "sync": {
@@ -158,6 +171,22 @@ def acknowledge_feedback(data, item):
         data["seen"].append(item.key)
     if item.thread and item.thread not in data["threads"]:
         data["threads"].append(item.thread)
+
+
+def review_change_evidence(patch, budget=4000):
+    """Retain bounded file/hunk locations from the verified patch."""
+    evidence = []
+    for line in patch.splitlines():
+        if not line.startswith((b"diff --git ", b"@@ ", b"Binary files ")):
+            continue
+        snippet = line[:max(0, budget - 1)].decode("utf-8", errors="ignore")
+        if not snippet:
+            break
+        evidence.append(snippet)
+        budget -= len(snippet.encode("utf-8")) + 1
+        if budget <= 1:
+            break
+    return evidence
 
 
 def draft_scope(job, stage, origin, target, config):
@@ -316,7 +345,7 @@ class Controller:
                 )
             cfg = {**cfg, "checks": [*cfg["checks"], *pull_checks]}
         adopted = job.get("kind") == "pull"
-        label = cfg.get("label", "agent:ready")
+        label = cfg.get("label")
         branch = (
             data.get("branch") or cfg.get("branch_prefix", "agent/") + f"issue-{issue}"
         )
@@ -335,11 +364,20 @@ class Controller:
             store.check(job)
             if adopted:
                 read_pull()
+                for source_issue in data.get("assignment_issues", ()):
+                    current = api.rest("GET", f"/repos/{repo}/issues/{source_issue}")
+                    if not eligible(
+                        api, repo, current, cfg.get("assignee") or self.bot_login, label
+                    ):
+                        store.cancel(repo, issue, kind="pull")
+                        raise LeaseLost("Originating issue is no longer assigned")
             else:
                 current = api.rest("GET", f"/repos/{repo}/issues/{issue}")
-                if not eligible(api, repo, current, label):
+                if not eligible(api, repo, current, cfg.get("assignee") or self.bot_login, label):
                     store.cancel(repo, issue)
                     raise LeaseLost()
+                if store.refresh_issue(repo, issue, current):
+                    raise LeaseLost("Issue requirements changed; refreshed work is queued")
             store.check(job)
 
         def cancelled():
@@ -358,6 +396,13 @@ class Controller:
             raise ValueError("adopted jobs can only review their existing pull request")
         origin = None
         instructions = f"{data['title']}\n\n{data['body']}"
+        if previous := data.get("issue_revision_previous"):
+            instructions += (
+                "\n\nThe issue requirements changed. Reassess any saved draft against the current "
+                "requirements above, update it as needed, and rerun verification. "
+                "Previous requirements (background only):\n"
+                f"{previous['title']}\n\n{previous['body']}"
+            )
         checks = tuple(tuple(check) for check in cfg["checks"])
         if not checks:
             raise ValueError("Configure at least one trusted check")
@@ -413,13 +458,19 @@ class Controller:
                 )
             if stage == "watch":
                 data.pop("draft_checkpoints", None)
+                data.pop("active_review_key", None)
+                data.pop("deferred_review_keys", None)
                 batch = review_batch()
                 for item in batch.handled:
+                    data.setdefault("review_outcomes", {}).setdefault(
+                        item.key, {"status": "ignored"}
+                    )
                     acknowledge_feedback(data, item)
                 head = data.get("last_commit")
                 ci_feedback = []
                 if (
-                    (batch.items or data["round"] < data.get("allowed_rounds", 3))
+                    not batch.items
+                    and data["round"] < data.get("allowed_rounds", 3)
                     and head
                     and head == batch.head == pr["head"]["sha"]
                     and adoptable_pull(pr, repo, self.bot_login, branch)
@@ -487,14 +538,18 @@ class Controller:
                 if batch.head != pr["head"]["sha"]:
                     raise TargetMoved("pull request head views do not agree yet")
                 previous_keys = {item["key"] for item in data.get("feedback", ())}
-                current_keys = {item.key for item in batch.items}
+                selected = tuple(
+                    item for item in batch.items
+                    if not data.get("active_review_key") or item.key == data["active_review_key"]
+                )
+                current_keys = {item.key for item in selected}
                 if current_keys != previous_keys:
                     _retire_drafts(data)
                     data.pop("model_attempt_failures", None)
                     data.pop("prior_model_attempt_failures", None)
                 for item in batch.handled:
                     acknowledge_feedback(data, item)
-                data["feedback"] = [dataclasses.asdict(item) for item in batch.items]
+                data["feedback"] = [dataclasses.asdict(item) for item in selected]
                 if not data["feedback"] and not data.get("ci_feedback"):
                     data["stage"] = "watch"
                     store.save(job, "queued", delay=45)
@@ -590,18 +645,33 @@ class Controller:
                     )
 
                 def needs_new_tests():
-                    return stage == "repair" and (
+                    return first_pr_regression or (stage == "repair" and (
                         bool(regression_edit_path) or any(
                             requests_new_tests(item["body"]) for item in data.get("feedback", ())
                         )
-                    )
+                    ))
 
+                first_pr_regression = (
+                    stage == "implement"
+                    and bool(focused_python_tests(checks, ("test_regression.py",)))
+                    and reproducible_bug(data["title"], data["body"])
+                )
                 try:
-                    regression_base, regression_edit_path = authorized_regression_request(
-                        data.get("feedback", ()) if stage == "repair" else ()
+                    regression_base, regression_edit_path = (
+                        authorized_regression_request(
+                            data.get("feedback", ())
+                            if stage == "repair" and prepared is not None
+                            else ()
+                        )
                     )
                 except ValueError as error:
                     raise ExecutionError(str(error)) from error
+                if first_pr_regression:
+                    regression_base = parent
+                    instructions += (
+                        "\n\nAdd a new runnable regression test using the configured Python test framework reproducing the reported bug. "
+                        "It must pass with the fix and fail by assertion against the pinned baseline using the same public APIs."
+                    )
                 if regression_base and target.repo.casefold() != repo.casefold():
                     raise ExecutionError("Regression verification requires a same-repository ancestor")
 
@@ -635,6 +705,19 @@ class Controller:
                                 mapped.append(dataclasses.asdict(current))
                                 continue
                             if cfg.get("mode", "shadow") != "shadow":
+                                question = (
+                                    "Could you point me to the line or section on the "
+                                    "current pull request that this request applies to?"
+                                )
+                                outcome = {
+                                    "status": "clarification",
+                                    "question": question,
+                                    "head": origin,
+                                }
+                                data.setdefault("review_outcomes", {})[item.key] = (
+                                    outcome
+                                )
+                                store.save(job)
                                 try:
                                     reply_to_review(
                                         api,
@@ -646,8 +729,7 @@ class Controller:
                                         commit=None,
                                         checks=(),
                                         bot_login=self.bot_login,
-                                        question="Could you point me to the line or section on the "
-                                        "current pull request that this request applies to?",
+                                        question=question,
                                         expected_head=origin,
                                     )
                                 except StaleHead:
@@ -655,7 +737,29 @@ class Controller:
                                     store.save(job, "queued")
                                     return
                                 acknowledge_feedback(data, item)
-                        data["feedback"] = mapped
+                                outcome["replied"] = True
+                                store.save(job)
+                        # Verify one request at a time. Other requests remain unseen and
+                        # are collected again against the newly published head.
+                        data["feedback"] = mapped[:1]
+                        data["deferred_review_keys"] = [
+                            item["key"] for item in mapped[1:]
+                        ]
+                        if mapped:
+                            data["active_review_key"] = mapped[0]["key"]
+                            # CI gets its own verified pass and cannot stand in as
+                            # evidence that the human request was implemented.
+                            deferred_ci = {
+                                failure["key"]
+                                for failure in data.get("ci_feedback", ())
+                            }
+                            data["ci_seen"] = [
+                                key
+                                for key in data.get("ci_seen", ())
+                                if key not in deferred_ci
+                            ]
+                            data["ci_feedback"] = []
+                        store.save(job)
                         if not mapped and not data.get("ci_feedback"):
                             data["stage"] = "watch"
                             if cfg.get("mode", "shadow") == "shadow":
@@ -663,6 +767,19 @@ class Controller:
                             else:
                                 store.save(job, "queued", delay=45)
                             return
+                        try:
+                            regression_base, regression_edit_path = (
+                                authorized_regression_request(data["feedback"])
+                            )
+                        except ValueError as error:
+                            raise ExecutionError(str(error)) from error
+                        if (
+                            regression_base
+                            and target.repo.casefold() != repo.casefold()
+                        ):
+                            raise ExecutionError(
+                                "Regression verification requires a same-repository ancestor"
+                            )
                     failures = data.get("model_attempt_failures", [])
                     rejections = (
                         *data.get("prior_model_attempt_failures", ()),
@@ -684,6 +801,33 @@ class Controller:
                         ) or last_round.get("candidate", {}).get("route")
                     scope, review_keys = draft_scope(job, stage, origin, target, cfg)
                     existing = data.get("draft_checkpoints", {})
+                    if stage == "implement" and (
+                        seed := data.get("revision_prepared_draft")
+                    ):
+                        keys = (
+                            ("plain/coding",)
+                            if cfg.get("backend", "plain") == "plain"
+                            else ("harness2/base",)
+                        )
+                        existing = {
+                            **seed,
+                            "scope": scope,
+                            "drafts": {
+                                key: DraftCheckpoint(
+                                    key,
+                                    seed["parent"],
+                                    base64.b64decode(seed["patch"], validate=True),
+                                ).to_data()
+                                for key in keys
+                            },
+                        }
+                        data["draft_checkpoints"] = existing
+                        data.pop("revision_prepared_draft")
+                        store.save(job)
+                    elif stage == "implement" and existing.get("requirements_changed"):
+                        existing["scope"] = scope
+                        existing.pop("requirements_changed")
+                        store.save(job)
                     if existing and existing.get("scope") != scope:
                         data.pop("draft_checkpoints")
                         store.save(job)
@@ -805,6 +949,7 @@ class Controller:
                         )
                         if stage == "repair"
                         else None,
+                        first_pr_regression=first_pr_regression,
                         regression_base=regression_base,
                         regression_edit_path=regression_edit_path,
                         regression_head=origin if regression_edit_path else None,
@@ -910,6 +1055,11 @@ class Controller:
                             previous_base,
                             adopted=adopted,
                         ),
+                        "summary": pull_summary(
+                            data["title"],
+                            result.patch,
+                            [dataclasses.asdict(check) for check in result.checks],
+                        ),
                         "trace": [
                             dataclasses.asdict(route) for route in result.route_trace
                         ],
@@ -922,8 +1072,22 @@ class Controller:
                         "usage": result.usage,
                         "verified_new_tests": task.require_new_tests,
                         "pull_checks": pull_checks,
-                        **({"regression_base": regression_base} if regression_base else {}),
-                        **({"regression_edit_path": regression_edit_path} if regression_edit_path else {}),
+                        "review_keys": [
+                            item["key"] for item in data.get("feedback", ())
+                        ]
+                        if stage == "repair"
+                        else [],
+                        "review_changes": review_change_evidence(result.patch),
+                        **(
+                            {"regression_base": regression_base}
+                            if regression_base
+                            else {}
+                        ),
+                        **(
+                            {"regression_edit_path": regression_edit_path}
+                            if regression_edit_path
+                            else {}
+                        ),
                         "refinement": dataclasses.asdict(result.refinement)
                         if result.refinement
                         else None,
@@ -961,6 +1125,8 @@ class Controller:
                     patch = transplant_patch(
                         path, parent, base64.b64decode(prepared["patch"])
                     )
+                    if first_pr_regression:
+                        regression_base = parent
                     context = current_context()
                     verify_task = TaskSnapshot(
                         repo,
@@ -973,6 +1139,7 @@ class Controller:
                         require_new_tests=needs_new_tests(),
                         pull_checks=tuple(map(tuple, pull_checks)),
                         verify_base_first=bool(regression_base),
+                        first_pr_regression=first_pr_regression,
                         regression_base=regression_base,
                         regression_edit_path=regression_edit_path,
                         regression_head=origin if regression_edit_path else None,
@@ -1012,6 +1179,14 @@ class Controller:
                             adopted=adopted,
                         )
                     )
+                    prepared["review_changes"] = review_change_evidence(verified.patch)
+                    prepared["summary"] = pull_summary(
+                        data["title"],
+                        verified.patch,
+                        [dataclasses.asdict(check) for check in verified.checks],
+                    )
+                    if first_pr_regression:
+                        prepared["regression_base"] = parent
                     store.save(job)
                 patch = base64.b64decode(prepared["patch"])
                 git(path, "read-tree", parent)
@@ -1048,7 +1223,8 @@ class Controller:
                             path,
                             sha,
                             data["title"],
-                            f"Implements issue #{issue}.",
+                            prepared.get("summary")
+                            or pull_summary(data["title"], patch, prepared["checks"]),
                             tuple(prepared["checks"]),
                             ready=True,
                             target=target,
@@ -1089,6 +1265,24 @@ class Controller:
                 data["last_commit"] = sha
                 data["last_target"] = dataclasses.asdict(target)
                 data["last_checks"] = prepared["checks"]
+                if stage == "repair":
+                    verified_keys = prepared.get("review_keys", [])
+                    for raw in data.get("feedback", ()):
+                        if verified_keys == [raw["key"]]:
+                            outcome = {
+                                "status": "addressed",
+                                "commit": sha,
+                                "checks": prepared["checks"],
+                                "changes": prepared.get("review_changes", []),
+                            }
+                        else:
+                            outcome = {
+                                "status": "clarification",
+                                "head": sha,
+                                "question": "I could not verify this request independently in the previous batch. "
+                                "Could you confirm what remains to be changed on the current pull request?",
+                            }
+                        data.setdefault("review_outcomes", {})[raw["key"]] = outcome
                 data["last_evidence"] = {
                     key: prepared[key]
                     for key in (
@@ -1108,7 +1302,43 @@ class Controller:
         if data["stage"] in {"reply", "question"}:
             for raw in data["feedback"]:
                 item = ReviewItem(**raw)
-                question = data.get("question")
+                if item.key in data["seen"]:
+                    continue
+                outcomes = data.setdefault("review_outcomes", {})
+                outcome = outcomes.get(item.key)
+                if (
+                    outcome is None
+                    and data["stage"] == "reply"
+                    and data.get("last_commit")
+                ):
+                    recovered = recover_legacy_review_reply(
+                        api,
+                        journal,
+                        repo=repo,
+                        pull=data["pull"],
+                        item=item,
+                        commit=data["last_commit"],
+                        bot_login=self.bot_login,
+                    )
+                    if recovered is not None:
+                        outcomes[item.key] = {
+                            "status": "recovered",
+                            "commit": data["last_commit"],
+                            "replied": True,
+                        }
+                        acknowledge_feedback(data, item)
+                        store.save(job)
+                        continue
+                if outcome is None:
+                    outcome = {
+                        "status": "clarification",
+                        "question": data.get("question")
+                        or "I do not have independent verification for this request. Could you confirm what remains to be changed?",
+                        "head": data.get("review_head"),
+                    }
+                    outcomes[item.key] = outcome
+                question = outcome.get("question")
+                store.save(job)
                 try:
                     reply_to_review(
                         api,
@@ -1117,11 +1347,12 @@ class Controller:
                         repo=repo,
                         pull=data["pull"],
                         item=item,
-                        commit=None if question else data["last_commit"],
-                        checks=data["last_checks"],
+                        commit=outcome.get("commit"),
+                        checks=outcome.get("checks", ()),
                         bot_login=self.bot_login,
                         question=question,
-                        expected_head=data["review_head"] if question else None,
+                        expected_head=outcome.get("head") if question else None,
+                        changes=outcome.get("changes", ()),
                     )
                 except StaleHead:
                     if not question:
@@ -1136,6 +1367,8 @@ class Controller:
                     store.save(job, "queued")
                     return
                 acknowledge_feedback(data, item)
+                outcome["replied"] = True
+                store.save(job)
             data.pop("question", None)
             data["stage"] = "watch"
         store.save(job, "queued", delay=45)

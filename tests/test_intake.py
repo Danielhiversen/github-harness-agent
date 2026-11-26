@@ -19,6 +19,7 @@ class FakeRepo:
                     "state": "open",
                     "title": "fixture",
                     "labels": [{"name": "agent:ready"}],
+                    "assignees": [{"login": "agent-user"}],
                 }
             ]
         if path.endswith("/events"):
@@ -43,14 +44,11 @@ def test_reconciliation_recovers_missed_delivery_and_waits_for_dependencies(tmp_
     db, api = Store(tmp_path / "db"), FakeRepo()
 
     def sync():
-        reconcile(api, db, "owner/repo", {"base": "main"})
+        reconcile(api, db, "owner/repo", {"base": "main", "bot_login": "agent-user"})
 
     sync()
     assert db.claim() is None
-    api.blocked, api.role = False, "read"
-    sync()
-    assert db.claim() is None
-    api.role = "maintain"
+    api.blocked = False
     sync()
     sync()
     assert db.claim()["data"]["base_sha"] == "abc"
@@ -200,3 +198,185 @@ def test_adoption_preserves_cooldown_and_only_resumes_matching_review_attempt(
     else:
         assert data["stage"] == "watch"
         assert not {"feedback", "review_head", "model_attempt_failures"} & data.keys()
+
+
+def test_assignment_is_required_and_label_is_only_an_optional_gate(tmp_path):
+    from github_harness_agent.intake import eligible
+
+    api = FakeRepo()
+    api.blocked = False
+    issue = {
+        "number": 4,
+        "state": "open",
+        "labels": [],
+        "assignees": [{"login": "Agent-User"}],
+    }
+    assert eligible(api, "owner/repo", issue, "agent-user")
+    assert not eligible(api, "owner/repo", issue, "agent-user", "agent:ready")
+    issue.update(
+        labels=[{"name": "agent:ready"}], assignees=[{"login": "someone-else"}]
+    )
+    assert not eligible(api, "owner/repo", issue, "agent-user")
+
+
+@pytest.mark.parametrize("leased", [False, True])
+def test_issue_edit_fences_old_work_and_retains_unverified_draft(tmp_path, leased):
+    from github_harness_agent.store import LeaseLost
+
+    store = Store(tmp_path / "db")
+    store.enqueue(
+        "owner/repo",
+        4,
+        {
+            "stage": "implement",
+            "title": "old",
+            "body": "old requirements",
+            "prepared": {
+                "patch": "cGF0Y2g=",
+                "sha": "old-sha",
+                "sync": {
+                    "origin": None,
+                    "parent": "base",
+                    "target": {"repo": "owner/repo", "ref": "main", "sha": "base"},
+                    "identity": ["Bot", "bot@example.test"],
+                    "previous_base": None,
+                },
+            },
+        },
+    )
+    old = store.claim() if leased else None
+    assert store.refresh_issue(
+        "owner/repo", 4, {"title": "new", "body": "new requirements"}
+    )
+    if old:
+        with pytest.raises(LeaseLost):
+            store.save(old)
+    current = store.claim()
+    assert current["data"]["title"] == "new"
+    assert current["data"]["body"] == "new requirements"
+    assert "prepared" not in current["data"]
+    assert current["data"]["revision_prepared_draft"]["patch"] == "cGF0Y2g="
+    assert current["data"]["issue_revision_previous"]["body"] == "old requirements"
+
+
+def test_reconciliation_cancels_a_lease_when_assignment_disappears(tmp_path):
+    from github_harness_agent.store import LeaseLost
+
+    store, api = Store(tmp_path / "db"), FakeRepo()
+    api.blocked = False
+    config = {"base": "main", "bot_login": "agent-user"}
+    reconcile(api, store, "owner/repo", config)
+    leased = store.claim()
+    original = api.paginate
+    api.paginate = (
+        lambda path, params=None: []
+        if path.endswith("/issues")
+        else original(path, params)
+    )
+    api.rest = lambda method, path: {
+        "number": 4,
+        "state": "open",
+        "assignees": [],
+        "title": "fixture",
+    }
+    reconcile(api, store, "owner/repo", config)
+    with pytest.raises(LeaseLost):
+        store.check(leased)
+
+
+def test_dedicated_assignee_can_differ_from_publishing_login(tmp_path):
+    store, api = Store(tmp_path / "db"), FakeRepo()
+    api.blocked = False
+    reconcile(
+        api,
+        store,
+        "owner/repo",
+        {"base": "main", "bot_login": "publishing-app[bot]", "assignee": "agent-user"},
+    )
+    assert store.claim()["issue"] == 4
+
+
+def test_optional_label_keeps_maintainer_provenance_gate():
+    from github_harness_agent.intake import eligible
+
+    api = FakeRepo()
+    api.blocked = False
+    issue = {
+        "number": 4,
+        "state": "open",
+        "labels": [{"name": "agent:ready"}],
+        "assignees": [{"login": "agent-user"}],
+    }
+    api.role = "read"
+    assert not eligible(api, "owner/repo", issue, "agent-user", "agent:ready")
+    api.role = "maintain"
+    assert eligible(api, "owner/repo", issue, "agent-user", "agent:ready")
+
+
+def test_issue_edits_do_not_unpause_existing_pull_review(tmp_path):
+    store = Store(tmp_path / "db")
+    store.enqueue(
+        "owner/repo", 4, {"stage": "repair", "pull": 21, "title": "old", "body": ""}
+    )
+    store.save(store.claim(), "paused")
+    assert not store.refresh_issue("owner/repo", 4, {"title": "new", "body": "new"})
+    assert store.claim() is None
+
+
+def test_stale_scan_cannot_cancel_refreshed_or_newly_queued_work(tmp_path):
+    store = Store(tmp_path / "db")
+    store.enqueue("owner/repo", 4, {"stage": "implement", "title": "old", "body": ""})
+    scan = store.issue_scan_snapshot("owner/repo")
+    store.refresh_issue("owner/repo", 4, {"title": "new", "body": "new"})
+    store.enqueue("owner/repo", 5, {"stage": "implement"})
+    store.cancel_missing_issues("owner/repo", set(), scan)
+    assert {store.claim()["issue"], store.claim()["issue"]} == {4, 5}
+
+
+def test_reassigned_issue_survives_a_lagging_filtered_list(tmp_path):
+    store, api = Store(tmp_path / "db"), FakeRepo()
+    api.blocked = False
+    config = {"base": "main", "bot_login": "agent-user"}
+    reconcile(api, store, "owner/repo", config)
+    leased = store.claim()
+    original = api.paginate
+    current = original("/repos/owner/repo/issues")[0]
+    api.paginate = (
+        lambda path, params=None: []
+        if path.endswith("/issues")
+        else original(path, params)
+    )
+    api.rest = lambda method, path: current
+    reconcile(api, store, "owner/repo", config)
+    store.check(leased)
+
+
+def test_adoption_preserves_assignment_authority_only_for_generated_issue_pull(
+    tmp_path,
+):
+    store = Store(tmp_path / "db")
+    store.enqueue(
+        "owner/repo",
+        5,
+        {
+            "stage": "watch",
+            "pull": 20,
+            "title": "old",
+            "body": "",
+            "branch": "agent/issue-5",
+        },
+    )
+    adopt_open_pulls(
+        PullListing([pull(20, "agent/issue-5"), pull(21, "standalone")]),
+        store,
+        "owner/repo",
+        {},
+        "agent-user",
+    )
+    with store.tx() as db:
+        rows = {
+            row["issue"]: json.loads(row["data"])
+            for row in db.execute("SELECT issue,data FROM tasks WHERE kind='pull'")
+        }
+    assert rows[20]["assignment_issues"] == [5]
+    assert "assignment_issues" not in rows[21]

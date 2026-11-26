@@ -41,6 +41,10 @@ uv run python -m github_harness_agent.qualify report results
 
 Between commands, give evaluators the anonymized patches and scorecard. Keep the ledger private until scoring ends. Run the held-out checks for each patch in a disposable evaluation environment, measure actual human correction minutes, and record acceptance, review rounds, quota and fallback. Include failed and timed-out runs. Report uses the complete matched sample to compare acceptance and median correction time against the incumbent. Review per-issue differences, quota and latency and extend the sample if results are inconclusive.
 
+The report divides all reported input and output tokens in an arm, including failed runs, by the number of accepted fixes. An incomplete measurement or zero accepted fixes yields a null ratio. The built-in wrappers record each model call in a private file outside the worker. External adapters can use the path in `HARNESS_REPLAY_USAGE_FILE` and the `usage_observer` helper in `replay_worker.py` to capture calls across retries and repairs. A missing file marks that run as unmeasured.
+
+Pass `--max-tokens-per-fix N` to the report to set your ceiling for refinement. The recommendation defaults to plain. Harness2 must pass the matched replay gate, improve acceptance or median reviewer time over plain, preserve the other measure, and fit the supplied ceiling. The recommendation is informational. The repository's `backend` setting controls production behavior.
+
 ## Live gates
 
 1. Record a passing basic exchange per enabled route and a tool round trip for each coding route. Record retired models, eligibility and quota behavior. A declared free price in a manifest cannot establish billing eligibility.

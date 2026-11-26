@@ -61,6 +61,22 @@ def openai_response():
     }
 
 
+def test_accounts_for_reported_tokens_from_rejected_provider_response():
+    def respond(request):
+        body = openai_response()
+        if request.url.host == "kilo-free.example.invalid":
+            body["choices"][0]["finish_reason"] = "length"
+        return httpx.Response(200, json=body)
+
+    router = routed(deployment(KILO, GROQ), respond)
+    result = router.complete(role="plain", messages=[])
+    assert result.usage == {"input_tokens": 4, "output_tokens": 6}
+    router = routed(deployment(KILO), respond)
+    with pytest.raises(ProviderExhausted) as exc:
+        router.complete(role="plain", messages=[])
+    assert exc.value.usage == {"input_tokens": 2, "output_tokens": 3}
+
+
 @pytest.mark.parametrize(
     "statuses,oversized,elapsed,expected_routes",
     [

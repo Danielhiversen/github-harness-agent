@@ -259,3 +259,28 @@ def test_keeps_moving_base_out_of_external_write(when):
     ).publish(updated)
     assert recovered.head == "d" * 40
     assert github.refs_created == github.pushes == len(github.pulls) == 1
+
+
+@pytest.mark.parametrize("failure", ["push", "pull"])
+def test_edited_issue_resumes_its_journal_owned_publish_after_crash(failure):
+    from dataclasses import replace
+    from github_harness_agent.publish import Journal, Publisher, PublishRequest
+    class MovingPullGitHub(FakeGitHub):
+        def push(self, repo, checkout, branch, expected_head, commit):
+            super().push(repo, checkout, branch, expected_head, commit)
+            for pull in self.pulls:
+                pull["head"]["sha"] = commit
+    github = MovingPullGitHub(failure, stopped=True)
+    old = PublishRequest(
+        repo="a/b", issue=3, base="main", base_sha="a" * 40,
+        branch="agent/issue-3", checkout=Path("/unused"), commit="b" * 40,
+        title="Old requirement", summary="Old result", checks=("pytest",),
+    )
+    data = {}
+    publisher = Publisher(github, Journal(data, lambda: None), lambda: None)
+    with pytest.raises(ControllerStopped):
+        publisher.publish(old)
+    new = replace(old, commit="c" * 40, title="Updated requirement", summary="Updated result")
+    result = publisher.publish(new)
+    assert result.number == 21 and result.head == "c" * 40
+    assert github.pushes == 2 and len(github.pulls) == 1

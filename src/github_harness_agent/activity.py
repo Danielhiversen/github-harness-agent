@@ -13,6 +13,22 @@ CREATE TABLE IF NOT EXISTS model_activity(
  PRIMARY KEY(repo,kind,issue,slot))
 """
 
+USAGE_TABLE = """
+CREATE TABLE IF NOT EXISTS model_usage(
+ call TEXT PRIMARY KEY, repo TEXT, kind TEXT, issue INTEGER, lease TEXT,
+ input_tokens INTEGER, output_tokens INTEGER, complete INTEGER NOT NULL)
+"""
+
+
+def token_counts(usage):
+    """Keep reported counts, including partial reports. Unknown spend is never zero."""
+    usage = usage or {}
+    inputs, outputs = usage.get("input_tokens"), usage.get("output_tokens")
+    complete = (
+        inputs is not None and outputs is not None and not usage.get("unmetered_attempts")
+    )
+    return inputs, outputs, bool(complete)
+
 
 def observed_call(task, gateway, **request):
     observe = task.observe_model
@@ -27,11 +43,11 @@ def observed_call(task, gateway, **request):
                 call, "attempt", role, provider, model
             )
         result = gateway.complete(**request)
-    except BaseException:
-        observe(call, "end", role, None, None)
+    except BaseException as error:
+        observe(call, "end", role, None, None, getattr(error, "usage", None))
         raise
     observe(
-        call, "success", role, result.route, result.model or result.configured_model
+        call, "success", role, result.route, result.model or result.configured_model, result.usage
     )
     return result
 
@@ -84,6 +100,12 @@ def status(store, repo=None, pull=None):
                 row["state"] == "queued" and row["due"] > store.clock()
             )
             last_error = data.get("last_error")
+            usage = db.execute(
+                """SELECT count(*) AS calls, coalesce(sum(input_tokens),0) AS input_tokens,
+                   coalesce(sum(output_tokens),0) AS output_tokens,
+                   count(*) - coalesce(sum(complete),0) AS incomplete_calls
+                   FROM model_usage WHERE repo=? AND kind=? AND issue=?""", key,
+            ).fetchone()
             yield {
                 **{
                     k: row[k]
@@ -103,6 +125,7 @@ def status(store, repo=None, pull=None):
                 "stage": data.get("stage"),
                 "last_commit": data.get("last_commit"),
                 "active_calls": active,
+                "token_usage": dict(usage),
                 "last_successful_call": success,
                 "next_retry_at": _iso(row["due"]) if row["state"] == "queued" else None,
                 "last_error": last_error,

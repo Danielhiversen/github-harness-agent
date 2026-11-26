@@ -6,7 +6,7 @@ import time
 import uuid
 from contextlib import contextmanager
 
-from .activity import ACTIVITY_TABLE
+from .activity import ACTIVITY_TABLE, USAGE_TABLE, token_counts
 
 
 class LeaseLost(RuntimeError):
@@ -44,6 +44,8 @@ class Store:
                     id TEXT PRIMARY KEY, payload TEXT, event TEXT, received REAL);
             """)
             db.execute(ACTIVITY_TABLE)
+            db.execute(USAGE_TABLE)
+            db.execute("CREATE INDEX IF NOT EXISTS usage_job ON model_usage(repo,kind,issue)")
             columns = db.execute("PRAGMA table_info(tasks)").fetchall()
             if columns and not any(column["name"] == "kind" for column in columns):
                 db.execute("ALTER TABLE tasks RENAME TO issue_tasks")
@@ -122,12 +124,93 @@ class Store:
                 (repo, issue, self.clock(), json.dumps(data)),
             )
 
-    def cancel(self, repo, issue):
+    def issue_scan_snapshot(self, repo):
+        with self.tx() as db:
+            return {
+                row["issue"]: row["generation"]
+                for row in db.execute(
+                    "SELECT issue,generation FROM tasks WHERE repo=? AND kind='issue' AND state NOT IN ('cancelled','superseded','complete')",
+                    (repo,),
+                )
+            }
+
+    def cancel_missing_issues(self, repo, eligible_issues, scan):
+        # Only cancel versions observed before listing. A concurrent reassignment,
+        # refresh, adoption or newly queued task must survive an older scan.
+        with self.tx() as db:
+            for issue, generation in scan.items():
+                if issue not in eligible_issues:
+                    db.execute(
+                        """UPDATE tasks SET state='cancelled',token=NULL,generation=generation+1
+                           WHERE repo=? AND kind='issue' AND issue=? AND generation=?
+                           AND state NOT IN ('cancelled','superseded','complete')""",
+                        (repo, issue, generation),
+                    )
+
+    def refresh_issue(self, repo, issue, current):
+        """Fence stale leases and keep only reusable, unverified draft work after edits."""
+        with self.tx() as db:
+            row = db.execute(
+                "SELECT * FROM tasks WHERE repo=? AND kind='issue' AND issue=?",
+                (repo, issue),
+            ).fetchone()
+            if not row or row["state"] in {"cancelled", "superseded", "complete"}:
+                return False
+            data = json.loads(row["data"])
+            title, body = current["title"], current.get("body") or ""
+            if (data.get("title"), data.get("body", "")) == (title, body):
+                return False
+            # Published pull flows retain their journal and continue normal review handling.
+            if data.get("pull") or data.get("stage") != "implement":
+                return False
+            data["issue_revision_previous"] = {
+                "title": data.get("title", ""),
+                "body": data.get("body", ""),
+            }
+            prepared = data.pop("prepared", None)
+            if prepared and prepared.get("sync"):
+                sync = prepared["sync"]
+                data["revision_prepared_draft"] = {
+                    **sync,
+                    "head": sync["origin"],
+                    "patch": prepared["patch"],
+                }
+            envelope = data.get("draft_checkpoints")
+            if envelope:
+                envelope.pop("solver_recovery", None)
+                envelope["requirements_changed"] = True
+                for draft in envelope.get("drafts", {}).values():
+                    draft.update(
+                        progress=[],
+                        guidance=None,
+                        last_editor=None,
+                        seed_patch_digest=None,
+                    )
+            for key in (
+                "model_attempt_failures",
+                "prior_model_attempt_failures",
+                "pause_reason",
+                "last_error",
+                "retry_at",
+                "provider_retry_count",
+                "provider_failures",
+            ):
+                data.pop(key, None)
+            data.update(title=title, body=body)
+            db.execute(
+                """UPDATE tasks SET data=?,state='queued',token=NULL,expires=0,
+                   generation=generation+1,due=?,attempts=0
+                   WHERE repo=? AND kind='issue' AND issue=?""",
+                (json.dumps(data), self.clock(), repo, issue),
+            )
+            return True
+
+    def cancel(self, repo, issue, *, kind="issue"):
         with self.tx() as db:
             db.execute(
                 """UPDATE tasks SET state='cancelled',token=NULL,generation=generation+1
-                WHERE repo=? AND issue=? AND kind='issue' AND state!='cancelled'""",
-                (repo, issue),
+                WHERE repo=? AND issue=? AND kind=? AND state!='cancelled'""",
+                (repo, issue, kind),
             )
 
     def adopt_pull(self, repo, pull, data, branch_prefix, *, head_sha=None):
@@ -163,6 +246,10 @@ class Store:
                 if job["state"] == "running" and job["expires"] > now:
                     return False
                 replacements.append(job["issue"])
+                if owned_pull == pull or same_branch:
+                    data["assignment_issues"] = sorted(
+                        {*data.get("assignment_issues", ()), job["issue"]}
+                    )
                 if owned_pull == pull and existing is None:
                     db.execute(
                         """INSERT OR REPLACE INTO model_activity
@@ -180,6 +267,9 @@ class Store:
                         "last_target",
                         "last_evidence",
                         "github_operations",
+                        "review_outcomes",
+                        "active_review_key",
+                        "deferred_review_keys",
                         "last_error",
                         "retry_at",
                         "provider_retry_count",
@@ -190,9 +280,11 @@ class Store:
                     ):
                         if key in original:
                             data[key] = original[key]
-                    if original["stage"] == "reply":
+                    if original["stage"] in {"reply", "question"}:
                         for key in ("stage", "feedback", "review_head"):
                             data[key] = original[key]
+                        if "question" in original:
+                            data["question"] = original["question"]
                     if (
                         original["stage"] == "repair"
                         and head_sha
@@ -217,6 +309,10 @@ class Store:
                             data["pause_reason"] = original["pause_reason"]
             for issue in replacements:
                 db.execute(
+                    "UPDATE model_usage SET kind='pull', issue=? WHERE repo=? AND kind='issue' AND issue=?",
+                    (pull, repo, issue),
+                )
+                db.execute(
                     """UPDATE tasks SET state='superseded', token=NULL, generation=generation+1,
                        data=json_remove(data,'$.draft_checkpoints')
                        WHERE repo=? AND kind='issue' AND issue=?""",
@@ -232,6 +328,10 @@ class Store:
                 ):
                     return False
                 previous["linked_issues"] = data["linked_issues"]
+                if data.get("assignment_issues"):
+                    previous["assignment_issues"] = sorted({
+                        *previous.get("assignment_issues", ()), *data["assignment_issues"]
+                    })
                 reopened = existing["state"] in {"complete", "cancelled"}
                 if reopened:
                     previous["stage"] = "watch"
@@ -377,25 +477,41 @@ class Store:
             )
             return {**dict(row), "data": json.loads(row["data"]), "token": token}
 
-    def observe_model(self, job, call, phase, role, provider, model):
+    def observe_model(self, job, call, phase, role, provider, model, usage=None):
         key = (job["repo"], job["kind"], job["issue"])
         with self.tx() as db:
             now = self.clock()
-            if not db.execute(
+            owns_job = db.execute(
                 "SELECT 1 FROM tasks WHERE token=? AND expires>?", (job["token"], now)
-            ).fetchone():
-                raise LeaseLost()
-            if phase in {"end", "success"}:
+            ).fetchone() is not None
+            if owns_job and phase in {"start", "end", "success"}:
+                db.execute(
+                    "INSERT OR IGNORE INTO model_usage VALUES (?,?,?,?,?,NULL,NULL,0)",
+                    (call, *key, job["token"]),
+                )
+            finished = phase in {"end", "success"}
+            if finished:
+                inputs, outputs, complete = token_counts(usage)
+                # A fenced call can still report tokens spent under its original
+                # lease, including after the PR job has adopted the usage row.
+                db.execute(
+                    """UPDATE model_usage SET input_tokens=?, output_tokens=?, complete=?
+                       WHERE call=? AND lease=?""",
+                    (inputs, outputs, complete, call, job["token"]),
+                )
+            if finished and owns_job:
                 db.execute(
                     "DELETE FROM model_activity WHERE repo=? AND kind=? AND issue=? AND slot=?",
                     (*key, call),
                 )
-            if phase != "end":
+            if owns_job and phase != "end":
                 slot = "last_success" if phase == "success" else call
                 db.execute(
                     "INSERT OR REPLACE INTO model_activity VALUES(?,?,?,?,?,?,?,?,?)",
                     (*key, slot, job["token"], role, provider, model, now),
                 )
+        if not owns_job:
+            raise LeaseLost()
 
     def check(self, job):
         with self.tx() as db:

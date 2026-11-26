@@ -227,13 +227,18 @@ def run_worker(store, config, once=False, *, pull: tuple[str, int] | None = None
                             logging.getLogger(__name__).info(
                                 "Adopted %s open PR(s) in %s", count, repo
                             )
-                    reconcile(controller.api, store, repo, controller.config)
+                    reconcile(
+                        controller.api,
+                        store,
+                        repo,
+                        {**controller.config, "bot_login": config["bot_login"]},
+                    )
                     if repo not in online:
                         logging.getLogger(__name__).info(
-                            "Listening to %s as %s for label %s",
+                            "Listening to %s for assignments to %s (optional label: %s)",
                             repo,
-                            config["bot_login"],
-                            controller.config.get("label", "agent:ready"),
+                            controller.config.get("assignee") or config["bot_login"],
+                            controller.config.get("label"),
                         )
                         online.add(repo)
                 except Exception as err:

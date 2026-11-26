@@ -342,6 +342,275 @@ def test_closed_pull_stops_review_processing():
         collect(github)
 
 
+@pytest.mark.parametrize("location", ["review", "inline", "conversation"])
+def test_clear_acknowledgments_are_ignored_without_hiding_requests(location):
+    github = ReviewGitHub()
+    github.reviews = []
+    github.pages = [[], []]
+    if location == "review":
+        github.reviews = [
+            review(1, body="Thanks!"),
+            review(2, body="Thanks! Please fix the example."),
+        ]
+    elif location == "inline":
+        github.pages[0] = [
+            thread("A", [comment(1, body="Thanks!")]),
+            thread("B", [comment(2, body="Thanks! Please fix the example.")]),
+        ]
+    else:
+        github.comments = [
+            {
+                "id": index,
+                "body": body,
+                "user": {"login": "maintainer"},
+                "created_at": "2026-01-02T00:00:00Z",
+            }
+            for index, body in enumerate(
+                ["Thanks!", "Thanks! Please fix the example."], 1
+            )
+        ]
+    batch = collect(github)
+    assert [item.body for item in batch.items] == ["Thanks! Please fix the example."]
+    assert [item.body for item in batch.handled] == ["Thanks!"]
+
+
+def test_two_items_in_one_thread_get_distinct_retry_safe_replies():
+    from dataclasses import replace
+    from github_harness_agent.publish import Journal
+    from github_harness_agent.reviews import reply_to_review
+
+    github = ReviewGitHub()
+    first = collect(github).items[1]
+    second = replace(first, key="second-revision", body="Also fix the example.")
+    journal = Journal({}, lambda: None)
+    for item in (first, second, first, second):
+        reply_to_review(
+            github,
+            journal,
+            lambda: None,
+            repo="test/repo",
+            pull=6,
+            item=item,
+            commit=github.head,
+            checks=("pytest tests/test_example.py (exit 0)",),
+            bot_login="test-app[bot]",
+        )
+    assert len(github.comments) == 2
+    assert first.body in github.comments[0]["body"]
+    assert second.body in github.comments[1]["body"]
+    assert (
+        f"https://github.com/test/repo/commit/{github.head}"
+        in github.comments[0]["body"]
+    )
+
+
+@pytest.mark.parametrize(
+    "saved_journal", [False, "pending", "pending-unposted", "complete"]
+)
+def test_previous_release_reply_is_recovered_without_duplicate(saved_journal):
+    from dataclasses import replace
+    from github_harness_agent.publish import Journal
+    from github_harness_agent.reviews import _digest, reply_to_review
+
+    github = ReviewGitHub()
+    item = collect(github).items[1]
+    legacy = _digest("test/repo", 6, item.thread, github.head)
+    body = f"Addressed this feedback in `{github.head}`.\n\n<!-- github-harness-agent:{legacy} -->"
+    github.comments = [
+        {
+            "id": 100,
+            "body": body,
+            "user": {"login": "test-app[bot]"},
+            "in_reply_to_id": item.reply_to,
+        }
+    ]
+    if saved_journal == "pending-unposted":
+        github.comments = []
+    data = {}
+    journal = Journal(data, lambda: None)
+    if saved_journal:
+        journal.begin(
+            f"reply:{legacy}",
+            {
+                "path": f"/repos/test/repo/pulls/6/comments/{item.reply_to}/replies",
+                "body": body,
+            },
+        )
+        if saved_journal == "complete":
+            journal.finish(f"reply:{legacy}", {"id": 100})
+    for _ in range(2):
+        assert (
+            reply_to_review(
+                github,
+                journal,
+                lambda: None,
+                repo="test/repo",
+                pull=6,
+                item=item,
+                commit=github.head,
+                checks=("pytest",),
+                bot_login="test-app[bot]",
+            )
+            == 100
+        )
+    assert len(github.comments) == 1
+    # A recovered legacy reply belongs to one revision, never every item in
+    # the same thread at the same commit.
+    next_item = replace(item, key="another-revision", body="Fix another case.")
+    assert (
+        reply_to_review(
+            github,
+            journal,
+            lambda: None,
+            repo="test/repo",
+            pull=6,
+            item=next_item,
+            commit=github.head,
+            checks=("pytest",),
+            bot_login="test-app[bot]",
+        )
+        == 101
+    )
+    assert len(github.comments) == 2
+
+
+@pytest.mark.parametrize("stage", ["reply", "question", "repair"])
+def test_review_decisions_survive_issue_to_pull_adoption(tmp_path, stage):
+    from github_harness_agent.store import Store
+
+    store = Store(tmp_path / "store.db")
+    original = {
+        "stage": stage,
+        "pull": 34,
+        "branch": "agent/issue-12",
+        "review_head": "head",
+        "feedback": [{"key": "active"}],
+        "question": "Which example?",
+        "review_outcomes": {
+            "done": {"status": "addressed", "commit": "head"},
+            "active": {"status": "clarification", "question": "Which example?"},
+        },
+        "active_review_key": "active",
+        "deferred_review_keys": ["later"],
+        "github_operations": {"reply:old": {"result": {"id": 100}}},
+    }
+    store.enqueue("org/repo", 12, original)
+    assert store.adopt_pull(
+        "org/repo",
+        34,
+        {
+            "stage": "watch",
+            "branch": original["branch"],
+            "author": "bot",
+            "linked_issues": [12],
+        },
+        "agent/",
+        head_sha="head",
+    )
+    adopted = store.claim(pull=("org/repo", 34))["data"]
+    for key in (
+        "stage",
+        "feedback",
+        "review_head",
+        "review_outcomes",
+        "active_review_key",
+        "deferred_review_keys",
+        "github_operations",
+    ):
+        assert adopted[key] == original[key]
+    if stage == "question":
+        assert adopted["question"] == original["question"]
+
+
+def test_review_diff_evidence_has_a_byte_budget_and_hunk_locations():
+    from github_harness_agent.controller import review_change_evidence
+
+    evidence = review_change_evidence(
+        b"diff --git a/example.py b/example.py\n@@ -1 +1 @@\n-secret\n+fix\n"
+        + ("@@ " + "é" * 10000).encode()
+    )
+    assert evidence[:2] == ["diff --git a/example.py b/example.py", "@@ -1 +1 @@"]
+    assert sum(len(line.encode()) + 1 for line in evidence) <= 4000
+    assert all("secret" not in line and "+fix" not in line for line in evidence)
+
+
+@pytest.mark.parametrize("recovery", ["journal", "pending", "remote"])
+def test_legacy_controller_restart_recovers_posted_reply_without_clarification(
+    tmp_path, recovery
+):
+    import dataclasses
+    from github_harness_agent.controller import Controller
+    from github_harness_agent.reviews import Feedback, _digest
+    from github_harness_agent.store import Store
+    from test_intake import pull
+
+    request = pull(20, "feature")
+    item = Feedback("old-revision", "old-thread", 44, "Fix the example", "maintainer")
+    head = request["head"]["sha"]
+    legacy = _digest("owner/repo", 20, item.thread, head)
+    body = f"Addressed this feedback in `{head}`.\n\n<!-- github-harness-agent:{legacy} -->"
+    posted = {
+        "id": 100,
+        "body": body,
+        "user": {"login": "agent-user"},
+        "in_reply_to_id": 44,
+    }
+    data = {
+        "stage": "reply",
+        "pull": 20,
+        "branch": "feature",
+        "author": "agent-user",
+        "linked_issues": [],
+        "title": "PR",
+        "body": "",
+        "base": "release/2",
+        "seen": [],
+        "threads": [],
+        "round": 1,
+        "feedback": [dataclasses.asdict(item)],
+        "review_head": "previous-head",
+        "last_commit": head,
+        "last_checks": ["pytest (exit 0)"],
+    }
+    if recovery in {"journal", "pending"}:
+        entry = {
+            "intent": {
+                "path": "/repos/owner/repo/pulls/20/comments/44/replies",
+                "body": body,
+            }
+        }
+        if recovery == "journal":
+            entry["result"] = {"id": 100}
+        data["github_operations"] = {f"reply:{legacy}": entry}
+
+    class API:
+        def rest(self, method, path, **kwargs):
+            assert method == "GET", "restart must not post a duplicate clarification"
+            return request
+
+        def paginate(self, path, **kwargs):
+            assert path == "/repos/owner/repo/pulls/20/comments"
+            return [] if recovery == "journal" else [posted]
+
+    database = tmp_path / "job.db"
+    Store(database).adopt_pull("owner/repo", 20, data, "agent/")
+    restarted = Store(database)
+    Controller(
+        restarted, API(), None, {"checks": [["test"]], "mode": "canary"}, "agent-user"
+    ).run(restarted.claim())
+    with restarted.tx() as connection_:
+        import json
+
+        saved = json.loads(connection_.execute("SELECT data FROM tasks").fetchone()[0])
+    assert saved["seen"] == [item.key]
+    assert saved["stage"] == "watch"
+    assert saved["review_outcomes"][item.key] == {
+        "status": "recovered",
+        "commit": head,
+        "replied": True,
+    }
+
+
 def test_thread_resolved_before_reply_suppresses_comment():
     from github_harness_agent.publish import Journal
     from github_harness_agent.reviews import reply_to_review

@@ -5,7 +5,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from urllib.parse import quote
 
-from .github import validate_repository
+from .github import GitHubError, validate_repository
 
 
 _CLOSING_REFERENCE = re.compile(
@@ -114,35 +114,46 @@ def maintainer(api, repo, login):
     return data["permission"] in {"admin", "maintain", "write"}
 
 
-def eligible(api, repo, issue, label):
-    if issue["state"] != "open" or label not in {x["name"] for x in issue["labels"]}:
+def eligible(api, repo, issue, bot_login, label=None):
+    """Assignment to the configured account is the authority to work an issue."""
+    if issue["state"] != "open" or not bot_login or bot_login.casefold() not in {
+        (assignee.get("login") or "").casefold()
+        for assignee in issue.get("assignees", ())
+    }:
         return False
-    number = issue["number"]
-    events = api.paginate(f"/repos/{repo}/issues/{number}/events")
-    actor = None
-    for event in events:
-        if event.get("label", {}).get("name") == label:
-            if event["event"] == "labeled":
-                actor = (event.get("actor") or {}).get("login")
-            elif event["event"] == "unlabeled":
-                actor = None
-    if not actor or not maintainer(api, repo, actor):
+    if label and label not in {x["name"] for x in issue.get("labels", ())}:
         return False
+    if label:
+        actor = None
+        for event in api.paginate(f"/repos/{repo}/issues/{issue['number']}/events"):
+            if event.get("label", {}).get("name") == label:
+                if event["event"] == "labeled":
+                    actor = (event.get("actor") or {}).get("login")
+                elif event["event"] == "unlabeled":
+                    actor = None
+        if not actor or not maintainer(api, repo, actor):
+            return False
     return all(
         dep["state"] == "closed"
-        for dep in api.paginate(
-            f"/repos/{repo}/issues/{number}/dependencies/blocked_by"
-        )
+        for dep in api.paginate(f"/repos/{repo}/issues/{issue['number']}/dependencies/blocked_by")
     )
 
 
 def reconcile(api, store, repo, config):
-    label = config.get("label", "agent:ready")
+    label = config.get("label")
+    bot_login = config.get("assignee") or config.get("bot_login")
+    params = {"state": "open", "assignee": bot_login}
+    if label:
+        params["labels"] = label
+    scan = store.issue_scan_snapshot(repo)
+    eligible_issues = set()
     for issue in api.paginate(
-        f"/repos/{repo}/issues", params={"state": "open", "labels": label}
+        f"/repos/{repo}/issues", params=params
     ):
-        if "pull_request" in issue or not eligible(api, repo, issue, label):
+        if "pull_request" in issue or not eligible(api, repo, issue, bot_login, label):
             continue
+        eligible_issues.add(issue["number"])
+        store.refresh_issue(repo, issue["number"], issue)
         base = config["base"]
         sha = api.rest("GET", f"/repos/{repo}/git/ref/heads/{quote(base, safe='/')}")[
             "object"
@@ -163,3 +174,16 @@ def reconcile(api, store, repo, config):
                 "stage": "implement",
             },
         )
+    # A filtered list can lag a reassignment. Confirm missing jobs individually
+    # before fencing them, and never infer cancellation from an incomplete scan.
+    for number in scan.keys() - eligible_issues:
+        try:
+            current = api.rest("GET", f"/repos/{repo}/issues/{number}")
+        except GitHubError as error:
+            if error.status != 404:
+                raise
+        else:
+            if eligible(api, repo, current, bot_login, label):
+                eligible_issues.add(number)
+                store.refresh_issue(repo, number, current)
+    store.cancel_missing_issues(repo, eligible_issues, scan)
