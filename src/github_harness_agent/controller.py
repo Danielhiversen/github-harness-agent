@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 from threading import Lock
 
+from .check_artifacts import check_label
 from .checkpoint import DraftCheckpoint, SolverRecovery
 from .ci import CI_BATCH_SIZE, format_ci_feedback, read_ci_report
 from .executor import (
@@ -30,6 +31,7 @@ from .publish import (
     StaleHead,
     TargetMoved,
 )
+from .providers import MODEL_ID, PUBLIC_ALIASES
 from .rebase import (
     BOT_IDENTITY,
     RebaseConflict,
@@ -43,6 +45,38 @@ from .reviews import ReviewItem, collect_reviews, map_feedback, reply_to_review
 from .test_updates import authorized_regression_request, authorized_test_update, requests_new_tests
 from .store import LeaseLost
 from .task_context import build_task_context, github_history, review_source_context
+
+
+def _log_candidate_rejection(job, error, parent):
+    cause = error.__cause__ or error
+    candidate = error.candidate
+    provider = getattr(candidate, "route", None)
+    model = getattr(candidate, "configured_model", None)
+    if provider not in PUBLIC_ALIASES:
+        provider = model = None
+    if not isinstance(model, str) or not MODEL_ID.fullmatch(model):
+        model = None
+    checks = getattr(cause, "checks", ())
+    failed_checks = [
+        f"{index}:{check_label(check.command, ()) or 'configured-check'}:{check.returncode}"
+        for index, check in enumerate(checks, 1)
+        if check.returncode
+    ][:16]
+    if isinstance(error, ReviewRoundExhausted):
+        reason = "review_round_exhausted"
+    elif str(cause) in {"Executor returned an empty patch", "empty patch"}:
+        reason = "empty_patch"
+    elif failed_checks:
+        reason = "verification_failed"
+    else:
+        reason = type(cause).__name__
+    logging.getLogger(__name__).info(
+        "candidate_rejected repo=%s kind=%s job=%s pull=%s generation=%s attempt=%s "
+        "base=%.12s reason=%s provider=%s model=%s model_calls=%s failed_checks=%s",
+        job["repo"], job["kind"], job["issue"], job["data"].get("pull"),
+        job["generation"], job["attempts"] + 1, parent, reason, provider or "-",
+        model or "-", len(error.route_trace), ",".join(failed_checks) or "-",
+    )
 
 
 def prepare_commit(path, parent, patch, issue, identity=BOT_IDENTITY, *, adopted=False):
@@ -385,7 +419,8 @@ class Controller:
                 head = data.get("last_commit")
                 ci_feedback = []
                 if (
-                    head
+                    (batch.items or data["round"] < data.get("allowed_rounds", 3))
+                    and head
                     and head == batch.head == pr["head"]["sha"]
                     and adoptable_pull(pr, repo, self.bot_login, branch)
                     and publisher.branch_head(repo, branch) == head
@@ -404,10 +439,6 @@ class Controller:
                     ][: max(0, min(CI_BATCH_SIZE, 128 - len(seen)))]
                 if not batch.items and not ci_feedback:
                     store.save(job, "queued", delay=45)
-                    return
-                if data["round"] >= data.get("allowed_rounds", 3):
-                    data["pause_reason"] = "review repair round limit reached"
-                    store.save(job, "paused")
                     return
                 data["feedback"] = [dataclasses.asdict(item) for item in batch.items]
                 data["ci_feedback"] = [dataclasses.asdict(item) for item in ci_feedback]
@@ -799,15 +830,18 @@ class Controller:
                             store.save(job, "queued")
                             return
                         logging.getLogger(__name__).info(
-                            "Starting %s %s #%s at %.12s (provider retry %s)",
+                            "Starting %s %s #%s at %.12s (provider retry %s, generation %s, attempt %s)",
                             repo,
                             job["kind"],
                             issue,
                             parent,
                             task.provider_offset,
+                            job["generation"],
+                            job["attempts"] + 1,
                         )
                         result = self.executor.execute(task, path, cancelled=cancelled)
                     except AttemptRejected as err:
+                        _log_candidate_rejection(job, err, parent)
                         candidate = err.candidate
                         trace = [dataclasses.asdict(route) for route in err.route_trace]
                         if isinstance(err, ReviewRoundExhausted):

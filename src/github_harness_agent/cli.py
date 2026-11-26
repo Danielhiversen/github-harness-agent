@@ -98,6 +98,12 @@ def _defer_provider(store, job, error, aliases):
     )
     _archive_candidate_failures(data)
     store.save(job, "queued", delay=delay)
+    logging.getLogger(__name__).info(
+        "provider_exhausted repo=%s kind=%s job=%s pull=%s generation=%s attempt=%s "
+        "cycle=%s retry_in_seconds=%d provider_failures=%s",
+        job["repo"], job["kind"], job["issue"], data.get("pull"), job["generation"],
+        job["attempts"] + 1, count, delay, json.dumps(data["provider_failures"]),
+    )
 
 
 def _configured_limit(repo, config, key, default, maximum):
@@ -200,6 +206,7 @@ def run_worker(store, config, once=False, *, pull: tuple[str, int] | None = None
         )
         controllers[repo] = Controller(store, api, executor, cfg, config["bot_login"])
     store.recover_provider_pauses(repositories, pull=pull)
+    store.recover_review_limit_pauses(repositories, pull=pull)
     next_sync = 0
     online = set()
     while True:
@@ -258,12 +265,6 @@ def run_worker(store, config, once=False, *, pull: tuple[str, int] | None = None
                 except LeaseLost:
                     pass
             except Exception as err:
-                logging.error(
-                    "Task %s#%s failed (%s)",
-                    job["repo"],
-                    job["issue"],
-                    type(err).__name__,
-                )
                 job["data"]["last_error"] = (
                     str(err)
                     if isinstance(err, ReviewRoundExhausted)
@@ -272,8 +273,16 @@ def run_worker(store, config, once=False, *, pull: tuple[str, int] | None = None
                 count = job["data"].get("consecutive_failures", 0) + 1
                 job["data"]["consecutive_failures"] = count
                 delay = max(30, min(3600, 2 ** min(count, 10)))
+                state = "paused" if count >= 5 else "queued"
+                logging.getLogger(__name__).error(
+                    "Task %s#%s failed (%s) kind=%s stage=%s generation=%s attempt=%s "
+                    "consecutive_failures=%s next_state=%s retry_in_seconds=%d",
+                    job["repo"], job["issue"], type(err).__name__, job["kind"],
+                    job["data"]["stage"], job["generation"], job["attempts"] + 1,
+                    count, state, delay if state == "queued" else 0,
+                )
                 try:
-                    store.save(job, "paused" if count >= 5 else "queued", delay)
+                    store.save(job, state, delay)
                 except LeaseLost:
                     pass
             else:

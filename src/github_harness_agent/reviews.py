@@ -11,7 +11,7 @@ from .github import GitHubError, validate_repository
 from .publish import ClosedPull, Journal, StaleHead
 
 
-_REVIEW_STATES = {"COMMENTED", "CHANGES_REQUESTED"}
+_REVIEW_STATES = {"APPROVED", "COMMENTED", "CHANGES_REQUESTED"}
 _PAGE = "pageInfo { hasNextPage endCursor }"
 _COMMENT = """
     fullDatabaseId author { login __typename } body lastEditedAt publishedAt state diffHunk
@@ -195,10 +195,10 @@ _BODY_REQUEST = re.compile(
 )
 
 
-def _prior_review_replies(github, repo, pull, reviews, candidates, bot_login):
+def _prior_review_replies(conversation, reviews, candidates, bot_login):
     """Match replies by review reference or a verified account's follow-up review."""
     replies = {}
-    for comment in github.paginate(f"/repos/{repo}/issues/{pull}/comments"):
+    for comment in conversation:
         login = (comment.get("user") or {}).get("login", "")
         body = comment.get("body") or ""
         if login.casefold() != bot_login.casefold() or not any(
@@ -331,6 +331,8 @@ def collect_reviews(
             body = review["body"].strip()
             if not login or not body or not allowed(login):
                 continue
+            if review["state"] == "APPROVED" and not _BODY_REQUEST.search(body):
+                continue
             thread = f"review:{review['fullDatabaseId']}"
             key = f"{thread}:{_digest(body, review.get('lastEditedAt'))}"
             if key not in previous_keys:
@@ -417,10 +419,27 @@ def collect_reviews(
                     )
                 )
 
+    conversation = list(github.paginate(f"/repos/{repo}/issues/{pull}/comments"))
+    for comment in conversation:
+        author = comment.get("user") or {}
+        login = _author(
+            {"author": {"login": author.get("login"), "__typename": author.get("type")}},
+            bot_login,
+        )
+        body = (comment.get("body") or "").strip()
+        revision = comment.get("updated_at") or comment.get("created_at")
+        when = _review_time(revision)
+        if not login or not body or not when or (cutoff and when <= cutoff):
+            continue
+        thread = f"conversation:{comment['id']}"
+        key = f"{thread}:{_digest(body, revision)}"
+        if key not in previous_keys and allowed(login):
+            items.append(Feedback(key, thread, None, comment["body"], login, revision_at=when.timestamp()))
+
     if cutoff is None:
         return ReviewBatch(
             head,
-            tuple(body_items.values()) + tuple(row[0] for row in inline_items),
+            tuple(body_items.values()) + tuple(row[0] for row in inline_items) + tuple(items),
             retry_at,
         )
 
@@ -434,7 +453,7 @@ def collect_reviews(
     current_reviews = {}
     for review in history:
         if (
-            review["state"] not in _REVIEW_STATES | {"APPROVED"}
+            review["state"] not in _REVIEW_STATES
             or _review_commit(review) != head
         ):
             continue
@@ -453,7 +472,7 @@ def collect_reviews(
         item.outdated and when and when <= cutoff for item, _, when, _ in inline_items
     )
     replied = (
-        _prior_review_replies(github, repo, pull, history, requests, bot_login)
+        _prior_review_replies(conversation, history, requests, bot_login)
         if have_history
         else {}
     )
@@ -528,8 +547,9 @@ def reply_to_review(
             raise ValueError("a review commit reply requires verification evidence")
         body = f"Addressed this feedback in `{commit}`.\n\nChecks\n\n{evidence}"
     if item.reply_to is None:
-        review_id = item.thread.removeprefix("review:")
-        body = f"Following up on review #{review_id}.\n\n{body}"
+        kind, _, number = item.thread.partition(":")
+        reference = f"PR comment #{number}" if kind == "conversation" else f"review #{number}"
+        body = f"Following up on {reference}.\n\n{body}"
     intent = {"path": post_path, "body": f"{body}\n\n{marker}"}
 
     def lookup():

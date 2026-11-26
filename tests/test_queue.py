@@ -36,3 +36,35 @@ def test_restart_redelivery_and_fencing(tmp_path):
     store.cancel(repo, 1)
     with pytest.raises(LeaseLost):
         store.check(resumed)
+
+
+def test_recover_legacy_review_limits_only_requeues_watchers(tmp_path):
+    store = Store(tmp_path / "db", lambda: 100)
+    for repo, number, reason in (
+        ("acme/widgets", 1, "review repair round limit reached"),
+        ("acme/widgets", 2, "operator paused this PR"),
+        ("acme/other", 3, "review repair round limit reached"),
+    ):
+        store.enqueue(repo, number, {"stage": "watch", "pause_reason": reason})
+        store.save(store.claim(), "paused")
+
+    assert store.recover_review_limit_pauses(("acme/widgets",)) == 1
+    job = store.claim()
+    assert job["issue"] == 1 and "pause_reason" not in job["data"]
+    assert store.claim() is None
+
+
+def test_only_pull_request_conversation_webhooks_enter_review_inbox(tmp_path):
+    repo = "acme/widgets"
+    store = Store(tmp_path / "db")
+    app = TestClient(create_app(store, b"secret", {repo}))
+    for number, issue in enumerate(({"number": 1}, {"number": 2, "pull_request": {"url": "pr"}})):
+        body = json.dumps({"repository": {"full_name": repo}, "issue": issue}).encode()
+        signature = hmac.new(b"secret", body, hashlib.sha256).hexdigest()
+        response = app.post("/webhook", content=body, headers={
+            "x-github-event": "issue_comment",
+            "x-github-delivery": str(number),
+            "x-hub-signature-256": "sha256=" + signature,
+        })
+        assert response.status_code == 202
+    assert [event["id"] for event in store.events()] == ["1"]

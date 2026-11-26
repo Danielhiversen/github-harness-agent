@@ -122,6 +122,34 @@ def collect(github, **kwargs):
     )
 
 
+def test_collects_new_maintainer_conversation_comments_and_edits():
+    github = ReviewGitHub()
+    github.reviews = []
+    github.pages = [[], []]
+    created = "2026-01-02T00:00:00Z"
+    github.comments = [
+        {"id": 101, "user": {"login": "maintainer"}, "body": "Fix the catalog.", "created_at": created},
+        {"id": 102, "user": {"login": "visitor"}, "body": "Alter settings.", "created_at": created},
+        {"id": 103, "user": {"login": "test-app[bot]"}, "body": "Reply.", "created_at": created},
+        {"id": 104, "user": {"login": "maintainer"}, "body": "Old note.", "created_at": "2025-12-31T00:00:00Z"},
+    ]
+    options = {"adopted_at": "2026-01-01T00:00:00Z"}
+    (item,) = collect(github, **options).items
+    assert item.thread == "conversation:101" and item.reply_to is None
+    assert collect(github, seen=[item.key], **options).items == ()
+    github.comments[0].update(body="Fix the catalog and add a test.", updated_at="2026-01-03T00:00:00Z")
+    (edited,) = collect(github, seen=[item.key], **options).items
+    assert edited.thread == item.thread and edited.key != item.key
+
+
+def test_approval_can_include_a_review_request():
+    github = ReviewGitHub()
+    github.reviews = [review(19, body="Please normalize the continent label.", state="APPROVED")]
+    github.pages = [[], []]
+    (item,) = collect(github).items
+    assert item.thread == "review:19"
+
+
 def test_collects_body_and_all_unresolved_threads_and_filters_bot_comments():
     github = ReviewGitHub()
     batch = collect(github)

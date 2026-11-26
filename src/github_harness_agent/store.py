@@ -275,6 +275,26 @@ class Store:
                         (repo, row["issue"]),
                     )
 
+    def recover_review_limit_pauses(self, repositories, *, pull=None):
+        """Old round-limit pauses must watch for fresh review feedback again."""
+        repositories = tuple(repositories)
+        if not repositories:
+            return 0
+        selection = " AND repo IN (" + ", ".join("?" for _ in repositories) + ")"
+        parameters = repositories
+        if pull is not None:
+            selection += " AND repo=? AND kind='pull' AND issue=?"
+            parameters += pull
+        with self.tx() as db:
+            return db.execute(
+                """UPDATE tasks SET state='queued',token=NULL,generation=generation+1,due=?,
+                   data=json_remove(data,'$.pause_reason')
+                   WHERE state='paused' AND json_extract(data,'$.stage')='watch'
+                   AND json_extract(data,'$.pause_reason')='review repair round limit reached'"""
+                + selection,
+                (self.clock(), *parameters),
+            ).rowcount
+
     def recover_provider_pauses(self, repositories, *, pull=None):
         """Recover only records paused by the old provider-exhaustion handler."""
         repositories = tuple(repositories)

@@ -47,6 +47,7 @@ from .executor import (
     RefinementEvidence,
     RouteEvidence,
     _CandidateOutputError,
+    _PythonPatchSyntaxError,
     _RequestBudgetExceeded,
     _VerificationRejected,
     _combined,
@@ -1252,7 +1253,7 @@ def evidence(
         for number, command in enumerate(commands):
             budget.claim("command", budget.limits.commands)
             try:
-                outcome = executor._command(ws, budget, command, checked=False)
+                outcome = executor._run_check_command(ws, budget, command, charge_retry=True)
             except CommandOutputExceeded:
                 if not private_proposal:
                     raise
@@ -1281,7 +1282,8 @@ def evidence(
                         ):
                             unused_import_checks.add(number)
                 nodes = [node for _, node in _TEST_RESULT.findall(output)]
-                line_traceback = "--tb=line" in command or any(
+                actual_args = getattr(outcome, "args", ()) or ()
+                line_traceback = "--tb=line" in actual_args or "--tb=line" in command or any(
                     option == ("--tb", "line") for option in zip(command, command[1:])
                 )
                 line_details = _line_failure_details(output) if line_traceback else {}
@@ -3109,7 +3111,14 @@ def solve(executor, task, archive, budget, version):
         restored_checkpoint = bool(draft and draft.guidance == _GUIDANCE and draft.base_sha == task.base_sha)
         if restored_checkpoint:
             executor._git(ws, budget, "apply", "--index", data=draft.patch)
-            executor._check_patch_paths(ws, task, budget, tree)
+            try:
+                executor._check_draft_paths(ws, task, budget, tree)
+            except _PythonPatchSyntaxError:
+                executor._git(ws, budget, "read-tree", "--reset", "-u", tree)
+                if task.save_checkpoint is not None:
+                    task.save_checkpoint(replace(draft, patch=b""))
+                restored_checkpoint = False
+        if restored_checkpoint:
             for path in current:
                 blob = executor._git(
                     ws,

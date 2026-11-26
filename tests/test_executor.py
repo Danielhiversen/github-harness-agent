@@ -366,7 +366,8 @@ def test_new_test_cannot_bypass_existing_checks(fixture):
         PlainExecutor(runner, gateway).execute(task, source)
 
 
-def test_model_can_continue_after_an_oversized_tool_read(fixture):
+def test_model_can_continue_after_an_oversized_tool_read(fixture, caplog):
+    caplog.set_level("INFO")
     task, source, runner = fixture
 
     class NarrowingGateway(ScriptedGateway):
@@ -382,6 +383,43 @@ def test_model_can_continue_after_an_oversized_tool_read(fixture):
         task, source
     )
     assert b"+4\n" in result.patch
+    assert "rollout_complete" in caplog.text and "run_calls=2" in caplog.text
+    assert "x" * 100 not in caplog.text
+
+
+def test_command_overflow_logs_check_category_without_arguments(fixture, caplog):
+    _, _, runner = fixture
+    executor = PlainExecutor(runner, ScriptedGateway(None))
+
+    def noisy_command(*args, **kwargs):
+        raise CommandOutputExceeded("Command output exceeded the configured size")
+
+    workspace = SimpleNamespace(command=noisy_command)
+    budget = SimpleNamespace(remaining=lambda: 10, cancelled=lambda: False)
+    with pytest.raises(CommandOutputExceeded):
+        executor._command(
+            workspace, budget, ("uv", "run", "--no-sync", "pytest", "private-path"), cap=1024
+        )
+    assert "pytest exceeded output limit (1024 bytes)" in caplog.text
+    assert "private-path" not in caplog.text
+
+
+def test_noisy_pytest_check_retries_with_compact_output(fixture, tmp_path):
+    _, _, runner = fixture
+    test = tmp_path / "test_noisy.py"
+    test.write_text(
+        "import pytest\n"
+        "@pytest.mark.parametrize('index', range(8))\n"
+        "def test_noisy(index):\n"
+        "    print('x' * 12000)\n"
+        "    assert index == -1\n"
+    )
+    command = (sys.executable, "-m", "pytest", "-v", str(test))
+    executor = PlainExecutor(runner, ScriptedGateway(None), Limits(command_output_bytes=10000))
+    budget = SimpleNamespace(remaining=lambda: 20, cancelled=lambda: False)
+    checks = executor._run_checks(FixtureWorkspace(tmp_path), budget, (command,))
+    assert len(checks) == 1 and checks[0].command == command
+    assert checks[0].returncode == 1 and "8 failed" in checks[0].output
 
 
 def test_oversized_checkout_reports_the_archive_limit(fixture):
@@ -1132,6 +1170,33 @@ def test_linux_worker_executes_without_controller_credentials(fixture, monkeypat
         task, source
     )
     assert b"+4\n" in result.patch
+
+
+def test_pinned_review_rejects_saved_python_with_invalid_syntax(fixture):
+    from github_harness_agent.checkpoint import DraftCheckpoint
+    from github_harness_agent.executor import _Budget, _CandidateOutputError
+    from github_harness_agent.review_solver import patch_for
+
+    task, source, runner = fixture
+    path = "scheduler.py"
+    original = "def schedule():\n    return 1\n"
+    (source / path).write_text(original)
+    subprocess.run(["git", "add", path], cwd=source, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+         "commit", "-qm", "Add scheduler"], cwd=source, check=True,
+    )
+    sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source).decode().strip()
+    task = replace(task, base_sha=sha, regression_edit_path=path)
+    executor = PlainExecutor(runner, ScriptedGateway(None))
+    budget = _Budget(executor.limits, lambda: False, task)
+    archive = subprocess.check_output(["git", "archive", sha], cwd=source)
+    patch = patch_for({path: original}, {path: "def schedule():\nreturn 1\n"})
+    draft = DraftCheckpoint("plain/coding", sha, patch)
+    with runner.workspace(archive, budget.remaining, budget.cancelled) as workspace:
+        baseline = executor._stage_baseline(workspace, budget)
+        with pytest.raises(_CandidateOutputError, match=r"scheduler\.py:2"):
+            executor._restore_draft(workspace, task, budget, baseline, draft, None)
 
 
 @pytest.mark.parametrize("executor_class", [PlainExecutor, Harness2Executor])

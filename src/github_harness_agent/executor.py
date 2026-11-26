@@ -154,6 +154,10 @@ class _CandidateOutputError(ExecutionError):
     pass
 
 
+class _PythonPatchSyntaxError(_CandidateOutputError):
+    pass
+
+
 @dataclass(frozen=True)
 class _CheckArtifact:
     index_entry: bytes
@@ -660,13 +664,15 @@ class PlainExecutor:
         ))
 
     def _command(self, workspace, budget, argv, *, data=b"", cap=None, checked=True):
-        result = workspace.command(
-            argv,
-            budget.remaining(),
-            budget.cancelled,
-            data=data,
-            cap=cap if cap is not None else self.limits.command_output_bytes,
-        )
+        limit = cap if cap is not None else self.limits.command_output_bytes
+        try:
+            result = workspace.command(
+                argv, budget.remaining(), budget.cancelled, data=data, cap=limit
+            )
+        except CommandOutputExceeded:
+            label, _ = self._command_progress(argv, None, check_label(argv, ()))
+            logging.getLogger(__name__).warning("%s (%d bytes)", label, limit)
+            raise
         if checked and result.returncode:
             raise ExecutionError(f"Worker command failed: {argv[0]}")
         return result
@@ -737,10 +743,29 @@ class PlainExecutor:
         )
         if result.returncode:
             raise ExecutionError("Saved draft no longer applies to this checkout")
-        self._check_patch_paths(workspace, task, budget, baseline)
+        self._check_draft_paths(workspace, task, budget, baseline)
         tree = self._git(workspace, budget, "write-tree").stdout.strip().decode("ascii")
         self._git(workspace, budget, "read-tree", baseline)
         return tree
+
+    def _check_draft_paths(self, workspace, task, budget, baseline, *, index=None):
+        new_tests, _ = self._check_patch_paths(workspace, task, budget, baseline, index=index)
+        if not task.regression_edit_path:
+            return
+        paths = (task.regression_edit_path, *new_tests)
+        for path in paths:
+            if not path.endswith(".py"):
+                continue
+            source = self._git(
+                workspace, budget, "cat-file", "blob", f":{path}",
+                index=index, cap=self.limits.patch_bytes,
+            ).stdout
+            try:
+                compile(source, path, "exec", dont_inherit=True)
+            except SyntaxError as error:
+                raise _PythonPatchSyntaxError(
+                    f"Invalid Python syntax at {path}:{error.lineno or 1}: {error.msg}"
+                ) from None
 
     @staticmethod
     def _command_progress(argv, returncode, check):
@@ -1031,14 +1056,17 @@ class PlainExecutor:
             progress = []
             instructions = task.instructions
             if draft is not None and draft.patch:
-                staged_tree = self._restore_draft(
-                    workspace,
-                    task,
-                    budget,
-                    baseline,
-                    draft,
-                    checkpoint_guidance,
-                )
+                try:
+                    staged_tree = self._restore_draft(
+                        workspace, task, budget, baseline, draft, checkpoint_guidance,
+                    )
+                except _PythonPatchSyntaxError as error:
+                    self._git(workspace, budget, "read-tree", "--reset", "-u", baseline)
+                    if task.save_checkpoint is not None:
+                        task.save_checkpoint(replace(draft, patch=b""))
+                    instructions += f"\n\nA saved draft was discarded because it failed syntax validation. {error}"
+                    draft = None
+            if draft is not None and draft.patch:
                 if upgraded and task.save_checkpoint is not None:
                     budget.remaining()
                     task.save_checkpoint(draft)
@@ -1141,6 +1169,7 @@ class PlainExecutor:
             actor = None
             last = None
             turns = 0
+            successful_edits = rejected_edits = run_calls = 0
             limit = budget.limits.rollout_requests
             automatic_review = task.verify_base_first and limit is None
             if automatic_review:
@@ -1552,6 +1581,13 @@ class PlainExecutor:
                         )
                     if text_recovery and touched and returncode == 0:
                         successful_text_edits += 1
+                    if is_edit:
+                        if touched and returncode == 0:
+                            successful_edits += 1
+                        else:
+                            rejected_edits += 1
+                    elif name == "run":
+                        run_calls += 1
                     if scoped_sources is not None:
                         edit_succeeded = is_edit and touched and returncode == 0
                         if scoped_action_counts is not None:
@@ -1708,17 +1744,18 @@ class PlainExecutor:
                                 )
                             )
                             if patch and tree != staged_tree:
-                                self._check_patch_paths(
+                                self._check_draft_paths(
                                     workspace,
                                     task,
                                     budget,
                                     baseline,
                                     index=checkpoint_index,
                                 )
-                        except _ProtectedPatchError as error:
+                        except (_ProtectedPatchError, _PythonPatchSyntaxError) as error:
                             # Keep the previous safe draft and let the model correct the checkout.
                             if task.verify_base_first:
-                                feedback = f"[PATCH VALIDATION] {error.repair_feedback}"
+                                detail = error.repair_feedback if isinstance(error, _ProtectedPatchError) else str(error)
+                                feedback = f"[PATCH VALIDATION] {detail}"
                                 messages[-1]["content"] += f"\n\n{feedback}"
                                 trajectory.append(feedback)
                         except (CommandOutputExceeded, _CandidateOutputError):
@@ -1789,7 +1826,7 @@ class PlainExecutor:
             try:
                 patch = self._draft_patch(workspace, budget, baseline)
                 if patch and not clarification:
-                    self._check_patch_paths(workspace, task, budget, baseline)
+                    self._check_draft_paths(workspace, task, budget, baseline)
                 if scoped_sources is not None:
                     updated = (
                         captured_exact_edits() if scoped_verify is not None else
@@ -1828,6 +1865,12 @@ class PlainExecutor:
                     scoped_sources.update(updated)
             except (CommandOutputExceeded, _CandidateOutputError) as error:
                 budget.reject(error, actor or last)
+        logging.getLogger(__name__).info(
+            "rollout_complete repo=%s base=%.12s candidate=%s model_turns=%d "
+            "successful_edits=%d rejected_edits=%d run_calls=%d patch_bytes=%d",
+            task.repository, task.base_sha, checkpoint_key or "-", turns,
+            successful_edits, rejected_edits, run_calls, len(patch),
+        )
         return patch, "\n".join(trajectory)[-32768:], actor or last
 
     def _capture_scoped_sources(self, workspace, budget, baseline, sources, *, text_only):
@@ -1984,10 +2027,24 @@ class PlainExecutor:
                 raise ExecutionError("Worker could not validate the generated patch")
             raise _CandidateOutputError(message)
 
+    def _run_check_command(self, workspace, budget, command, *, charge_retry=False):
+        try:
+            return self._command(workspace, budget, command, checked=False)
+        except CommandOutputExceeded:
+            compact = ("--tb=line", "--show-capture=no")
+            if (
+                check_label(command, ()) != "pytest" or "--" in command
+                or all(option in command for option in compact)
+            ):
+                raise
+            if charge_retry:
+                budget.claim("command", budget.limits.commands)
+            return self._command(workspace, budget, (*command, *compact), checked=False)
+
     def _run_checks(self, workspace, budget, commands, *, collect=False):
         checks = []
         for command in commands:
-            result = self._command(workspace, budget, command, checked=False)
+            result = self._run_check_command(workspace, budget, command)
             checks.append(CheckEvidence(command, result.returncode, _combined(result)))
             if result.returncode and (not collect or not 0 < result.returncode < 125):
                 break

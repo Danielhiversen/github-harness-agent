@@ -106,7 +106,7 @@ def test_generic_pytest_failure_selects_structured_details_before_excerpting(
     executor = SimpleNamespace(
         verification_runner=SimpleNamespace(workspace=lambda *args: nullcontext(object())),
         _stage_baseline=lambda *args: None,
-        _command=lambda *args, **kwargs: SimpleNamespace(returncode=2, stdout=output.encode(), stderr=b""),
+        _run_check_command=lambda *args, **kwargs: SimpleNamespace(returncode=2, stdout=output.encode(), stderr=b""),
     )
     budget = SimpleNamespace(
         remaining=None, cancelled=None, claim=lambda *args: None, limits=SimpleNamespace(commands=1),

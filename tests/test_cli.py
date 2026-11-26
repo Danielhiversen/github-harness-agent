@@ -310,8 +310,9 @@ def _stored_job(store, kind, number):
 
 
 def test_provider_cooldown_and_backoff_are_durable_and_only_clear_on_progress(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, caplog
 ):
+    caplog.set_level("INFO")
     outcomes = iter(
         [
             providers.ProviderExhausted(
@@ -348,6 +349,9 @@ def test_provider_cooldown_and_backoff_are_durable_and_only_clear_on_progress(
 
     work()
     record = _stored_job(store, "pull", 20)
+    assert "provider_exhausted repo=example/project kind=pull job=20" in caplog.text
+    assert "retry_in_seconds=11900" in caplog.text
+    assert "secret or response text" not in caplog.text and "secret-route-token" not in caplog.text
     assert record["state"] == "queued" and record["due"] == 12_000
     assert record["data"]["provider_failures"] == {
         "kilo-free": "rate limited",

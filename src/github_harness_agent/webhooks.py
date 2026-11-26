@@ -35,12 +35,10 @@ def create_app(store: Store, secret: bytes, repositories: set[str]):
             store.receive(
                 delivery, event, {"repository": {"full_name": repo}}, ci_failure=failure
             )
-        elif repo in repositories and event in {
-            "issues",
-            "pull_request",
-            "pull_request_review",
-            "pull_request_review_comment",
-        }:
+        elif repo in repositories and (
+            event in {"issues", "pull_request", "pull_request_review", "pull_request_review_comment"}
+            or event == "issue_comment" and (payload.get("issue") or {}).get("pull_request")
+        ):
             store.receive(delivery, event, payload)
         return {"received": True}
 

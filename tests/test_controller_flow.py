@@ -27,6 +27,20 @@ from test_intake import pull
 from test_publish import FakeGitHub
 
 
+def test_candidate_diagnostics_log_check_categories_without_private_data(caplog):
+    caplog.set_level("INFO")
+    route = RouteEvidence("coding", "kilo-free", "private upstream identifier", {}, "model:free")
+    cause = ExecutionError("private verification summary")
+    cause.checks = (CheckEvidence(("uv", "run", "pytest", "private/check.py"), 2, "private output"),)
+    error = AttemptRejected("private error", route, (route,))
+    error.__cause__ = cause
+    job = {"repo": "a/b", "kind": "pull", "issue": 19, "generation": 3, "attempts": 9, "data": {"pull": 19}}
+    controller._log_candidate_rejection(job, error, "a" * 40)
+    assert "reason=verification_failed" in caplog.text
+    assert "failed_checks=1:pytest:2" in caplog.text and "model=model:free" in caplog.text
+    assert "private" not in caplog.text
+
+
 @pytest.mark.parametrize(
     "scenario",
     [
@@ -34,7 +48,8 @@ from test_publish import FakeGitHub
         "moving-operator-failure",
     ],
 )
-def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario):
+def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario, caplog):
+    caplog.set_level("INFO")
     operator_failure = scenario == "moving-operator-failure"
     move_target = scenario in {"moving", "conflict"} or operator_failure
     if operator_failure:
@@ -246,6 +261,8 @@ def test_issue_and_review_update_the_same_pull(tmp_path, monkeypatch, scenario):
         recorded = retry["data"]["model_attempt_failures"][0]
         assert recorded["candidate"]["model"] == "actual"
         assert recorded["reason"] == "empty patch"
+        assert "candidate_rejected repo=a/b kind=issue job=3" in caplog.text
+        assert "reason=empty_patch" in caplog.text
         Controller(db, api, Executor(), cfg, "app[bot]").run(retry)
         with db.tx() as conn:
             after = json.loads(conn.execute("SELECT data FROM tasks").fetchone()[0])

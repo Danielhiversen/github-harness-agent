@@ -15,7 +15,7 @@ from test_intake import pull
 
 @pytest.mark.parametrize(
     "scenario",
-    ["ci", "mixed", "stale", "retired", "clarification", "round-limit", "resume"],
+    ["ci", "mixed", "stale", "retired", "clarification", "round-limit", "resume", "review-after-limit"],
 )
 def test_current_agent_ci_failure_can_update_existing_pr_once(
     tmp_path, monkeypatch, scenario
@@ -87,7 +87,7 @@ def test_current_agent_ci_failure_can_update_existing_pr_once(
                 "ci/circleci" in task.instructions
                 and "Failed regression" in task.instructions
             )
-            assert ("Human review" in task.instructions) == (scenario == "mixed")
+            assert ("Human review" in task.instructions) == (scenario in {"mixed", "review-after-limit"})
             executions.append(task)
             if scenario == "clarification":
                 raise NeedsClarification("What is the hidden failure?")
@@ -106,7 +106,7 @@ def test_current_agent_ci_failure_can_update_existing_pr_once(
 
     def collect_reviews(*args, **kwargs):
         feedback = (
-            (human,) if scenario == "mixed" and human.key not in kwargs["seen"] else ()
+            (human,) if scenario in {"mixed", "review-after-limit"} and human.key not in kwargs["seen"] else ()
         )
         return ReviewBatch(request["head"]["sha"], feedback)
 
@@ -129,7 +129,7 @@ def test_current_agent_ci_failure_can_update_existing_pr_once(
         "last_commit": agent_commit,
         "threads": [],
         "seen": [],
-        "round": 3 if scenario in {"round-limit", "resume"} else 0,
+        "round": 3 if scenario in {"round-limit", "resume", "review-after-limit"} else 0,
         "adopted_at": "2026-01-01T00:00:00Z",
     }
     if scenario == "resume":
@@ -145,17 +145,14 @@ def test_current_agent_ci_failure_can_update_existing_pr_once(
     elif scenario == "round-limit":
         with store.tx() as db:
             job = db.execute("SELECT state,data FROM tasks").fetchone()
-        assert job["state"] == "paused"
-        assert (
-            json.loads(job["data"])["pause_reason"]
-            == "review repair round limit reached"
-        )
+        assert job["state"] == "queued"
+        assert json.loads(job["data"])["stage"] == "watch"
         assert not executions and not pushes
     else:
         assert len(executions) == len(pushes) == 1
         assert git(repo, "show", "past/feature:value") == b"CI fix\n"
         assert [reply["item"] for reply in replies] == (
-            [human] if scenario == "mixed" else []
+            [human] if scenario in {"mixed", "review-after-limit"} else []
         )
         with store.tx() as db:
             persisted = json.loads(db.execute("SELECT data FROM tasks").fetchone()[0])
